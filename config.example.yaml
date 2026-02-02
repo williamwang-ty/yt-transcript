@@ -1,0 +1,8 @@
+# yt-transcript Configuration Template
+# Copy this file to config.yaml and fill in your settings
+
+# Deepgram API Key (get from https://console.deepgram.com/)
+deepgram_api_key: "your_deepgram_api_key_here"
+
+# Output directory for transcribed files
+output_dir: "~/Downloads"
