@@ -55,11 +55,24 @@ pip install yt-dlp
 2. Provide a YouTube link in your Claude conversation
 3. Claude will automatically execute the transcription workflow
 
-#### Example
+#### Single Video Example
 
 ```
 Please transcribe this video: https://www.youtube.com/watch?v=xxxxx
 ```
+
+#### Multiple Videos (Batch Processing)
+
+You can provide multiple links at once. They will be processed **serially** (one at a time) to ensure quality and context isolation:
+
+```
+Please transcribe these videos:
+- https://www.youtube.com/watch?v=xxxxx
+- https://www.youtube.com/watch?v=yyyyy
+- https://www.youtube.com/watch?v=zzzzz
+```
+
+After completion, a summary table will be provided with status and output paths for each video.
 
 ### 📁 Project Structure
 
@@ -96,6 +109,16 @@ yt-transcript/
 - AI text optimization: Punctuation, paragraphing, error correction
 - Bilingual translation: Requires language capabilities
 - Formatting decisions: Speaker labels, section titles
+
+#### Why Serial Processing for Multiple Links?
+
+When processing multiple YouTube links, this skill uses **serial processing** (one video at a time) instead of parallel:
+
+| Approach | Feasibility | Reason |
+|----------|-------------|--------|
+| Parallel with Subagents | Not supported | Current Claude/Gemini Code architecture does not support spawning independent subagents with isolated context for general tasks |
+| Parallel in single session | Not feasible | AI optimization step requires direct LLM involvement; cannot split into multiple parallel cognitive threads |
+| Serial processing | Adopted | Process one video completely, clear context, then proceed to next |
 
 ### 📄 License
 
@@ -159,11 +182,24 @@ pip install yt-dlp
 2. 在 Claude 对话中提供 YouTube 链接
 3. Claude 将自动执行转录流程
 
-#### 示例
+#### 单个视频示例
 
 ```
 请帮我转录这个视频：https://www.youtube.com/watch?v=xxxxx
 ```
+
+#### 多个视频（批量处理）
+
+可以一次提供多个链接，将**串行处理**（逐个处理）以确保质量和上下文隔离：
+
+```
+请帮我转录这些视频：
+- https://www.youtube.com/watch?v=xxxxx
+- https://www.youtube.com/watch?v=yyyyy
+- https://www.youtube.com/watch?v=zzzzz
+```
+
+处理完成后会提供汇总表格，显示每个视频的状态和输出路径。
 
 ### 📁 项目结构
 
@@ -200,6 +236,16 @@ yt-transcript/
 - AI 文本优化：添加标点、分段分章节、纠错
 - 双语翻译：需要语言能力
 - 格式化决策：说话者标识、章节标题
+
+#### 为什么多链接采用串行处理？
+
+处理多个 YouTube 链接时，本工具采用**串行处理**（逐个处理）而非并行：
+
+| 方案 | 可行性 | 原因 |
+|------|--------|------|
+| 并行 + Subagent | 不支持 | 当前 Claude/Gemini Code 架构不支持为通用任务创建具有独立上下文的子智能体 |
+| 单会话内并行 | 不可行 | AI 优化步骤需要 LLM 直接参与，无法"分身"成多个并行认知线程 |
+| 串行处理 | 采用 | 完整处理一个视频后清理上下文，再处理下一个 |
 
 ### 📄 许可证
 
