@@ -654,6 +654,64 @@ def merge_content(work_dir: str, output_file: str, header_content: str = "") -> 
     }
 
 
+def load_config(config_path: str = None) -> dict:
+    """
+    Load configuration from config.yaml
+    
+    Args:
+        config_path: Optional path to config file. 
+                     Defaults to ~/.claude/skills/yt-transcript/config.yaml
+    
+    Returns:
+        {"output_dir": "...", "deepgram_api_key": "...", "config_path": "..."}
+    """
+    # Default config path
+    if config_path is None:
+        config_path = os.path.expanduser("~/.claude/skills/yt-transcript/config.yaml")
+    
+    path = Path(config_path)
+    if not path.exists():
+        print(f"Error: Config file not found: {config_path}", file=sys.stderr)
+        sys.exit(1)
+    
+    try:
+        content = path.read_text(encoding='utf-8')
+    except Exception as e:
+        print(f"Error: Cannot read config file: {e}", file=sys.stderr)
+        sys.exit(2)
+    
+    # Simple YAML parsing for key: value pairs (no external dependency)
+    config = {}
+    for line in content.split('\n'):
+        line = line.strip()
+        if not line or line.startswith('#'):
+            continue
+        if ':' in line:
+            key, _, value = line.partition(':')
+            key = key.strip()
+            # Remove inline comments (e.g. value # comment) but allow # inside quotes if needed (simple approximation)
+            if '#' in value:
+                # Naive comment stripping: assume # starts a comment unless it's a color code or inside quotes
+                # For this simple config, stripping from first # is likely safe enough
+                value = value.split('#', 1)[0]
+            
+            value = value.strip().strip('"').strip("'")
+            if key:
+                config[key] = value
+    
+    # Expand ~ in output_dir
+    output_dir = config.get('output_dir', '')
+    if output_dir:
+        output_dir = os.path.expanduser(output_dir)
+        if not os.path.isdir(output_dir):
+            print(f"Warning: output_dir does not exist: {output_dir}", file=sys.stderr)
+    
+    return {
+        "output_dir": output_dir,
+        "deepgram_api_key": config.get('deepgram_api_key', ''),
+        "config_path": str(path.absolute())
+    }
+
 
 def main():
     parser = argparse.ArgumentParser(
@@ -728,6 +786,14 @@ def main():
     merge_parser.add_argument('output_file', help='Output file path')
     merge_parser.add_argument('--header', default='', help='Optional header content to prepend')
 
+    # load-config command
+    config_parser = subparsers.add_parser(
+        'load-config',
+        help='Load and return configuration from config.yaml'
+    )
+    config_parser.add_argument('--config-path', default=None,
+                               help='Optional path to config file')
+
     args = parser.parse_args()
 
     if args.command == 'parse-vtt':
@@ -762,6 +828,10 @@ def main():
 
     elif args.command == 'merge-content':
         result = merge_content(args.work_dir, args.output_file, args.header)
+        print(json.dumps(result, ensure_ascii=False))
+
+    elif args.command == 'load-config':
+        result = load_config(args.config_path)
         print(json.dumps(result, ensure_ascii=False))
 
     else:

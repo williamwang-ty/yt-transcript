@@ -14,6 +14,7 @@ Extract and confirm from state file (do not rely on memory):
 - `mode` = _______ (copy from state)
 - `src` = _______ (copy from state)
 - `work_dir` = _______ (copy from state, if present)
+- `output_dir` = _______ (copy from state)
 
 **If state file is missing or corrupt**: STOP. Return to SKILL.md Step 1.
 
@@ -128,6 +129,9 @@ For each chunk file in `/tmp/${VIDEO_ID}_chunks/chunk_*.txt`:
 更新 `chunk: N+1`, `last_action: wrote processed_N.md`, `next: process chunk_N+1`
 
 ### Step 5: Merge with Chapter Headers
+
+> [!IMPORTANT]
+> After merge, the final file will be moved to `$OUTPUT_DIR` in SKILL.md Step 6. Do not save directly to output_dir here.
 
 ```bash
 python3 ~/.claude/skills/yt-transcript/yt_transcript_utils.py merge-content \

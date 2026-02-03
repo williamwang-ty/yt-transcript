@@ -28,11 +28,14 @@ Use this streamlined path for:
 2. **Get metadata**:
    ```bash
    bash ~/.claude/skills/yt-transcript/scripts/download.sh "$VIDEO_URL" metadata
+   
+   # Load config for output_dir
+   OUTPUT_DIR=$(python3 ~/.claude/skills/yt-transcript/yt_transcript_utils.py load-config | python3 -c "import sys,json; print(json.load(sys.stdin)['output_dir'])")
    ```
-   Record: `VIDEO_ID`, `TITLE`, `DURATION`
+   Record: `VIDEO_ID`, `TITLE`, `DURATION`, `OUTPUT_DIR`
 
    **↳ CREATE State File**:
-   创建 `/tmp/${VIDEO_ID}_state.md` (标准模板), `step: 1 (quick)`
+   创建 `/tmp/${VIDEO_ID}_state.md` (标准模板), `step: 1 (quick)`, `output_dir: $OUTPUT_DIR`
 
 3. **Check subtitles exist**:
    ```bash
@@ -107,6 +110,7 @@ vid: ${VIDEO_ID}
 url: ${VIDEO_URL}
 title: ${TITLE}
 duration: ${DURATION}
+output_dir: (Step 1.1 后填充)
 mode: (Step 3 后填充)
 src: (Step 3 后填充)
 work_dir: /tmp/${VIDEO_ID}_chunks
@@ -118,12 +122,25 @@ total: 0
 last_action: got metadata
 
 # Next
-Check subtitle availability (Step 2)
+Load configuration (Step 1.1)
 
 # Rules
 - On error: STOP and report, no retry
 - Refer to current workflow file for details
 ```
+
+---
+
+### Step 1.1: Load Configuration
+
+```bash
+python3 ~/.claude/skills/yt-transcript/yt_transcript_utils.py load-config
+```
+
+**Record the following**:
+- `OUTPUT_DIR` = _______
+
+**↳ WRITE State**: 更新 `output_dir: ${OUTPUT_DIR}`, `next: Check subtitle availability`
 
 ---
 
@@ -270,18 +287,29 @@ transcript_source: $SUBTITLE_SOURCE
 
 ### Step 6: Save File
 
-#### 6.1 Sanitize Filename
+> [!IMPORTANT]
+> **Must read `output_dir` from state file before saving**. Do not rely on memory.
+
+#### 6.1 Read Output Directory from State
+
+```bash
+OUTPUT_DIR=$(grep 'output_dir' /tmp/${VIDEO_ID}_state.md | sed 's/.*: *//')
+```
+
+If `OUTPUT_DIR` is empty, run `load-config` again:
+```bash
+OUTPUT_DIR=$(python3 ~/.claude/skills/yt-transcript/yt_transcript_utils.py load-config | python3 -c "import sys,json; print(json.load(sys.stdin)['output_dir'])")
+```
+
+#### 6.2 Sanitize Filename
 
 ```bash
 CLEAN_TITLE=$(python3 ~/.claude/skills/yt-transcript/yt_transcript_utils.py sanitize-filename "$TITLE")
 ```
 
-#### 6.2 Save to Output Directory
+#### 6.3 Save to Output Directory
 
 ```bash
-CONFIG_FILE=~/.claude/skills/yt-transcript/config.yaml
-OUTPUT_DIR=$(grep 'output_dir' "$CONFIG_FILE" | sed 's/.*: *"\(.*\)"/\1/' | sed "s|~|$HOME|")
-
 OUTPUT_FILE="$OUTPUT_DIR/${DATE}. ${CLEAN_TITLE}.md"
 ```
 
