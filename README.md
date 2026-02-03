@@ -122,13 +122,23 @@ We enforce a hard rule: **One Prompt = One Primary Objective**.
 
 *Impact: Drastically reduces "hallucination" and instruction skipping.*
 
-**2.3 The "Context Recap" Handshake**
-Every workflow file begins with a **Variable Confirmation Section** that forces the model to "ground" itself before executing new instructions, combating state amnesia.
+**2.3 The "Context Sync" Handshake**
+Every workflow file begins with a **Context Sync Section** that forces the model to read the State File (`/tmp/${VIDEO_ID}_state.md`) and extract variable values. This replaces memory-based recall with reliable disk-based verification.
 
 **2.4 Fail-Fast & "Safety Nets"**
 Weak models tend to loop indefinitely when errors occur.
 *   **Fail-Fast**: Instructions explicitly say "If step X fails, STOP. Do not retry."
 *   **Safety Net**: In `quick_cleanup.md`, we added a trigger: "If text has ZERO punctuation, ignore minimal-change rules and fully punctuate."
+
+**2.5 Workflow State Persistence (New in v4.1)**
+To survive context loss or session interruptions, we maintain a lightweight **State File** (`/tmp/${VIDEO_ID}_state.md`).
+*   **Mechanism**: The LLM reads this state at the start of every cognitive turn (~180 tokens overhead) and updates it only after irreversible actions (checkpoints).
+*   **Checkpointing**: 
+    1.  **CREATE** after fetching metadata.
+    2.  **READ** before every decision/action.
+    3.  **WRITE** after key milestones (Download complete, Chunk processed, File saved).
+    4.  **DELETE** upon successful cleanup.
+*   **Impact**: Ensures the Agent never "forgets" where it is or what rules to follow, even if the chat context is cleared.
 
 #### 3. Directory Structure Role
 
@@ -320,13 +330,23 @@ yt-transcript/
 
 *影响：大幅减少“幻觉”和指令跳过。*
 
-**2.3 "Context Recap" 握手**
-每个 Workflow 文件都以 **变量确认部分** 开头，强制模型在执行新指令前先“落地”自身状态，以对抗状态失忆。
+**2.3 "Context Sync" 握手**
+每个 Workflow 文件都以 **Context Sync 部分** 开头，强制模型读取状态文件（`/tmp/${VIDEO_ID}_state.md`）并提取变量值。这用可靠的基于磁盘的验证取代了基于记忆的回想。
 
 **2.4 Fail-Fast & "安全网"**
 弱模型在出错时倾向于无限循环。
 *   **Fail-Fast**: 指令显式说明 "如果步骤 X 失败，停止 (STOP)。不要重试。"
 *   **Safety Net**: 在 `quick_cleanup.md` 中，我们添加了一个触发器："如果文本包含零标点，忽略最小修改规则并完全添加标点。"
+
+**2.5 工作流状态管理 (v4.1 新增)**
+为了在上下文丢失或会话中断后存活，我们维护一个轻量级的 **状态文件** (`/tmp/${VIDEO_ID}_state.md`)。
+*   **机制**: LLM 在每个认知回合开始时读取此状态（约 180 tokens 开销），并仅在不可逆操作（检查点）后更新它。
+*   **检查点设计**:
+    1.  **CREATE**: 获取 Metadata 后创建。
+    2.  **READ**: 每次决策/行动前读取。
+    3.  **WRITE**: 关键里程碑后写入（下载完成、分块处理完、文件保存）。
+    4.  **DELETE**: 清理完成后删除。
+*   **价值**: 确保 Agent 即使在聊天上下文被清空的情况下，也永远不会“忘记”当前进度或应遵循的规则。
 
 #### 3. 目录结构角色
 

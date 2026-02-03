@@ -31,6 +31,9 @@ Use this streamlined path for:
    ```
    Record: `VIDEO_ID`, `TITLE`, `DURATION`
 
+   **↳ CREATE State File**:
+   创建 `/tmp/${VIDEO_ID}_state.md` (标准模板), `step: 1 (quick)`
+
 3. **Check subtitles exist**:
    ```bash
    yt-dlp --list-subs "$VIDEO_URL" 2>&1 | grep -q "has no subtitles"
@@ -54,12 +57,15 @@ Use this streamlined path for:
    - Replace `{RAW_TEXT}` with content from `/tmp/${VIDEO_ID}_raw_text.txt`
    - Send to model, save output to `/tmp/${VIDEO_ID}_optimized.txt`
 
+   **↳ WRITE State**: 更新 `step: 4`, `last_action: optimized (quick)`
+
 7. **Generate final file** (see Step 5 below)
 
 8. **Cleanup**:
    ```bash
    bash ~/.claude/skills/yt-transcript/scripts/cleanup.sh "$VIDEO_ID"
    ```
+   **↳ DELETE State**: `rm /tmp/${VIDEO_ID}_state.md`
 
 **Exit Quick Mode if**:
 - Duration > 900 seconds (15 min)
@@ -93,9 +99,37 @@ bash ~/.claude/skills/yt-transcript/scripts/download.sh "$VIDEO_URL" metadata
 - `DURATION` = _______ (seconds)
 - `CHANNEL` = _______
 
+**↳ CREATE State File**:
+创建 `/tmp/${VIDEO_ID}_state.md`，内容：
+```markdown
+# State
+vid: ${VIDEO_ID}
+url: ${VIDEO_URL}
+title: ${TITLE}
+duration: ${DURATION}
+mode: (Step 3 后填充)
+src: (Step 3 后填充)
+work_dir: /tmp/${VIDEO_ID}_chunks
+
+# Progress
+step: 1
+chunk: 0
+total: 0
+last_action: got metadata
+
+# Next
+Check subtitle availability (Step 2)
+
+# Rules
+- On error: STOP and report, no retry
+- Refer to current workflow file for details
+```
+
 ---
 
 ### Step 2: Check Subtitle Availability
+
+**↳ READ State**: `cat /tmp/${VIDEO_ID}_state.md`
 
 ```bash
 yt-dlp --list-subs "$VIDEO_URL" 2>&1
@@ -106,9 +140,13 @@ yt-dlp --list-subs "$VIDEO_URL" 2>&1
   - **YES** → Go to **Step 3B** (Audio Transcription)
   - **NO** → Go to **Step 3A** (Subtitle Download)
 
+**↳ WRITE State**: 更新 `step: 2`, `next: Step 3A/3B`
+
 ---
 
 ### Step 3A: Subtitle Download Path
+
+**↳ READ State**: `cat /tmp/${VIDEO_ID}_state.md`
 
 **Load and follow**: `workflows/subtitle_download.md`
 
@@ -122,6 +160,8 @@ This workflow will:
 ---
 
 ### Step 3B: Audio Transcription Path
+
+**↳ READ State**: `cat /tmp/${VIDEO_ID}_state.md`
 
 **Load and follow**: `workflows/deepgram_transcribe.md`
 
@@ -140,18 +180,22 @@ This workflow will:
 
 ### Checkpoint After Step 3
 
-**Verify you have**:
-- [ ] `VIDEO_ID` = _______
-- [ ] `TITLE` = _______
-- [ ] Raw text saved to: _______
-- [ ] Subtitle source: [ ] YouTube Subtitles / [ ] Deepgram Transcription
-- [ ] Language mode: [ ] Chinese only / [ ] Bilingual
+**↳ READ State**: `cat /tmp/${VIDEO_ID}_state.md`
+
+**Verify from state file**:
+- [ ] `src` is set to `youtube` or `deepgram`
+- [ ] `mode` is set to `bilingual` or `chinese`
+- [ ] Raw text file exists at `/tmp/${VIDEO_ID}_raw_text.txt`
 
 **If any is missing, STOP. Review Step 3A or 3B.**
+
+**↳ WRITE State**: 更新 `step: 3`, `src: youtube/deepgram`, `mode: bilingual/chinese`
 
 ---
 
 ### Step 4: Text Optimization
+
+**↳ READ State**: `cat /tmp/${VIDEO_ID}_state.md`
 
 **Load and follow**: `workflows/text_optimization.md`
 
@@ -161,20 +205,28 @@ This workflow will:
 - Handle chapter detection and chunking for long videos
 - Save optimized text to `/tmp/${VIDEO_ID}_optimized.txt`
 
+**↳ WRITE State** (Long Video Path, 每个 chunk 后):
+更新 `step: 4`, `chunk: N`, `total: M`, `work_dir: /tmp/${VIDEO_ID}_chunks`
+
 ---
 
 ### Checkpoint After Step 4
 
-**Verify you have**:
-- [ ] Optimized text saved to: `/tmp/${VIDEO_ID}_optimized.txt`
-- [ ] Text is structured with sections
-- [ ] Translation complete (if bilingual mode)
+**↳ READ State**: `cat /tmp/${VIDEO_ID}_state.md`
 
-**If any is missing, STOP. Review Step 4.**
+**Verify from state file**:
+- [ ] `last_action` contains `optimized`
+- [ ] Optimized text file exists at `/tmp/${VIDEO_ID}_optimized.txt`
+
+**If verification fails, STOP. Review Step 4.**
+
+**↳ WRITE State**: 更新 `step: 4`, `last_action: optimized`
 
 ---
 
 ### Step 5: Generate Final Markdown File
+
+**↳ READ State**: `cat /tmp/${VIDEO_ID}_state.md`
 
 #### 5.1 Create Frontmatter
 
@@ -235,6 +287,8 @@ OUTPUT_FILE="$OUTPUT_DIR/${DATE}. ${CLEAN_TITLE}.md"
 
 Write final markdown content to `$OUTPUT_FILE`.
 
+**↳ WRITE State**: 更新 `step: 6`, `last_action: saved final file`
+
 ---
 
 ### Step 7: Cleanup
@@ -242,6 +296,8 @@ Write final markdown content to `$OUTPUT_FILE`.
 ```bash
 bash ~/.claude/skills/yt-transcript/scripts/cleanup.sh "$VIDEO_ID"
 ```
+
+**↳ DELETE State**: `rm /tmp/${VIDEO_ID}_state.md`
 
 ---
 

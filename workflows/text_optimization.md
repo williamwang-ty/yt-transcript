@@ -4,15 +4,18 @@ This workflow handles AI-powered text optimization, including structure, transla
 
 ---
 
-## Context Recap
+## Context Sync
 
-Before starting, confirm you have:
-- **VIDEO_ID**: `_______`
-- **TITLE**: `_______`
-- **DURATION**: `_______` seconds
-- **RAW_TEXT_PATH**: `_______`
-- **LANGUAGE**: `_______` (zh or en)
-- **SUBTITLE_SOURCE**: `_______` (YouTube Subtitles or Deepgram Transcription)
+**↳ READ State**: `cat /tmp/${VIDEO_ID}_state.md`
+
+Extract and confirm from state file (do not rely on memory):
+- `vid` = _______ (copy from state)
+- `duration` = _______ (copy from state, in seconds)
+- `mode` = _______ (copy from state)
+- `src` = _______ (copy from state)
+- `work_dir` = _______ (copy from state, if present)
+
+**If state file is missing or corrupt**: STOP. Return to SKILL.md Step 1.
 
 ---
 
@@ -61,6 +64,9 @@ RAW_TEXT=$(cat /tmp/${VIDEO_ID}_raw_text.txt)
 5. Replace `{STRUCTURED_TEXT}` with content from step 3
 6. Send to model, save output to `/tmp/${VIDEO_ID}_optimized.txt`
 
+**↳ WRITE State** (优化完成后):
+更新 `step: 4`, `last_action: optimized (short video)`
+
 ---
 
 ## Long Video Path (≥ 30 minutes)
@@ -81,6 +87,8 @@ python3 ~/.claude/skills/yt-transcript/yt_transcript_utils.py chunk-text \
     /tmp/${VIDEO_ID}_chunks \
     --chunk-size 8000
 ```
+
+**↳ WRITE State**: 更新 `chunk: 0`, `total: N`, `work_dir: /tmp/${VIDEO_ID}_chunks`
 
 ### Step 3: Generate Chapter Plan (if no YouTube chapters)
 
@@ -104,6 +112,8 @@ If `HAS_CHAPTERS=true`:
 
 ### Step 4: Process Each Chunk
 
+**↳ READ State**: `cat /tmp/${VIDEO_ID}_state.md` (每个 chunk 处理前)
+
 For each chunk file in `/tmp/${VIDEO_ID}_chunks/chunk_*.txt`:
 
 **For Chinese-only mode**:
@@ -113,6 +123,9 @@ For each chunk file in `/tmp/${VIDEO_ID}_chunks/chunk_*.txt`:
 **For Bilingual mode**:
 - Use `prompts/translate_only.md` (no section headers)
 - Save to `processed_XXX.md`
+
+**↳ WRITE State** (每个 chunk 处理后):
+更新 `chunk: N+1`, `last_action: wrote processed_N.md`, `next: process chunk_N+1`
 
 ### Step 5: Merge with Chapter Headers
 

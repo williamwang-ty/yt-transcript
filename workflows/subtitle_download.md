@@ -4,12 +4,16 @@ This workflow handles downloading and parsing subtitle files from YouTube.
 
 ---
 
-## Context Recap
+## Context Sync
 
-Before starting, confirm you have:
-- **VIDEO_ID**: `_______`
-- **VIDEO_URL**: `_______`
-- **TITLE**: `_______`
+**↳ READ State**: `cat /tmp/${VIDEO_ID}_state.md`
+
+Extract and confirm from state file:
+- `vid` = _______
+- `url` = _______
+- `title` = _______
+
+**If state file is missing**: STOP. Return to SKILL.md Step 1.
 
 ---
 

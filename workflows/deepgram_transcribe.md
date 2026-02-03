@@ -4,13 +4,19 @@ This workflow handles audio download and speech-to-text transcription using Deep
 
 ---
 
-## Context Recap
+## Context Sync
 
-Before starting, confirm you have:
-- **VIDEO_ID**: `_______`
-- **VIDEO_URL**: `_______`
-- **TITLE**: `_______`
-- **CONFIG_FILE**: `~/.claude/skills/yt-transcript/config.yaml`
+**↳ READ State**: `cat /tmp/${VIDEO_ID}_state.md`
+
+Extract and confirm from state file:
+- `vid` = _______
+- `url` = _______
+- `title` = _______
+
+From system:
+- `CONFIG_FILE`: `~/.claude/skills/yt-transcript/config.yaml`
+
+**If state file is missing**: STOP. Return to SKILL.md Step 1.
 
 ---
 
