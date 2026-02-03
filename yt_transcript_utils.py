@@ -10,6 +10,7 @@ Commands:
     parse-vtt <vtt_path>           Parse VTT subtitle file, output plain text
     process-deepgram <json_path>   Process Deepgram JSON, output cleaned text
     sanitize-filename "<title>"    Clean illegal filename characters
+    test-deepgram-api <api_key>    Test Deepgram API key validity
 """
 
 import argparse
@@ -149,6 +150,50 @@ def sanitize_filename(title: str) -> str:
     return sanitized
 
 
+def test_deepgram_api(api_key: str) -> dict:
+    """
+    Quick test of Deepgram API key validity
+    
+    Makes a minimal request to verify:
+    - API key is valid
+    - Network connectivity works
+    - Account has credits
+    
+    Returns:
+        {"valid": bool, "error": str or None, "balance_warning": bool}
+    """
+    import urllib.request
+    import urllib.error
+    
+    url = "https://api.deepgram.com/v1/listen?model=nova-2&language=en"
+    headers = {
+        "Authorization": f"Token {api_key}",
+        "Content-Type": "audio/wav"
+    }
+    
+    # Send empty audio to trigger auth check (will fail with audio error if auth works)
+    req = urllib.request.Request(url, data=b'', headers=headers, method='POST')
+    
+    try:
+        with urllib.request.urlopen(req, timeout=10) as response:
+            # Unexpected success with empty audio
+            return {"valid": True, "error": None, "balance_warning": False}
+    except urllib.error.HTTPError as e:
+        if e.code == 401:
+            return {"valid": False, "error": "Invalid API key (401 Unauthorized)", "balance_warning": False}
+        elif e.code == 402:
+            return {"valid": False, "error": "Insufficient credits (402 Payment Required)", "balance_warning": True}
+        elif e.code == 400:
+            # Bad request usually means auth worked but audio was invalid
+            return {"valid": True, "error": None, "balance_warning": False}
+        else:
+            return {"valid": False, "error": f"HTTP Error {e.code}: {e.reason}", "balance_warning": False}
+    except urllib.error.URLError as e:
+        return {"valid": False, "error": f"Network error: {e.reason}", "balance_warning": False}
+    except Exception as e:
+        return {"valid": False, "error": f"Unexpected error: {e}", "balance_warning": False}
+
+
 def main():
     parser = argparse.ArgumentParser(
         description='yt-transcript utility script',
@@ -178,6 +223,13 @@ def main():
     )
     fn_parser.add_argument('title', help='Original title')
 
+    # test-deepgram-api command
+    api_parser = subparsers.add_parser(
+        'test-deepgram-api',
+        help='Test Deepgram API key validity'
+    )
+    api_parser.add_argument('api_key', help='Deepgram API key')
+
     args = parser.parse_args()
 
     if args.command == 'parse-vtt':
@@ -191,6 +243,12 @@ def main():
     elif args.command == 'sanitize-filename':
         result = sanitize_filename(args.title)
         print(result)
+
+    elif args.command == 'test-deepgram-api':
+        result = test_deepgram_api(args.api_key)
+        print(json.dumps(result, ensure_ascii=False))
+        if not result['valid']:
+            sys.exit(1)
 
     else:
         parser.print_help()

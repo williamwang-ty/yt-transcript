@@ -46,6 +46,92 @@ DEEPGRAM_API_KEY=$(grep 'deepgram_api_key' "$CONFIG_FILE" | sed 's/.*: *"\(.*\)"
 OUTPUT_DIR=$(grep 'output_dir' "$CONFIG_FILE" | sed 's/.*: *"\(.*\)"/\1/' | sed "s|~|$HOME|")
 ```
 
+## Error Handling & Retry Policy
+
+> [!IMPORTANT]
+> **Never retry indefinitely.** If an operation fails after max retries, stop and report to the user.
+
+### Maximum Retry Attempts
+
+| Operation | Max Retries | Action on Failure |
+|-----------|-------------|-------------------|
+| yt-dlp metadata/subtitle commands | 2 | Report error, suggest updating yt-dlp |
+| yt-dlp audio download | 2 | Report error, check video availability |
+| Deepgram API call | 1 | Report error, do NOT retry automatically |
+| File read/write | 1 | Report error |
+
+### Pre-flight Checks (Before Step 1)
+
+Before starting the workflow, perform these checks:
+
+```bash
+# 1. Verify Deepgram API key is configured
+CONFIG_FILE=~/.claude/skills/yt-transcript/config.yaml
+DEEPGRAM_API_KEY=$(grep 'deepgram_api_key' "$CONFIG_FILE" | sed 's/.*: *"\(.*\)"/\1/')
+if [ -z "$DEEPGRAM_API_KEY" ] || [ "$DEEPGRAM_API_KEY" = "your_api_key_here" ]; then
+    echo "❌ Error: Deepgram API key not configured"
+    exit 1
+fi
+
+# 2. Test Deepgram API connectivity (quick validation)
+python3 ~/.claude/skills/yt-transcript/yt_transcript_utils.py test-deepgram-api "$DEEPGRAM_API_KEY"
+```
+
+### Timeout Guidelines (for Deepgram API)
+
+Based on audio file size, use appropriate timeout:
+
+| File Size | Recommended --max-time | Estimated Time |
+|-----------|------------------------|----------------|
+| <10MB     | 300 (5 min)            | ~2-3 min       |
+| 10-30MB   | 600 (10 min)           | ~5-7 min       |
+| 30-50MB   | 900 (15 min)           | ~8-12 min      |
+| >50MB     | 1200 (20 min)          | Warn user first |
+
+```bash
+# Calculate timeout based on file size
+FILE_SIZE=$(stat -f%z "$AUDIO_FILE" 2>/dev/null || stat -c%s "$AUDIO_FILE")
+if [ "$FILE_SIZE" -lt 10485760 ]; then
+    MAX_TIME=300
+elif [ "$FILE_SIZE" -lt 31457280 ]; then
+    MAX_TIME=600
+elif [ "$FILE_SIZE" -lt 52428800 ]; then
+    MAX_TIME=900
+else
+    MAX_TIME=1200
+    echo "⚠️ Large file detected ($(($FILE_SIZE/1048576))MB). Upload may take 10-20 minutes."
+fi
+```
+
+### Failure Reporting Format
+
+When a step fails after max retries, report to user immediately:
+
+```
+❌ Transcription failed at Step X: <Step Name>
+
+**Error**: <specific error message>
+**Attempts**: <number of retries> / <max retries>
+**Suggestion**: <actionable next step>
+
+Options:
+1. Retry with different settings
+2. Skip this video (for batch processing)
+3. Abort the entire task
+```
+
+### Common Failure Scenarios
+
+| Scenario | Detection | Response |
+|----------|-----------|----------|
+| Video unavailable | yt-dlp returns "Video unavailable" | Stop, report to user |
+| No subtitles + Deepgram fails | Deepgram returns error JSON | Stop, report error details |
+| Network timeout | curl returns exit code 28 | Stop after 1 attempt, do NOT auto-retry |
+| API key invalid | Deepgram returns 401 | Stop immediately, ask user to check config |
+| Insufficient credits | Deepgram returns 402 | Stop immediately, ask user to top up |
+
+
+
 ## Workflow
 
 ### Step 0: Ensure yt-dlp is up to date (Important!)
@@ -271,22 +357,28 @@ You are a professional video transcript editor. The following is raw transcript 
 
 Please optimize the text as follows, output the optimized plain text directly (don't explain what you did):
 
-1. **Punctuation**: Add correct punctuation based on semantics and tone (periods, commas, question marks, exclamation marks, colons, semicolons, etc.)
-2. **Sentence splitting**: Break continuous text into natural sentences based on semantics
-3. **Paragraph splitting**: Divide into paragraphs based on topic transitions or logical pauses (3-8 sentences per paragraph recommended), separate paragraphs with blank lines
-4. **Section splitting**: Identify obvious topic transition points, mark with second-level headings (## Section Name), section names should concisely summarize the content
-5. **Error correction**:
-   - Fix obvious speech recognition errors (homophones, near-homophones)
-   - Fix proper noun spelling (technical terms, names, product names, etc.)
-   - Fix grammar errors
-   - Remove unnecessary repeated content
-6. **Cleanup**: Remove filler words (uh, um, like, you know) and meaningless repetition
+1. **Structure & Sectioning (CRITICAL)**:
+   - **Paragraphs**: Divide text into natural paragraphs (3-8 sentences) based on logical pauses.
+   - **Sections**: Identify distinct topic transitions and insert descriptive headers using Markdown Level 2 (## Header Name). **Every transcript must have at least 3-5 clear section headers.**
+
+2. **Bilingual Translation (CRITICAL)**:
+   - **If the content is English**: You MUST output in **Bilingual Mode**.
+     - Format:
+       [English Paragraph]
+       
+       [Chinese Translation Paragraph]
+     - The Chinese translation must be fluent, natural, and accurate.
+   - **If the content is Chinese**: Output in Chinese only.
+
+3. **Error Correction & Cleanup**:
+   - Fix speech recognition errors (homophones), proper noun spellings, and grammar.
+   - Remove filler words (uh, um, like) and meaningless repetitions.
+   - Add correct punctuation based on tone and semantics.
 
 Notes:
-- Keep the original meaning and style unchanged, only make necessary corrections
-- Don't add content not in the original
-- If unsure about an error, keep the original
-- Keep original text for proper nouns on first appearance, add parenthetical notes if needed
+- **Headers**: Use English headers if the video is English, but they serve as section dividers for both languages.
+- **Translation**: Keep technical terms in English (e.g., "API", "LLM") within the Chinese text if appropriate.
+- **Fidelity**: Preserve the original meaning and style. Do NOT summarize; translate the full content.
 
 Raw text:
 ---
