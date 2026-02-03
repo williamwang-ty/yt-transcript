@@ -1,25 +1,271 @@
 ---
 name: yt-transcript
-description: Transcribe YouTube videos into formatted Markdown articles. Supports subtitle download or Deepgram speech-to-text (with multi-speaker recognition). Use this skill when a user provides a YouTube link and wants a text version of the video content.
+description: Transcribe YouTube videos into formatted Markdown articles. Supports subtitle download or Deepgram speech-to-text. Use this skill when a user provides a YouTube link and wants a text version.
 ---
 
 # YouTube Video Transcription
 
-Transcribe YouTube videos into formatted Markdown articles.
+Transcribe YouTube videos into formatted Markdown articles with optional bilingual support.
 
-## Trigger Conditions
+> [!IMPORTANT]
+> **For Weak Models**: This skill uses a modular workflow design. You will load specific workflow files as needed, keeping context manageable.
 
-Automatically use this skill when a user provides a YouTube link and wants a text version of the video content.
+---
+
+## Quick Mode (Recommended for Simple Cases)
+
+Use this streamlined path for:
+- Videos **< 15 minutes**
+- **Has subtitles** available
+
+### Quick Mode Steps
+
+1. **Run pre-flight check**:
+   ```bash
+   bash ~/.claude/skills/yt-transcript/scripts/preflight.sh
+   ```
+
+2. **Get metadata**:
+   ```bash
+   bash ~/.claude/skills/yt-transcript/scripts/download.sh "$VIDEO_URL" metadata
+   ```
+   Record: `VIDEO_ID`, `TITLE`, `DURATION`
+
+3. **Check subtitles exist**:
+   ```bash
+   yt-dlp --list-subs "$VIDEO_URL" 2>&1 | grep -q "has no subtitles"
+   # If output contains "has no subtitles" AND "has no automatic captions", EXIT Quick Mode
+   ```
+
+4. **Download subtitles**:
+   ```bash
+   bash ~/.claude/skills/yt-transcript/scripts/download.sh "$VIDEO_URL" subtitles
+   ```
+
+5. **Parse VTT to text**:
+   ```bash
+   # Find the first available VTT file
+   VTT_FILE=$(ls /tmp/${VIDEO_ID}.*.vtt 2>/dev/null | head -1)
+   python3 ~/.claude/skills/yt-transcript/yt_transcript_utils.py parse-vtt "$VTT_FILE" > /tmp/${VIDEO_ID}_raw_text.txt
+   ```
+
+6. **Apply quick cleanup**:
+   - Load `prompts/quick_cleanup.md`
+   - Replace `{RAW_TEXT}` with content from `/tmp/${VIDEO_ID}_raw_text.txt`
+   - Send to model, save output to `/tmp/${VIDEO_ID}_optimized.txt`
+
+7. **Generate final file** (see Step 5 below)
+
+8. **Cleanup**:
+   ```bash
+   bash ~/.claude/skills/yt-transcript/scripts/cleanup.sh "$VIDEO_ID"
+   ```
+
+**Exit Quick Mode if**:
+- Duration > 900 seconds (15 min)
+- No subtitles available
+- User requests advanced features (chapter detection, multi-speaker)
+
+---
+
+## Full Workflow (For Complex Cases)
+
+### Step 0: Pre-flight Check
+
+**Always run first**:
+```bash
+bash ~/.claude/skills/yt-transcript/scripts/preflight.sh
+```
+
+If this fails, STOP and report error to user.
+
+---
+
+### Step 1: Get Video Metadata
+
+```bash
+bash ~/.claude/skills/yt-transcript/scripts/download.sh "$VIDEO_URL" metadata
+```
+
+**Record the following**:
+- `VIDEO_ID` = _______
+- `TITLE` = _______
+- `DURATION` = _______ (seconds)
+- `CHANNEL` = _______
+
+---
+
+### Step 2: Check Subtitle Availability
+
+```bash
+yt-dlp --list-subs "$VIDEO_URL" 2>&1
+```
+
+**Decision**:
+- Output contains "has no subtitles" AND "has no automatic captions"?
+  - **YES** → Go to **Step 3B** (Audio Transcription)
+  - **NO** → Go to **Step 3A** (Subtitle Download)
+
+---
+
+### Step 3A: Subtitle Download Path
+
+**Load and follow**: `workflows/subtitle_download.md`
+
+This workflow will:
+- Detect available subtitle languages
+- Download and parse VTT files
+- Save raw text to `/tmp/${VIDEO_ID}_*_text.txt`
+
+**After completion**, proceed to **Step 4**.
+
+---
+
+### Step 3B: Audio Transcription Path
+
+**Load and follow**: `workflows/deepgram_transcribe.md`
+
+This workflow will:
+- Download audio file
+- Split if > 10MB
+- Call Deepgram API
+- Save raw text to `/tmp/${VIDEO_ID}_raw_text.txt`
+
+**After completion**, proceed to **Step 4**.
+
+> [!WARNING]
+> **Error Recovery**: If Deepgram API fails, do NOT retry automatically. Report error and ask user: "Retry or skip?"
+
+---
+
+### Checkpoint After Step 3
+
+**Verify you have**:
+- [ ] `VIDEO_ID` = _______
+- [ ] `TITLE` = _______
+- [ ] Raw text saved to: _______
+- [ ] Subtitle source: [ ] YouTube Subtitles / [ ] Deepgram Transcription
+- [ ] Language mode: [ ] Chinese only / [ ] Bilingual
+
+**If any is missing, STOP. Review Step 3A or 3B.**
+
+---
+
+### Step 4: Text Optimization
+
+**Load and follow**: `workflows/text_optimization.md`
+
+This workflow will:
+- Determine if video is short (< 30 min) or long (≥ 30 min)
+- Apply appropriate optimization strategy
+- Handle chapter detection and chunking for long videos
+- Save optimized text to `/tmp/${VIDEO_ID}_optimized.txt`
+
+---
+
+### Checkpoint After Step 4
+
+**Verify you have**:
+- [ ] Optimized text saved to: `/tmp/${VIDEO_ID}_optimized.txt`
+- [ ] Text is structured with sections
+- [ ] Translation complete (if bilingual mode)
+
+**If any is missing, STOP. Review Step 4.**
+
+---
+
+### Step 5: Generate Final Markdown File
+
+#### 5.1 Create Frontmatter
+
+```bash
+DATE=$(date +%Y-%m-%d)
+DURATION_MIN=$((DURATION / 60))
+BILINGUAL=$([ "$LANGUAGE_MODE" = "Bilingual" ] && echo "true" || echo "false")
+```
+
+#### 5.2 Build Final File
+
+```markdown
+---
+title: $TITLE
+source: $VIDEO_URL
+channel: $CHANNEL
+date: $UPLOAD_DATE
+created: $DATE
+type: video-transcript
+bilingual: $BILINGUAL
+duration: ${DURATION_MIN}m
+transcript_source: $SUBTITLE_SOURCE
+---
+
+# $TITLE
+
+> Video source: [YouTube - $CHANNEL]($VIDEO_URL)
+> Language mode: $LANGUAGE_MODE
+> Duration: ${DURATION_MIN} minutes
+
+---
+
+[Insert optimized text from /tmp/${VIDEO_ID}_optimized.txt]
+
+---
+
+*This article was generated by AI voice transcription ($SUBTITLE_SOURCE), for reference only.*
+```
+
+---
+
+### Step 6: Save File
+
+#### 6.1 Sanitize Filename
+
+```bash
+CLEAN_TITLE=$(python3 ~/.claude/skills/yt-transcript/yt_transcript_utils.py sanitize-filename "$TITLE")
+```
+
+#### 6.2 Save to Output Directory
+
+```bash
+CONFIG_FILE=~/.claude/skills/yt-transcript/config.yaml
+OUTPUT_DIR=$(grep 'output_dir' "$CONFIG_FILE" | sed 's/.*: *"\(.*\)"/\1/' | sed "s|~|$HOME|")
+
+OUTPUT_FILE="$OUTPUT_DIR/${DATE}. ${CLEAN_TITLE}.md"
+```
+
+Write final markdown content to `$OUTPUT_FILE`.
+
+---
+
+### Step 7: Cleanup
+
+```bash
+bash ~/.claude/skills/yt-transcript/scripts/cleanup.sh "$VIDEO_ID"
+```
+
+---
+
+### Step 8: Report Success
+
+```
+✅ Video transcription complete
+   Title: $TITLE
+   Language: $LANGUAGE_MODE
+   Subtitle source: $SUBTITLE_SOURCE
+   Output file: $OUTPUT_FILE
+```
+
+---
 
 ## Multi-Link Processing
 
-When the user provides **multiple YouTube links**:
+When processing **multiple YouTube links**:
 
-1. **Serial processing**: Process one at a time, not in parallel
-2. **Clear context after each video** (use /clear or equivalent) to prevent performance degradation from long text accumulation
-3. Output summary after all are completed
+1. **Process serially** (one at a time, not parallel)
+2. **Clear context** between videos (to prevent memory buildup)
+3. **Track results** in a table
 
-### Summary Output Format
+### Batch Summary Format
 
 ```
 ✅ Batch transcription complete (N videos total)
@@ -31,87 +277,27 @@ When the user provides **multiple YouTube links**:
 | 3 | <Title3> | ❌ Failed: <Reason> | - |
 ```
 
-## Configuration
+---
 
-**Config file**: `config.yaml` (in the same directory as this file)
+## Error Handling Policy
 
-```bash
-# Before first use, read the config file
-CONFIG_FILE="$(dirname "$0")/config.yaml"
-# Or use the config in the skill directory
-CONFIG_FILE=~/.claude/skills/yt-transcript/config.yaml
-
-# Extract config values
-DEEPGRAM_API_KEY=$(grep 'deepgram_api_key' "$CONFIG_FILE" | sed 's/.*: *"\(.*\)"/\1/')
-OUTPUT_DIR=$(grep 'output_dir' "$CONFIG_FILE" | sed 's/.*: *"\(.*\)"/\1/' | sed "s|~|$HOME|")
-```
-
-## Error Handling & Retry Policy
-
-> [!IMPORTANT]
-> **Never retry indefinitely.** If an operation fails after max retries, stop and report to the user.
+> [!CAUTION]
+> **Never retry indefinitely**. If an operation fails after max retries, STOP and report to user.
 
 ### Maximum Retry Attempts
 
 | Operation | Max Retries | Action on Failure |
 |-----------|-------------|-------------------|
-| yt-dlp metadata/subtitle commands | 2 | Report error, suggest updating yt-dlp |
-| yt-dlp audio download | 2 | Report error, check video availability |
-| Deepgram API call | 1 | Report error, do NOT retry automatically |
+| yt-dlp commands | 1 | Report error, suggest updating yt-dlp |
+| Deepgram API call | 0 | Report error, ask user for retry |
 | File read/write | 1 | Report error |
 
-### Pre-flight Checks (Before Step 1)
-
-Before starting the workflow, perform these checks:
-
-```bash
-# 1. Verify Deepgram API key is configured
-CONFIG_FILE=~/.claude/skills/yt-transcript/config.yaml
-DEEPGRAM_API_KEY=$(grep 'deepgram_api_key' "$CONFIG_FILE" | sed 's/.*: *"\(.*\)"/\1/')
-if [ -z "$DEEPGRAM_API_KEY" ] || [ "$DEEPGRAM_API_KEY" = "your_api_key_here" ]; then
-    echo "❌ Error: Deepgram API key not configured"
-    exit 1
-fi
-
-# 2. Test Deepgram API connectivity (quick validation)
-python3 ~/.claude/skills/yt-transcript/yt_transcript_utils.py test-deepgram-api "$DEEPGRAM_API_KEY"
-```
-
-### Timeout Guidelines (for Deepgram API)
-
-Based on audio file size, use appropriate timeout:
-
-| File Size | Recommended --max-time | Estimated Time |
-|-----------|------------------------|----------------|
-| <10MB     | 300 (5 min)            | ~2-3 min       |
-| 10-30MB   | 600 (10 min)           | ~5-7 min       |
-| 30-50MB   | 900 (15 min)           | ~8-12 min      |
-| >50MB     | 1200 (20 min)          | Warn user first |
-
-```bash
-# Calculate timeout based on file size
-FILE_SIZE=$(stat -f%z "$AUDIO_FILE" 2>/dev/null || stat -c%s "$AUDIO_FILE")
-if [ "$FILE_SIZE" -lt 10485760 ]; then
-    MAX_TIME=300
-elif [ "$FILE_SIZE" -lt 31457280 ]; then
-    MAX_TIME=600
-elif [ "$FILE_SIZE" -lt 52428800 ]; then
-    MAX_TIME=900
-else
-    MAX_TIME=1200
-    echo "⚠️ Large file detected ($(($FILE_SIZE/1048576))MB). Upload may take 10-20 minutes."
-fi
-```
-
-### Failure Reporting Format
-
-When a step fails after max retries, report to user immediately:
+### Failure Response Template
 
 ```
 ❌ Transcription failed at Step X: <Step Name>
 
 **Error**: <specific error message>
-**Attempts**: <number of retries> / <max retries>
 **Suggestion**: <actionable next step>
 
 Options:
@@ -120,654 +306,65 @@ Options:
 3. Abort the entire task
 ```
 
-### Common Failure Scenarios
-
-| Scenario | Detection | Response |
-|----------|-----------|----------|
-| Video unavailable | yt-dlp returns "Video unavailable" | Stop, report to user |
-| No subtitles + Deepgram fails | Deepgram returns error JSON | Stop, report error details |
-| Network timeout | curl returns exit code 28 | Stop after 1 attempt, do NOT auto-retry |
-| API key invalid | Deepgram returns 401 | Stop immediately, ask user to check config |
-| Insufficient credits | Deepgram returns 402 | Stop immediately, ask user to top up |
-
-
-
-## Workflow
-
-### Step 0: Ensure yt-dlp is up to date (Important!)
-
-YouTube frequently updates its API, older yt-dlp versions may fail to download. **Update before each execution**:
-
-```bash
-brew upgrade yt-dlp 2>/dev/null || pip install -U yt-dlp --break-system-packages 2>/dev/null || echo "Please manually update yt-dlp"
-```
-
-### Step 1: Extract VIDEO_ID and Get Video Basic Info
-
-#### 1.1 Extract VIDEO_ID (supports all formats)
-
-```bash
-# Use yt-dlp directly, compatible with all YouTube URL formats
-VIDEO_ID=$(yt-dlp --print "%(id)s" "<VIDEO_URL>" 2>/dev/null)
-```
-
-Supported URL formats:
-- `https://www.youtube.com/watch?v=xxx`
-- `https://youtu.be/xxx`
-- `https://youtube.com/shorts/xxx`
-- `https://youtube.com/live/xxx`
-
-#### 1.2 Get Video Metadata
-
-```bash
-yt-dlp --print "%(title)s" --print "%(duration)s" --print "%(upload_date)s" --print "%(channel)s" "<VIDEO_URL>" 2>/dev/null
-```
-
-Record:
-- VIDEO_ID (used in subsequent steps)
-- Video title
-- Duration (seconds)
-- Upload date
-- Channel name
-
-### Step 2: Check Subtitle Availability
-
-```bash
-yt-dlp --list-subs "<VIDEO_URL>" 2>&1
-```
-
-**Decision logic**:
-- If output contains "has no subtitles" AND "has no automatic captions" → No subtitles, go to Step 3B
-- Otherwise → Has subtitles, go to Step 3A
-
-### Step 3A: Has Subtitles - Download and Parse Subtitle File
-
-#### 3A.1 Check Available Subtitle Languages
-
-From Step 2's `--list-subs` output, determine:
-- Whether Chinese subtitles exist (zh, zh-Hans, zh-CN, zh-Hant)
-- Whether English subtitles exist (en, en-orig, en-US)
-
-**Subtitle strategy**:
-| Available Subtitles | Download Strategy | Output Format |
-|---------------------|-------------------|---------------|
-| Chinese only | Download Chinese | Chinese only |
-| English only | Download English | Bilingual (translate English) |
-| Chinese + English | Download both | Bilingual (side-by-side) |
-
-#### 3A.2 Download Subtitles
-
-**Scenario 1: Download Chinese subtitles only**
-```bash
-yt-dlp --write-sub --write-auto-sub --sub-lang "zh,zh-Hans,zh-CN" --sub-format "vtt" --skip-download -o "/tmp/${VIDEO_ID}" "<VIDEO_URL>"
-```
-
-**Scenario 2: Download English subtitles only**
-```bash
-yt-dlp --write-sub --write-auto-sub --sub-lang "en" --sub-format "vtt" --skip-download -o "/tmp/${VIDEO_ID}" "<VIDEO_URL>"
-```
-
-**Scenario 3: Download bilingual subtitles**
-```bash
-yt-dlp --write-sub --write-auto-sub --sub-lang "zh,zh-Hans,zh-CN,en" --sub-format "vtt" --skip-download -o "/tmp/${VIDEO_ID}" "<VIDEO_URL>"
-```
-
-#### 3A.3 Parse VTT File to Extract Plain Text
-
-```bash
-# Use utility script to parse VTT file
-python3 ~/.claude/skills/yt-transcript/yt_transcript_utils.py parse-vtt "/tmp/${VIDEO_ID}.zh.vtt"
-# Output: plain text content to stdout
-```
-
-The script automatically handles: removes timestamps, VTT tags, cue numbers, consecutive duplicate lines.
-
-Priority: Manual subtitles > Auto subtitles, Chinese > English
-
-### Step 3B: No Subtitles - Audio Transcription
-
-#### 3B.1 Check Available Audio Formats and Download (Important!)
-
-**Don't specify format directly**, check available formats first:
-
-```bash
-# List all available formats
-yt-dlp --list-formats "<VIDEO_URL>" 2>&1 | grep -E "audio|ID"
-```
-
-**Multi-track Video Handling**:
-
-Modern YouTube videos may have multiple audio tracks (e.g., Chinese dubbing, English dubbing). Format IDs may have suffixes:
-- `140-0`, `251-0` = Default/English track
-- `140-1`, `251-1` = Chinese original track
-- `140-drc`, `251-drc` = Dynamic range compression version
-
-**Download strategy**:
-
-```bash
-# Method 1: Prioritize Chinese original track (recommended for Chinese videos)
-# Check for zh-Hant or zh tagged audio tracks
-AUDIO_FORMAT=$(yt-dlp --list-formats "<VIDEO_URL>" 2>&1 | grep -E "audio.*zh" | head -1 | awk '{print $1}')
-
-# If no explicit Chinese track, use highest quality track without language tag
-if [ -z "$AUDIO_FORMAT" ]; then
-    AUDIO_FORMAT=$(yt-dlp --list-formats "<VIDEO_URL>" 2>&1 | grep -E "^140-0|^140 " | head -1 | awk '{print $1}')
-fi
-
-# If still nothing, use bestaudio
-if [ -z "$AUDIO_FORMAT" ]; then
-    AUDIO_FORMAT="bestaudio"
-fi
-
-# Download audio
-yt-dlp -f "$AUDIO_FORMAT" -o "/tmp/${VIDEO_ID}.%(ext)s" "<VIDEO_URL>"
-```
-
-**Fallback** (if above fails):
-
-```bash
-# Try common format IDs directly
-yt-dlp -f "140-0" -o "/tmp/${VIDEO_ID}.m4a" "<VIDEO_URL>" 2>&1 || \
-yt-dlp -f "140" -o "/tmp/${VIDEO_ID}.m4a" "<VIDEO_URL>" 2>&1 || \
-yt-dlp -f "bestaudio[ext=m4a]" -o "/tmp/${VIDEO_ID}.m4a" "<VIDEO_URL>" 2>&1
-```
-
-#### 3B.2 Determine Language
-
-**Let Claude determine directly**, combining the following information:
-- Video title
-- Channel name
-- Video description (if available)
-
-Decision rules:
-- Title/channel primarily Chinese → `language=zh`
-- Title/channel primarily English or other languages → `language=en`
-- For mixed Chinese-English, determine primary language based on channel type and content
-
-#### 3B.2.5 Check File Size and Split if Needed
-
-If the audio file exceeds 10MB, split it before sending to Deepgram:
-
-```bash
-AUDIO_FILE=$(ls /tmp/${VIDEO_ID}.* 2>/dev/null | head -1)
-FILE_SIZE=$(stat -f%z "$AUDIO_FILE" 2>/dev/null || stat -c%s "$AUDIO_FILE")
-MAX_SIZE=10485760  # 10MB
-
-if [ "$FILE_SIZE" -gt "$MAX_SIZE" ]; then
-    echo "⚠️ Audio file exceeds 10MB ($(($FILE_SIZE/1048576))MB), splitting..."
-    
-    # Split audio using silence detection
-    SPLIT_RESULT=$(python3 ~/.claude/skills/yt-transcript/yt_transcript_utils.py split-audio "$AUDIO_FILE" --max-size 10)
-    
-    # Parse output to get chunk count
-    CHUNK_COUNT=$(echo "$SPLIT_RESULT" | python3 -c "import sys,json; print(json.load(sys.stdin)['total_chunks'])")
-    echo "📁 Split into $CHUNK_COUNT chunks"
-    
-    # Set flag for multi-chunk processing
-    MULTI_CHUNK=true
-else
-    MULTI_CHUNK=false
-fi
-```
-
-**Algorithm**: 
-1. Calculate rough split points at 10MB intervals
-2. Find nearest silence point (before or after) within 60 seconds
-3. If no silence point within 60s, force split at rough point
-
-#### 3B.3 Call Deepgram API
-
-**Set Content-Type based on audio file extension**:
-
-```bash
-# Detect file extension
-AUDIO_FILE=$(ls /tmp/${VIDEO_ID}.* 2>/dev/null | head -1)
-EXT="${AUDIO_FILE##*.}"
-
-# Set correct Content-Type
-case "$EXT" in
-    m4a|mp4) CONTENT_TYPE="audio/mp4" ;;
-    webm)    CONTENT_TYPE="audio/webm" ;;
-    opus)    CONTENT_TYPE="audio/opus" ;;
-    mp3)     CONTENT_TYPE="audio/mpeg" ;;
-    *)       CONTENT_TYPE="audio/mp4" ;;
-esac
-```
-
-**For single file (< 10MB)**:
-
-```bash
-curl -s -X POST "https://api.deepgram.com/v1/listen?model=nova-2&language=<LANG>&diarize=true&punctuate=true&paragraphs=true&smart_format=true" \
-  -H "Authorization: Token $DEEPGRAM_API_KEY" \
-  -H "Content-Type: $CONTENT_TYPE" \
-  --data-binary @"$AUDIO_FILE" \
-  --max-time 300 \
-  -o /tmp/${VIDEO_ID}_deepgram.json
-```
-
-**For split files (≥ 10MB)**:
-
-```bash
-if [ "$MULTI_CHUNK" = true ]; then
-    ALL_TRANSCRIPTS=""
-    CHUNK_INDEX=0
-    
-    for CHUNK in /tmp/${VIDEO_ID}_chunk_*.mp3; do
-        echo "🔄 Processing chunk $((CHUNK_INDEX + 1))/$CHUNK_COUNT..."
-        
-        # Calculate timeout based on chunk size
-        CHUNK_SIZE=$(stat -f%z "$CHUNK" 2>/dev/null || stat -c%s "$CHUNK")
-        MAX_TIME=$((CHUNK_SIZE / 30000 + 60))  # ~30KB/s + 60s buffer
-        
-        curl -s -X POST "https://api.deepgram.com/v1/listen?model=nova-2&language=<LANG>&diarize=true&punctuate=true&paragraphs=true&smart_format=true" \
-          -H "Authorization: Token $DEEPGRAM_API_KEY" \
-          -H "Content-Type: audio/mpeg" \
-          --data-binary @"$CHUNK" \
-          --max-time "$MAX_TIME" \
-          -o "/tmp/${VIDEO_ID}_chunk_${CHUNK_INDEX}_deepgram.json"
-        
-        # Extract transcript from this chunk
-        CHUNK_TEXT=$(python3 ~/.claude/skills/yt-transcript/yt_transcript_utils.py process-deepgram "/tmp/${VIDEO_ID}_chunk_${CHUNK_INDEX}_deepgram.json" | python3 -c "import sys,json; print(json.load(sys.stdin)['transcript'])")
-        ALL_TRANSCRIPTS="$ALL_TRANSCRIPTS $CHUNK_TEXT"
-        
-        CHUNK_INDEX=$((CHUNK_INDEX + 1))
-    done
-    
-    # Write combined transcript for further processing
-    echo "$ALL_TRANSCRIPTS" > /tmp/${VIDEO_ID}_combined_transcript.txt
-fi
-```
-
-**Note**: Set timeout to 300 seconds (5 minutes), longer videos need more time.
-
-#### 3B.4 Parse Transcription Result
-
-**Known issues with Deepgram Chinese transcription**:
-1. Spaces between Chinese characters
-2. Almost no punctuation
-3. Repeated fragments
-
-**Use utility script to process**:
-
-```bash
-# For single file
-python3 ~/.claude/skills/yt-transcript/yt_transcript_utils.py process-deepgram "/tmp/${VIDEO_ID}_deepgram.json"
-# Output: JSON {"transcript": "cleaned text", "speaker_count": N}
-
-# For multi-chunk: transcript already combined in ALL_TRANSCRIPTS variable
-```
-
-The script automatically handles:
-- Removes spaces between Chinese characters (multiple passes for thoroughness)
-- Fixes spaces around punctuation
-- Removes consecutive repeated phrases
-- Counts number of speakers
-
-### Step 4: AI Text Optimization (Core Step)
-
-After obtaining preliminary text in Step 3, **must** use the model's own language understanding capability to deeply optimize the text. This is the key step for improving transcription quality.
-
-#### 4.1 Why This Step is Needed
-
-| Source | Typical Issues |
-|--------|----------------|
-| YouTube auto-captions | Poor sentence breaks, missing punctuation, homophone errors, poor proper noun recognition |
-| Deepgram Chinese transcription | Almost no punctuation, no paragraph structure, spaces between Chinese chars, repeated fragments |
-| YouTube manual subtitles | Better quality, but may still have poor segmentation |
-
-#### 4.2 Processing Method
-
-**Chunk** the raw text from Step 3 and send to the model for processing (about 2000-3000 characters per chunk to avoid omissions), using the following prompt to guide optimization:
-
-**Processing prompt template**:
-
-```
-You are a professional video transcript editor. The following is raw transcript text extracted from the YouTube video "{video_title}" (source: {subtitle_source}).
-
-Please optimize the text as follows, output the optimized plain text directly (don't explain what you did):
-
-1. **Structure & Sectioning (CRITICAL)**:
-   - **Paragraphs**: Divide text into natural paragraphs (3-8 sentences) based on logical pauses.
-   - **Sections**: Identify distinct topic transitions and insert descriptive headers using Markdown Level 2 (## Header Name). **Every transcript must have at least 3-5 clear section headers.**
-
-2. **Bilingual Translation (CRITICAL)**:
-   - **If the content is English**: You MUST output in **Bilingual Mode**.
-     - Format:
-       [English Paragraph]
-       
-       [Chinese Translation Paragraph]
-     - The Chinese translation must be fluent, natural, and accurate.
-   - **If the content is Chinese**: Output in Chinese only.
-
-3. **Error Correction & Cleanup**:
-   - Fix speech recognition errors (homophones), proper noun spellings, and grammar.
-   - Remove filler words (uh, um, like) and meaningless repetitions.
-   - Add correct punctuation based on tone and semantics.
-
-Notes:
-- **Headers**: Use English headers if the video is English, but they serve as section dividers for both languages.
-- **Translation**: Keep technical terms in English (e.g., "API", "LLM") within the Chinese text if appropriate.
-- **Fidelity**: Preserve the original meaning and style. Do NOT summarize; translate the full content.
-
-Raw text:
----
-{chunk_text}
----
-```
-
-#### 4.3 Enhanced Long-Text Processing (For Videos > 30 minutes)
-
-For long videos (producing raw text > 10,000 characters), use the script-assisted pipeline:
-
-##### 4.3.1 Check for YouTube Chapter Metadata First
-
-```bash
-python3 ~/.claude/skills/yt-transcript/yt_transcript_utils.py get-chapters "<VIDEO_URL>"
-# Returns: {"has_chapters": true/false, "chapters": [...]}
-```
-
-If `has_chapters: true`, you can use the provided chapters directly for section headers instead of generating a chapter plan.
-
-##### 4.3.2 Split Raw Text into Chunks
-
-```bash
-# Save raw text to file first
-echo "$RAW_TEXT" > /tmp/${VIDEO_ID}_raw.txt
-
-# Split into ~8000 character chunks at sentence boundaries
-python3 ~/.claude/skills/yt-transcript/yt_transcript_utils.py chunk-text \
-    /tmp/${VIDEO_ID}_raw.txt \
-    /tmp/${VIDEO_ID}_chunks \
-    --chunk-size 8000
-
-# Output: manifest.json + chunk_000.txt, chunk_001.txt, ...
-```
-
-##### 4.3.3 Two-Stage Chapter Planning (If No YouTube Chapters)
-
-**Stage 1: Generate Summaries**
-
-For each chunk, generate a 1-2 sentence summary:
-
-```
-用1-2句话总结以下段落的核心主题（保持英文）：
----
-{chunk_content}
----
-只输出摘要，不要其他内容。
-```
-
-Save summaries to `summary_chunk_XXX.txt`.
-
-**Stage 2: Generate Chapter Plan**
-
-Aggregate all summaries and ask the model to create a chapter structure:
-
-```
-以下是视频各部分的主题摘要（按时间顺序）：
-1. {summary_0}
-2. {summary_1}
-...
-
-请将内容划分为 5-8 个逻辑章节，输出 JSON：
-[{"title_en": "...", "title_zh": "...", "start_chunk": 0}, ...]
-```
-
-Save as `chapter_plan.json` in the chunks directory.
-
-##### 4.3.4 Process Each Chunk (Stateless Translation)
-
-For each chunk, use a simplified prompt that **does not require adding section headers**:
-
-```
-你是一个专业翻译。请将以下文本转换为"中英双语 Markdown"格式。
-要求：
-1. 保持段落结构。
-2. 英文在前，中文在后。
-3. **不要添加任何一级或二级标题**（标题将由脚本自动插入）。
-4. 仅输出翻译后的内容。
----
-{chunk_content}
-```
-
-Save the output to `processed_XXX.md`.
-
-##### 4.3.5 Merge with Chapter Headers
-
-```bash
-python3 ~/.claude/skills/yt-transcript/yt_transcript_utils.py merge-content \
-    /tmp/${VIDEO_ID}_chunks \
-    /tmp/${VIDEO_ID}_final.md \
-    --header "---\ntitle: \"${VIDEO_TITLE}\"\ndate: ${DATE}\n---"
-
-# The script automatically:
-# - Reads chapter_plan.json
-# - Inserts chapter headers at the start of corresponding chunks
-# - Merges all processed content into final file
-```
-
-##### 4.3.6 Verification Checklist
-
-After merging, verify:
-- [ ] All `processed_*.md` files exist and are non-empty
-- [ ] Final file contains all expected chapter headers
-- [ ] Final file size > raw text size × 1.5 (due to bilingual expansion)
-- [ ] Content is continuous with no abrupt cuts
-
-#### 4.4 Legacy Chunked Processing Flow (For Simple Cases)
-
-For shorter videos or when script-based processing is not needed:
-
-```
-1. Divide raw text into 2000-3000 character chunks
-   - Split at sentence ends, avoid breaking mid-sentence
-   - Overlap ~100 characters for context continuity
-
-2. Execute AI optimization for each chunk
-   - Use the full prompt template from section 4.2
-   - Collect optimized text
-
-3. Merge all optimized chunks
-   - Handle overlapping regions (deduplicate)
-   - Ensure section titles don't repeat
-   - Check paragraph transitions
-
-4. Final review for coherence
-```
-
-#### 4.5 Special Handling for Multi-Speaker Scenarios
-
-If Step 3 detected multiple speakers (Deepgram diarize result), add to the optimization prompt:
-
-```
-This video has multiple speakers. Please mark speaker changes at appropriate positions.
-Use format: [Speaker X] followed by that speaker's content.
-```
-
-#### 4.6 Quality Checklist
-
-After optimization, verify the following:
-- [ ] Every sentence has ending punctuation
-- [ ] Paragraph length is moderate (no more than 300 characters/paragraph)
-- [ ] Reasonable section divisions (at least 3-5 sections, depending on content length)
-- [ ] Proper nouns are spelled correctly and consistently
-- [ ] No obvious repeated paragraphs
-- [ ] Text flows naturally and is readable
-
-### Step 5: Text Processing and Formatting
-
-#### 5.1 Speech Recognition Error Correction (Supplementary)
-
-Step 4's AI optimization handles most corrections. This step does final rule-based fixes:
-
-Common correction mappings (extend based on context):
-
-| Error | Correct |
-|-------|---------|
-| Number 0 replacing letter O | e.g., 0penc0de → OpenCode |
-| ai → AI | Case normalization |
-| agent → Agent | Proper nouns |
-| mcp → MCP | Acronym normalization |
-
-#### 5.2 Language Processing Rules
-
-**Decision logic** (by priority):
-
-1. **Has English subtitles** (regardless of video language) → Output bilingual format
-2. **Chinese video (no English subtitles)** → Output Chinese only
-3. **English video (no subtitles, transcribed via Deepgram)** → Output bilingual format
-
-**Bilingual processing flow**:
-
-When English subtitles are detected:
-1. Download English subtitles (en or en-orig)
-2. Also download Chinese subtitles (if available) or translate English content
-3. Format in side-by-side paragraphs
-
-**Bilingual format example**:
-```markdown
-## Introduction
-
-**Speaker:** This is the original English content. We're going to discuss how technology shapes our future.
-
-**讲者：** 这是原始的英文内容。我们将讨论技术如何塑造我们的未来。
-
 ---
 
-## Main Topic
+## Configuration
 
-**Speaker:** The key point here is that innovation drives change.
+**Config file**: `~/.claude/skills/yt-transcript/config.yaml`
 
-**讲者：** 这里的关键点是创新推动变革。
-```
-
-**Bilingual formatting rules**:
-- Within each topic paragraph, English first then Chinese
-- English uses `**Speaker:**` label
-- Chinese uses `**讲者：**` label
-- Separate paragraphs with blank lines
-- Separate topics with `---` dividers
-
-**Translation requirements** (when translating English):
-- Maintain accurate meaning
-- Use natural, fluent Chinese expressions
-- Keep technical terms in English with parenthetical Chinese notes, e.g.: API (Application Programming Interface)
-- Keep names, place names and other proper nouns in English
-
-#### 5.3 Formatting Requirements
-
-**Speaker labels**:
-- Single speaker: `**Speaker:**`
-- Multiple speakers: `**Host:**`, `**Guest A:**`, `**Guest B:**`
-- Deepgram returns speaker 0, 1, 2... map to Speaker, Guest A, Guest B...
-
-**Paragraph structure**:
-- Create paragraphs by natural topics
-- Use second-level headings (##) to divide main topics
-- Use dividers (---) to separate major sections
-
-**Content optimization**:
-- Remove: filler words (uh, um, like), repeated content, excessive pauses
-- Keep: Emotional expressions in parentheses `(laughter)`, `(emphasis)`
-- Special marks: Background music in *italics*
-- Corrections: Fix speech recognition errors based on context
-
-### Step 6: Generate Markdown File
-
-File structure template:
-
-```markdown
----
-title: <Video Title>
-source: <YouTube Link>
-channel: <Channel Name>
-date: <Upload Date YYYY-MM-DD>
-created: <Today's Date>
-type: video-transcript
-bilingual: <true/false>
-duration: <Duration>
-transcript_source: <YouTube Subtitles/Deepgram Transcription>
----
-
-# <Video Title>
-
-> Video source: [YouTube - <Channel Name>](<YouTube Link>)
-> Language mode: <Chinese only / Bilingual Chinese-English>
-> Duration: <X minutes>
+Required settings:
+- `deepgram_api_key`: Your Deepgram API key
+- `output_dir`: Directory to save transcripts
 
 ---
-
-<Body content, arranged in paragraphs>
-
----
-
-*This article was generated by AI voice transcription (<source>), for reference only.*
-```
-
-### Step 7: Save File
-
-#### 7.1 Clean Filename
-
-Video titles may contain illegal filename characters, use utility script to clean:
-
-```bash
-# Clean filename
-python3 ~/.claude/skills/yt-transcript/yt_transcript_utils.py sanitize-filename "Video Title: Special Characters?"
-# Output: Video Title_ Special Characters_
-```
-
-The script automatically handles: replaces `/ \ : * ? " < > |` with `_`, removes leading/trailing spaces and periods, limits length to 200 characters.
-
-#### 7.2 Save
-
-File naming: `<YYYY-MM-DD>. <Cleaned Video Title>.md`
-
-Save path: `$OUTPUT_DIR` (read from config.yaml)
-
-### Step 8: Clean Temporary Files
-
-```bash
-rm -f /tmp/${VIDEO_ID}.* /tmp/${VIDEO_ID}_deepgram.json /tmp/${VIDEO_ID}.*.vtt
-rm -f /tmp/${VIDEO_ID}_chunk_*.mp3 /tmp/${VIDEO_ID}_chunk_*_deepgram.json /tmp/${VIDEO_ID}_combined_transcript.txt
-```
-
-### Step 9: Output Confirmation
-
-```
-✅ Video transcription complete
-   Title: <Video Title>
-   Language: <Chinese/English/Bilingual>
-   Subtitle source: <YouTube Subtitles/Deepgram Transcription>
-   Bilingual mode: <Yes/No>
-   Number of speakers: <N>
-   Output file: <Full Path>
-```
 
 ## Dependencies
 
-- `yt-dlp`: Download YouTube videos/audio/subtitles (**keep updated**)
-- `ffmpeg`: Audio processing and splitting (for large files >10MB)
-- `curl`: Call Deepgram API
-- `python3`: Process JSON and text formatting
+- `yt-dlp` (keep updated: `brew upgrade yt-dlp`)
+- `ffmpeg` (for audio splitting: `brew install ffmpeg`)
+- `python3` (built-in utilities)
+- `curl` (for API calls)
 - Deepgram API account and key
+
+---
 
 ## Troubleshooting
 
-| Issue | Cause | Solution |
-|-------|-------|----------|
-| **HTTP 403 error** | yt-dlp version outdated, YouTube API updated | `brew upgrade yt-dlp` or `pip install -U yt-dlp` |
-| **"Requested format is not available"** | Specified format ID doesn't exist | Check available formats with `--list-formats` first |
-| **Multi-track video downloads wrong language** | Video has multiple audio tracks | Check format list, select track with `zh` tag |
-| **Deepgram Chinese has no punctuation** | Deepgram Chinese punctuation recognition is weak | Use post-processing with character count segmentation |
-| **Spaces between Chinese characters** | Deepgram Chinese processing characteristic | Use regex to remove spaces multiple times |
-| **Repeated fragments** | Common speech recognition issue | Use regex deduplication |
-| **Deepgram API timeout** | Video too long (>30 minutes) | Increase `--max-time 300` or longer |
-| **API error** | Invalid API Key or insufficient balance | Check Deepgram console |
-| **Video inaccessible** | Private video or region restricted | Use VPN or proxy |
+| Issue | Solution |
+|-------|----------|
+| HTTP 403 error | Update yt-dlp: `brew upgrade yt-dlp` |
+| Deepgram timeout | Increase `--max-time` or split file |
+| API error 401 | Check Deepgram API key in config.yaml |
+| API error 402 | Insufficient credits, top up account |
+
+---
+
+## File Structure
+
+```
+~/.claude/skills/yt-transcript/
+├── SKILL.md                    # This file (main entry point)
+├── workflows/                  # Modular workflow files
+│   ├── subtitle_download.md
+│   ├── deepgram_transcribe.md
+│   └── text_optimization.md
+├── prompts/                    # Single-task prompt templates
+│   ├── structure_only.md
+│   ├── translate_only.md
+│   └── quick_cleanup.md
+├── scripts/                    # Helper shell scripts
+│   ├── preflight.sh
+│   ├── download.sh
+│   └── cleanup.sh
+└── yt_transcript_utils.py      # Python utilities
+```
+
+---
 
 ## Version History
 
-- **v3.1** (2026-02): Refactor: Extract Python code to standalone script `yt_transcript_utils.py`, language detection changed to direct LLM judgment
-- **v3.0** (2026-02): Added Step 4 "AI Text Optimization", use model understanding to add punctuation, sentence/paragraph/section splitting, error correction
-- **v2.0** (2025-02): Fixed yt-dlp 403 error, support multi-track videos, improved Deepgram Chinese processing
+- **v4.0** (2026-02): Refactored for weak model adaptability - modular workflows, single-task prompts
+- **v3.1** (2026-02): Extracted Python utilities to standalone script
+- **v3.0** (2026-02): Added AI text optimization step
+- **v2.0** (2025-02): Multi-track video support, improved Chinese processing
 - **v1.0**: Initial version

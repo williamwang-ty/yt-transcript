@@ -79,38 +79,83 @@ After completion, a summary table will be provided with status and output paths 
 
 ```
 yt-transcript/
-├── SKILL.md                 # Claude Skill workflow guide
-├── yt_transcript_utils.py   # Utility scripts (VTT parsing, Deepgram processing, etc.)
-├── config.yaml              # Local config (not uploaded)
+├── SKILL.md                 # Claude Skill workflow guide (main entry point)
+├── workflows/               # Modular workflow files
+├── prompts/                 # Single-task prompt templates
+├── scripts/                 # Helper shell scripts
+├── yt_transcript_utils.py   # Python utilities
+├── config.yaml              # Local config (gitignored)
 ├── config.example.yaml      # Config template
-├── LICENSE                  # MIT License
 └── README.md                # This document
 ```
 
-### 🏗️ Architecture
+### 🏗️ Architecture & Design Philosophy (v4.0)
 
-#### Design Principles
+> **Design Goal**: Enable highly reliable execution on **Weak Models** (e.g., 8B parameters) while maintaining advanced capabilities for SOTA models.
 
-| Dimension | Scripted (Fixed) | LLM (Flexible) |
-|-----------|------------------|----------------|
-| **Determinism** | Predictable input→output | Requires context understanding |
-| **Rule-based** | Fixed algorithms | Needs judgment, inference |
-| **Complexity** | Complex code prone to errors | Simple rules or flexibility needed |
-| **Dependencies** | Only input parameters | Relies on global context/history |
+#### 1. The "Weak Model" Challenge
 
-#### Hybrid Architecture
+We identified three primary failure modes when running complex agentic skills on smaller models (Llama-3-8B, Gemini Flash, etc.):
 
-**Script Processing (yt_transcript_utils.py)**:
-- `parse-vtt`: VTT subtitle parsing - pure format conversion, deterministic
-- `process-deepgram`: Deepgram result processing - complex regex, needs precision
-- `sanitize-filename`: Filename cleaning - filesystem rules are fixed
-- `split-audio`: Smart audio splitting - uses FFmpeg silence detection to split large audio files (>10MB) at natural pauses
+1.  **Context Overflow**: Loading a 800+ line `SKILL.md` plus conversation history dilutes attention.
+2.  **Instruction Interference**: When a prompt contains >3 distinct objectives (e.g., "Translate AND Format AND Fix Grammar"), weak models tend to ignore the secondary constraints.
+3.  **State Amnesia**: During multi-step workflows, weak models often lose track of variable state (`VIDEO_ID`, `LANGUAGE`) after context switching.
 
-**LLM Processing**:
-- Language detection: Combines title, description, channel name
-- AI text optimization: Punctuation, paragraphing, error correction
-- Bilingual translation: Requires language capabilities
-- Formatting decisions: Speaker labels, section titles
+#### 2. Core Design Patterns
+
+To address these, we implemented the following patterns:
+
+**2.1 Modular Context Loading (The "Swap" Pattern)**
+Instead of a monolithic instruction file, we split the skill into a lightweight router and specialized modules.
+
+*   **Router (`SKILL.md`)**: < 400 lines. Contains only high-level decision trees (Binary choices: Yes/No).
+*   **Modules (`workflows/*.md`)**: Loaded *on-demand*. The model never sees the "Subtitle Download" instructions while doing "Text Optimization".
+
+*Impact: Reduces active context by ~40-50%.*
+
+**2.2 Single-Task Prompts**
+We enforce a hard rule: **One Prompt = One Primary Objective**.
+
+*   `structure_only.md`: Only adds newlines and headers. explicit instruction to NOT translate.
+*   `translate_only.md`: Only translates. Explicit instruction to preserve structure.
+*   `quick_cleanup.md`: Only adds punctuation.
+
+*Impact: Drastically reduces "hallucination" and instruction skipping.*
+
+**2.3 The "Context Recap" Handshake**
+Every workflow file begins with a **Variable Confirmation Section** that forces the model to "ground" itself before executing new instructions, combating state amnesia.
+
+**2.4 Fail-Fast & "Safety Nets"**
+Weak models tend to loop indefinitely when errors occur.
+*   **Fail-Fast**: Instructions explicitly say "If step X fails, STOP. Do not retry."
+*   **Safety Net**: In `quick_cleanup.md`, we added a trigger: "If text has ZERO punctuation, ignore minimal-change rules and fully punctuate."
+
+#### 3. Directory Structure Role
+
+```
+yt-transcript/
+├── SKILL.md                # The Brain (Router)
+├── workflows/              # The Limbs (Procedural Knowledge)
+│   ├── subtitle_download.md
+│   ├── deepgram_transcribe.md
+│   └── text_optimization.md
+├── prompts/                # The Voice (Generation Templates)
+│   ├── structure_only.md
+│   ├── translate_only.md
+│   └── quick_cleanup.md
+├── scripts/                # The Hands (Tool Execution)
+│   ├── preflight.sh
+│   ├── download.sh
+│   └── cleanup.sh
+└── yt_transcript_utils.py  # Python Utilities
+```
+
+#### 4. Minimum Requirements
+
+*   **Context**: 4k tokens active window
+*   **Reasoning**: Elementary (Binary classification)
+*   **Instruction Following**: Medium (Single-constraint following)
+*   **Target Model Tier**: Llama-3-8B (Instruct) / GPT-3.5 Turbo level.
 
 #### Audio Splitting Strategy
 
@@ -232,38 +277,83 @@ pip install yt-dlp
 
 ```
 yt-transcript/
-├── SKILL.md                 # Claude Skill 工作流程指南
-├── yt_transcript_utils.py   # 工具脚本（VTT解析、Deepgram处理等）
-├── config.yaml              # 本地配置（不上传）
+├── SKILL.md                 # Claude Skill 工作流程指南（主入口）
+├── workflows/               # 模块化工作流文件
+├── prompts/                 # 单任务 Prompt 模板
+├── scripts/                 # Shell 辅助脚本
+├── yt_transcript_utils.py   # Python 工具脚本
+├── config.yaml              # 本地配置（已 gitignore）
 ├── config.example.yaml      # 配置模板
-├── LICENSE                  # MIT 许可证
 └── README.md                # 本文档
 ```
 
-### 🏗️ 架构设计
+### 🏗️ 架构设计与设计哲学 (v4.0)
 
-#### 设计原则
+> **设计目标**: 使 Skill 能够在 **弱模型**（如 8B 参数）上高度可靠地运行，同时为 SOTA 模型保留高级能力。
 
-| 维度 | 适合固化为脚本 | 适合 LLM 灵活处理 |
-|------|----------------|-------------------|
-| **确定性** | 输入→输出完全可预测 | 需要理解上下文、语义 |
-| **规则性** | 基于固定规则/算法 | 需要判断、推理 |
-| **复杂度** | 代码复杂易出错 | 规则简单或需要灵活性 |
-| **依赖** | 仅依赖输入参数 | 依赖全局上下文/对话历史 |
+#### 1. "弱模型"的挑战
 
-#### 混合架构
+我们在较小模型（Llama-3-8B, Gemini Flash 等）上运行复杂的 Agent Skill 时，识别出三种主要故障模式：
 
-**脚本处理（yt_transcript_utils.py）**：
-- `parse-vtt`：VTT 字幕解析 - 纯格式转换，规则确定
-- `process-deepgram`：Deepgram 结果处理 - 正则复杂，需精确执行
-- `sanitize-filename`：文件名清理 - 文件系统规则固定
-- `split-audio`：智能音频分割 - 使用 FFmpeg 静音检测在自然停顿处分割大音频文件（>10MB）
+1.  **上下文溢出 (Context Overflow)**: 加载 800+ 行的 `SKILL.md` 加上对话历史会稀释模型的注意力。
+2.  **指令干扰 (Instruction Interference)**: 当一个 Prompt 包含 >3 个不同的目标（例如“翻译”且“格式化”且“修复语法”）时，弱模型倾向于忽略次要约束。
+3.  **状态失忆 (State Amnesia)**: 在多步骤工作流中，弱模型在切换上下文后经常丢失变量状态（如 `VIDEO_ID`, `LANGUAGE`）。
 
-**LLM 处理**：
-- 语言判断：综合标题、描述、频道名判断
-- AI 文本优化：添加标点、分段分章节、纠错
-- 双语翻译：需要语言能力
-- 格式化决策：说话者标识、章节标题
+#### 2. 核心设计模式
+
+为了解决这些问题，我们实施了以下模式：
+
+**2.1 模块化上下文加载 ("Swap" Pattern)**
+我们将 Skill 拆分为一个轻量级的路由（Router）和专门的模块（Modules），而不是使用单体现成文件。
+
+*   **Router (`SKILL.md`)**: < 400 行。仅包含高级决策树（二元选择：是/否）。
+*   **Modules (`workflows/*.md`)**: *按需*加载。模型在执行“文本优化”时永远不会看到“字幕下载”的指令。
+
+*影响：减少约 40-50% 的活跃上下文。*
+
+**2.2 单任务 Prompts**
+我们强制执行一条硬性规则：**一个 Prompt = 一个主要目标**。
+
+*   `structure_only.md`: 仅添加换行和标题。显式指令**不**翻译。
+*   `translate_only.md`: 仅翻译。显式指令保留结构。
+*   `quick_cleanup.md`: 仅添加标点。
+
+*影响：大幅减少“幻觉”和指令跳过。*
+
+**2.3 "Context Recap" 握手**
+每个 Workflow 文件都以 **变量确认部分** 开头，强制模型在执行新指令前先“落地”自身状态，以对抗状态失忆。
+
+**2.4 Fail-Fast & "安全网"**
+弱模型在出错时倾向于无限循环。
+*   **Fail-Fast**: 指令显式说明 "如果步骤 X 失败，停止 (STOP)。不要重试。"
+*   **Safety Net**: 在 `quick_cleanup.md` 中，我们添加了一个触发器："如果文本包含零标点，忽略最小修改规则并完全添加标点。"
+
+#### 3. 目录结构角色
+
+```
+yt-transcript/
+├── SKILL.md                # 大脑 (路由)
+├── workflows/              # 四肢 (过程知识)
+│   ├── subtitle_download.md
+│   ├── deepgram_transcribe.md
+│   └── text_optimization.md
+├── prompts/                # 声音 (生成模板)
+│   ├── structure_only.md
+│   ├── translate_only.md
+│   └── quick_cleanup.md
+├── scripts/                # 双手 (工具执行)
+│   ├── preflight.sh
+│   ├── download.sh
+│   └── cleanup.sh
+└── yt_transcript_utils.py  # Python 工具脚本
+```
+
+#### 4. 最低要求
+
+*   **上下文**: 4k tokens 活跃窗口
+*   **推理**: 初级 (二元分类)
+*   **指令遵循**: 中等 (单一约束遵循)
+*   **目标模型层级**: Llama-3-8B (Instruct) / GPT-3.5 Turbo 级别。
 
 #### 音频分割策略
 
