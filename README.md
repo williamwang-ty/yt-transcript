@@ -20,6 +20,7 @@ Transcribe YouTube videos into formatted Markdown articles. Supports subtitle do
 ### 📋 Prerequisites
 
 - `yt-dlp`: Download YouTube videos/audio/subtitles
+- `ffmpeg`: Audio processing (splitting, silence detection)
 - `python3`: Text processing
 - `curl`: Call Deepgram API
 - [Deepgram Account](https://console.deepgram.com/): For speech transcription
@@ -28,7 +29,7 @@ Transcribe YouTube videos into formatted Markdown articles. Supports subtitle do
 
 ```bash
 # macOS
-brew install yt-dlp python3
+brew install yt-dlp python3 ffmpeg
 
 # or via pip
 pip install yt-dlp
@@ -103,12 +104,37 @@ yt-transcript/
 - `parse-vtt`: VTT subtitle parsing - pure format conversion, deterministic
 - `process-deepgram`: Deepgram result processing - complex regex, needs precision
 - `sanitize-filename`: Filename cleaning - filesystem rules are fixed
+- `split-audio`: Smart audio splitting - uses FFmpeg silence detection to split large audio files (>10MB) at natural pauses
 
 **LLM Processing**:
 - Language detection: Combines title, description, channel name
 - AI text optimization: Punctuation, paragraphing, error correction
 - Bilingual translation: Requires language capabilities
 - Formatting decisions: Speaker labels, section titles
+
+#### Audio Splitting Strategy
+
+To bypass API limits (25MB) and improve reliability, large audio files are split intelligently:
+1. **Rough Split**: Calculate theoretical split points at 10MB intervals.
+2. **Silence Detection**: Use FFmpeg to find silence intervals near rough split points.
+3. **Smart Decision**: Choose the nearest silence point within 60s deviation.
+4. **Fallback**: If no silence is found, force split at the rough point.
+
+#### Long-Text Processing Strategy (New!)
+
+To handle arbitrarily long videos (e.g., >2 hours) without hitting LLM context limits, we use a **Map-Reduce inspired hybrid pipeline**:
+
+1.  **Structural Chunking (Script)**:
+    - The `chunk-text` command splits raw text into semantic chunks (~8000 chars) based on sentence boundaries.
+    - Uses an idempotent `manifest.json` to track processing status, allowing resumability.
+
+2.  **Two-Stage Chapter Planning**:
+    - **Priority 1**: Use YouTube Chapters if available (via `get-chapters`).
+    - **Priority 2**: If no chapters, the LLM first generates summaries for each chunk, then plans a global chapter structure based on summaries.
+
+3.  **Stateless Translation**:
+    - Each chunk is translated independently by the LLM without needing global context.
+    - Script (`merge-content`) handles the re-assembly and injection of chapter headers.
 
 #### Why Serial Processing for Multiple Links?
 
@@ -147,6 +173,7 @@ MIT License
 ### 📋 前置依赖
 
 - `yt-dlp`：下载 YouTube 视频/音频/字幕
+- `ffmpeg`：音频处理（分割、静音检测）
 - `python3`：处理文本格式化
 - `curl`：调用 Deepgram API
 - [Deepgram 账号](https://console.deepgram.com/)：用于语音转录
@@ -155,7 +182,7 @@ MIT License
 
 ```bash
 # macOS
-brew install yt-dlp python3
+brew install yt-dlp python3 ffmpeg
 
 # 或使用 pip
 pip install yt-dlp
@@ -230,12 +257,37 @@ yt-transcript/
 - `parse-vtt`：VTT 字幕解析 - 纯格式转换，规则确定
 - `process-deepgram`：Deepgram 结果处理 - 正则复杂，需精确执行
 - `sanitize-filename`：文件名清理 - 文件系统规则固定
+- `split-audio`：智能音频分割 - 使用 FFmpeg 静音检测在自然停顿处分割大音频文件（>10MB）
 
 **LLM 处理**：
 - 语言判断：综合标题、描述、频道名判断
 - AI 文本优化：添加标点、分段分章节、纠错
 - 双语翻译：需要语言能力
 - 格式化决策：说话者标识、章节标题
+
+#### 音频分割策略
+
+为规避 API 限制（25MB）并提高稳定性，对大音频文件进行智能分割：
+1. **粗略分割**：按 10MB 间隔计算理论分割点。
+2. **静音检测**：使用 FFmpeg 检测粗略点附近的静音区间。
+3. **智能决策**：选择 60秒偏差范围内最近的静音点作为实际分割位置。
+4. **兜底机制**：若范围内无静音，则在粗略点强制分割。
+
+#### 长文本处理策略（新增！）
+
+为了在不突破 LLM 上下文限制的情况下处理超长视频（如 >2小时），我们采用了 **Map-Reduce 思想的混合流水线**：
+
+1.  **结构化分块（脚本）**：
+    - `chunk-text` 命令按句子边界将原始文本切分为语义块（~8000字符）。
+    - 使用幂等的 `manifest.json` 追踪状态，支持断点续传。
+
+2.  **两阶段章节规划**：
+    - **优先级 1**：如果有 YouTube 章节（通过 `get-chapters` 获取），直接使用。
+    - **优先级 2**：无章节时，LLM 先对每个块生成摘要，再基于摘要规划全局章节结构。
+
+3.  **无状态翻译**：
+    - 每个文本块由 LLM 独立翻译，不需要全局上下文。
+    - 最终由脚本（`merge-content`）负责按顺序组装并插入章节标题。
 
 #### 为什么多链接采用串行处理？
 

@@ -284,6 +284,37 @@ Decision rules:
 - Title/channel primarily English or other languages → `language=en`
 - For mixed Chinese-English, determine primary language based on channel type and content
 
+#### 3B.2.5 Check File Size and Split if Needed
+
+If the audio file exceeds 10MB, split it before sending to Deepgram:
+
+```bash
+AUDIO_FILE=$(ls /tmp/${VIDEO_ID}.* 2>/dev/null | head -1)
+FILE_SIZE=$(stat -f%z "$AUDIO_FILE" 2>/dev/null || stat -c%s "$AUDIO_FILE")
+MAX_SIZE=10485760  # 10MB
+
+if [ "$FILE_SIZE" -gt "$MAX_SIZE" ]; then
+    echo "⚠️ Audio file exceeds 10MB ($(($FILE_SIZE/1048576))MB), splitting..."
+    
+    # Split audio using silence detection
+    SPLIT_RESULT=$(python3 ~/.claude/skills/yt-transcript/yt_transcript_utils.py split-audio "$AUDIO_FILE" --max-size 10)
+    
+    # Parse output to get chunk count
+    CHUNK_COUNT=$(echo "$SPLIT_RESULT" | python3 -c "import sys,json; print(json.load(sys.stdin)['total_chunks'])")
+    echo "📁 Split into $CHUNK_COUNT chunks"
+    
+    # Set flag for multi-chunk processing
+    MULTI_CHUNK=true
+else
+    MULTI_CHUNK=false
+fi
+```
+
+**Algorithm**: 
+1. Calculate rough split points at 10MB intervals
+2. Find nearest silence point (before or after) within 60 seconds
+3. If no silence point within 60s, force split at rough point
+
 #### 3B.3 Call Deepgram API
 
 **Set Content-Type based on audio file extension**:
@@ -301,14 +332,50 @@ case "$EXT" in
     mp3)     CONTENT_TYPE="audio/mpeg" ;;
     *)       CONTENT_TYPE="audio/mp4" ;;
 esac
+```
 
-# Call API (using API Key from config file)
+**For single file (< 10MB)**:
+
+```bash
 curl -s -X POST "https://api.deepgram.com/v1/listen?model=nova-2&language=<LANG>&diarize=true&punctuate=true&paragraphs=true&smart_format=true" \
   -H "Authorization: Token $DEEPGRAM_API_KEY" \
   -H "Content-Type: $CONTENT_TYPE" \
   --data-binary @"$AUDIO_FILE" \
   --max-time 300 \
   -o /tmp/${VIDEO_ID}_deepgram.json
+```
+
+**For split files (≥ 10MB)**:
+
+```bash
+if [ "$MULTI_CHUNK" = true ]; then
+    ALL_TRANSCRIPTS=""
+    CHUNK_INDEX=0
+    
+    for CHUNK in /tmp/${VIDEO_ID}_chunk_*.mp3; do
+        echo "🔄 Processing chunk $((CHUNK_INDEX + 1))/$CHUNK_COUNT..."
+        
+        # Calculate timeout based on chunk size
+        CHUNK_SIZE=$(stat -f%z "$CHUNK" 2>/dev/null || stat -c%s "$CHUNK")
+        MAX_TIME=$((CHUNK_SIZE / 30000 + 60))  # ~30KB/s + 60s buffer
+        
+        curl -s -X POST "https://api.deepgram.com/v1/listen?model=nova-2&language=<LANG>&diarize=true&punctuate=true&paragraphs=true&smart_format=true" \
+          -H "Authorization: Token $DEEPGRAM_API_KEY" \
+          -H "Content-Type: audio/mpeg" \
+          --data-binary @"$CHUNK" \
+          --max-time "$MAX_TIME" \
+          -o "/tmp/${VIDEO_ID}_chunk_${CHUNK_INDEX}_deepgram.json"
+        
+        # Extract transcript from this chunk
+        CHUNK_TEXT=$(python3 ~/.claude/skills/yt-transcript/yt_transcript_utils.py process-deepgram "/tmp/${VIDEO_ID}_chunk_${CHUNK_INDEX}_deepgram.json" | python3 -c "import sys,json; print(json.load(sys.stdin)['transcript'])")
+        ALL_TRANSCRIPTS="$ALL_TRANSCRIPTS $CHUNK_TEXT"
+        
+        CHUNK_INDEX=$((CHUNK_INDEX + 1))
+    done
+    
+    # Write combined transcript for further processing
+    echo "$ALL_TRANSCRIPTS" > /tmp/${VIDEO_ID}_combined_transcript.txt
+fi
 ```
 
 **Note**: Set timeout to 300 seconds (5 minutes), longer videos need more time.
@@ -323,9 +390,11 @@ curl -s -X POST "https://api.deepgram.com/v1/listen?model=nova-2&language=<LANG>
 **Use utility script to process**:
 
 ```bash
-# Process Deepgram JSON result
+# For single file
 python3 ~/.claude/skills/yt-transcript/yt_transcript_utils.py process-deepgram "/tmp/${VIDEO_ID}_deepgram.json"
 # Output: JSON {"transcript": "cleaned text", "speaker_count": N}
+
+# For multi-chunk: transcript already combined in ALL_TRANSCRIPTS variable
 ```
 
 The script automatically handles:
@@ -386,29 +455,127 @@ Raw text:
 ---
 ```
 
-#### 4.3 Chunked Processing Flow
+#### 4.3 Enhanced Long-Text Processing (For Videos > 30 minutes)
+
+For long videos (producing raw text > 10,000 characters), use the script-assisted pipeline:
+
+##### 4.3.1 Check for YouTube Chapter Metadata First
+
+```bash
+python3 ~/.claude/skills/yt-transcript/yt_transcript_utils.py get-chapters "<VIDEO_URL>"
+# Returns: {"has_chapters": true/false, "chapters": [...]}
+```
+
+If `has_chapters: true`, you can use the provided chapters directly for section headers instead of generating a chapter plan.
+
+##### 4.3.2 Split Raw Text into Chunks
+
+```bash
+# Save raw text to file first
+echo "$RAW_TEXT" > /tmp/${VIDEO_ID}_raw.txt
+
+# Split into ~8000 character chunks at sentence boundaries
+python3 ~/.claude/skills/yt-transcript/yt_transcript_utils.py chunk-text \
+    /tmp/${VIDEO_ID}_raw.txt \
+    /tmp/${VIDEO_ID}_chunks \
+    --chunk-size 8000
+
+# Output: manifest.json + chunk_000.txt, chunk_001.txt, ...
+```
+
+##### 4.3.3 Two-Stage Chapter Planning (If No YouTube Chapters)
+
+**Stage 1: Generate Summaries**
+
+For each chunk, generate a 1-2 sentence summary:
 
 ```
-1. Divide complete raw text into chunks of about 2000-3000 characters
-   - Try to split at sentence ends or obvious pauses, avoid breaking sentences
-   - Overlap about 100 characters between adjacent chunks for context continuity
+用1-2句话总结以下段落的核心主题（保持英文）：
+---
+{chunk_content}
+---
+只输出摘要，不要其他内容。
+```
 
-2. Execute AI optimization for each chunk:
-   - Use the above prompt template
-   - Collect the optimized text returned by the model
+Save summaries to `summary_chunk_XXX.txt`.
 
-3. Merge all optimized chunks:
+**Stage 2: Generate Chapter Plan**
+
+Aggregate all summaries and ask the model to create a chapter structure:
+
+```
+以下是视频各部分的主题摘要（按时间顺序）：
+1. {summary_0}
+2. {summary_1}
+...
+
+请将内容划分为 5-8 个逻辑章节，输出 JSON：
+[{"title_en": "...", "title_zh": "...", "start_chunk": 0}, ...]
+```
+
+Save as `chapter_plan.json` in the chunks directory.
+
+##### 4.3.4 Process Each Chunk (Stateless Translation)
+
+For each chunk, use a simplified prompt that **does not require adding section headers**:
+
+```
+你是一个专业翻译。请将以下文本转换为"中英双语 Markdown"格式。
+要求：
+1. 保持段落结构。
+2. 英文在前，中文在后。
+3. **不要添加任何一级或二级标题**（标题将由脚本自动插入）。
+4. 仅输出翻译后的内容。
+---
+{chunk_content}
+```
+
+Save the output to `processed_XXX.md`.
+
+##### 4.3.5 Merge with Chapter Headers
+
+```bash
+python3 ~/.claude/skills/yt-transcript/yt_transcript_utils.py merge-content \
+    /tmp/${VIDEO_ID}_chunks \
+    /tmp/${VIDEO_ID}_final.md \
+    --header "---\ntitle: \"${VIDEO_TITLE}\"\ndate: ${DATE}\n---"
+
+# The script automatically:
+# - Reads chapter_plan.json
+# - Inserts chapter headers at the start of corresponding chunks
+# - Merges all processed content into final file
+```
+
+##### 4.3.6 Verification Checklist
+
+After merging, verify:
+- [ ] All `processed_*.md` files exist and are non-empty
+- [ ] Final file contains all expected chapter headers
+- [ ] Final file size > raw text size × 1.5 (due to bilingual expansion)
+- [ ] Content is continuous with no abrupt cuts
+
+#### 4.4 Legacy Chunked Processing Flow (For Simple Cases)
+
+For shorter videos or when script-based processing is not needed:
+
+```
+1. Divide raw text into 2000-3000 character chunks
+   - Split at sentence ends, avoid breaking mid-sentence
+   - Overlap ~100 characters for context continuity
+
+2. Execute AI optimization for each chunk
+   - Use the full prompt template from section 4.2
+   - Collect optimized text
+
+3. Merge all optimized chunks
    - Handle overlapping regions (deduplicate)
    - Ensure section titles don't repeat
-   - Check that paragraph transitions are natural
+   - Check paragraph transitions
 
-4. Final review:
-   - Read through the entire text for coherence
-   - Confirm section divisions are reasonable
-   - Verify proper nouns are consistent throughout
+4. Final review for coherence
 ```
 
-#### 4.4 Special Handling for Multi-Speaker Scenarios
+#### 4.5 Special Handling for Multi-Speaker Scenarios
 
 If Step 3 detected multiple speakers (Deepgram diarize result), add to the optimization prompt:
 
@@ -417,7 +584,7 @@ This video has multiple speakers. Please mark speaker changes at appropriate pos
 Use format: [Speaker X] followed by that speaker's content.
 ```
 
-#### 4.5 Quality Checklist
+#### 4.6 Quality Checklist
 
 After optimization, verify the following:
 - [ ] Every sentence has ending punctuation
@@ -561,6 +728,7 @@ Save path: `$OUTPUT_DIR` (read from config.yaml)
 
 ```bash
 rm -f /tmp/${VIDEO_ID}.* /tmp/${VIDEO_ID}_deepgram.json /tmp/${VIDEO_ID}.*.vtt
+rm -f /tmp/${VIDEO_ID}_chunk_*.mp3 /tmp/${VIDEO_ID}_chunk_*_deepgram.json /tmp/${VIDEO_ID}_combined_transcript.txt
 ```
 
 ### Step 9: Output Confirmation
@@ -578,6 +746,7 @@ rm -f /tmp/${VIDEO_ID}.* /tmp/${VIDEO_ID}_deepgram.json /tmp/${VIDEO_ID}.*.vtt
 ## Dependencies
 
 - `yt-dlp`: Download YouTube videos/audio/subtitles (**keep updated**)
+- `ffmpeg`: Audio processing and splitting (for large files >10MB)
 - `curl`: Call Deepgram API
 - `python3`: Process JSON and text formatting
 - Deepgram API account and key
