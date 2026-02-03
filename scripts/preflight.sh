@@ -16,9 +16,62 @@ if ! command -v yt-dlp &> /dev/null; then
 fi
 echo "✅ yt-dlp is installed"
 
-# 2. Check yt-dlp version and update if needed
-echo "📦 Updating yt-dlp..."
-brew upgrade yt-dlp 2>/dev/null || pip install -U yt-dlp --break-system-packages 2>/dev/null || echo "⚠️ Could not auto-update, please manually update yt-dlp"
+# 2. Check yt-dlp version and smart update (yt-dlp existence verified in step 1)
+CURRENT_VERSION=$(yt-dlp --version)
+echo "ℹ️  Current yt-dlp version: $CURRENT_VERSION"
+
+# Version cache to avoid GitHub API rate limits (check at most once per hour)
+VERSION_CACHE="/tmp/yt-dlp-version-cache"
+CACHE_MAX_AGE=3600  # 1 hour in seconds
+
+SHOULD_CHECK_UPDATE=true
+if [ -f "$VERSION_CACHE" ]; then
+    CACHE_AGE=$(($(date +%s) - $(stat -f %m "$VERSION_CACHE" 2>/dev/null || echo 0)))
+    if [ "$CACHE_AGE" -lt "$CACHE_MAX_AGE" ]; then
+        CACHED_VERSION=$(cat "$VERSION_CACHE")
+        if [ "$CURRENT_VERSION" = "$CACHED_VERSION" ]; then
+            echo "✅ yt-dlp is up to date (cached)"
+            SHOULD_CHECK_UPDATE=false
+        fi
+    fi
+fi
+
+if [ "$SHOULD_CHECK_UPDATE" = true ]; then
+    echo "🌐 Checking for yt-dlp updates..."
+    # Fetch latest release tag from GitHub API
+    LATEST_VERSION_JSON=$(curl -s --max-time 5 https://api.github.com/repos/yt-dlp/yt-dlp/releases/latest)
+    
+    if [ -n "$LATEST_VERSION_JSON" ]; then
+        # Parse tag_name using python to avoid jq dependency
+        LATEST_VERSION=$(echo "$LATEST_VERSION_JSON" | python3 -c "import sys, json; print(json.load(sys.stdin).get('tag_name', ''))" 2>/dev/null)
+        
+        if [ -n "$LATEST_VERSION" ]; then
+            if [ "$CURRENT_VERSION" != "$LATEST_VERSION" ]; then
+                echo "📦 Update available: $LATEST_VERSION (current: $CURRENT_VERSION)"
+                echo "   Updating yt-dlp..."
+                if brew upgrade yt-dlp 2>/dev/null || pip install -U yt-dlp --break-system-packages 2>/dev/null; then
+                    # Verify update success
+                    NEW_VERSION=$(yt-dlp --version)
+                    if [ "$NEW_VERSION" = "$LATEST_VERSION" ]; then
+                        echo "✅ yt-dlp updated to $NEW_VERSION"
+                        echo "$NEW_VERSION" > "$VERSION_CACHE"
+                    else
+                        echo "⚠️ Update ran but version is $NEW_VERSION (expected $LATEST_VERSION)"
+                    fi
+                else
+                    echo "⚠️ Auto-update failed, please update manually: brew upgrade yt-dlp"
+                fi
+            else
+                echo "✅ yt-dlp is up to date"
+                echo "$CURRENT_VERSION" > "$VERSION_CACHE"
+            fi
+        else
+            echo "⚠️  Could not parse latest version from GitHub"
+        fi
+    else
+        echo "⚠️  Could not check for updates (network or API limit)"
+    fi
+fi
 
 # 3. Check ffmpeg is installed (needed for audio splitting)
 if ! command -v ffmpeg &> /dev/null; then
