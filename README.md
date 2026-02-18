@@ -46,7 +46,16 @@ pip install yt-dlp
    ```yaml
    deepgram_api_key: "your_api_key_here"
    output_dir: "~/Downloads"
+
+   # LLM API for long video chunk processing (optional)
+   # Format: "openai" or "anthropic"
+   llm_api_format: "openai"
+   llm_api_key: "your_llm_api_key"
+   llm_base_url: "https://api.openai.com/v1"
+   llm_model: "gpt-4o-mini"
    ```
+
+   > **Note**: LLM API config is only needed for long video processing (context-isolated chunk processing). Short videos work without it.
 
 ### 🚀 Usage
 
@@ -146,7 +155,16 @@ pip install yt-dlp
    ```yaml
    deepgram_api_key: "your_api_key_here"
    output_dir: "~/Downloads"
+
+   # 长视频 chunk 处理的 LLM API 配置（可选）
+   # 格式: "openai" 或 "anthropic"
+   llm_api_format: "openai"
+   llm_api_key: "your_llm_api_key"
+   llm_base_url: "https://api.openai.com/v1"
+   llm_model: "gpt-4o-mini"
    ```
+
+   > **注意**：LLM API 配置仅用于长视频的上下文隔离 chunk 处理。短视频无需配置。
 
 ### 🚀 使用方法
 
