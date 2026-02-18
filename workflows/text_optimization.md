@@ -146,15 +146,11 @@ python3 ~/.claude/skills/yt-transcript/yt_transcript_utils.py process-chunks \
     /tmp/${VIDEO_ID}_chunks \
     --prompt structure_only
 
-# Then translate (reads processed_*.md as input via {STRUCTURED_TEXT} placeholder)
-# Note: translate_only needs the structured output, so rename first:
-for f in /tmp/${VIDEO_ID}_chunks/processed_*.md; do
-    mv "$f" "${f%.md}_structured.md"
-done
-
+# Then translate (reads structured output via --input-key processed_path)
 python3 ~/.claude/skills/yt-transcript/yt_transcript_utils.py process-chunks \
     /tmp/${VIDEO_ID}_chunks \
-    --prompt translate_only
+    --prompt translate_only \
+    --input-key processed_path
 ```
 
 > [!IMPORTANT]
@@ -171,20 +167,11 @@ python3 ~/.claude/skills/yt-transcript/yt_transcript_utils.py process-chunks \
 ```bash
 python3 ~/.claude/skills/yt-transcript/yt_transcript_utils.py merge-content \
     /tmp/${VIDEO_ID}_chunks \
-    /tmp/${VIDEO_ID}_optimized.txt \
-    --header "---
-title: \"$TITLE\"
-date: $(date +%Y-%m-%d)
----"
+    /tmp/${VIDEO_ID}_optimized.txt
 ```
 
-### Step 6: Verify Merge
-
-Check:
-- [ ] All `processed_*.md` files exist
-- [ ] Final file size > raw text size × 1.5 (for bilingual)
-- [ ] Chapter headers are present
-- [ ] No abrupt content cuts
+> [!IMPORTANT]
+> Do NOT pass `--header` here. Frontmatter is handled by `assemble-final` in SKILL.md Step 5.
 
 ---
 

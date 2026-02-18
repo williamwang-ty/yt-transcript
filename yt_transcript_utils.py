@@ -15,7 +15,7 @@ Commands:
     chunk-text <input> <output_dir> Split text file into chunks by sentence boundary
     get-chapters <video_url>       Fetch YouTube video chapter metadata
     merge-content <work_dir> <output_file>  Merge processed chunks with chapter headers
-    process-chunks <work_dir> --prompt <name>  Process chunks with isolated LLM API calls
+    process-chunks <work_dir> --prompt <name>  Process chunks with isolated LLM API calls (--input-key for chained processing)
     assemble-final <optimized_text> <output_file>  Assemble final markdown from optimized text + metadata
     verify-quality <optimized_text>  Verify quality of optimized text (structural checks)
 """
@@ -740,22 +740,25 @@ def _call_llm_api(api_key: str, base_url: str, model: str, messages: list,
 
 
 def process_chunks(work_dir: str, prompt_name: str, extra_instruction: str = "",
-                   config_path: str = None, dry_run: bool = False) -> dict:
+                   config_path: str = None, dry_run: bool = False,
+                   input_key: str = "raw_path") -> dict:
     """
     Process each chunk with isolated LLM API calls for context isolation.
-    
+
     Each chunk is processed in a completely independent API call, preventing
     cognitive drift and instruction forgetting across chunks.
-    
+
     Args:
         work_dir: Directory containing manifest.json and chunk_*.txt files
         prompt_name: Name of prompt template (e.g., 'structure_only', 'translate_only', 'summarize')
         extra_instruction: Optional additional instruction to append to prompt
         config_path: Optional path to config.yaml
         dry_run: If True, only validate setup without calling API
-    
+        input_key: Manifest key for input files. Default 'raw_path' reads chunk_*.txt.
+                   Use 'processed_path' to read from previous pass output (for chained processing).
+
     Returns:
-        {"success": bool, "processed_count": int, "failed_count": int, 
+        {"success": bool, "processed_count": int, "failed_count": int,
          "warnings": [...], "output_files": [...]}
     """
     work_path = Path(work_dir)
@@ -819,15 +822,16 @@ def process_chunks(work_dir: str, prompt_name: str, extra_instruction: str = "",
     
     for chunk_info in manifest["chunks"]:
         chunk_id = chunk_info["id"]
-        raw_path = work_path / chunk_info["raw_path"]
-        
-        if not raw_path.exists():
-            print(f"Error: Chunk file not found: {raw_path}", file=sys.stderr)
+        input_filename = chunk_info.get(input_key, chunk_info["raw_path"])
+        input_path = work_path / input_filename
+
+        if not input_path.exists():
+            print(f"Error: Input file not found: {input_path}", file=sys.stderr)
             failed_count += 1
             continue
-        
+
         # Read chunk content
-        chunk_text = raw_path.read_text(encoding='utf-8')
+        chunk_text = input_path.read_text(encoding='utf-8')
         chunk_char_count = len(chunk_text)
         
         # Build prompt with chunk content
@@ -1291,6 +1295,8 @@ def main():
                            help='Prompt template name (e.g., structure_only, translate_only, summarize)')
     pc_parser.add_argument('--extra-instruction', default='',
                            help='Additional instruction to append to prompt')
+    pc_parser.add_argument('--input-key', default='raw_path',
+                           help='Manifest key for input files (default: raw_path, use processed_path for chained processing)')
     pc_parser.add_argument('--config-path', default=None,
                            help='Optional path to config file')
     pc_parser.add_argument('--dry-run', action='store_true',
@@ -1368,7 +1374,7 @@ def main():
     elif args.command == 'process-chunks':
         result = process_chunks(
             args.work_dir, args.prompt, args.extra_instruction,
-            args.config_path, args.dry_run
+            args.config_path, args.dry_run, args.input_key
         )
         print(json.dumps(result, ensure_ascii=False))
         if not result.get('success', False) and not result.get('dry_run', False):
