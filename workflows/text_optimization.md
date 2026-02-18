@@ -190,17 +190,22 @@ Check:
 
 ## Checkpoint
 
-Before proceeding to final markdown generation, verify:
+Before proceeding to final markdown generation, run quality verification:
 
-- [ ] Optimized text saved to: `/tmp/${VIDEO_ID}_optimized.txt`
-- [ ] Text is properly structured with sections
-- [ ] Translation complete (if bilingual mode)
-- [ ] Quality check passed (no obvious errors)
+```bash
+python3 ~/.claude/skills/yt-transcript/yt_transcript_utils.py verify-quality \
+    /tmp/${VIDEO_ID}_optimized.txt \
+    --raw-text /tmp/${VIDEO_ID}_raw_text.txt
+# Add --bilingual if bilingual mode
+```
 
-If any is missing, STOP and review the appropriate path above.
+> [!IMPORTANT]
+> Do NOT read the optimized text file into context. The script checks quality and returns a JSON report. Only review the report.
+
+**If `"passed": false`**, review the `warnings` array and STOP.
 
 ---
 
 ## Next Step
 
-Return to main SKILL.md, Step 5: Generate Final Markdown File
+Return to main SKILL.md, Step 5: Assemble and Save Final File

@@ -137,6 +137,30 @@ Key design decisions:
 *   **Manifest-based progress tracking**: Each chunk's status is updated in `manifest.json` after processing, enabling resumability.
 *   **No external dependencies**: Uses only `urllib.request` for HTTP calls.
 
+#### 2.5 Deterministic File Assembly & Quality Verification
+
+**Problem**: For very long videos (> 1 hour), the final "Assembly" phase (merging chunks into a markdown file) and "Verification" phase (checking quality) can cause context explosion if done by the Agent.
+1.  **Assembly**: Reading a 50k+ char text file into context just to prepend a header is wasteful and risky.
+2.  **Verification**: Asking the Agent to "read this 100-page document and check for errors" hits context limits and "lost-in-the-middle" issues.
+
+**Solution**: Offload these tasks to deterministic Python scripts.
+
+1.  **Assembly (`assemble-final`)**:
+    - The Agent passes metadata (Title, URL, Date) and the path to the optimized text file to the script.
+    - The script handles file I/O, frontmatter generation, and concatenation.
+    - **Key Benefit**: The Agent *never* loads the full optimized text into its context.
+
+2.  **Two-Layer Quality Verification**:
+    - **Layer 1 (Chunk Level via LLM)**: `process-chunks` checks every chunk output for:
+        - Size ratio (detects accidental summarization)
+        - Section headers (detects structure failure)
+        - Language ratio (detects translation failure)
+    - **Layer 2 (Document Level via Script)**: `verify-quality` check structural integrity of the merged file:
+        - File existence/non-empty
+        - No abrupt truncation at the end
+        - Global bilingual balance
+    - **Key Benefit**: The Agent only reads a lightweight JSON report (`{"passed": true, ...}`), keeping context usage constant regardless of video length.
+
 ---
 
 ### Part 3: Technical Reference
@@ -302,6 +326,30 @@ yt-transcript/
 *   **输出验证**：非摘要任务中，脚本检查输出字符数 >= 输入的 50%。低于阈值则发出警告（可能误做了摘要）。
 *   **Manifest 进度追踪**：每个 chunk 处理后更新 `manifest.json` 中的状态，支持断点续传。
 *   **零外部依赖**：仅使用 `urllib.request` 进行 HTTP 调用。
+
+#### 2.5 确定性文件组装与质量验证
+
+**问题**：对于超长视频（> 1小时），最后的"组装"阶段（合并 chunk 为 markdown）和"验证"阶段（检查质量）如果由 Agent 执行，会导致上下文爆炸。
+1.  **组装**：仅仅为了加个标题就把 5万+ 字符的文本读入上下文，既浪费又危险。
+2.  **验证**：让 Agent "阅读这份 100 页的文档并检查错误" 会触碰到上下文限制和 "中间迷失 (lost-in-the-middle)" 问题。
+
+**解决方案**：将这些任务卸载给确定性的 Python 脚本。
+
+1.  **组装 (`assemble-final`)**：
+    - Agent 将元数据（标题、URL、日期）和优化后的文本路径传递给脚本。
+    - 脚本负责文件 I/O、Frontmatter 生成和拼接。
+    - **核心收益**：Agent *永远不需要* 将完整的优化文本加载到其上下文中。
+
+2.  **双层质量验证**：
+    - **第一层（Chunk 级 LLM 验证）**：`process-chunks` 检查每个 chunk 的输出：
+        - 大小比例（检测意外摘要）
+        - 章节标题（检测结构化失败）
+        - 语言比例（检测翻译失败）
+    - **第二层（文档级脚本验证）**：`verify-quality` 检查合并文件的结构完整性：
+        - 文件存在/非空
+        - 结尾无突兀截断
+        - 全局双语平衡
+    - **核心收益**：Agent 只读取轻量级的 JSON 报告（`{"passed": true, ...}`），无论视频多长，上下文占用保持恒定。
 
 ---
 

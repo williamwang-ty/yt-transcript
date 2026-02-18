@@ -16,6 +16,8 @@ Commands:
     get-chapters <video_url>       Fetch YouTube video chapter metadata
     merge-content <work_dir> <output_file>  Merge processed chunks with chapter headers
     process-chunks <work_dir> --prompt <name>  Process chunks with isolated LLM API calls
+    assemble-final <optimized_text> <output_file>  Assemble final markdown from optimized text + metadata
+    verify-quality <optimized_text>  Verify quality of optimized text (structural checks)
 """
 
 import argparse
@@ -864,12 +866,31 @@ def process_chunks(work_dir: str, prompt_name: str, extra_instruction: str = "",
             result_char_count = len(result_text)
             ratio = result_char_count / chunk_char_count if chunk_char_count > 0 else 0
             
+            # Check 1: Output size ratio (detect accidental summarization)
             if ratio < 0.5:
                 warning = (f"⚠️ Chunk {chunk_id}: output is only {ratio:.0%} of input size "
                           f"({result_char_count} vs {chunk_char_count} chars). "
                           f"Possible summarization instead of structuring.")
                 warnings.append(warning)
                 print(warning, file=sys.stderr)
+            
+            # Check 2: Section headers present (for structure tasks)
+            if prompt_name in ("structure_only", "quick_cleanup"):
+                if '##' not in result_text and chunk_char_count > 2000:
+                    warning = (f"⚠️ Chunk {chunk_id}: no section headers (##) found in output "
+                              f"({chunk_char_count} chars input). Structuring may have failed.")
+                    warnings.append(warning)
+                    print(warning, file=sys.stderr)
+            
+            # Check 3: Chinese character ratio (for translation tasks)
+            if prompt_name == "translate_only":
+                cn_chars = sum(1 for c in result_text if '\u4e00' <= c <= '\u9fff')
+                cn_ratio = cn_chars / result_char_count if result_char_count > 0 else 0
+                if cn_ratio < 0.1:
+                    warning = (f"⚠️ Chunk {chunk_id}: Chinese character ratio is only {cn_ratio:.0%}. "
+                              f"Translation may have been skipped.")
+                    warnings.append(warning)
+                    print(warning, file=sys.stderr)
         
         # Write output
         out_path.write_text(result_text, encoding='utf-8')
@@ -890,6 +911,237 @@ def process_chunks(work_dir: str, prompt_name: str, extra_instruction: str = "",
         "total_chunks": total,
         "warnings": warnings,
         "output_files": output_files
+    }
+
+
+def assemble_final(optimized_text_path: str, output_file: str,
+                    title: str = "", source: str = "", channel: str = "",
+                    date: str = "", created: str = "", duration: int = 0,
+                    transcript_source: str = "", bilingual: bool = False) -> dict:
+    """
+    Assemble final markdown file from optimized text and metadata.
+    
+    Pure file operation: reads optimized text, prepends YAML frontmatter
+    and metadata header, appends footer, writes to output file.
+    The Agent never needs to read the optimized text into its context.
+    
+    Args:
+        optimized_text_path: Path to the optimized text file
+        output_file: Path to write the final markdown file
+        title: Video title
+        source: Video URL
+        channel: Channel name
+        date: Video upload date
+        created: File creation date (today)
+        duration: Video duration in seconds
+        transcript_source: 'youtube' or 'deepgram'
+        bilingual: Whether the content is bilingual
+    
+    Returns:
+        {"success": bool, "output_file": str, "total_chars": int, "total_lines": int}
+    """
+    # Read optimized text
+    opt_path = Path(optimized_text_path)
+    if not opt_path.exists():
+        print(f"Error: Optimized text file not found: {optimized_text_path}", file=sys.stderr)
+        sys.exit(1)
+    
+    try:
+        optimized_text = opt_path.read_text(encoding='utf-8').strip()
+    except Exception as e:
+        print(f"Error: Cannot read optimized text file: {e}", file=sys.stderr)
+        sys.exit(2)
+    
+    # Calculate duration in minutes
+    duration_min = duration // 60 if duration > 0 else 0
+    bilingual_str = "true" if bilingual else "false"
+    language_mode = "Bilingual" if bilingual else "Chinese"
+    
+    # Build YAML frontmatter
+    frontmatter_lines = [
+        "---",
+        f"title: \"{title}\"",
+        f"source: {source}",
+        f"channel: \"{channel}\"",
+    ]
+    if date:
+        frontmatter_lines.append(f"date: {date}")
+    frontmatter_lines.extend([
+        f"created: {created}",
+        "type: video-transcript",
+        f"bilingual: {bilingual_str}",
+        f"duration: {duration_min}m",
+        f"transcript_source: {transcript_source}",
+        "---",
+    ])
+    
+    # Build header section
+    header_lines = [
+        "",
+        f"# {title}",
+        "",
+        f"> Video source: [YouTube - {channel}]({source})",
+        f"> Language mode: {language_mode}",
+        f"> Duration: {duration_min} minutes",
+        "",
+        "---",
+        "",
+    ]
+    
+    # Build footer
+    footer_lines = [
+        "",
+        "---",
+        "",
+        f"*This article was generated by AI voice transcription ({transcript_source}), for reference only.*",
+        "",
+    ]
+    
+    # Assemble final content
+    final_content = '\n'.join(frontmatter_lines) + '\n' + '\n'.join(header_lines) + optimized_text + '\n' + '\n'.join(footer_lines)
+    
+    # Write output file
+    out_path = Path(output_file)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(final_content, encoding='utf-8')
+    
+    return {
+        "success": True,
+        "output_file": str(out_path.absolute()),
+        "total_chars": len(final_content),
+        "total_lines": final_content.count('\n') + 1
+    }
+
+
+def verify_quality(optimized_text_path: str, raw_text_path: str = None,
+                   bilingual: bool = False) -> dict:
+    """
+    Verify quality of optimized text file with structural checks.
+    
+    Pure file-based validation. The Agent only reads the JSON report,
+    never the actual text content. Checks:
+    1. File exists and is non-empty
+    2. Has section headers (##)
+    3. No abrupt truncation (last line is complete)
+    4. Bilingual balance (Chinese char ratio in expected range)
+    5. Size ratio vs raw text (if raw_text_path provided)
+    
+    Args:
+        optimized_text_path: Path to the optimized text file
+        raw_text_path: Optional path to raw text file for comparison
+        bilingual: Whether the content should be bilingual
+    
+    Returns:
+        {"passed": bool, "checks": {...}, "warnings": [...]}
+    """
+    warnings = []
+    checks = {}
+    
+    # Read optimized text
+    opt_path = Path(optimized_text_path)
+    if not opt_path.exists():
+        return {
+            "passed": False,
+            "checks": {"file_exists": False},
+            "warnings": ["Optimized text file not found"]
+        }
+    
+    try:
+        text = opt_path.read_text(encoding='utf-8')
+    except Exception as e:
+        return {
+            "passed": False,
+            "checks": {"file_exists": True, "file_readable": False},
+            "warnings": [f"Cannot read file: {e}"]
+        }
+    
+    total_chars = len(text)
+    total_lines = text.count('\n') + 1
+    
+    checks["file_exists"] = True
+    checks["total_chars"] = total_chars
+    checks["total_lines"] = total_lines
+    
+    # Check 1: Non-empty
+    checks["non_empty"] = total_chars > 0
+    if not checks["non_empty"]:
+        warnings.append("File is empty")
+    
+    # Check 2: Has section headers
+    section_headers = re.findall(r'^##\s+.+', text, re.MULTILINE)
+    checks["section_count"] = len(section_headers)
+    checks["has_sections"] = len(section_headers) > 0
+    if not checks["has_sections"] and total_chars > 3000:
+        warnings.append(f"No section headers (##) found in {total_chars} chars of text")
+    
+    # Check 3: No abrupt truncation
+    # Check if last non-empty line ends with proper punctuation or closing marker
+    lines = [l for l in text.strip().split('\n') if l.strip()]
+    if lines:
+        last_line = lines[-1].strip()
+        # Consider proper endings: punctuation, markdown markers, closing quotes
+        proper_endings = ('.', '!', '?', '。', '！', '？', '*', '`', '"', '"', 
+                         ')', '）', '」', '>', '-', ':', '：')
+        checks["no_truncation"] = (
+            last_line.endswith(proper_endings) or 
+            last_line.startswith('#') or
+            len(last_line) < 10  # very short last lines are likely intentional
+        )
+        if not checks["no_truncation"]:
+            warnings.append(f"Possible truncation: last line does not end with punctuation: \"{last_line[-50:]}\"")
+    else:
+        checks["no_truncation"] = False
+        warnings.append("No non-empty lines found")
+    
+    # Check 4: Bilingual balance
+    if bilingual:
+        cn_chars = sum(1 for c in text if '\u4e00' <= c <= '\u9fff')
+        en_chars = sum(1 for c in text if c.isascii() and c.isalpha())
+        cn_ratio = cn_chars / total_chars if total_chars > 0 else 0
+        en_ratio = en_chars / total_chars if total_chars > 0 else 0
+        
+        checks["cn_char_ratio"] = round(cn_ratio, 3)
+        checks["en_char_ratio"] = round(en_ratio, 3)
+        
+        # Expect both languages present in reasonable proportions
+        checks["bilingual_balanced"] = cn_ratio > 0.1 and en_ratio > 0.05
+        if not checks["bilingual_balanced"]:
+            if cn_ratio < 0.1:
+                warnings.append(f"Chinese character ratio too low ({cn_ratio:.1%}), translation may be missing")
+            if en_ratio < 0.05:
+                warnings.append(f"English character ratio too low ({en_ratio:.1%}), original text may be missing")
+    
+    # Check 5: Size ratio vs raw text
+    if raw_text_path:
+        raw_path = Path(raw_text_path)
+        if raw_path.exists():
+            try:
+                raw_text = raw_path.read_text(encoding='utf-8')
+                raw_chars = len(raw_text)
+                if raw_chars > 0:
+                    size_ratio = total_chars / raw_chars
+                    checks["raw_text_chars"] = raw_chars
+                    checks["size_ratio_vs_raw"] = round(size_ratio, 2)
+                    
+                    # For bilingual, expect ~1.5-3x; for monolingual, expect ~0.8-1.5x
+                    if bilingual:
+                        checks["size_ratio_ok"] = 1.2 <= size_ratio <= 4.0
+                        if not checks["size_ratio_ok"]:
+                            warnings.append(f"Size ratio {size_ratio:.2f}x vs raw text is outside expected range (1.2-4.0x for bilingual)")
+                    else:
+                        checks["size_ratio_ok"] = 0.7 <= size_ratio <= 2.0
+                        if not checks["size_ratio_ok"]:
+                            warnings.append(f"Size ratio {size_ratio:.2f}x vs raw text is outside expected range (0.7-2.0x for monolingual)")
+            except Exception:
+                pass  # Non-critical, skip if raw text unreadable
+    
+    # Overall result
+    passed = len(warnings) == 0
+    
+    return {
+        "passed": passed,
+        "checks": checks,
+        "warnings": warnings
     }
 
 
@@ -1044,6 +1296,31 @@ def main():
     pc_parser.add_argument('--dry-run', action='store_true',
                            help='Validate setup without calling API')
 
+    # assemble-final command
+    af_parser = subparsers.add_parser(
+        'assemble-final',
+        help='Assemble final markdown file from optimized text and metadata'
+    )
+    af_parser.add_argument('optimized_text_path', help='Path to optimized text file')
+    af_parser.add_argument('output_file', help='Path to write final markdown file')
+    af_parser.add_argument('--title', default='', help='Video title')
+    af_parser.add_argument('--source', default='', help='Video URL')
+    af_parser.add_argument('--channel', default='', help='Channel name')
+    af_parser.add_argument('--date', default='', help='Video upload date')
+    af_parser.add_argument('--created', default='', help='File creation date')
+    af_parser.add_argument('--duration', type=int, default=0, help='Video duration in seconds')
+    af_parser.add_argument('--transcript-source', default='', help='youtube or deepgram')
+    af_parser.add_argument('--bilingual', action='store_true', help='Whether content is bilingual')
+
+    # verify-quality command
+    vq_parser = subparsers.add_parser(
+        'verify-quality',
+        help='Verify quality of optimized text file (structural checks)'
+    )
+    vq_parser.add_argument('optimized_text_path', help='Path to optimized text file')
+    vq_parser.add_argument('--raw-text', default=None, help='Path to raw text file for size comparison')
+    vq_parser.add_argument('--bilingual', action='store_true', help='Whether content should be bilingual')
+
     # load-config command
     config_parser = subparsers.add_parser(
         'load-config',
@@ -1095,6 +1372,25 @@ def main():
         )
         print(json.dumps(result, ensure_ascii=False))
         if not result.get('success', False) and not result.get('dry_run', False):
+            sys.exit(1)
+
+    elif args.command == 'assemble-final':
+        result = assemble_final(
+            args.optimized_text_path, args.output_file,
+            title=args.title, source=args.source, channel=args.channel,
+            date=args.date, created=args.created, duration=args.duration,
+            transcript_source=args.transcript_source, bilingual=args.bilingual
+        )
+        print(json.dumps(result, ensure_ascii=False))
+
+    elif args.command == 'verify-quality':
+        result = verify_quality(
+            args.optimized_text_path,
+            raw_text_path=args.raw_text,
+            bilingual=args.bilingual
+        )
+        print(json.dumps(result, ensure_ascii=False))
+        if not result['passed']:
             sys.exit(1)
 
     elif args.command == 'load-config':
