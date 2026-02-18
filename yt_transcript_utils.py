@@ -15,6 +15,7 @@ Commands:
     chunk-text <input> <output_dir> Split text file into chunks by sentence boundary
     get-chapters <video_url>       Fetch YouTube video chapter metadata
     merge-content <work_dir> <output_file>  Merge processed chunks with chapter headers
+    process-chunks <work_dir> --prompt <name>  Process chunks with isolated LLM API calls
 """
 
 import argparse
@@ -654,6 +655,244 @@ def merge_content(work_dir: str, output_file: str, header_content: str = "") -> 
     }
 
 
+def _call_llm_api(api_key: str, base_url: str, model: str, messages: list,
+                  api_format: str = "openai", max_tokens: int = 8192,
+                  temperature: float = 0.3) -> str:
+    """
+    Call LLM API with support for both OpenAI and Anthropic formats.
+    
+    Uses urllib (no external dependencies) to make HTTP requests.
+    
+    Args:
+        api_key: API key for authentication
+        base_url: Base URL of the API endpoint
+        model: Model identifier
+        messages: List of message dicts [{"role": "user", "content": "..."}]
+        api_format: "openai" or "anthropic"
+        max_tokens: Maximum tokens in response
+        temperature: Sampling temperature
+    
+    Returns:
+        Response text content
+    """
+    import urllib.request
+    import urllib.error
+    
+    base_url = base_url.rstrip('/')
+    
+    if api_format == "anthropic":
+        url = f"{base_url}/v1/messages"
+        headers = {
+            "x-api-key": api_key,
+            "Content-Type": "application/json",
+            "anthropic-version": "2023-06-01",
+            "User-Agent": "yt-transcript/4.0"
+        }
+        body = {
+            "model": model,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "messages": messages
+        }
+    else:  # openai format
+        url = f"{base_url}/v1/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "User-Agent": "yt-transcript/4.0"
+        }
+        body = {
+            "model": model,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "messages": messages
+        }
+    
+    data = json.dumps(body).encode('utf-8')
+    req = urllib.request.Request(url, data=data, headers=headers, method='POST')
+    
+    try:
+        with urllib.request.urlopen(req, timeout=120) as response:
+            result = json.loads(response.read().decode('utf-8'))
+    except urllib.error.HTTPError as e:
+        error_body = e.read().decode('utf-8', errors='replace')
+        print(f"Error: LLM API returned HTTP {e.code}: {error_body}", file=sys.stderr)
+        sys.exit(1)
+    except urllib.error.URLError as e:
+        print(f"Error: Cannot reach LLM API: {e.reason}", file=sys.stderr)
+        sys.exit(1)
+    except Exception as e:
+        print(f"Error: LLM API call failed: {e}", file=sys.stderr)
+        sys.exit(1)
+    
+    # Extract response text based on format
+    try:
+        if api_format == "anthropic":
+            return result["content"][0]["text"]
+        else:
+            return result["choices"][0]["message"]["content"]
+    except (KeyError, IndexError) as e:
+        print(f"Error: Unexpected API response structure: {e}", file=sys.stderr)
+        print(f"Response: {json.dumps(result, ensure_ascii=False)[:500]}", file=sys.stderr)
+        sys.exit(1)
+
+
+def process_chunks(work_dir: str, prompt_name: str, extra_instruction: str = "",
+                   config_path: str = None, dry_run: bool = False) -> dict:
+    """
+    Process each chunk with isolated LLM API calls for context isolation.
+    
+    Each chunk is processed in a completely independent API call, preventing
+    cognitive drift and instruction forgetting across chunks.
+    
+    Args:
+        work_dir: Directory containing manifest.json and chunk_*.txt files
+        prompt_name: Name of prompt template (e.g., 'structure_only', 'translate_only', 'summarize')
+        extra_instruction: Optional additional instruction to append to prompt
+        config_path: Optional path to config.yaml
+        dry_run: If True, only validate setup without calling API
+    
+    Returns:
+        {"success": bool, "processed_count": int, "failed_count": int, 
+         "warnings": [...], "output_files": [...]}
+    """
+    work_path = Path(work_dir)
+    
+    # 1. Read manifest
+    manifest_path = work_path / "manifest.json"
+    if not manifest_path.exists():
+        print(f"Error: manifest.json not found in {work_dir}", file=sys.stderr)
+        sys.exit(1)
+    
+    manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
+    
+    # 2. Load prompt template
+    skill_dir = Path(__file__).parent
+    prompt_path = skill_dir / "prompts" / f"{prompt_name}.md"
+    if not prompt_path.exists():
+        print(f"Error: Prompt template not found: {prompt_path}", file=sys.stderr)
+        print(f"Available prompts: {[p.stem for p in (skill_dir / 'prompts').glob('*.md')]}", file=sys.stderr)
+        sys.exit(1)
+    
+    prompt_template = prompt_path.read_text(encoding='utf-8')
+    
+    # Append extra instruction if provided
+    if extra_instruction:
+        prompt_template += f"\n\n**Additional Instructions**: {extra_instruction}\n"
+    
+    # 3. Load LLM config
+    config = load_config(config_path)
+    api_key = config.get('llm_api_key', '')
+    base_url = config.get('llm_base_url', '')
+    model = config.get('llm_model', '')
+    api_format = config.get('llm_api_format', 'openai')
+    
+    if not api_key or not base_url or not model:
+        print("Error: LLM API not configured. Set llm_api_key, llm_base_url, llm_model in config.yaml", file=sys.stderr)
+        sys.exit(1)
+    
+    # Determine output file pattern based on prompt type
+    is_summary = (prompt_name == "summarize")
+    
+    # 4. Dry run - just validate and return
+    if dry_run:
+        return {
+            "success": True,
+            "dry_run": True,
+            "total_chunks": manifest["total_chunks"],
+            "prompt_name": prompt_name,
+            "prompt_length": len(prompt_template),
+            "model": model,
+            "api_format": api_format,
+            "message": "Dry run: all validations passed"
+        }
+    
+    # 5. Process each chunk
+    processed_count = 0
+    failed_count = 0
+    warnings = []
+    output_files = []
+    
+    total = manifest["total_chunks"]
+    
+    for chunk_info in manifest["chunks"]:
+        chunk_id = chunk_info["id"]
+        raw_path = work_path / chunk_info["raw_path"]
+        
+        if not raw_path.exists():
+            print(f"Error: Chunk file not found: {raw_path}", file=sys.stderr)
+            failed_count += 1
+            continue
+        
+        # Read chunk content
+        chunk_text = raw_path.read_text(encoding='utf-8')
+        chunk_char_count = len(chunk_text)
+        
+        # Build prompt with chunk content
+        if "{RAW_TEXT}" in prompt_template:
+            prompt = prompt_template.replace("{RAW_TEXT}", chunk_text)
+        elif "{STRUCTURED_TEXT}" in prompt_template:
+            prompt = prompt_template.replace("{STRUCTURED_TEXT}", chunk_text)
+        else:
+            prompt = prompt_template + "\n\n" + chunk_text
+        
+        # Determine output path
+        if is_summary:
+            out_filename = f"summary_chunk_{chunk_id:03d}.txt"
+        else:
+            out_filename = chunk_info["processed_path"]
+        out_path = work_path / out_filename
+        
+        # Call LLM API (isolated context per chunk)
+        print(f"Processing chunk {chunk_id + 1}/{total}...", file=sys.stderr)
+        
+        try:
+            result_text = _call_llm_api(
+                api_key=api_key,
+                base_url=base_url,
+                model=model,
+                messages=[{"role": "user", "content": prompt}],
+                api_format=api_format
+            )
+        except SystemExit:
+            print(f"Failed on chunk {chunk_id}, skipping...", file=sys.stderr)
+            failed_count += 1
+            continue
+        
+        # Output validation (for non-summary tasks)
+        if not is_summary:
+            result_char_count = len(result_text)
+            ratio = result_char_count / chunk_char_count if chunk_char_count > 0 else 0
+            
+            if ratio < 0.5:
+                warning = (f"⚠️ Chunk {chunk_id}: output is only {ratio:.0%} of input size "
+                          f"({result_char_count} vs {chunk_char_count} chars). "
+                          f"Possible summarization instead of structuring.")
+                warnings.append(warning)
+                print(warning, file=sys.stderr)
+        
+        # Write output
+        out_path.write_text(result_text, encoding='utf-8')
+        output_files.append(str(out_path))
+        processed_count += 1
+        
+        # Update manifest status
+        chunk_info["status"] = "done"
+        manifest_path.write_text(
+            json.dumps(manifest, ensure_ascii=False, indent=2),
+            encoding='utf-8'
+        )
+    
+    return {
+        "success": failed_count == 0 and len(warnings) == 0,
+        "processed_count": processed_count,
+        "failed_count": failed_count,
+        "total_chunks": total,
+        "warnings": warnings,
+        "output_files": output_files
+    }
+
+
 def load_config(config_path: str = None) -> dict:
     """
     Load configuration from config.yaml
@@ -709,6 +948,10 @@ def load_config(config_path: str = None) -> dict:
     return {
         "output_dir": output_dir,
         "deepgram_api_key": config.get('deepgram_api_key', ''),
+        "llm_api_key": config.get('llm_api_key', ''),
+        "llm_base_url": config.get('llm_base_url', ''),
+        "llm_model": config.get('llm_model', ''),
+        "llm_api_format": config.get('llm_api_format', 'openai'),
         "config_path": str(path.absolute())
     }
 
@@ -786,6 +1029,21 @@ def main():
     merge_parser.add_argument('output_file', help='Output file path')
     merge_parser.add_argument('--header', default='', help='Optional header content to prepend')
 
+    # process-chunks command
+    pc_parser = subparsers.add_parser(
+        'process-chunks',
+        help='Process chunks with isolated LLM API calls'
+    )
+    pc_parser.add_argument('work_dir', help='Working directory with manifest.json')
+    pc_parser.add_argument('--prompt', required=True,
+                           help='Prompt template name (e.g., structure_only, translate_only, summarize)')
+    pc_parser.add_argument('--extra-instruction', default='',
+                           help='Additional instruction to append to prompt')
+    pc_parser.add_argument('--config-path', default=None,
+                           help='Optional path to config file')
+    pc_parser.add_argument('--dry-run', action='store_true',
+                           help='Validate setup without calling API')
+
     # load-config command
     config_parser = subparsers.add_parser(
         'load-config',
@@ -829,6 +1087,15 @@ def main():
     elif args.command == 'merge-content':
         result = merge_content(args.work_dir, args.output_file, args.header)
         print(json.dumps(result, ensure_ascii=False))
+
+    elif args.command == 'process-chunks':
+        result = process_chunks(
+            args.work_dir, args.prompt, args.extra_instruction,
+            args.config_path, args.dry_run
+        )
+        print(json.dumps(result, ensure_ascii=False))
+        if not result.get('success', False) and not result.get('dry_run', False):
+            sys.exit(1)
 
     elif args.command == 'load-config':
         result = load_config(args.config_path)

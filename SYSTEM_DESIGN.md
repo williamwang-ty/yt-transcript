@@ -100,7 +100,42 @@ When processing multiple YouTube links, this skill uses **serial processing** (o
 |----------|-------------|--------|
 | Parallel with Subagents | Not supported | Current Claude/Gemini Code architecture does not support spawning independent subagents with isolated context for general tasks |
 | Parallel in single session | Not feasible | AI optimization step requires direct LLM involvement; cannot split into multiple parallel cognitive threads |
-| Serial processing | ✅ Adopted | Process one video completely, clear context, then proceed to next |
+| Serial processing | Adopted | Process one video completely, clear context, then proceed to next |
+
+#### 2.4 Context Isolation for Chunk Processing
+
+**Problem**: During long video processing, the Agent processes multiple chunks sequentially within a single conversation. After the summary generation phase (Step 3: chapter planning), the Agent enters a summarization cognitive mode. When it then switches to the structuring phase (Step 4), this cognitive inertia causes **Goal Drift** -- the Agent produces summaries instead of structured original text.
+
+Root causes:
+
+1.  **Recency Bias**: The Agent spent significant tokens generating summaries, so summarization has high attention weight.
+2.  **Context Accumulation**: In Agent IDE (Claude Code / Gemini Code), all intermediate outputs (summaries, tool call results) accumulate in a shared, non-clearable conversation context.
+3.  **Instruction Decay**: After many rounds of chunk processing, the original instruction (Do NOT summarize) gets diluted.
+
+**Solution**: Offload chunk processing to the Python script (`process-chunks` command), which makes **independent LLM API calls** per chunk.
+
+```
+Before (shared context, cognitive drift):
+  Agent conversation
+    +-- chunk_0: generate summary    <-- sets summarize mode
+    +-- chunk_1: generate summary    <-- reinforces mode
+    +-- chunk_0: structure text      <-- instruction conflict!
+    +-- chunk_1: structure text      <-- likely produces summary
+
+After (hard isolation, no drift):
+  Agent conversation
+    +-- run: process-chunks --prompt summarize        <-- one command
+    |     +-- Script: API call per chunk (isolated)
+    +-- run: process-chunks --prompt structure_only   <-- one command
+          +-- Script: API call per chunk (isolated)
+```
+
+Key design decisions:
+
+*   **Dual API format support**: `_call_llm_api()` supports both OpenAI (`/v1/chat/completions`) and Anthropic (`/v1/messages`) formats, controlled by `llm_api_format` in `config.yaml`.
+*   **Output validation**: For non-summary tasks, the script checks that output character count >= 50% of input. If below, a warning is raised (possible accidental summarization).
+*   **Manifest-based progress tracking**: Each chunk's status is updated in `manifest.json` after processing, enabling resumability.
+*   **No external dependencies**: Uses only `urllib.request` for HTTP calls.
 
 ---
 
@@ -231,7 +266,42 @@ yt-transcript/
 |------|--------|------|
 | 并行 + Subagent | 不支持 | 当前 Claude/Gemini Code 架构不支持为通用任务创建具有独立上下文的子智能体 |
 | 单会话内并行 | 不可行 | AI 优化步骤需要 LLM 直接参与，无法"分身"成多个并行认知线程 |
-| 串行处理 | ✅ 采用 | 完整处理一个视频后清理上下文，再处理下一个 |
+| 串行处理 | 采用 | 完整处理一个视频后清理上下文，再处理下一个 |
+
+#### 2.4 Chunk 处理的上下文隔离
+
+**问题**：处理长视频时，Agent 在同一对话中顺序处理多个 chunk。完成"摘要生成"阶段（Step 3: 章节规划）后，Agent 进入"概括"认知模式。切换到"结构化"阶段（Step 4）时，这种认知惯性导致**目标漂移（Goal Drift）**——Agent 输出摘要而非结构化原文。
+
+根因分析：
+
+1.  **近因偏差（Recency Bias）**：Agent 花了大量 token 生成摘要，"概括"在注意力中的权重过高。
+2.  **上下文累积**：在 Agent IDE（Claude Code / Gemini Code）中，所有中间产物（摘要、工具调用结果）累积在共享的、不可清除的对话上下文中。
+3.  **指令衰减（Instruction Decay）**：多轮 chunk 处理后，原始指令（"不要摘要"）被稀释。
+
+**解决方案**：将 chunk 处理下沉到 Python 脚本（`process-chunks` 命令），每个 chunk 通过**独立的 LLM API 调用**处理。
+
+```
+改造前（共享上下文，认知漂移）：
+  Agent 对话
+    +-- chunk_0: 生成摘要    <-- 设定"概括"模式
+    +-- chunk_1: 生成摘要    <-- 强化模式
+    +-- chunk_0: 结构化文本  <-- 指令冲突！
+    +-- chunk_1: 结构化文本  <-- 很可能输出摘要
+
+改造后（硬隔离，无漂移）：
+  Agent 对话
+    +-- 执行: process-chunks --prompt summarize      <-- 一条命令
+    |     +-- 脚本: 每个 chunk 独立 API 调用（隔离）
+    +-- 执行: process-chunks --prompt structure_only  <-- 一条命令
+          +-- 脚本: 每个 chunk 独立 API 调用（隔离）
+```
+
+关键设计决策：
+
+*   **双 API 格式支持**：`_call_llm_api()` 同时支持 OpenAI（`/v1/chat/completions`）和 Anthropic（`/v1/messages`）格式，通过 `config.yaml` 中的 `llm_api_format` 切换。
+*   **输出验证**：非摘要任务中，脚本检查输出字符数 >= 输入的 50%。低于阈值则发出警告（可能误做了摘要）。
+*   **Manifest 进度追踪**：每个 chunk 处理后更新 `manifest.json` 中的状态，支持断点续传。
+*   **零外部依赖**：仅使用 `urllib.request` 进行 HTTP 调用。
 
 ---
 

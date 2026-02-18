@@ -6,3 +6,10 @@ deepgram_api_key: "your_deepgram_api_key_here"
 
 # Output directory for transcribed files
 output_dir: "~/Downloads"
+
+# LLM API Configuration (for process-chunks command)
+# Format: "openai" (OpenAI-compatible) or "anthropic" (Anthropic Messages API)
+llm_api_format: "openai"
+llm_api_key: "your_llm_api_key_here"
+llm_base_url: "https://api.openai.com/v1"
+llm_model: "gpt-4o-mini"

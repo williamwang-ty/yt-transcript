@@ -95,16 +95,26 @@ python3 ~/.claude/skills/yt-transcript/yt_transcript_utils.py chunk-text \
 
 If `HAS_CHAPTERS=false`:
 
-1. For each chunk, generate a 1-2 sentence summary (store as `summary_chunk_XXX.txt`)
-2. Aggregate all summaries
-3. Ask model to create chapter structure as JSON:
+1. Generate summaries for all chunks (isolated LLM calls):
+   ```bash
+   python3 ~/.claude/skills/yt-transcript/yt_transcript_utils.py process-chunks \
+       /tmp/${VIDEO_ID}_chunks \
+       --prompt summarize
+   ```
+
+2. Read all summary files and aggregate:
+   ```bash
+   cat /tmp/${VIDEO_ID}_chunks/summary_chunk_*.txt
+   ```
+
+3. Based on aggregated summaries, create chapter structure as JSON:
    ```json
    [
      {"title_en": "Introduction", "title_zh": "介绍", "start_chunk": 0},
      {"title_en": "Main Topic", "title_zh": "主题", "start_chunk": 2}
    ]
    ```
-4. Save to `/tmp/${VIDEO_ID}_chunks/chapter_plan.json`
+   Save to `/tmp/${VIDEO_ID}_chunks/chapter_plan.json`
 
 If `HAS_CHAPTERS=true`:
 1. Convert YouTube chapters to the same format
@@ -113,20 +123,45 @@ If `HAS_CHAPTERS=true`:
 
 ### Step 4: Process Each Chunk
 
-**↳ READ State**: `cat /tmp/${VIDEO_ID}_state.md` (每个 chunk 处理前)
-
-For each chunk file in `/tmp/${VIDEO_ID}_chunks/chunk_*.txt`:
+**↳ READ State**: `cat /tmp/${VIDEO_ID}_state.md` (处理前确认模式)
 
 **For Chinese-only mode**:
-- Use `prompts/structure_only.md` (simplified: no section headers)
-- Save to `processed_XXX.md`
+```bash
+python3 ~/.claude/skills/yt-transcript/yt_transcript_utils.py process-chunks \
+    /tmp/${VIDEO_ID}_chunks \
+    --prompt structure_only
+```
 
-**For Bilingual mode**:
-- Use `prompts/translate_only.md` (no section headers)
-- Save to `processed_XXX.md`
+**For Chinese + Deepgram** (needs extra cleanup):
+```bash
+python3 ~/.claude/skills/yt-transcript/yt_transcript_utils.py process-chunks \
+    /tmp/${VIDEO_ID}_chunks \
+    --prompt structure_only \
+    --extra-instruction "Also fix: Chinese character spacing, add punctuation based on context, remove repeated phrases"
+```
 
-**↳ WRITE State** (每个 chunk 处理后):
-更新 `chunk: N+1`, `last_action: wrote processed_N.md`, `next: process chunk_N+1`
+**For Bilingual mode** (English content):
+```bash
+python3 ~/.claude/skills/yt-transcript/yt_transcript_utils.py process-chunks \
+    /tmp/${VIDEO_ID}_chunks \
+    --prompt structure_only
+
+# Then translate (reads processed_*.md as input via {STRUCTURED_TEXT} placeholder)
+# Note: translate_only needs the structured output, so rename first:
+for f in /tmp/${VIDEO_ID}_chunks/processed_*.md; do
+    mv "$f" "${f%.md}_structured.md"
+done
+
+python3 ~/.claude/skills/yt-transcript/yt_transcript_utils.py process-chunks \
+    /tmp/${VIDEO_ID}_chunks \
+    --prompt translate_only
+```
+
+> [!IMPORTANT]
+> Each chunk is processed in a **completely isolated LLM API call**. The model never sees other chunks or previous processing results. This prevents cognitive drift and instruction forgetting.
+
+**↳ WRITE State** (处理完成后):
+更新 `step: 4`, `last_action: processed all chunks (isolated)`, `next: merge content`
 
 ### Step 5: Merge with Chapter Headers
 
