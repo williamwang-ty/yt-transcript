@@ -1,15 +1,21 @@
 # yt-transcript Configuration Template
 # Copy this file to config.yaml and fill in your settings
+# This config surface is intentionally limited to flat top-level key/value pairs.
+# Nested YAML and multi-line values are not supported.
 
 # Deepgram API Key (get from https://console.deepgram.com/)
+# Required only when a video has no usable subtitles and audio transcription is needed.
 deepgram_api_key: "your_deepgram_api_key_here"
 
-# Output directory for transcribed files
+# Output directory for transcribed files. This is the only always-required field.
 output_dir: "~/Downloads"
 
-# LLM API Configuration (for process-chunks command)
+# LLM API Configuration
+# Required only when plan-optimization selects long-video chunk processing,
+# or when bilingual translation is needed.
 # Format: "openai" (OpenAI-compatible) or "anthropic" (Anthropic Messages API)
 llm_api_format: "openai"
 llm_api_key: "your_llm_api_key_here"
-llm_base_url: "https://api.openai.com/v1"
+# Can be either provider root URL or a /v1 URL; the tool normalizes both.
+llm_base_url: "https://api.openai.com"
 llm_model: "gpt-4o-mini"

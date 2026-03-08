@@ -2,10 +2,35 @@
 set -e
 
 # preflight.sh - Pre-flight checks for yt-transcript skill
-# Usage: ./preflight.sh
+# Usage: ./preflight.sh [--require-deepgram] [--require-llm]
+# Mode semantics:
+#   base                -> metadata / subtitle-driven workflows
+#   --require-deepgram  -> audio transcription path only
+#   --require-llm       -> long-video chunk processing only
+# The checks are intentionally staged: subtitle-only flows should not fail just
+# because Deepgram or LLM settings are absent.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CONFIG_FILE="$SCRIPT_DIR/../config.yaml"
+ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+CONFIG_FILE="$ROOT_DIR/config.yaml"
+REQUIRE_DEEPGRAM=false
+REQUIRE_LLM=false
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --require-deepgram)
+            REQUIRE_DEEPGRAM=true
+            ;;
+        --require-llm)
+            REQUIRE_LLM=true
+            ;;
+        *)
+            echo "Usage: $0 [--require-deepgram] [--require-llm]"
+            exit 1
+            ;;
+    esac
+    shift
+done
 
 echo "🔍 Running pre-flight checks..."
 
@@ -89,26 +114,66 @@ echo "✅ python3 is available"
 # 5. Check config file exists
 if [ ! -f "$CONFIG_FILE" ]; then
     echo "❌ Error: config.yaml not found at $CONFIG_FILE"
-    echo "   Copy config.example.yaml to config.yaml and add your Deepgram API key"
+    echo "   Copy config.example.yaml to config.yaml, set output_dir,"
+    echo "   and add Deepgram / LLM credentials only for the paths that need them."
     exit 1
 fi
 echo "✅ config.yaml found"
 
-# 6. Extract and validate Deepgram API key
-DEEPGRAM_API_KEY=$(grep 'deepgram_api_key' "$CONFIG_FILE" | sed 's/.*: *"\(.*\)"/\1/')
-if [ -z "$DEEPGRAM_API_KEY" ] || [ "$DEEPGRAM_API_KEY" = "your_api_key_here" ]; then
-    echo "❌ Error: Deepgram API key not configured in config.yaml"
+# 6. Load config once
+CONFIG_JSON=$(python3 "$ROOT_DIR/yt_transcript_utils.py" load-config --config-path "$CONFIG_FILE")
+
+# 7. Validate output_dir
+OUTPUT_DIR=$(printf '%s' "$CONFIG_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin).get('output_dir', ''))")
+if [ -z "$OUTPUT_DIR" ]; then
+    echo "❌ Error: output_dir is missing in config.yaml"
     exit 1
 fi
-echo "✅ Deepgram API key configured"
+if [ ! -d "$OUTPUT_DIR" ]; then
+    echo "ℹ️  Creating output_dir: $OUTPUT_DIR"
+    mkdir -p "$OUTPUT_DIR"
+fi
+echo "✅ output_dir is ready"
 
-# 7. Test Deepgram API connectivity (quick validation)
-echo "🌐 Testing Deepgram API connectivity..."
-if python3 "$SCRIPT_DIR/../yt_transcript_utils.py" test-deepgram-api "$DEEPGRAM_API_KEY" > /dev/null 2>&1; then
-    echo "✅ Deepgram API is reachable and key is valid"
+DEEPGRAM_API_KEY=$(printf '%s' "$CONFIG_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin).get('deepgram_api_key', ''))")
+LLM_API_KEY=$(printf '%s' "$CONFIG_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin).get('llm_api_key', ''))")
+LLM_BASE_URL=$(printf '%s' "$CONFIG_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin).get('llm_base_url', ''))")
+LLM_MODEL=$(printf '%s' "$CONFIG_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin).get('llm_model', ''))")
+
+# 7. Deepgram checks only when required
+if [ "$REQUIRE_DEEPGRAM" = true ]; then
+    if [ -z "$DEEPGRAM_API_KEY" ] || [ "$DEEPGRAM_API_KEY" = "your_api_key_here" ] || [ "$DEEPGRAM_API_KEY" = "your_deepgram_api_key_here" ]; then
+        echo "❌ Error: Deepgram API key not configured in config.yaml"
+        exit 1
+    fi
+    echo "✅ Deepgram API key configured"
+
+    echo "🌐 Testing Deepgram API connectivity..."
+    if python3 "$ROOT_DIR/yt_transcript_utils.py" test-deepgram-api "$DEEPGRAM_API_KEY" > /dev/null 2>&1; then
+        echo "✅ Deepgram API is reachable and key is valid"
+    else
+        echo "❌ Error: Deepgram API test failed. Check your API key or network connection"
+        exit 1
+    fi
 else
-    echo "❌ Error: Deepgram API test failed. Check your API key or network connection"
-    exit 1
+    if [ -n "$DEEPGRAM_API_KEY" ] && [ "$DEEPGRAM_API_KEY" != "your_api_key_here" ] && [ "$DEEPGRAM_API_KEY" != "your_deepgram_api_key_here" ]; then
+        echo "✅ Deepgram API key configured (not validated in base mode)"
+    else
+        echo "ℹ️  Deepgram API key not configured; subtitle-only workflows can still run"
+    fi
+fi
+
+# 8. LLM checks only when required
+if [ "$REQUIRE_LLM" = true ]; then
+    if [ -z "$LLM_API_KEY" ] || [ -z "$LLM_BASE_URL" ] || [ -z "$LLM_MODEL" ]; then
+        echo "❌ Error: LLM API is not fully configured in config.yaml"
+        exit 1
+    fi
+    echo "✅ LLM API configuration is present"
+elif [ -n "$LLM_API_KEY" ] && [ -n "$LLM_BASE_URL" ] && [ -n "$LLM_MODEL" ]; then
+    echo "✅ LLM API configuration is present (not required for this run)"
+else
+    echo "ℹ️  LLM API configuration missing; long-video chunk processing will be unavailable"
 fi
 
 echo ""

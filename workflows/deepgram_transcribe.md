@@ -1,148 +1,107 @@
 # Deepgram Transcription Workflow
 
-This workflow handles audio download and speech-to-text transcription using Deepgram API.
+This workflow handles audio download and Deepgram transcription. Large audio files are split and merged by the Python utility, not by prompt-side shell logic.
 
 ---
 
 ## Context Sync
 
-**↳ READ State**: `cat /tmp/${VIDEO_ID}_state.md`
+Read `/tmp/${VIDEO_ID}_state.md` and confirm:
 
-Extract and confirm from state file:
-- `vid` = _______
-- `url` = _______
-- `title` = _______
+- `vid`
+- `url`
+- `title`
+- `channel`
 
-From system:
-- `CONFIG_FILE`: `~/.claude/skills/yt-transcript/config.yaml`
+If the state file is missing, STOP.
 
-**If state file is missing**: STOP. Return to SKILL.md Step 1.
+Before this workflow starts, base preflight and `--require-deepgram` preflight must already have passed.
 
 ---
 
 ## Step 1: Download Audio
 
-Use the unified download script:
-
 ```bash
-bash ~/.claude/skills/yt-transcript/scripts/download.sh "$VIDEO_URL" audio
+AUDIO_JSON=$(bash <skill-root>/scripts/download.sh "$VIDEO_URL" audio)
 ```
 
-This downloads the best available audio to `/tmp/${VIDEO_ID}.*` (extension auto-detected).
+Record from JSON:
+
+- `audio_file`
+- `audio_format`
+- `extension`
+- `size_bytes`
+
+If `audio_file` is missing, STOP.
 
 ---
 
-## Step 2: Determine Language
+## Step 2: Determine Source Language
 
-Based on video title and channel name, determine primary language:
-- Primarily Chinese → `LANGUAGE=zh`
-- Primarily English → `LANGUAGE=en`
+Set:
 
-Record: `LANGUAGE=_______`
+- `LANGUAGE=zh` for primarily Chinese audio
+- `LANGUAGE=en` for primarily English audio
 
----
+Then write to state:
 
-## Step 3: Check File Size and Split if Needed
-
-```bash
-AUDIO_FILE=$(ls /tmp/${VIDEO_ID}.* 2>/dev/null | grep -v vtt | head -1)
-FILE_SIZE=$(stat -f%z "$AUDIO_FILE" 2>/dev/null || stat -c%s "$AUDIO_FILE")
-MAX_SIZE=10485760  # 10MB
-
-if [ "$FILE_SIZE" -gt "$MAX_SIZE" ]; then
-    echo "⚠️ Audio file exceeds 10MB, splitting..."
-    python3 ~/.claude/skills/yt-transcript/yt_transcript_utils.py split-audio "$AUDIO_FILE" --max-size 10
-    SPLIT_MODE=true
-else
-    SPLIT_MODE=false
-fi
-```
+- `src: deepgram`
+- `source_language: $LANGUAGE`
+- `mode: chinese` if `LANGUAGE=zh`
+- `mode: bilingual` if `LANGUAGE=en`
+- `subtitle_source: Deepgram Transcription`
 
 ---
 
-## Step 4: Call Deepgram API
-
-### For Single File (< 10MB)
+## Step 3: Transcribe with Unified Utility
 
 ```bash
-CONFIG_FILE=~/.claude/skills/yt-transcript/config.yaml
-DEEPGRAM_API_KEY=$(grep 'deepgram_api_key' "$CONFIG_FILE" | sed 's/.*: *"\(.*\)"/\1/')
-
-# Detect file extension and set Content-Type
-AUDIO_FILE=$(ls /tmp/${VIDEO_ID}.* 2>/dev/null | grep -v vtt | head -1)
-EXT="${AUDIO_FILE##*.}"
-case "$EXT" in
-    m4a|mp4) CONTENT_TYPE="audio/mp4" ;;
-    webm)    CONTENT_TYPE="audio/webm" ;;
-    opus)    CONTENT_TYPE="audio/opus" ;;
-    mp3)     CONTENT_TYPE="audio/mpeg" ;;
-    *)       CONTENT_TYPE="audio/mp4" ;;
-esac
-
-curl -s -X POST "https://api.deepgram.com/v1/listen?model=nova-2&language=$LANGUAGE&diarize=true&punctuate=true&paragraphs=true&smart_format=true" \
-  -H "Authorization: Token $DEEPGRAM_API_KEY" \
-  -H "Content-Type: $CONTENT_TYPE" \
-  --data-binary @"$AUDIO_FILE" \
-  --max-time 300 \
-  -o /tmp/${VIDEO_ID}_deepgram.json
+python3 <skill-root>/yt_transcript_utils.py transcribe-deepgram \
+    "$AUDIO_FILE" \
+    --language "$LANGUAGE" \
+    --output-json "/tmp/${VIDEO_ID}_deepgram.json" \
+    --output-text "/tmp/${VIDEO_ID}_raw_text.txt" \
+    > /tmp/${VIDEO_ID}_deepgram_result.json
 ```
 
-**Error Handling**:
-- If curl fails, do NOT retry automatically
-- Print error and ask user: "Deepgram API failed. Retry or skip?"
-- Wait for user response
+This command automatically:
 
-### For Split Files (≥ 10MB)
+- Splits files larger than 10 MB
+- Calls Deepgram once per chunk
+- Processes each response
+- Merges all chunk transcripts into `/tmp/${VIDEO_ID}_raw_text.txt`
 
-Process each chunk sequentially:
+No separate split-path workflow is needed.
 
-```bash
-CHUNK_INDEX=0
-ALL_TRANSCRIPTS=""
+**Error Handling**
 
-for CHUNK in /tmp/${VIDEO_ID}_chunk_*.mp3; do
-    echo "🔄 Processing chunk $((CHUNK_INDEX + 1))..."
-    
-    curl -s -X POST "https://api.deepgram.com/v1/listen?model=nova-2&language=$LANGUAGE&diarize=true&punctuate=true&paragraphs=true&smart_format=true" \
-      -H "Authorization: Token $DEEPGRAM_API_KEY" \
-      -H "Content-Type: audio/mpeg" \
-      --data-binary @"$CHUNK" \
-      --max-time 300 \
-      -o "/tmp/${VIDEO_ID}_chunk_${CHUNK_INDEX}_deepgram.json"
-    
-    CHUNK_TEXT=$(python3 ~/.claude/skills/yt-transcript/yt_transcript_utils.py process-deepgram "/tmp/${VIDEO_ID}_chunk_${CHUNK_INDEX}_deepgram.json" | python3 -c "import sys,json; print(json.load(sys.stdin)['transcript'])")
-    ALL_TRANSCRIPTS="$ALL_TRANSCRIPTS $CHUNK_TEXT"
-    
-    CHUNK_INDEX=$((CHUNK_INDEX + 1))
-done
-
-echo "$ALL_TRANSCRIPTS" > /tmp/${VIDEO_ID}_combined_transcript.txt
-```
+- If the command fails, STOP
+- Do not auto-retry
+- Ask the user whether to retry only after surfacing the error
 
 ---
 
-## Step 5: Parse Transcription Result
+## Step 4: Record Output Metadata
 
-```bash
-python3 ~/.claude/skills/yt-transcript/yt_transcript_utils.py process-deepgram "/tmp/${VIDEO_ID}_deepgram.json" > /tmp/${VIDEO_ID}_processed.json
+Read `/tmp/${VIDEO_ID}_deepgram_result.json` and record:
 
-# Extract cleaned transcript and speaker count
-TRANSCRIPT=$(cat /tmp/${VIDEO_ID}_processed.json | python3 -c "import sys,json; print(json.load(sys.stdin)['transcript'])")
-SPEAKER_COUNT=$(cat /tmp/${VIDEO_ID}_processed.json | python3 -c "import sys,json; print(json.load(sys.stdin)['speaker_count'])")
+- `speaker_count`
+- `chunk_count`
+- `used_split_mode`
 
-# Save to file
-echo "$TRANSCRIPT" > /tmp/${VIDEO_ID}_raw_text.txt
-```
+Write to state:
+
+- `step: 3`
+- `last_action: deepgram transcription completed`
 
 ---
 
 ## Checkpoint
 
-Before proceeding to `workflows/text_optimization.md`, verify:
+Before proceeding to `workflows/text_optimization.md`, run:
 
-- [ ] Raw text saved to: `/tmp/${VIDEO_ID}_raw_text.txt`
-- [ ] Language: `_______` (zh or en)
-- [ ] Speaker count: `_______`
-- [ ] Subtitle source recorded: `Deepgram Transcription`
+```bash
+python3 <skill-root>/yt_transcript_utils.py validate-state /tmp/${VIDEO_ID}_state.md --stage post-source
+```
 
-If any is missing, STOP and review Steps 1-5.
+If `hard_failures` is non-empty, STOP.

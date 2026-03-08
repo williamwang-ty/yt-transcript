@@ -29,6 +29,10 @@ Instead of a monolithic instruction file, we split the skill into a lightweight 
 
 *Impact: Reduces active context by ~40-50%.*
 
+**1.2.1.b Script-First Decision Logic**
+
+High-risk decisions should live in scripts that emit JSON, not in prompt prose. Subtitle availability, subtitle source-language selection, Deepgram split/merge behavior, config-path discovery, state validation, optimization planning, and quality gates are handled by helper scripts so the workflow docs stay declarative.
+
 **1.2.2 Single-Task Prompts**
 
 We enforce a hard rule: **One Prompt = One Primary Objective**.
@@ -41,7 +45,7 @@ We enforce a hard rule: **One Prompt = One Primary Objective**.
 
 **1.2.3 The "Context Sync" Handshake**
 
-Every workflow file begins with a **Context Sync Section** that forces the model to read the State File (`/tmp/${VIDEO_ID}_state.md`) and extract variable values. This replaces memory-based recall with reliable disk-based verification.
+Every workflow file begins with a **Context Sync Section** that forces the model to read the State File (`/tmp/${VIDEO_ID}_state.md`) and extract variable values. This replaces memory-based recall with reliable disk-based verification. In the stabilized flow, `validate-state` is the canonical checkpoint instead of prompt-side field checklists.
 
 **1.2.4 Workflow State Persistence**
 
@@ -52,7 +56,7 @@ To survive context loss or session interruptions, we maintain a lightweight **St
     1.  **CREATE**: After fetching metadata.
     2.  **READ**: Before every decision/action.
     3.  **WRITE**: After key milestones (Download complete, Chunk processed, File saved).
-    4.  **DELETE**: Upon successful cleanup.
+    4.  **DELETE**: Upon successful cleanup (handled by `cleanup.sh` by default).
 
 *Impact: Ensures the Agent never "forgets" where it is or what rules to follow, even if the chat context is cleared.*
 
@@ -91,6 +95,10 @@ To handle arbitrarily long videos (e.g., >2 hours) without hitting LLM context l
 3.  **Stateless Translation**:
     - Each chunk is translated independently by the LLM without needing global context.
     - Script (`merge-content`) handles the re-assembly and injection of chapter headers.
+
+4.  **Structured Optimization Planning**:
+    - `plan-optimization` reads validated state and emits the canonical short/long path, required operations, and whether `--require-llm` preflight is needed.
+    - Workflow docs consume this JSON instead of re-deriving prompt branches in prose.
 
 #### 2.3 Serial Processing for Multiple Links
 
@@ -132,10 +140,11 @@ After (hard isolation, no drift):
 
 Key design decisions:
 
-*   **Dual API format support**: `_call_llm_api()` supports both OpenAI (`/v1/chat/completions`) and Anthropic (`/v1/messages`) formats, controlled by `llm_api_format` in `config.yaml`.
+*   **Dual API format support**: `_call_llm_api()` supports both OpenAI (`/v1/chat/completions`) and Anthropic (`/v1/messages`) formats, controlled by `llm_api_format` in `config.yaml`. The URL builder accepts either a provider root URL or a `/v1` URL.
 *   **Output validation**: For non-summary tasks, the script checks that output character count >= 50% of input. If below, a warning is raised (possible accidental summarization).
 *   **Manifest-based progress tracking**: Each chunk's status is updated in `manifest.json` after processing, enabling resumability.
 *   **No external dependencies**: Uses only `urllib.request` for HTTP calls.
+*   **Script-owned routing**: `plan-optimization` is the canonical source for text-optimization branching and `transcribe-deepgram` is the only supported Deepgram transcription entry.
 
 #### 2.5 Deterministic File Assembly & Quality Verification
 
@@ -147,7 +156,7 @@ Key design decisions:
 
 1.  **Assembly (`assemble-final`)**:
     - The Agent passes metadata (Title, URL, Date) and the path to the optimized text file to the script.
-    - The script handles file I/O, frontmatter generation, and concatenation.
+    - The script handles file I/O, frontmatter generation, Markdown header escaping, safe link encoding, and concatenation.
     - **Key Benefit**: The Agent *never* loads the full optimized text into its context.
 
 2.  **Two-Layer Quality Verification**:
@@ -159,7 +168,26 @@ Key design decisions:
         - File existence/non-empty
         - No abrupt truncation at the end
         - Global bilingual balance
-    - **Key Benefit**: The Agent only reads a lightweight JSON report (`{"passed": true, ...}`), keeping context usage constant regardless of video length.
+        - Minimum paragraph/section structure
+        - Basic bilingual paragraph pairing
+    - **Stop/go semantics**:
+        - Non-empty `hard_failures` => STOP
+        - `warnings` only => review and decide
+    - **Key Benefit**: The Agent only reads a lightweight JSON report (`{"passed": true, "hard_failures": [], "warnings": [...]}`), keeping context usage constant regardless of video length.
+
+#### 2.6 Validation Lifecycle
+
+The stabilized execution order is intentionally small and reusable:
+
+1.  `scripts/preflight.sh`
+2.  `scripts/download.sh "$URL" metadata`
+3.  `scripts/download.sh "$URL" subtitle-info`
+4.  `validate-state --stage metadata|post-source|pre-assemble|final`
+5.  `plan-optimization`
+6.  `transcribe-deepgram` when subtitle fallback is needed
+7.  `verify-quality`
+
+This keeps terminology and flow aligned across `README.md`, `SKILL.md`, `SYSTEM_DESIGN.md`, and `workflows/*.md`.
 
 ---
 
@@ -219,6 +247,10 @@ yt-transcript/
 
 *影响：减少约 40-50% 的活跃上下文。*
 
+**1.2.1.b 脚本优先的决策逻辑**
+
+高风险的分支判断应尽量下沉到输出 JSON 的脚本，而不是散落在 Prompt 文案中。字幕可用性、字幕源语言选择、Deepgram 分片合并、配置路径发现、state 校验、文本优化分支规划、质量门禁等逻辑统一由辅助脚本负责，workflow 文档只描述调用顺序。
+
 **1.2.2 单任务 Prompts**
 
 我们强制执行一条硬性规则：**一个 Prompt = 一个主要目标**。
@@ -231,7 +263,7 @@ yt-transcript/
 
 **1.2.3 "Context Sync" 握手**
 
-每个 Workflow 文件都以 **Context Sync 部分** 开头，强制模型读取状态文件（`/tmp/${VIDEO_ID}_state.md`）并提取变量值。这用可靠的基于磁盘的验证取代了基于记忆的回想。
+每个 Workflow 文件都以 **Context Sync 部分** 开头，强制模型读取状态文件（`/tmp/${VIDEO_ID}_state.md`）并提取变量值。这用可靠的基于磁盘的验证取代了基于记忆的回想。在稳定版流程中，`validate-state` 是标准检查点，而不是依赖文档里的人工字段核对。
 
 **1.2.4 工作流状态持久化**
 
@@ -242,7 +274,7 @@ yt-transcript/
     1.  **CREATE**: 获取 Metadata 后创建。
     2.  **READ**: 每次决策/行动前读取。
     3.  **WRITE**: 关键里程碑后写入（下载完成、分块处理完、文件保存）。
-    4.  **DELETE**: 清理完成后删除。
+    4.  **DELETE**: 清理完成后删除（默认由 `cleanup.sh` 执行）。
 
 *价值: 确保 Agent 即使在聊天上下文被清空的情况下，也永远不会"忘记"当前进度或应遵循的规则。*
 
@@ -281,6 +313,10 @@ yt-transcript/
 3.  **无状态翻译**：
     - 每个文本块由 LLM 独立翻译，不需要全局上下文。
     - 最终由脚本（`merge-content`）负责按顺序组装并插入章节标题。
+
+4.  **结构化优化规划**：
+    - `plan-optimization` 读取已校验的 state，输出 canonical 的短视频/长视频路径、操作序列，以及是否需要 `--require-llm`。
+    - workflow 文档消费这份 JSON，而不是再次用 prose 推导分支。
 
 #### 2.3 多链接串行处理
 
@@ -322,10 +358,11 @@ yt-transcript/
 
 关键设计决策：
 
-*   **双 API 格式支持**：`_call_llm_api()` 同时支持 OpenAI（`/v1/chat/completions`）和 Anthropic（`/v1/messages`）格式，通过 `config.yaml` 中的 `llm_api_format` 切换。
+*   **双 API 格式支持**：`_call_llm_api()` 同时支持 OpenAI（`/v1/chat/completions`）和 Anthropic（`/v1/messages`）格式，通过 `config.yaml` 中的 `llm_api_format` 切换，并兼容填写服务根地址或 `/v1` 地址两种配置方式。
 *   **输出验证**：非摘要任务中，脚本检查输出字符数 >= 输入的 50%。低于阈值则发出警告（可能误做了摘要）。
 *   **Manifest 进度追踪**：每个 chunk 处理后更新 `manifest.json` 中的状态，支持断点续传。
 *   **零外部依赖**：仅使用 `urllib.request` 进行 HTTP 调用。
+*   **脚本拥有最终路由权**：`plan-optimization` 是文本优化分支的唯一口径，`transcribe-deepgram` 是唯一支持的 Deepgram 转录入口。
 
 #### 2.5 确定性文件组装与质量验证
 
@@ -337,7 +374,7 @@ yt-transcript/
 
 1.  **组装 (`assemble-final`)**：
     - Agent 将元数据（标题、URL、日期）和优化后的文本路径传递给脚本。
-    - 脚本负责文件 I/O、Frontmatter 生成和拼接。
+    - 脚本负责文件 I/O、Frontmatter 生成、Markdown 头部转义、链接安全编码与拼接。
     - **核心收益**：Agent *永远不需要* 将完整的优化文本加载到其上下文中。
 
 2.  **双层质量验证**：
@@ -349,7 +386,26 @@ yt-transcript/
         - 文件存在/非空
         - 结尾无突兀截断
         - 全局双语平衡
-    - **核心收益**：Agent 只读取轻量级的 JSON 报告（`{"passed": true, ...}`），无论视频多长，上下文占用保持恒定。
+        - 最低段落/章节结构要求
+        - 基本的双语段落配对
+    - **Stop/go 语义**：
+        - `hard_failures` 非空 => 必须 STOP
+        - 只有 `warnings` => 人工复核后决定是否继续
+    - **核心收益**：Agent 只读取轻量级的 JSON 报告（`{"passed": true, "hard_failures": [], "warnings": [...]}`），无论视频多长，上下文占用保持恒定。
+
+#### 2.6 验证生命周期
+
+稳定版执行顺序刻意保持为一组可复用的最小命令：
+
+1.  `scripts/preflight.sh`
+2.  `scripts/download.sh "$URL" metadata`
+3.  `scripts/download.sh "$URL" subtitle-info`
+4.  `validate-state --stage metadata|post-source|pre-assemble|final`
+5.  `plan-optimization`
+6.  需要字幕兜底时执行 `transcribe-deepgram`
+7.  `verify-quality`
+
+这样可以把术语和流程固定下来，并降低 `README.md`、`SKILL.md`、`SYSTEM_DESIGN.md` 与 `workflows/*.md` 之间再次漂移的风险。
 
 ---
 

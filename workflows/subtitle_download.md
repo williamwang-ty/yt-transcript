@@ -1,80 +1,113 @@
 # Subtitle Download Workflow
 
-This workflow handles downloading and parsing subtitle files from YouTube.
+This workflow handles subtitle inspection, download, source-file selection, and raw text extraction.
 
 ---
 
 ## Context Sync
 
-**↳ READ State**: `cat /tmp/${VIDEO_ID}_state.md`
+Read `/tmp/${VIDEO_ID}_state.md` and confirm:
 
-Extract and confirm from state file:
-- `vid` = _______
-- `url` = _______
-- `title` = _______
+- `vid`
+- `url`
+- `title`
+- `channel`
 
-**If state file is missing**: STOP. Return to SKILL.md Step 1.
+If the state file is missing, STOP.
 
 ---
 
-## Step 1: Check Subtitle Languages
-
-List available subtitles:
+## Step 1: Inspect Subtitle Availability
 
 ```bash
-yt-dlp --list-subs "$VIDEO_URL" 2>&1
+SUB_INFO_JSON=$(bash <skill-root>/scripts/download.sh "$VIDEO_URL" subtitle-info)
 ```
 
-Identify:
-- Chinese subtitles: `zh`, `zh-Hans`, `zh-CN`, `zh-Hant`
-- English subtitles: `en`, `en-orig`, `en-US`
+Record from JSON:
+
+- `has_manual`
+- `has_auto`
+- `english_available`
+- `chinese_available`
+- `preferred_source_language`
+- `mode`
+
+Rules:
+
+- If English subtitles are available, set `mode=bilingual` and use English as the source text
+- Else if Chinese subtitles are available, set `mode=chinese` and use Chinese as the source text
+- Else STOP
+
+Explicit product rule:
+
+- If both English and Chinese subtitles exist, bilingual mode still uses English subtitles as the only source text for content generation
+- The Chinese subtitle file is not merged into the output; bilingual output is produced by translating the English source text
+
+Write to state:
+
+- `src: youtube`
+- `mode: chinese|bilingual`
+- `source_language: <preferred_source_language>`
+- `subtitle_source: YouTube Subtitles`
 
 ---
 
-## Step 2: Download Subtitles
-
-Use the unified download script:
+## Step 2: Download Subtitle Files
 
 ```bash
-bash ~/.claude/skills/yt-transcript/scripts/download.sh "$VIDEO_URL" subtitles
+SUB_DOWNLOAD_JSON=$(bash <skill-root>/scripts/download.sh "$VIDEO_URL" subtitles)
 ```
 
-This automatically downloads available subtitles to `/tmp/${VIDEO_ID}.*.vtt`.
+Record:
+
+- `downloaded_files`
+- `english_files`
+- `chinese_files`
+- `selected_source_vtt`
+- `selected_source_language`
+- `selected_source_kind`
+
+If no VTT files were downloaded, STOP.
 
 ---
 
-## Step 3: Parse VTT to Plain Text
+## Step 3: Use the Script-Selected Source VTT
 
-For each downloaded subtitle file:
+Do not choose files manually in the workflow.
+
+Use:
+
+- `selected_source_vtt` for raw-text extraction
+- `selected_source_language` for state
+- `selected_source_kind` for debugging/reporting
+
+Optional:
+
+- When `mode=bilingual` and Chinese VTT also exists, keep it on disk for debugging only
+- Do not merge two subtitle files directly in this workflow
+
+---
+
+## Step 4: Parse VTT to Raw Text
 
 ```bash
-# Find the first available VTT file (prefer Chinese, then English)
-VTT_FILE=$(ls /tmp/${VIDEO_ID}.zh*.vtt 2>/dev/null | head -1)
-[ -z "$VTT_FILE" ] && VTT_FILE=$(ls /tmp/${VIDEO_ID}.en*.vtt 2>/dev/null | head -1)
-[ -z "$VTT_FILE" ] && VTT_FILE=$(ls /tmp/${VIDEO_ID}.*.vtt 2>/dev/null | head -1)
-
-# Parse to plain text - always output to consistent path
-python3 ~/.claude/skills/yt-transcript/yt_transcript_utils.py parse-vtt "$VTT_FILE" > /tmp/${VIDEO_ID}_raw_text.txt
+python3 <skill-root>/yt_transcript_utils.py parse-vtt "$SELECTED_SOURCE_VTT" > /tmp/${VIDEO_ID}_raw_text.txt
 ```
 
----
+Write to state:
 
-## Step 4: Determine Output Strategy
-
-| Available Subtitles | Strategy | Next Workflow |
-|---------------------|----------|---------------|
-| Chinese only | Use Chinese text | `text_optimization.md` (Chinese mode) |
-| English only | Use English text | `text_optimization.md` (Bilingual mode) |
-| Both | Use both texts | `text_optimization.md` (Bilingual mode) |
+- `step: 3`
+- `source_language: <selected_source_language>`
+- `last_action: parsed subtitles to raw text`
 
 ---
 
 ## Checkpoint
 
-Before proceeding to `workflows/text_optimization.md`, verify:
+Before proceeding to `workflows/text_optimization.md`, run:
 
-- [ ] Raw text saved to: `/tmp/${VIDEO_ID}_raw_text.txt`
-- [ ] Language mode: [ ] Chinese only / [ ] Bilingual
-- [ ] Subtitle source recorded: `YouTube Subtitles`
+```bash
+python3 <skill-root>/yt_transcript_utils.py validate-state /tmp/${VIDEO_ID}_state.md --stage post-source
+```
 
-If any is missing, STOP and review Steps 1-4.
+If `hard_failures` is non-empty, STOP.

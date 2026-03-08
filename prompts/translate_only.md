@@ -2,6 +2,8 @@
 
 **Task**: Translate English content to bilingual Chinese-English format.
 
+> `bilingual` here means: keep each English paragraph as the source text, then place the Chinese translation below it. It does not mean merging two subtitle files.
+
 ---
 
 ## Instructions

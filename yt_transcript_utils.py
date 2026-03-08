@@ -3,12 +3,18 @@
 yt-transcript utility script
 Provides VTT parsing, Deepgram result processing, audio splitting, filename sanitization, etc.
 
+This module also owns the script-first workflow checkpoints:
+- `validate-state` for stage-based state validation
+- `plan-optimization` for canonical short/long routing
+- `verify-quality` for final stop/go gating
+
 Usage:
     python3 yt_transcript_utils.py <command> [args]
 
 Commands:
     parse-vtt <vtt_path>           Parse VTT subtitle file, output plain text
     process-deepgram <json_path>   Process Deepgram JSON, output cleaned text
+    transcribe-deepgram <audio_path>  Call Deepgram API and auto-merge split chunks
     sanitize-filename "<title>"    Clean illegal filename characters
     test-deepgram-api <api_key>    Test Deepgram API key validity
     split-audio <audio_path>       Split large audio at silence points (--max-size, --max-deviation)
@@ -18,6 +24,8 @@ Commands:
     process-chunks <work_dir> --prompt <name>  Process chunks with isolated LLM API calls (--input-key for chained processing)
     assemble-final <optimized_text> <output_file>  Assemble final markdown from optimized text + metadata
     verify-quality <optimized_text>  Verify quality of optimized text (structural checks)
+    validate-state <state_path>    Validate workflow state fields for a given stage
+    plan-optimization <state_path> Generate a structured optimization plan from workflow state
 """
 
 import argparse
@@ -28,7 +36,186 @@ import os
 import re
 import subprocess
 import sys
+import urllib.parse
 from pathlib import Path
+
+
+def _skill_root() -> Path:
+    return Path(__file__).resolve().parent
+
+
+def _default_config_path() -> Path:
+    return _skill_root() / "config.yaml"
+
+
+def _strip_inline_comment(value: str) -> str:
+    """
+    Remove inline comments while preserving # inside quotes.
+    """
+    in_single = False
+    in_double = False
+    escaped = False
+
+    for idx, char in enumerate(value):
+        if escaped:
+            escaped = False
+            continue
+        if char == "\\" and in_double:
+            escaped = True
+            continue
+        if char == "'" and not in_double:
+            in_single = not in_single
+            continue
+        if char == '"' and not in_single:
+            in_double = not in_double
+            continue
+        if char == "#" and not in_single and not in_double:
+            return value[:idx]
+    return value
+
+
+def _strip_wrapping_quotes(value: str) -> str:
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+        return value[1:-1]
+    return value
+
+
+def _yaml_string(value: str) -> str:
+    # Intentionally quote every scalar. The frontmatter should favor predictable
+    # parsing over pretty YAML, especially for titles/channels that may contain
+    # punctuation, quotes, or comment-like characters.
+    return json.dumps(str(value).replace("\r\n", "\n"), ensure_ascii=False)
+
+
+def _single_line_text(value: str) -> str:
+    return " ".join(str(value).split())
+
+
+def _escape_markdown_text(value: str) -> str:
+    """
+    Escape Markdown-significant characters in inline text contexts.
+    """
+    text = _single_line_text(value)
+    return re.sub(r'([\\`*_{}\[\]()#+!<>|])', r'\\\1', text)
+
+
+def _sanitize_markdown_url(value: str) -> str:
+    """
+    Encode a URL so it remains valid inside Markdown link destinations.
+    """
+    text = _single_line_text(value)
+    return urllib.parse.quote(text, safe=":/?&=#%@+,-._~")
+
+
+def _build_api_url(base_url: str, api_format: str = "openai") -> str:
+    base = base_url.rstrip("/")
+
+    if api_format == "anthropic":
+        if base.endswith("/messages"):
+            return base
+        if base.endswith("/v1"):
+            return f"{base}/messages"
+        return f"{base}/v1/messages"
+
+    if base.endswith("/chat/completions"):
+        return base
+    if base.endswith("/v1"):
+        return f"{base}/chat/completions"
+    return f"{base}/v1/chat/completions"
+
+
+def _split_sentences(text: str) -> list[str]:
+    """
+    Split text into sentences without requiring spaces after punctuation.
+
+    The splitter is intentionally conservative around English periods so it
+    does not break on decimals, initials, or common honorific abbreviations.
+    """
+    normalized = re.sub(r"\s+", " ", text.strip())
+    if not normalized:
+        return []
+
+    honorific_abbreviations = {
+        "mr", "mrs", "ms", "dr", "prof", "sr", "jr", "st",
+    }
+    closers = '”"\'’」)]}'
+
+    def next_non_space(index: int) -> str:
+        for char in normalized[index + 1:]:
+            if not char.isspace():
+                return char
+        return ""
+
+    def previous_ascii_word(index: int) -> str:
+        match = re.search(r"([A-Za-z]+)$", normalized[:index])
+        return match.group(1) if match else ""
+
+    def acronym_before_period(index: int) -> bool:
+        return bool(re.search(r"(?:\b[A-Za-z]\.){2,}$", normalized[:index + 1]))
+
+    sentences = []
+    start = 0
+    i = 0
+
+    while i < len(normalized):
+        char = normalized[i]
+        boundary = False
+
+        if char in "。！？!?":
+            boundary = True
+        elif char == ".":
+            prev_char = normalized[i - 1] if i > 0 else ""
+            next_char = normalized[i + 1] if i + 1 < len(normalized) else ""
+            next_next_char = normalized[i + 2] if i + 2 < len(normalized) else ""
+            next_visible = next_non_space(i)
+            lower_word = previous_ascii_word(i).lower()
+
+            if next_char == ".":
+                i += 1
+                continue
+            if prev_char.isdigit() and next_char.isdigit():
+                boundary = False
+            elif prev_char.isalpha() and next_char.isalpha() and next_next_char == ".":
+                boundary = False
+            elif acronym_before_period(i):
+                boundary = not next_visible or not next_visible.islower()
+            elif lower_word in honorific_abbreviations and next_visible.isupper():
+                boundary = False
+            else:
+                boundary = True
+
+        if not boundary:
+            i += 1
+            continue
+
+        end = i
+        while end + 1 < len(normalized) and normalized[end + 1] in closers:
+            end += 1
+
+        sentence = normalized[start:end + 1].strip()
+        if sentence:
+            sentences.append(sentence)
+
+        start = end + 1
+        while start < len(normalized) and normalized[start].isspace():
+            start += 1
+        i = start
+
+    if start < len(normalized):
+        tail = normalized[start:].strip()
+        if tail:
+            sentences.append(tail)
+
+    return sentences
+
+
+def _hard_split_text(text: str, max_len: int) -> list[str]:
+    """
+    Force-split overlong text into fixed-width chunks as a last-resort fallback.
+    """
+    if max_len <= 0:
+        return [text]
+    return [text[i:i + max_len].strip() for i in range(0, len(text), max_len) if text[i:i + max_len].strip()]
 
 
 def parse_vtt(vtt_path: str) -> str:
@@ -109,10 +296,14 @@ def process_deepgram(json_path: str) -> dict:
         sys.exit(2)
 
     try:
-        transcript = data['results']['channels'][0]['alternatives'][0]['transcript']
+        return process_deepgram_payload(data)
     except (KeyError, IndexError) as e:
         print(f"Error: Deepgram JSON structure unexpected {e}", file=sys.stderr)
         sys.exit(2)
+
+
+def process_deepgram_payload(data: dict) -> dict:
+    transcript = data['results']['channels'][0]['alternatives'][0]['transcript']
 
     # 1. Remove spaces between Chinese characters (multiple passes for thoroughness)
     for _ in range(10):
@@ -124,20 +315,20 @@ def process_deepgram(json_path: str) -> dict:
     # 3. Remove consecutive repeated phrases (3-20 characters)
     transcript = re.sub(r'([\u4e00-\u9fff]{3,20})\1{1,5}', r'\1', transcript)
 
-    # 4. Get speaker count
     speakers = set()
     try:
         paragraphs = data['results']['channels'][0]['alternatives'][0].get('paragraphs', {}).get('paragraphs', [])
         for para in paragraphs:
             for sent in para.get('sentences', []):
-                speakers.add(sent.get('speaker', 0))
+                speaker = sent.get('speaker')
+                if speaker is not None:
+                    speakers.add(speaker)
     except (KeyError, TypeError):
         pass
 
     speaker_count = len(speakers) if speakers else 1
-
     return {
-        "transcript": transcript,
+        "transcript": transcript.strip(),
         "speaker_count": speaker_count
     }
 
@@ -406,34 +597,7 @@ def chunk_text(input_path: str, output_dir: str, chunk_size: int = 8000) -> dict
         print(f"Error: Cannot read file {e}", file=sys.stderr)
         sys.exit(2)
     
-    # Split by sentence boundaries - more robust pattern
-    # Handles: period/exclamation/question (EN and CN) followed by space OR followed by next sentence start
-    # Also handles cases where there's no space after punctuation (common in Chinese)
-    # Split by sentence boundaries - robust pattern
-    # 1. Match punctuation: . ! ? 。 ！ ？
-    # 2. Look behind to ensure it's punctuation
-    # 3. Handle optional quotes/brackets often found after punctuation: " ' ” 」 )
-    # 4. Require either whitespace OR a lookahead to specific sentence-starting chars (or end of string)
-    # Ideally, we split AFTER punctuation (+ optional quote)
-    
-    # Simplified approach: Split after punctuation, then rejoin if needed
-    # But here we use a split pattern that keeps the delimiter if wrapped in capturing group
-    # However, re.split behavior with lookbehind is cleaner for "split at this boundary"
-    
-    # Improved pattern:
-    # (?<=[.!?。！？])  Lookbehind: preceded by punctuation
-    # [”"']?           Optional closing quote
-    # (?:\s+|(?=[A-Z0-9\u4e00-\u9fff]))  Followed by whitespace OR followed by typical sentence starter (Capital, digit, Chinese)
-    
-    sentence_pattern = r'(?<=[.!?。！？][”"’」\)]?)(?:\s+|(?=[A-Z0-9\u4e00-\u9fff]))'
-    try:
-        sentences = re.split(sentence_pattern, text)
-    except re.error:
-        # Fallback to simple split if regex fails (e.g. strict lookbehind issues)
-        sentences = re.split(r'(?<=[.!?。！？])\s+', text)
-    
-    # Filter empty sentences and strip whitespace
-    sentences = [s.strip() for s in sentences if s.strip()]
+    sentences = _split_sentences(text)
     
     # Accumulate sentences into chunks
     chunks = []
@@ -442,24 +606,34 @@ def chunk_text(input_path: str, output_dir: str, chunk_size: int = 8000) -> dict
     warnings = []
     
     for i, sentence in enumerate(sentences):
+        sentence_segments = [sentence]
         sentence_len = len(sentence)
-        
-        # Warning for extremely long sentences
+
         if sentence_len > chunk_size:
-            warnings.append(f"Sentence {i} exceeds chunk_size ({sentence_len} > {chunk_size}), will be its own chunk")
-        
-        # If adding this sentence exceeds chunk_size and we have content, start new chunk
-        if current_size + sentence_len > chunk_size and current_chunk:
-            chunks.append(' '.join(current_chunk))
-            current_chunk = [sentence]
-            current_size = sentence_len
-        else:
-            current_chunk.append(sentence)
-            current_size += sentence_len + 1  # +1 for space
+            # This is an intentional degradation path for long unpunctuated
+            # transcripts (common in raw STT output). Preserving the exact
+            # sentence boundary is less important than keeping chunk size within
+            # the downstream LLM budget.
+            sentence_segments = _hard_split_text(sentence, chunk_size)
+            warnings.append(
+                f"Sentence {i} exceeds chunk_size ({sentence_len} > {chunk_size}), split into {len(sentence_segments)} fixed-width segment(s)"
+            )
+
+        for segment in sentence_segments:
+            segment_len = len(segment)
+
+            # If adding this segment exceeds chunk_size and we have content, start new chunk
+            if current_size + segment_len > chunk_size and current_chunk:
+                chunks.append('\n\n'.join(current_chunk))
+                current_chunk = [segment]
+                current_size = segment_len
+            else:
+                current_chunk.append(segment)
+                current_size += segment_len + 2  # +2 for '\n\n' separator
     
     # Don't forget the last chunk
     if current_chunk:
-        chunks.append(' '.join(current_chunk))
+        chunks.append('\n\n'.join(current_chunk))
     
     # Write chunks to files and build manifest
     manifest = {
@@ -680,10 +854,8 @@ def _call_llm_api(api_key: str, base_url: str, model: str, messages: list,
     import urllib.request
     import urllib.error
     
-    base_url = base_url.rstrip('/')
-    
     if api_format == "anthropic":
-        url = f"{base_url}/v1/messages"
+        url = _build_api_url(base_url, api_format)
         headers = {
             "x-api-key": api_key,
             "Content-Type": "application/json",
@@ -697,7 +869,7 @@ def _call_llm_api(api_key: str, base_url: str, model: str, messages: list,
             "messages": messages
         }
     else:  # openai format
-        url = f"{base_url}/v1/chat/completions"
+        url = _build_api_url(base_url, api_format)
         headers = {
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
@@ -918,6 +1090,116 @@ def process_chunks(work_dir: str, prompt_name: str, extra_instruction: str = "",
     }
 
 
+def detect_audio_content_type(audio_path: str) -> str:
+    ext = Path(audio_path).suffix.lower().lstrip(".")
+    return {
+        "m4a": "audio/mp4",
+        "mp4": "audio/mp4",
+        "webm": "audio/webm",
+        "opus": "audio/opus",
+        "mp3": "audio/mpeg",
+        "wav": "audio/wav",
+        "flac": "audio/flac",
+    }.get(ext, "application/octet-stream")
+
+
+def _call_deepgram_api(audio_path: str, api_key: str, language: str,
+                       timeout: int = 300) -> dict:
+    import urllib.request
+    import urllib.error
+
+    audio_file = Path(audio_path)
+    if not audio_file.exists():
+        print(f"Error: Audio file not found: {audio_path}", file=sys.stderr)
+        sys.exit(1)
+
+    params = (
+        f"model=nova-2&language={language}"
+        "&diarize=true&punctuate=true&paragraphs=true&smart_format=true"
+    )
+    url = f"https://api.deepgram.com/v1/listen?{params}"
+    headers = {
+        "Authorization": f"Token {api_key}",
+        "Content-Type": detect_audio_content_type(audio_path),
+        "User-Agent": "yt-transcript/4.0",
+    }
+
+    data = audio_file.read_bytes()
+    req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        error_body = e.read().decode("utf-8", errors="replace")
+        print(f"Error: Deepgram API returned HTTP {e.code}: {error_body}", file=sys.stderr)
+        sys.exit(1)
+    except urllib.error.URLError as e:
+        print(f"Error: Cannot reach Deepgram API: {e.reason}", file=sys.stderr)
+        sys.exit(1)
+    except Exception as e:
+        print(f"Error: Deepgram API call failed: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+def transcribe_deepgram(audio_path: str, language: str, config_path: str = None,
+                        api_key: str = "", max_size_mb: float = 10.0,
+                        max_deviation_sec: float = 60.0, timeout: int = 300,
+                        output_json: str = "", output_text: str = "") -> dict:
+    """
+    Transcribe audio via Deepgram. Automatically splits large files and merges
+    chunk transcripts into one raw transcript output.
+    """
+    if not api_key:
+        config = load_config(config_path)
+        api_key = config.get("deepgram_api_key", "")
+
+    if not api_key:
+        print("Error: Deepgram API key not configured", file=sys.stderr)
+        sys.exit(1)
+
+    path = Path(audio_path)
+    if not path.exists():
+        print(f"Error: Audio file not found: {audio_path}", file=sys.stderr)
+        sys.exit(1)
+
+    split_result = split_audio(audio_path, max_size_mb=max_size_mb, max_deviation_sec=max_deviation_sec)
+    chunk_paths = split_result["chunks"]
+
+    transcripts = []
+    speaker_count = 1
+    json_outputs = []
+
+    for idx, chunk_path in enumerate(chunk_paths):
+        payload = _call_deepgram_api(chunk_path, api_key=api_key, language=language, timeout=timeout)
+        processed = process_deepgram_payload(payload)
+        transcripts.append(processed["transcript"])
+        speaker_count = max(speaker_count, processed["speaker_count"])
+
+        if output_json:
+            output_base = Path(output_json)
+            if len(chunk_paths) == 1:
+                json_path = output_base
+            else:
+                json_path = output_base.with_name(f"{output_base.stem}_chunk_{idx:03d}{output_base.suffix or '.json'}")
+            json_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            json_outputs.append(str(json_path))
+
+    transcript = "\n\n".join(t for t in transcripts if t).strip()
+
+    if output_text:
+        Path(output_text).write_text(transcript, encoding="utf-8")
+
+    return {
+        "transcript": transcript,
+        "speaker_count": speaker_count,
+        "chunk_count": len(chunk_paths),
+        "json_outputs": json_outputs,
+        "split_points": split_result.get("split_points", []),
+        "used_split_mode": len(chunk_paths) > 1,
+    }
+
+
 def assemble_final(optimized_text_path: str, output_file: str,
                     title: str = "", source: str = "", channel: str = "",
                     date: str = "", created: str = "", duration: int = 0,
@@ -960,31 +1242,34 @@ def assemble_final(optimized_text_path: str, output_file: str,
     duration_min = duration // 60 if duration > 0 else 0
     bilingual_str = "true" if bilingual else "false"
     language_mode = "Bilingual" if bilingual else "Chinese"
+    safe_title = _escape_markdown_text(title)
+    safe_channel = _escape_markdown_text(channel)
+    safe_source = _sanitize_markdown_url(source)
     
     # Build YAML frontmatter
     frontmatter_lines = [
         "---",
-        f"title: \"{title}\"",
-        f"source: {source}",
-        f"channel: \"{channel}\"",
+        f"title: {_yaml_string(title)}",
+        f"source: {_yaml_string(source)}",
+        f"channel: {_yaml_string(channel)}",
     ]
     if date:
-        frontmatter_lines.append(f"date: {date}")
+        frontmatter_lines.append(f"date: {_yaml_string(date)}")
     frontmatter_lines.extend([
-        f"created: {created}",
+        f"created: {_yaml_string(created)}",
         "type: video-transcript",
         f"bilingual: {bilingual_str}",
-        f"duration: {duration_min}m",
-        f"transcript_source: {transcript_source}",
+        f"duration: {_yaml_string(f'{duration_min}m')}",
+        f"transcript_source: {_yaml_string(transcript_source)}",
         "---",
     ])
     
     # Build header section
     header_lines = [
         "",
-        f"# {title}",
+        f"# {safe_title}",
         "",
-        f"> Video source: [YouTube - {channel}]({source})",
+        f"> Video source: [YouTube - {safe_channel}]({safe_source})",
         f"> Language mode: {language_mode}",
         f"> Duration: {duration_min} minutes",
         "",
@@ -1036,9 +1321,14 @@ def verify_quality(optimized_text_path: str, raw_text_path: str = None,
         bilingual: Whether the content should be bilingual
     
     Returns:
-        {"passed": bool, "checks": {...}, "warnings": [...]}
+        {"passed": bool, "checks": {...}, "warnings": [...], "hard_failures": [...]}
+
+    Stop/go contract:
+        - non-empty hard_failures => STOP
+        - warnings only => review before proceeding
     """
     warnings = []
+    hard_failures = []
     checks = {}
     
     # Read optimized text
@@ -1047,7 +1337,8 @@ def verify_quality(optimized_text_path: str, raw_text_path: str = None,
         return {
             "passed": False,
             "checks": {"file_exists": False},
-            "warnings": ["Optimized text file not found"]
+            "warnings": [],
+            "hard_failures": ["Optimized text file not found"],
         }
     
     try:
@@ -1056,7 +1347,8 @@ def verify_quality(optimized_text_path: str, raw_text_path: str = None,
         return {
             "passed": False,
             "checks": {"file_exists": True, "file_readable": False},
-            "warnings": [f"Cannot read file: {e}"]
+            "warnings": [],
+            "hard_failures": [f"Cannot read file: {e}"],
         }
     
     total_chars = len(text)
@@ -1065,18 +1357,26 @@ def verify_quality(optimized_text_path: str, raw_text_path: str = None,
     checks["file_exists"] = True
     checks["total_chars"] = total_chars
     checks["total_lines"] = total_lines
+    paragraphs = [block.strip() for block in re.split(r'\n\s*\n', text) if block.strip()]
+    body_paragraphs = [
+        block for block in paragraphs
+        if not block.startswith('#') and not block.startswith('>') and not block.startswith('---')
+    ]
+    checks["paragraph_count"] = len(body_paragraphs)
     
     # Check 1: Non-empty
     checks["non_empty"] = total_chars > 0
     if not checks["non_empty"]:
-        warnings.append("File is empty")
+        hard_failures.append("File is empty")
     
     # Check 2: Has section headers
     section_headers = re.findall(r'^##\s+.+', text, re.MULTILINE)
     checks["section_count"] = len(section_headers)
     checks["has_sections"] = len(section_headers) > 0
-    if not checks["has_sections"] and total_chars > 3000:
-        warnings.append(f"No section headers (##) found in {total_chars} chars of text")
+    if not checks["has_sections"] and total_chars > 1200:
+        hard_failures.append(f"No section headers (##) found in {total_chars} chars of text")
+    if len(body_paragraphs) < 2 and total_chars > 400:
+        warnings.append(f"Only {len(body_paragraphs)} body paragraph found in {total_chars} chars of text")
     
     # Check 3: No abrupt truncation
     # Check if last non-empty line ends with proper punctuation or closing marker
@@ -1114,6 +1414,19 @@ def verify_quality(optimized_text_path: str, raw_text_path: str = None,
                 warnings.append(f"Chinese character ratio too low ({cn_ratio:.1%}), translation may be missing")
             if en_ratio < 0.05:
                 warnings.append(f"English character ratio too low ({en_ratio:.1%}), original text may be missing")
+
+        text_blocks = body_paragraphs
+        paired_blocks = 0
+        for idx in range(0, len(text_blocks) - 1, 2):
+            first = text_blocks[idx]
+            second = text_blocks[idx + 1]
+            first_en = any(ch.isascii() and ch.isalpha() for ch in first)
+            second_cn = any('\u4e00' <= ch <= '\u9fff' for ch in second)
+            if first_en and second_cn:
+                paired_blocks += 1
+        checks["bilingual_pairs"] = paired_blocks
+        if text_blocks and paired_blocks == 0:
+            hard_failures.append("No English/Chinese paragraph pairs detected in bilingual output")
     
     # Check 5: Size ratio vs raw text
     if raw_text_path:
@@ -1140,12 +1453,217 @@ def verify_quality(optimized_text_path: str, raw_text_path: str = None,
                 pass  # Non-critical, skip if raw text unreadable
     
     # Overall result
-    passed = len(warnings) == 0
+    passed = len(hard_failures) == 0
     
     return {
         "passed": passed,
         "checks": checks,
-        "warnings": warnings
+        "warnings": warnings,
+        "hard_failures": hard_failures,
+    }
+
+
+STATE_STAGE_FIELDS = {
+    "metadata": ["vid", "url", "title", "channel", "upload_date", "duration", "output_dir"],
+    "post-source": ["vid", "url", "title", "channel", "upload_date", "duration", "output_dir",
+                    "mode", "src", "source_language", "subtitle_source"],
+    "pre-assemble": ["vid", "url", "title", "channel", "upload_date", "duration", "output_dir",
+                     "mode", "src", "source_language", "subtitle_source"],
+    "final": ["vid", "url", "title", "channel", "upload_date", "duration", "output_dir",
+              "mode", "src", "source_language", "subtitle_source", "output_file"],
+}
+
+
+def load_state(state_path: str) -> dict:
+    """
+    Load the workflow state markdown file as a simple flat key/value mapping.
+    """
+    path = Path(state_path)
+    if not path.exists():
+        print(f"Error: State file not found: {state_path}", file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        content = path.read_text(encoding="utf-8")
+    except Exception as e:
+        print(f"Error: Cannot read state file: {e}", file=sys.stderr)
+        sys.exit(2)
+
+    state = {}
+    for raw_line in content.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or line.startswith("-"):
+            continue
+        if ":" not in line:
+            continue
+        key, _, value = line.partition(":")
+        state[key.strip()] = value.strip()
+    return state
+
+
+def validate_state(state_path: str, stage: str = "", require: list[str] | None = None) -> dict:
+    """
+    Validate the state file for a workflow stage or explicit required fields.
+
+    This is the canonical workflow checkpoint validator. Stages intentionally
+    model the real execution order instead of enforcing one global required
+    field set.
+    """
+    state = load_state(state_path)
+    warnings = []
+    hard_failures = []
+
+    required_fields = []
+    if stage:
+        if stage not in STATE_STAGE_FIELDS:
+            print(f"Error: Unknown state validation stage: {stage}", file=sys.stderr)
+            sys.exit(2)
+        required_fields.extend(STATE_STAGE_FIELDS[stage])
+    if require:
+        for field in require:
+            if field not in required_fields:
+                required_fields.append(field)
+
+    missing_fields = []
+    placeholder_fields = []
+    present_fields = []
+
+    for field in required_fields:
+        value = state.get(field, "")
+        if not value:
+            missing_fields.append(field)
+        elif value.lower() == "unknown":
+            placeholder_fields.append(field)
+        else:
+            present_fields.append(field)
+
+    if missing_fields:
+        hard_failures.append("Missing required state fields: " + ", ".join(missing_fields))
+    if placeholder_fields:
+        hard_failures.append("Unresolved placeholder state fields: " + ", ".join(placeholder_fields))
+
+    checks = {
+        "stage": stage or "custom",
+        "required_fields": required_fields,
+        "present_fields": present_fields,
+        "missing_fields": missing_fields,
+        "placeholder_fields": placeholder_fields,
+    }
+
+    return {
+        "passed": len(hard_failures) == 0,
+        "checks": checks,
+        "warnings": warnings,
+        "hard_failures": hard_failures,
+    }
+
+
+def plan_optimization(state_path: str) -> dict:
+    """
+    Build a structured optimization plan from validated workflow state.
+
+    This is the canonical routing source for text optimization. Workflow docs
+    should consume this JSON instead of re-deriving short/long or bilingual
+    branches in prose.
+    """
+    validation = validate_state(state_path, stage="post-source")
+    if not validation["passed"]:
+        return {
+            "passed": False,
+            "checks": validation["checks"],
+            "warnings": validation["warnings"],
+            "hard_failures": validation["hard_failures"],
+        }
+
+    state = load_state(state_path)
+    try:
+        duration = int(state.get("duration", "0") or 0)
+    except ValueError:
+        duration = 0
+
+    mode = state.get("mode", "")
+    source = state.get("src", "")
+    work_dir = state.get("work_dir", "/tmp/unknown_chunks")
+    video_id = state.get("vid", "")
+
+    video_path = "long" if duration >= 1800 else "short"
+    outputs = {
+        "raw_text": f"/tmp/{video_id}_raw_text.txt",
+        "structured_text": f"/tmp/{video_id}_structured.txt",
+        "optimized_text": f"/tmp/{video_id}_optimized.txt",
+        "work_dir": work_dir,
+    }
+
+    if video_path == "short":
+        if mode == "bilingual":
+            operations = [
+                {
+                    "kind": "prompt",
+                    "prompt": "structure_only",
+                    "input": outputs["raw_text"],
+                    "output": outputs["structured_text"],
+                    "extra_instruction": "",
+                },
+                {
+                    "kind": "prompt",
+                    "prompt": "translate_only",
+                    "input": outputs["structured_text"],
+                    "output": outputs["optimized_text"],
+                    "extra_instruction": "",
+                },
+            ]
+        else:
+            extra_instruction = ""
+            if source == "deepgram":
+                extra_instruction = "Also fix: Chinese character spacing, add punctuation based on context, remove repeated phrases"
+            operations = [
+                {
+                    "kind": "prompt",
+                    "prompt": "structure_only",
+                    "input": outputs["raw_text"],
+                    "output": outputs["optimized_text"],
+                    "extra_instruction": extra_instruction,
+                }
+            ]
+    else:
+        extra_instruction = ""
+        if mode == "chinese" and source == "deepgram":
+            extra_instruction = "Also fix: Chinese character spacing, add punctuation based on context, remove repeated phrases"
+
+        operations = [
+            {
+                "kind": "chunk",
+                "prompt": "structure_only",
+                "input_key": "raw_path",
+                "extra_instruction": extra_instruction,
+            }
+        ]
+        if mode == "bilingual":
+            operations.append(
+                {
+                    "kind": "chunk",
+                    "prompt": "translate_only",
+                    "input_key": "processed_path",
+                    "extra_instruction": "",
+                }
+            )
+
+    return {
+        "passed": True,
+        "checks": {
+            "state_stage": "post-source",
+            "duration": duration,
+            "mode": mode,
+            "source": source,
+            "video_path": video_path,
+        },
+        "warnings": [],
+        "hard_failures": [],
+        "video_path": video_path,
+        "requires_llm_preflight": video_path == "long",
+        "requires_quality_check": True,
+        "operations": operations,
+        "outputs": outputs,
     }
 
 
@@ -1155,14 +1673,14 @@ def load_config(config_path: str = None) -> dict:
     
     Args:
         config_path: Optional path to config file. 
-                     Defaults to ~/.claude/skills/yt-transcript/config.yaml
+                     Defaults to <skill-root>/config.yaml
     
     Returns:
         {"output_dir": "...", "deepgram_api_key": "...", "config_path": "..."}
     """
     # Default config path
     if config_path is None:
-        config_path = os.path.expanduser("~/.claude/skills/yt-transcript/config.yaml")
+        config_path = str(_default_config_path())
     
     path = Path(config_path)
     if not path.exists():
@@ -1175,7 +1693,9 @@ def load_config(config_path: str = None) -> dict:
         print(f"Error: Cannot read config file: {e}", file=sys.stderr)
         sys.exit(2)
     
-    # Simple YAML parsing for key: value pairs (no external dependency)
+    # Intentionally support only a restricted flat key/value config format.
+    # This is not a general YAML parser; nested structures and multi-line YAML
+    # are out of scope for the skill's config surface.
     config = {}
     for line in content.split('\n'):
         line = line.strip()
@@ -1184,13 +1704,8 @@ def load_config(config_path: str = None) -> dict:
         if ':' in line:
             key, _, value = line.partition(':')
             key = key.strip()
-            # Remove inline comments (e.g. value # comment) but allow # inside quotes if needed (simple approximation)
-            if '#' in value:
-                # Naive comment stripping: assume # starts a comment unless it's a color code or inside quotes
-                # For this simple config, stripping from first # is likely safe enough
-                value = value.split('#', 1)[0]
-            
-            value = value.strip().strip('"').strip("'")
+            value = _strip_inline_comment(value)
+            value = _strip_wrapping_quotes(value.strip())
             if key:
                 config[key] = value
     
@@ -1240,6 +1755,23 @@ def main():
         help='Clean illegal filename characters'
     )
     fn_parser.add_argument('title', help='Original title')
+
+    # transcribe-deepgram command
+    tdg_parser = subparsers.add_parser(
+        'transcribe-deepgram',
+        help='Call Deepgram API and merge split chunks automatically'
+    )
+    tdg_parser.add_argument('audio_path', help='Audio file path')
+    tdg_parser.add_argument('--language', required=True, help='Transcription language code')
+    tdg_parser.add_argument('--config-path', default=None, help='Optional path to config.yaml')
+    tdg_parser.add_argument('--api-key', default='', help='Optional Deepgram API key override')
+    tdg_parser.add_argument('--max-size', type=float, default=10.0,
+                            help='Max chunk size in MB before splitting (default: 10)')
+    tdg_parser.add_argument('--max-deviation', type=float, default=60.0,
+                            help='Max deviation from silence split point in seconds (default: 60)')
+    tdg_parser.add_argument('--timeout', type=int, default=300, help='Request timeout in seconds')
+    tdg_parser.add_argument('--output-json', default='', help='Optional JSON output path (or prefix for chunked outputs)')
+    tdg_parser.add_argument('--output-text', default='', help='Optional path to write merged transcript text')
 
     # test-deepgram-api command
     api_parser = subparsers.add_parser(
@@ -1335,6 +1867,32 @@ def main():
     config_parser.add_argument('--config-path', default=None,
                                help='Optional path to config file')
 
+    # validate-state command
+    state_parser = subparsers.add_parser(
+        'validate-state',
+        help='Validate workflow state fields for a given stage'
+    )
+    state_parser.add_argument('state_path', help='Path to state markdown file')
+    state_parser.add_argument(
+        '--stage',
+        default='',
+        choices=sorted(STATE_STAGE_FIELDS.keys()),
+        help='Named validation stage to enforce',
+    )
+    state_parser.add_argument(
+        '--require',
+        action='append',
+        default=[],
+        help='Additional required field name (can be repeated)',
+    )
+
+    # plan-optimization command
+    plan_parser = subparsers.add_parser(
+        'plan-optimization',
+        help='Generate a structured optimization plan from workflow state'
+    )
+    plan_parser.add_argument('state_path', help='Path to state markdown file')
+
     args = parser.parse_args()
 
     if args.command == 'parse-vtt':
@@ -1348,6 +1906,20 @@ def main():
     elif args.command == 'sanitize-filename':
         result = sanitize_filename(args.title)
         print(result)
+
+    elif args.command == 'transcribe-deepgram':
+        result = transcribe_deepgram(
+            args.audio_path,
+            language=args.language,
+            config_path=args.config_path,
+            api_key=args.api_key,
+            max_size_mb=args.max_size,
+            max_deviation_sec=args.max_deviation,
+            timeout=args.timeout,
+            output_json=args.output_json,
+            output_text=args.output_text
+        )
+        print(json.dumps(result, ensure_ascii=False))
 
     elif args.command == 'test-deepgram-api':
         result = test_deepgram_api(args.api_key)
@@ -1403,6 +1975,18 @@ def main():
         result = load_config(args.config_path)
         print(json.dumps(result, ensure_ascii=False))
 
+    elif args.command == 'validate-state':
+        result = validate_state(args.state_path, stage=args.stage, require=args.require)
+        print(json.dumps(result, ensure_ascii=False))
+        if not result['passed']:
+            sys.exit(1)
+
+    elif args.command == 'plan-optimization':
+        result = plan_optimization(args.state_path)
+        print(json.dumps(result, ensure_ascii=False))
+        if not result['passed']:
+            sys.exit(1)
+
     else:
         parser.print_help()
         sys.exit(1)
@@ -1410,4 +1994,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
