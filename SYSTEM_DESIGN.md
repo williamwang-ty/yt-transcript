@@ -86,18 +86,24 @@ To handle arbitrarily long videos (e.g., >2 hours) without hitting LLM context l
 
 1.  **Structural Chunking (Script)**:
     - The `chunk-text` command splits raw text into semantic chunks based on sentence boundaries.
-    - The current implementation is still character-budgeted, but now uses prompt-aware defaults: smaller chunks for rewrite / translation paths and larger chunks for summarize-only paths.
+    - The default path is now token-aware and prompt-aware: rewrite / translation paths use smaller targets, while summarize-only paths use larger ones.
+    - Character-based chunking remains as a compatibility fallback, and an explicit `--chunk-size` without `--prompt` keeps the legacy character interpretation.
+    - Prompt names are validated during chunk planning so bad prompt identifiers fail fast.
     - Uses an idempotent `manifest.json` to track processing status, allowing resumability.
 
-2.  **Two-Stage Chapter Planning**:
+2.  **Budgeted Chunk Processing**:
+    - `process-chunks` uses prompt-specific `max_output_tokens` computed from the same request budget as chunk planning.
+    - This keeps request envelopes conservative instead of sending one oversized output cap for every task.
+
+3.  **Two-Stage Chapter Planning**:
     - **Priority 1**: Use YouTube Chapters if available (via `get-chapters`).
     - **Priority 2**: If no chapters, the LLM first generates summaries for each chunk, then plans a global chapter structure based on summaries.
 
-3.  **Stateless Translation**:
+4.  **Stateless Translation**:
     - Each chunk is translated independently by the LLM without needing global context.
     - Script (`merge-content`) handles the re-assembly and injection of chapter headers.
 
-4.  **Structured Optimization Planning**:
+5.  **Structured Optimization Planning**:
     - `plan-optimization` reads validated state and emits the canonical short/long path, required operations, and whether `--require-llm` preflight is needed.
     - Workflow docs consume this JSON instead of re-deriving prompt branches in prose.
 
@@ -307,18 +313,24 @@ yt-transcript/
 
 1.  **结构化分块（脚本）**：
     - `chunk-text` 命令按句子边界将原始文本切分为语义块。
-    - 当前实现仍然以字符预算为主，但已经按 prompt 类型采用更保守的默认值：rewrite / translation 路径更小，summarize-only 路径更大。
+    - 默认路径已经切到 token-aware + prompt-aware：rewrite / translation 路径更小，summarize-only 路径更大。
+    - 字符模式仍然保留为兼容 fallback；如果只传显式 `--chunk-size` 而不传 `--prompt`，会继续按 legacy 字符大小解释。
+    - 分块规划阶段会提前校验 prompt 名称，避免坏 prompt 标识静默通过。
     - 使用幂等的 `manifest.json` 追踪状态，支持断点续传。
 
-2.  **两阶段章节规划**：
+2.  **预算化 Chunk 处理**：
+    - `process-chunks` 会使用与分块规划同一套请求预算，为不同 prompt 单独计算 `max_output_tokens`。
+    - 这样可以避免所有任务都带着同一个偏大的输出上限发请求。
+
+3.  **两阶段章节规划**：
     - **优先级 1**：如果有 YouTube 章节（通过 `get-chapters` 获取），直接使用。
     - **优先级 2**：无章节时，LLM 先对每个块生成摘要，再基于摘要规划全局章节结构。
 
-3.  **无状态翻译**：
+4.  **无状态翻译**：
     - 每个文本块由 LLM 独立翻译，不需要全局上下文。
     - 最终由脚本（`merge-content`）负责按顺序组装并插入章节标题。
 
-4.  **结构化优化规划**：
+5.  **结构化优化规划**：
     - `plan-optimization` 读取已校验的 state，输出 canonical 的短视频/长视频路径、操作序列，以及是否需要 `--require-llm`。
     - workflow 文档消费这份 JSON，而不是再次用 prose 推导分支。
 

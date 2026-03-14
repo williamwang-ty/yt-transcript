@@ -145,7 +145,12 @@ def _parse_bool(value, default: bool = False) -> bool:
         return value
     if value is None:
         return default
-    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "on"}:
+        return True
+    if text in {"0", "false", "no", "off"}:
+        return False
+    return default
 
 
 def _parse_int(value, default: int) -> int:
@@ -162,6 +167,27 @@ def _parse_float(value, default: float) -> float:
         return default
 
 
+def _parse_int_min(value, default: int, minimum: int) -> int:
+    parsed = _parse_int(value, default)
+    if parsed < minimum:
+        return default
+    return parsed
+
+
+def _parse_float_min(value, default: float, minimum: float) -> float:
+    parsed = _parse_float(value, default)
+    if parsed < minimum:
+        return default
+    return parsed
+
+
+def _parse_float_range(value, default: float, minimum: float, maximum: float) -> float:
+    parsed = _parse_float(value, default)
+    if parsed < minimum or parsed > maximum:
+        return default
+    return parsed
+
+
 def _normalize_stream_mode(value) -> str:
     if value is None:
         return "auto"
@@ -175,15 +201,415 @@ def _now_iso() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime())
 
 
-def _recommended_chunk_size(prompt_name: str = "") -> int:
+LEGACY_CHAR_CHUNK_DEFAULTS = {
+    "translate_only": 3000,
+    "structure_only": 4000,
+    "quick_cleanup": 4000,
+    "summarize": 8000,
+}
+
+TASK_CHUNK_TOKEN_DEFAULTS = {
+    "structure_only": 1200,
+    "quick_cleanup": 1000,
+    "translate_only": 900,
+    "summarize": 2500,
+}
+
+TASK_OUTPUT_RATIO_DEFAULTS = {
+    "structure_only": 1.15,
+    "quick_cleanup": 1.05,
+    "translate_only": 1.10,
+    "summarize": 0.15,
+}
+
+TASK_MAX_OUTPUT_TOKEN_DEFAULTS = {
+    "structure_only": 1800,
+    "quick_cleanup": 1400,
+    "translate_only": 1500,
+    "summarize": 384,
+}
+
+TASK_REQUEST_CAP_DEFAULTS = {
+    "structure_only": 3000,
+    "quick_cleanup": 3000,
+    "translate_only": 2600,
+    "summarize": 4500,
+}
+
+DEFAULT_CHUNK_MODE = "tokens"
+DEFAULT_CONTEXT_WINDOW = 32000
+DEFAULT_CONTEXT_UTILIZATION_LIMIT = 0.12
+DEFAULT_CHUNK_HARD_CAP_MULTIPLIER = 1.33
+MAX_CHUNK_HARD_CAP_MULTIPLIER = 2.0
+DEFAULT_CHUNK_SAFETY_BUFFER_TOKENS = 400
+DEFAULT_CHUNK_OVERLAP_SENTENCES = 0
+DEFAULT_CHUNK_CONTEXT_TAIL_SENTENCES = 1
+DEFAULT_CHUNK_CONTEXT_SUMMARY_TOKENS = 60
+DEFAULT_ENABLE_TOKEN_COUNT_PROBE = True
+DEFAULT_ENABLE_CHUNK_AUTOTUNE = False
+DEFAULT_UNKNOWN_CHUNK_TOKENS = 900
+CHUNK_SEPARATOR = "\n\n"
+DEFAULT_UNKNOWN_OUTPUT_RATIO = 1.0
+DEFAULT_UNKNOWN_MAX_OUTPUT_TOKENS = 1400
+DEFAULT_UNKNOWN_REQUEST_CAP = 2600
+DEFAULT_UNKNOWN_LEGACY_CHARS = 8000
+
+
+def _normalize_chunk_mode(value) -> str:
+    if value is None:
+        return DEFAULT_CHUNK_MODE
+    text = str(value).strip().lower()
+    if text in {"tokens", "chars"}:
+        return text
+    return DEFAULT_CHUNK_MODE
+
+
+def _default_config_values(config_path: str = "") -> dict:
+    return {
+        "output_dir": "",
+        "deepgram_api_key": "",
+        "llm_api_key": "",
+        "llm_base_url": "",
+        "llm_model": "",
+        "llm_api_format": "openai",
+        "llm_timeout_sec": 120,
+        "llm_max_retries": 3,
+        "llm_backoff_sec": 1.5,
+        "llm_stream": "auto",
+        "llm_probe_timeout_sec": 20,
+        "llm_probe_max_tokens": 16,
+        "llm_stop_after_consecutive_timeouts": 2,
+        "chunk_mode": DEFAULT_CHUNK_MODE,
+        "chunk_size_override": 0,
+        "chunk_tokens_structure_only": TASK_CHUNK_TOKEN_DEFAULTS["structure_only"],
+        "chunk_tokens_quick_cleanup": TASK_CHUNK_TOKEN_DEFAULTS["quick_cleanup"],
+        "chunk_tokens_translate_only": TASK_CHUNK_TOKEN_DEFAULTS["translate_only"],
+        "chunk_tokens_summarize": TASK_CHUNK_TOKEN_DEFAULTS["summarize"],
+        "chunk_hard_cap_multiplier": DEFAULT_CHUNK_HARD_CAP_MULTIPLIER,
+        "chunk_safety_buffer_tokens": DEFAULT_CHUNK_SAFETY_BUFFER_TOKENS,
+        "chunk_overlap_sentences": DEFAULT_CHUNK_OVERLAP_SENTENCES,
+        "chunk_context_tail_sentences": DEFAULT_CHUNK_CONTEXT_TAIL_SENTENCES,
+        "chunk_context_summary_tokens": DEFAULT_CHUNK_CONTEXT_SUMMARY_TOKENS,
+        "output_ratio_structure_only": TASK_OUTPUT_RATIO_DEFAULTS["structure_only"],
+        "output_ratio_quick_cleanup": TASK_OUTPUT_RATIO_DEFAULTS["quick_cleanup"],
+        "output_ratio_translate_only": TASK_OUTPUT_RATIO_DEFAULTS["translate_only"],
+        "output_ratio_summarize": TASK_OUTPUT_RATIO_DEFAULTS["summarize"],
+        "max_output_tokens_structure_only": TASK_MAX_OUTPUT_TOKEN_DEFAULTS["structure_only"],
+        "max_output_tokens_quick_cleanup": TASK_MAX_OUTPUT_TOKEN_DEFAULTS["quick_cleanup"],
+        "max_output_tokens_translate_only": TASK_MAX_OUTPUT_TOKEN_DEFAULTS["translate_only"],
+        "max_output_tokens_summarize": TASK_MAX_OUTPUT_TOKEN_DEFAULTS["summarize"],
+        "enable_token_count_probe": DEFAULT_ENABLE_TOKEN_COUNT_PROBE,
+        "enable_chunk_autotune": DEFAULT_ENABLE_CHUNK_AUTOTUNE,
+        "config_path": config_path,
+        "config_warnings": [],
+    }
+
+
+def _legacy_chunk_target_chars(prompt_name: str = "", config: dict | None = None) -> int:
+    config = config or {}
+    override = max(0, _parse_int(config.get("chunk_size_override"), 0))
+    if override > 0:
+        return override
+
     prompt = (prompt_name or "").strip().lower()
-    if prompt == "translate_only":
-        return 3000
-    if prompt in {"structure_only", "quick_cleanup"}:
-        return 4000
-    if prompt == "summarize":
-        return 8000
-    return 8000
+    return LEGACY_CHAR_CHUNK_DEFAULTS.get(prompt, DEFAULT_UNKNOWN_LEGACY_CHARS)
+
+
+def _get_task_chunk_target(prompt_name: str, config: dict | None = None) -> int:
+    config = config or {}
+    override = max(0, _parse_int(config.get("chunk_size_override"), 0))
+    if override > 0:
+        return override
+
+    prompt = (prompt_name or "").strip().lower()
+    key = f"chunk_tokens_{prompt}"
+    default = TASK_CHUNK_TOKEN_DEFAULTS.get(prompt, DEFAULT_UNKNOWN_CHUNK_TOKENS)
+    return max(1, _parse_int(config.get(key), default))
+
+
+def _get_task_output_ratio(prompt_name: str, config: dict | None = None) -> float:
+    config = config or {}
+    prompt = (prompt_name or "").strip().lower()
+    key = f"output_ratio_{prompt}"
+    default = TASK_OUTPUT_RATIO_DEFAULTS.get(prompt, DEFAULT_UNKNOWN_OUTPUT_RATIO)
+    return max(0.01, _parse_float(config.get(key), default))
+
+
+def _get_task_max_output_tokens(prompt_name: str, config: dict | None = None) -> int:
+    config = config or {}
+    prompt = (prompt_name or "").strip().lower()
+    key = f"max_output_tokens_{prompt}"
+    default = TASK_MAX_OUTPUT_TOKEN_DEFAULTS.get(prompt, DEFAULT_UNKNOWN_MAX_OUTPUT_TOKENS)
+    return max(1, _parse_int(config.get(key), default))
+
+
+def _get_task_request_cap(prompt_name: str) -> int:
+    prompt = (prompt_name or "").strip().lower()
+    return TASK_REQUEST_CAP_DEFAULTS.get(prompt, DEFAULT_UNKNOWN_REQUEST_CAP)
+
+
+def _is_cjk_char(char: str) -> bool:
+    return "\u3400" <= char <= "\u9fff"
+
+
+def _is_kana_hangul_char(char: str) -> bool:
+    return ("\u3040" <= char <= "\u30ff") or ("\uac00" <= char <= "\ud7af")
+
+
+def _is_latin_word_char(char: str) -> bool:
+    return ("a" <= char <= "z") or ("A" <= char <= "Z") or char.isdigit()
+
+
+def _new_token_estimate_state() -> dict:
+    return {"tokens": 0, "punct_count": 0, "latin_word_len": 0}
+
+
+def _advance_token_estimate_state(state: dict, char: str, next_char: str = "") -> None:
+    if _is_cjk_char(char) or _is_kana_hangul_char(char):
+        state["latin_word_len"] = 0
+        state["tokens"] += 1
+        return
+
+    if _is_latin_word_char(char):
+        word_len = state["latin_word_len"]
+        if word_len == 0 or word_len % 4 == 0:
+            state["tokens"] += 1
+        state["latin_word_len"] = word_len + 1
+        return
+
+    if char in "'-" and state["latin_word_len"] > 0 and _is_latin_word_char(next_char):
+        word_len = state["latin_word_len"]
+        if word_len % 4 == 0:
+            state["tokens"] += 1
+        state["latin_word_len"] = word_len + 1
+        return
+
+    state["latin_word_len"] = 0
+    if char.isspace():
+        return
+
+    punct_count = state["punct_count"]
+    if punct_count % 4 == 0:
+        state["tokens"] += 1
+    state["punct_count"] = punct_count + 1
+
+
+
+def _estimate_tokens(text: str, mode: str = "tokens", config: dict | None = None) -> int:
+    # Heuristic estimation only. This intentionally over-approximates common
+    # transcript shapes and is not a substitute for provider-side token counting.
+    del config
+    if not text:
+        return 0
+    if _normalize_chunk_mode(mode) == "chars":
+        return len(text)
+
+    state = _new_token_estimate_state()
+    for index, char in enumerate(text):
+        next_char = text[index + 1] if index + 1 < len(text) else ""
+        _advance_token_estimate_state(state, char, next_char)
+    return max(1, state["tokens"])
+
+
+def _calculate_chunk_budget(prompt_name: str, prompt_template: str,
+                            config: dict | None = None, model_info: dict = None) -> dict:
+    config = config or {}
+    prompt_tokens = _estimate_tokens(prompt_template or "", "tokens", config)
+    target_tokens = _get_task_chunk_target(prompt_name, config)
+    output_ratio = _get_task_output_ratio(prompt_name, config)
+    task_max_output_tokens = _get_task_max_output_tokens(prompt_name, config)
+    safety_buffer_tokens = _parse_int_min(
+        config.get("chunk_safety_buffer_tokens"), DEFAULT_CHUNK_SAFETY_BUFFER_TOKENS, 0
+    )
+    hard_cap_multiplier = _parse_float_range(
+        config.get("chunk_hard_cap_multiplier"),
+        DEFAULT_CHUNK_HARD_CAP_MULTIPLIER,
+        1.0,
+        MAX_CHUNK_HARD_CAP_MULTIPLIER,
+    )
+    task_request_cap = _get_task_request_cap(prompt_name)
+    context_window = DEFAULT_CONTEXT_WINDOW
+    if model_info and model_info.get("context_window"):
+        context_window = max(1024, _parse_int(model_info.get("context_window"), DEFAULT_CONTEXT_WINDOW))
+    effective_budget = min(task_request_cap, int(context_window * DEFAULT_CONTEXT_UTILIZATION_LIMIT))
+
+    expected_output_tokens = min(task_max_output_tokens, int(math.ceil(target_tokens * output_ratio)))
+    for _ in range(2):
+        available_input_tokens = max(1, effective_budget - prompt_tokens - expected_output_tokens - safety_buffer_tokens)
+        target_tokens = min(target_tokens, available_input_tokens)
+        expected_output_tokens = min(task_max_output_tokens, int(math.ceil(target_tokens * output_ratio)))
+
+    available_input_tokens = max(1, effective_budget - prompt_tokens - expected_output_tokens - safety_buffer_tokens)
+    planned_max_output_tokens = max(
+        expected_output_tokens,
+        min(task_max_output_tokens, effective_budget - prompt_tokens - target_tokens - safety_buffer_tokens),
+    )
+    hard_cap_tokens = max(target_tokens, int(math.ceil(target_tokens * hard_cap_multiplier)))
+    hard_cap_tokens = min(hard_cap_tokens, available_input_tokens)
+    hard_cap_tokens = max(target_tokens, hard_cap_tokens)
+
+    return {
+        "prompt_name": prompt_name,
+        "prompt_tokens": prompt_tokens,
+        "target_tokens": target_tokens,
+        "hard_cap_tokens": hard_cap_tokens,
+        "output_ratio": output_ratio,
+        "planned_max_output_tokens": planned_max_output_tokens,
+        "expected_output_tokens": expected_output_tokens,
+        "available_input_tokens": available_input_tokens,
+        "effective_budget_tokens": effective_budget,
+        "safety_buffer_tokens": safety_buffer_tokens,
+        "chunk_mode": _normalize_chunk_mode(config.get("chunk_mode", DEFAULT_CHUNK_MODE)),
+        "request_cap_tokens": task_request_cap,
+    }
+
+
+def _recommended_chunk_size(prompt_name: str = "", config: dict | None = None) -> int:
+    config = config or {}
+    if _normalize_chunk_mode(config.get("chunk_mode", DEFAULT_CHUNK_MODE)) == "chars":
+        return _legacy_chunk_target_chars(prompt_name, config)
+    return _get_task_chunk_target(prompt_name, config)
+
+
+def _available_prompt_names() -> list[str]:
+    return sorted(p.stem for p in (_skill_root() / "prompts").glob("*.md"))
+
+
+def _resolve_prompt_template_path(prompt_name: str) -> Path:
+    prompt = (prompt_name or "").strip()
+    if not prompt:
+        raise ValueError("Prompt name is required")
+    if not re.fullmatch(r"[A-Za-z0-9_]+", prompt):
+        raise ValueError(f"Invalid prompt name: {prompt}")
+
+    prompt_path = (_skill_root() / "prompts" / f"{prompt}.md").resolve()
+    prompts_root = (_skill_root() / "prompts").resolve()
+    try:
+        prompt_path.relative_to(prompts_root)
+    except ValueError as exc:
+        raise ValueError(f"Invalid prompt name: {prompt}") from exc
+    if not prompt_path.exists():
+        raise ValueError(f"Prompt template not found: {prompt_path}")
+    return prompt_path
+
+
+def _load_optional_config(config_path: str = None) -> dict:
+    if config_path is None or not str(config_path).strip():
+        return load_config(None, allow_missing=True)
+    return load_config(config_path, allow_missing=False)
+
+
+def _force_split_text_by_tokens(text: str, max_tokens: int, config: dict | None = None) -> list[str]:
+    del config
+    if max_tokens <= 0:
+        return [text]
+
+    segments = []
+    current_chars = []
+    current_state = _new_token_estimate_state()
+
+    for index, char in enumerate(text):
+        next_char = text[index + 1] if index + 1 < len(text) else ""
+        candidate_state = dict(current_state)
+        _advance_token_estimate_state(candidate_state, char, next_char)
+        if current_chars and candidate_state["tokens"] > max_tokens:
+            segments.append("".join(current_chars))
+            current_chars = [char]
+            current_state = _new_token_estimate_state()
+            _advance_token_estimate_state(current_state, char, next_char)
+        else:
+            current_chars.append(char)
+            current_state = candidate_state
+
+    if current_chars:
+        segments.append("".join(current_chars))
+    return segments
+
+
+def _force_split_text(text: str, max_size: int, chunk_mode: str,
+                      config: dict | None = None) -> list[str]:
+    if _normalize_chunk_mode(chunk_mode) == "chars":
+        return _hard_split_text(text, max_size)
+    return _force_split_text_by_tokens(text, max_size, config)
+
+
+def _build_chunk_plan(prompt_name: str, chunk_size: int, config: dict,
+                      prompt_template: str) -> dict:
+    requested_chunk_mode = _normalize_chunk_mode(config.get("chunk_mode", DEFAULT_CHUNK_MODE))
+    use_legacy_char_override = requested_chunk_mode == "tokens" and chunk_size and chunk_size > 0 and not prompt_name
+    chunk_mode = "chars" if use_legacy_char_override else requested_chunk_mode
+    budget = _calculate_chunk_budget(prompt_name, prompt_template, config)
+    recommended_chunk_size = (
+        _legacy_chunk_target_chars(prompt_name, config)
+        if chunk_mode == "chars"
+        else _get_task_chunk_target(prompt_name, config)
+    )
+    hard_cap_multiplier = _parse_float_range(
+        config.get("chunk_hard_cap_multiplier"),
+        DEFAULT_CHUNK_HARD_CAP_MULTIPLIER,
+        1.0,
+        MAX_CHUNK_HARD_CAP_MULTIPLIER,
+    )
+
+    if chunk_mode == "chars":
+        effective_chunk_size = chunk_size if chunk_size and chunk_size > 0 else recommended_chunk_size
+        hard_cap_size = effective_chunk_size
+        target_tokens = budget["target_tokens"]
+        hard_cap_tokens = budget["hard_cap_tokens"]
+    else:
+        effective_chunk_size = chunk_size if chunk_size and chunk_size > 0 else budget["target_tokens"]
+        effective_chunk_size = max(1, min(effective_chunk_size, budget["available_input_tokens"]))
+        hard_cap_size = max(effective_chunk_size, int(math.ceil(effective_chunk_size * hard_cap_multiplier)))
+        hard_cap_size = min(hard_cap_size, budget["hard_cap_tokens"])
+        hard_cap_size = max(effective_chunk_size, hard_cap_size)
+        target_tokens = effective_chunk_size
+        hard_cap_tokens = hard_cap_size
+
+    return {
+        "budget": budget,
+        "chunk_mode": chunk_mode,
+        "use_legacy_char_override": use_legacy_char_override,
+        "recommended_chunk_size": recommended_chunk_size,
+        "effective_chunk_size": effective_chunk_size,
+        "hard_cap_size": hard_cap_size,
+        "target_tokens": target_tokens,
+        "hard_cap_tokens": hard_cap_tokens,
+    }
+
+
+def _split_text_into_chunks(sentences: list[str], chunk_mode: str,
+                            effective_chunk_size: int, hard_cap_size: int,
+                            config: dict) -> tuple[list[str], list[str]]:
+    chunks = []
+    current_chunk = []
+    current_size = 0
+    warnings = []
+    separator_size = len(CHUNK_SEPARATOR) if chunk_mode == "chars" else _estimate_tokens(CHUNK_SEPARATOR, "tokens", config)
+
+    for i, sentence in enumerate(sentences):
+        sentence_segments = [sentence]
+        sentence_len = _estimate_tokens(sentence, chunk_mode, config)
+
+        if sentence_len > hard_cap_size:
+            sentence_segments = _force_split_text(sentence, hard_cap_size, chunk_mode, config)
+            warnings.append(
+                f"Sentence {i} exceeds chunk_size ({sentence_len} > {hard_cap_size}), split into {len(sentence_segments)} fixed-width segment(s)"
+            )
+
+        for segment in sentence_segments:
+            segment_len = _estimate_tokens(segment, chunk_mode, config)
+            candidate_size = current_size + segment_len + (separator_size if current_chunk else 0)
+            if current_chunk and (candidate_size > effective_chunk_size or candidate_size > hard_cap_size):
+                chunks.append(CHUNK_SEPARATOR.join(current_chunk))
+                current_chunk = [segment]
+                current_size = segment_len
+            else:
+                current_chunk.append(segment)
+                current_size = candidate_size
+
+    if current_chunk:
+        chunks.append(CHUNK_SEPARATOR.join(current_chunk))
+    return chunks, warnings
 
 
 def _atomic_write_text(path: Path, content: str) -> None:
@@ -828,7 +1254,7 @@ def test_deepgram_api(api_key: str) -> dict:
 
 
 def chunk_text(input_path: str, output_dir: str, chunk_size: int = 0,
-               prompt_name: str = "") -> dict:
+               prompt_name: str = "", config_path: str = None) -> dict:
     """
     Split text file into chunks by sentence boundary.
 
@@ -839,7 +1265,26 @@ def chunk_text(input_path: str, output_dir: str, chunk_size: int = 0,
         print(f"Error: File does not exist {input_path}", file=sys.stderr)
         sys.exit(1)
 
-    effective_chunk_size = chunk_size if chunk_size and chunk_size > 0 else _recommended_chunk_size(prompt_name)
+    config = _load_optional_config(config_path)
+    prompt_template = ""
+    if prompt_name:
+        try:
+            prompt_path = _resolve_prompt_template_path(prompt_name)
+        except ValueError as error:
+            print(f"Error: {error}", file=sys.stderr)
+            print(f"Available prompts: {_available_prompt_names()}", file=sys.stderr)
+            sys.exit(1)
+        prompt_template = prompt_path.read_text(encoding="utf-8")
+
+    chunk_plan = _build_chunk_plan(prompt_name, chunk_size, config, prompt_template)
+    budget = chunk_plan["budget"]
+    chunk_mode = chunk_plan["chunk_mode"]
+    use_legacy_char_override = chunk_plan["use_legacy_char_override"]
+    recommended_chunk_size = chunk_plan["recommended_chunk_size"]
+    effective_chunk_size = chunk_plan["effective_chunk_size"]
+    hard_cap_size = chunk_plan["hard_cap_size"]
+    target_tokens = chunk_plan["target_tokens"]
+    hard_cap_tokens = chunk_plan["hard_cap_tokens"]
 
     out_dir = Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -851,40 +1296,27 @@ def chunk_text(input_path: str, output_dir: str, chunk_size: int = 0,
         sys.exit(2)
 
     sentences = _split_sentences(text)
-
-    chunks = []
-    current_chunk = []
-    current_size = 0
-    warnings = []
-
-    for i, sentence in enumerate(sentences):
-        sentence_segments = [sentence]
-        sentence_len = len(sentence)
-
-        if sentence_len > effective_chunk_size:
-            sentence_segments = _hard_split_text(sentence, effective_chunk_size)
-            warnings.append(
-                f"Sentence {i} exceeds chunk_size ({sentence_len} > {effective_chunk_size}), split into {len(sentence_segments)} fixed-width segment(s)"
-            )
-
-        for segment in sentence_segments:
-            segment_len = len(segment)
-            if current_size + segment_len > effective_chunk_size and current_chunk:
-                chunks.append('\n\n'.join(current_chunk))
-                current_chunk = [segment]
-                current_size = segment_len
-            else:
-                current_chunk.append(segment)
-                current_size += segment_len + 2
-
-    if current_chunk:
-        chunks.append('\n\n'.join(current_chunk))
+    chunks, warnings = _split_text_into_chunks(
+        sentences,
+        chunk_mode,
+        effective_chunk_size,
+        hard_cap_size,
+        config,
+    )
 
     manifest = {
         "total_chunks": len(chunks),
         "chunk_size": effective_chunk_size,
-        "recommended_chunk_size": _recommended_chunk_size(prompt_name),
+        "recommended_chunk_size": recommended_chunk_size,
+        "chunk_mode": chunk_mode,
         "prompt_name": prompt_name,
+        "target_tokens": target_tokens,
+        "hard_cap_tokens": hard_cap_tokens,
+        "prompt_tokens": budget["prompt_tokens"],
+        "planned_max_output_tokens": budget["planned_max_output_tokens"],
+        "effective_budget_tokens": budget["effective_budget_tokens"],
+        "output_ratio": budget["output_ratio"],
+        "chunk_safety_buffer_tokens": budget["safety_buffer_tokens"],
         "source_file": str(path.absolute()),
         "work_dir": str(out_dir.absolute()),
         "chunks": []
@@ -901,7 +1333,10 @@ def chunk_text(input_path: str, output_dir: str, chunk_size: int = 0,
             "processed_path": f"processed_{i:03d}.md",
             "char_count": len(chunk_content),
             "input_chars": len(chunk_content),
+            "estimated_input_tokens": _estimate_tokens(chunk_content, "tokens", config),
             "output_chars": 0,
+            "actual_output_tokens": 0,
+            "planned_max_output_tokens": budget["planned_max_output_tokens"],
             "status": "pending",
             "attempts": 0,
             "last_error": "",
@@ -920,9 +1355,15 @@ def chunk_text(input_path: str, output_dir: str, chunk_size: int = 0,
     for warning in warnings:
         print(f"⚠️ {warning}", file=sys.stderr)
 
+    if use_legacy_char_override:
+        print(
+            "ℹ️ Interpreting explicit chunk_size as characters for backward compatibility; add --prompt to use token-aware auto sizing.",
+            file=sys.stderr,
+        )
+
     if prompt_name and chunk_size <= 0:
         print(
-            f"ℹ️ Auto-selected chunk_size={effective_chunk_size} for prompt '{prompt_name}'",
+            f"ℹ️ Auto-selected chunk_size={effective_chunk_size} ({chunk_mode}) for prompt '{prompt_name}'",
             file=sys.stderr,
         )
 
@@ -933,6 +1374,9 @@ def chunk_text(input_path: str, output_dir: str, chunk_size: int = 0,
         "warnings": warnings,
         "chunk_size": effective_chunk_size,
         "recommended_chunk_size": manifest["recommended_chunk_size"],
+        "chunk_mode": chunk_mode,
+        "target_tokens": manifest["target_tokens"],
+        "hard_cap_tokens": manifest["hard_cap_tokens"],
     }
 def get_chapters(video_url: str, timeout: int = 30) -> dict:
     """
@@ -1230,11 +1674,11 @@ def process_chunks(work_dir: str, prompt_name: str, extra_instruction: str = "",
 
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
 
-    skill_dir = Path(__file__).parent
-    prompt_path = skill_dir / "prompts" / f"{prompt_name}.md"
-    if not prompt_path.exists():
-        print(f"Error: Prompt template not found: {prompt_path}", file=sys.stderr)
-        print(f"Available prompts: {[p.stem for p in (skill_dir / 'prompts').glob('*.md')]}", file=sys.stderr)
+    try:
+        prompt_path = _resolve_prompt_template_path(prompt_name)
+    except ValueError as error:
+        print(f"Error: {error}", file=sys.stderr)
+        print(f"Available prompts: {_available_prompt_names()}", file=sys.stderr)
         sys.exit(1)
 
     prompt_template = prompt_path.read_text(encoding="utf-8")
@@ -1258,13 +1702,28 @@ def process_chunks(work_dir: str, prompt_name: str, extra_instruction: str = "",
 
     is_summary = (prompt_name == "summarize")
     request_url = _build_api_url(base_url, api_format)
-    recommended_chunk_size = _recommended_chunk_size(prompt_name)
+    prompt_budget = _calculate_chunk_budget(prompt_name, prompt_template, config)
+    planned_max_output_tokens = prompt_budget["planned_max_output_tokens"]
     manifest_chunk_size = manifest.get("chunk_size") or 0
+    manifest_chunk_mode = _normalize_chunk_mode(manifest.get("chunk_mode", config.get("chunk_mode", DEFAULT_CHUNK_MODE)))
+    if manifest_chunk_mode == "chars":
+        recommended_chunk_size = _legacy_chunk_target_chars(prompt_name, config)
+    else:
+        recommended_chunk_size = _get_task_chunk_target(prompt_name, config)
     setup_warnings = []
 
-    if manifest_chunk_size and manifest_chunk_size > recommended_chunk_size:
+    if manifest_chunk_mode == "tokens":
+        manifest_target_tokens = max(0, _parse_int(manifest.get("target_tokens"), 0))
+        if manifest_target_tokens and manifest_target_tokens > prompt_budget["target_tokens"]:
+            setup_warning = (
+                f"⚠️ Chunk target {manifest_target_tokens} tokens is larger than the recommended "
+                f"{prompt_budget['target_tokens']} for prompt '{prompt_name}'. Long outputs may time out."
+            )
+            setup_warnings.append(setup_warning)
+            print(setup_warning, file=sys.stderr)
+    elif manifest_chunk_size and manifest_chunk_size > recommended_chunk_size:
         setup_warning = (
-            f"⚠️ Chunk size {manifest_chunk_size} is larger than the recommended {recommended_chunk_size} "
+            f"⚠️ Chunk size {manifest_chunk_size} chars is larger than the recommended {recommended_chunk_size} chars "
             f"for prompt '{prompt_name}'. Long outputs may time out."
         )
         setup_warnings.append(setup_warning)
@@ -1277,7 +1736,11 @@ def process_chunks(work_dir: str, prompt_name: str, extra_instruction: str = "",
         chunk_info.setdefault("last_error_type", "")
         chunk_info.setdefault("latency_ms", None)
         chunk_info.setdefault("input_chars", chunk_info.get("char_count", 0))
+        chunk_info.setdefault("estimated_input_tokens", 0)
         chunk_info.setdefault("output_chars", 0)
+        chunk_info.setdefault("actual_output_tokens", 0)
+        chunk_info.setdefault("prompt_tokens", prompt_budget["prompt_tokens"])
+        chunk_info.setdefault("planned_max_output_tokens", planned_max_output_tokens)
         chunk_info.setdefault("request_url", request_url)
         chunk_info.setdefault("streaming_used", False)
         chunk_info.setdefault("updated_at", "")
@@ -1287,6 +1750,14 @@ def process_chunks(work_dir: str, prompt_name: str, extra_instruction: str = "",
     manifest["last_prompt"] = prompt_name
     manifest["last_request_url"] = request_url
     manifest["recommended_chunk_size"] = recommended_chunk_size
+    manifest["chunk_mode"] = manifest_chunk_mode
+    manifest["target_tokens"] = prompt_budget["target_tokens"]
+    manifest["hard_cap_tokens"] = prompt_budget["hard_cap_tokens"]
+    manifest["prompt_tokens"] = prompt_budget["prompt_tokens"]
+    manifest["planned_max_output_tokens"] = planned_max_output_tokens
+    manifest["effective_budget_tokens"] = prompt_budget["effective_budget_tokens"]
+    manifest["output_ratio"] = prompt_budget["output_ratio"]
+    manifest["chunk_safety_buffer_tokens"] = prompt_budget["safety_buffer_tokens"]
     _write_manifest(manifest_path, manifest)
 
     if dry_run:
@@ -1299,7 +1770,12 @@ def process_chunks(work_dir: str, prompt_name: str, extra_instruction: str = "",
             "model": model,
             "api_format": api_format,
             "request_url": request_url,
+            "chunk_mode": manifest_chunk_mode,
             "recommended_chunk_size": recommended_chunk_size,
+            "planned_max_output_tokens": planned_max_output_tokens,
+            "prompt_tokens": prompt_budget["prompt_tokens"],
+            "target_tokens": prompt_budget["target_tokens"],
+            "hard_cap_tokens": prompt_budget["hard_cap_tokens"],
             "warnings": setup_warnings,
             "message": "Dry run: all validations passed"
         }
@@ -1344,7 +1820,11 @@ def process_chunks(work_dir: str, prompt_name: str, extra_instruction: str = "",
 
         chunk_text = input_path.read_text(encoding="utf-8")
         chunk_char_count = len(chunk_text)
+        estimated_input_tokens = _estimate_tokens(chunk_text, "tokens", config)
         chunk_info["input_chars"] = chunk_char_count
+        chunk_info["estimated_input_tokens"] = estimated_input_tokens
+        chunk_info["prompt_tokens"] = prompt_budget["prompt_tokens"]
+        chunk_info["planned_max_output_tokens"] = planned_max_output_tokens
 
         if "{RAW_TEXT}" in prompt_template:
             prompt = prompt_template.replace("{RAW_TEXT}", chunk_text)
@@ -1360,7 +1840,9 @@ def process_chunks(work_dir: str, prompt_name: str, extra_instruction: str = "",
         _write_manifest(manifest_path, manifest)
 
         print(
-            f"Processing chunk {chunk_id + 1}/{total} chars={chunk_char_count} model={model} url={request_url}",
+            f"Processing chunk {chunk_id + 1}/{total} chars={chunk_char_count} "
+            f"est_tokens={estimated_input_tokens} max_output_tokens={planned_max_output_tokens} "
+            f"model={model} url={request_url}",
             file=sys.stderr,
         )
 
@@ -1375,9 +1857,11 @@ def process_chunks(work_dir: str, prompt_name: str, extra_instruction: str = "",
                 max_retries=max_retries,
                 backoff_sec=backoff_sec,
                 stream_mode=stream_mode,
+                max_tokens=planned_max_output_tokens,
             )
             result_text = llm_result["text"]
             result_char_count = len(result_text)
+            actual_output_tokens = _estimate_tokens(result_text, "tokens", config)
             ratio = result_char_count / chunk_char_count if chunk_char_count > 0 else 0
             consecutive_timeouts = 0
 
@@ -1419,13 +1903,15 @@ def process_chunks(work_dir: str, prompt_name: str, extra_instruction: str = "",
             chunk_info["last_error_type"] = ""
             chunk_info["latency_ms"] = llm_result["latency_ms"]
             chunk_info["output_chars"] = result_char_count
+            chunk_info["actual_output_tokens"] = actual_output_tokens
             chunk_info["request_url"] = llm_result["request_url"]
             chunk_info["streaming_used"] = llm_result["streaming_used"]
             chunk_info["completed_at"] = _now_iso()
             chunk_info["updated_at"] = chunk_info["completed_at"]
             print(
                 f"Completed chunk {chunk_id + 1}/{total} latency={llm_result['latency_ms']}ms "
-                f"attempts={llm_result['attempts']} streaming={llm_result['streaming_used']} output_chars={result_char_count}",
+                f"attempts={llm_result['attempts']} streaming={llm_result['streaming_used']} "
+                f"output_chars={result_char_count} output_tokens={actual_output_tokens}",
                 file=sys.stderr,
             )
         except LLMRequestError as error:
@@ -2049,7 +2535,7 @@ def plan_optimization(state_path: str) -> dict:
     }
 
 
-def load_config(config_path: str = None) -> dict:
+def load_config(config_path: str = None, allow_missing: bool = False) -> dict:
     """
     Load configuration from config.yaml
 
@@ -2064,7 +2550,10 @@ def load_config(config_path: str = None) -> dict:
         config_path = str(_default_config_path())
 
     path = Path(config_path)
+    defaults = _default_config_values(str(path.absolute()))
     if not path.exists():
+        if allow_missing:
+            return defaults
         print(f"Error: Config file not found: {config_path}", file=sys.stderr)
         sys.exit(1)
 
@@ -2087,20 +2576,63 @@ def load_config(config_path: str = None) -> dict:
             if key:
                 config[key] = value
 
+    config_warnings = []
+
+    def parse_int_field(key: str, default: int, minimum: int | None = None, maximum: int | None = None) -> int:
+        raw = config.get(key)
+        if raw is None or raw == '':
+            return default
+        try:
+            parsed = int(str(raw).strip())
+        except (TypeError, ValueError):
+            config_warnings.append(f"{key}={raw!r} is not a valid integer; using default {default}")
+            return default
+        if minimum is not None and parsed < minimum:
+            if maximum is None:
+                config_warnings.append(f"{key}={raw!r} is below minimum {minimum}; using default {default}")
+            else:
+                config_warnings.append(f"{key}={raw!r} is outside [{minimum}, {maximum}]; using default {default}")
+            return default
+        if maximum is not None and parsed > maximum:
+            config_warnings.append(f"{key}={raw!r} is outside [{minimum}, {maximum}]; using default {default}")
+            return default
+        return parsed
+
+    def parse_float_field(key: str, default: float, minimum: float | None = None, maximum: float | None = None) -> float:
+        raw = config.get(key)
+        if raw is None or raw == '':
+            return default
+        try:
+            parsed = float(str(raw).strip())
+        except (TypeError, ValueError):
+            config_warnings.append(f"{key}={raw!r} is not a valid number; using default {default}")
+            return default
+        if minimum is not None and parsed < minimum:
+            if maximum is None:
+                config_warnings.append(f"{key}={raw!r} is below minimum {minimum}; using default {default}")
+            else:
+                config_warnings.append(f"{key}={raw!r} is outside [{minimum}, {maximum}]; using default {default}")
+            return default
+        if maximum is not None and parsed > maximum:
+            config_warnings.append(f"{key}={raw!r} is outside [{minimum}, {maximum}]; using default {default}")
+            return default
+        return parsed
+
     output_dir = config.get('output_dir', '')
     if output_dir:
         output_dir = os.path.expanduser(output_dir)
         if not os.path.isdir(output_dir):
             print(f"Warning: output_dir does not exist: {output_dir}", file=sys.stderr)
 
-    llm_timeout_sec = max(1, _parse_int(config.get('llm_timeout_sec'), 120))
-    llm_max_retries = max(0, _parse_int(config.get('llm_max_retries'), 3))
-    llm_backoff_sec = max(0.1, _parse_float(config.get('llm_backoff_sec'), 1.5))
-    llm_probe_timeout_sec = max(1, _parse_int(config.get('llm_probe_timeout_sec'), 20))
-    llm_probe_max_tokens = max(1, _parse_int(config.get('llm_probe_max_tokens'), 16))
-    llm_stop_after_consecutive_timeouts = max(1, _parse_int(config.get('llm_stop_after_consecutive_timeouts'), 2))
+    llm_timeout_sec = parse_int_field('llm_timeout_sec', 120, minimum=1)
+    llm_max_retries = parse_int_field('llm_max_retries', 3, minimum=0)
+    llm_backoff_sec = parse_float_field('llm_backoff_sec', 1.5, minimum=0.1)
+    llm_probe_timeout_sec = parse_int_field('llm_probe_timeout_sec', 20, minimum=1)
+    llm_probe_max_tokens = parse_int_field('llm_probe_max_tokens', 16, minimum=1)
+    llm_stop_after_consecutive_timeouts = parse_int_field('llm_stop_after_consecutive_timeouts', 2, minimum=1)
 
-    return {
+    parsed = dict(defaults)
+    parsed.update({
         "output_dir": output_dir,
         "deepgram_api_key": config.get('deepgram_api_key', ''),
         "llm_api_key": config.get('llm_api_key', ''),
@@ -2114,8 +2646,40 @@ def load_config(config_path: str = None) -> dict:
         "llm_probe_timeout_sec": llm_probe_timeout_sec,
         "llm_probe_max_tokens": llm_probe_max_tokens,
         "llm_stop_after_consecutive_timeouts": llm_stop_after_consecutive_timeouts,
-        "config_path": str(path.absolute())
-    }
+        "chunk_mode": _normalize_chunk_mode(config.get('chunk_mode', DEFAULT_CHUNK_MODE)),
+        "chunk_size_override": parse_int_field('chunk_size_override', 0, minimum=0),
+        "chunk_tokens_structure_only": parse_int_field('chunk_tokens_structure_only', TASK_CHUNK_TOKEN_DEFAULTS['structure_only'], minimum=1),
+        "chunk_tokens_quick_cleanup": parse_int_field('chunk_tokens_quick_cleanup', TASK_CHUNK_TOKEN_DEFAULTS['quick_cleanup'], minimum=1),
+        "chunk_tokens_translate_only": parse_int_field('chunk_tokens_translate_only', TASK_CHUNK_TOKEN_DEFAULTS['translate_only'], minimum=1),
+        "chunk_tokens_summarize": parse_int_field('chunk_tokens_summarize', TASK_CHUNK_TOKEN_DEFAULTS['summarize'], minimum=1),
+        "chunk_hard_cap_multiplier": parse_float_field(
+            'chunk_hard_cap_multiplier',
+            DEFAULT_CHUNK_HARD_CAP_MULTIPLIER,
+            minimum=1.0,
+            maximum=MAX_CHUNK_HARD_CAP_MULTIPLIER,
+        ),
+        "chunk_safety_buffer_tokens": parse_int_field('chunk_safety_buffer_tokens', DEFAULT_CHUNK_SAFETY_BUFFER_TOKENS, minimum=0),
+        "chunk_overlap_sentences": parse_int_field('chunk_overlap_sentences', DEFAULT_CHUNK_OVERLAP_SENTENCES, minimum=0),
+        "chunk_context_tail_sentences": parse_int_field('chunk_context_tail_sentences', DEFAULT_CHUNK_CONTEXT_TAIL_SENTENCES, minimum=0),
+        "chunk_context_summary_tokens": parse_int_field('chunk_context_summary_tokens', DEFAULT_CHUNK_CONTEXT_SUMMARY_TOKENS, minimum=0),
+        "output_ratio_structure_only": parse_float_field('output_ratio_structure_only', TASK_OUTPUT_RATIO_DEFAULTS['structure_only'], minimum=0.01),
+        "output_ratio_quick_cleanup": parse_float_field('output_ratio_quick_cleanup', TASK_OUTPUT_RATIO_DEFAULTS['quick_cleanup'], minimum=0.01),
+        "output_ratio_translate_only": parse_float_field('output_ratio_translate_only', TASK_OUTPUT_RATIO_DEFAULTS['translate_only'], minimum=0.01),
+        "output_ratio_summarize": parse_float_field('output_ratio_summarize', TASK_OUTPUT_RATIO_DEFAULTS['summarize'], minimum=0.01),
+        "max_output_tokens_structure_only": parse_int_field('max_output_tokens_structure_only', TASK_MAX_OUTPUT_TOKEN_DEFAULTS['structure_only'], minimum=1),
+        "max_output_tokens_quick_cleanup": parse_int_field('max_output_tokens_quick_cleanup', TASK_MAX_OUTPUT_TOKEN_DEFAULTS['quick_cleanup'], minimum=1),
+        "max_output_tokens_translate_only": parse_int_field('max_output_tokens_translate_only', TASK_MAX_OUTPUT_TOKEN_DEFAULTS['translate_only'], minimum=1),
+        "max_output_tokens_summarize": parse_int_field('max_output_tokens_summarize', TASK_MAX_OUTPUT_TOKEN_DEFAULTS['summarize'], minimum=1),
+        "enable_token_count_probe": _parse_bool(config.get('enable_token_count_probe'), DEFAULT_ENABLE_TOKEN_COUNT_PROBE),
+        "enable_chunk_autotune": _parse_bool(config.get('enable_chunk_autotune'), DEFAULT_ENABLE_CHUNK_AUTOTUNE),
+        "config_path": str(path.absolute()),
+        "config_warnings": config_warnings,
+    })
+    if config_warnings:
+        print(f"Warning: Invalid numeric config values in {path}:", file=sys.stderr)
+        for warning in config_warnings:
+            print(f"  - {warning}", file=sys.stderr)
+    return parsed
 def main():
     parser = argparse.ArgumentParser(
         description='yt-transcript utility script',
@@ -2201,9 +2765,11 @@ def main():
     chunk_parser.add_argument('input_path', help='Input text file path')
     chunk_parser.add_argument('output_dir', help='Output directory for chunks')
     chunk_parser.add_argument('--chunk-size', type=int, default=0,
-                              help='Target chunk size in characters (default: auto by prompt, fallback 8000)')
+                              help='Target chunk size in the active chunk_mode; without --prompt it keeps legacy character sizing')
     chunk_parser.add_argument('--prompt', default='',
                               help='Optional prompt name for task-aware auto chunk sizing')
+    chunk_parser.add_argument('--config-path', default=None,
+                              help='Optional path to config file for chunk planning')
 
     # get-chapters command
     chapters_parser = subparsers.add_parser(
@@ -2352,7 +2918,7 @@ def main():
         print(json.dumps(result, ensure_ascii=False))
 
     elif args.command == 'chunk-text':
-        result = chunk_text(args.input_path, args.output_dir, args.chunk_size, args.prompt)
+        result = chunk_text(args.input_path, args.output_dir, args.chunk_size, args.prompt, args.config_path)
         print(json.dumps(result, ensure_ascii=False))
 
     elif args.command == 'get-chapters':

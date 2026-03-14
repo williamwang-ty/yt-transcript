@@ -95,7 +95,7 @@ python3 <skill-root>/yt_transcript_utils.py get-chapters "$VIDEO_URL" > /tmp/${V
 python3 <skill-root>/yt_transcript_utils.py chunk-text \
     /tmp/${VIDEO_ID}_raw_text.txt \
     /tmp/${VIDEO_ID}_chunks \
-    --chunk-size 8000
+    --prompt structure_only
 ```
 
 Update state:

@@ -1,3 +1,4 @@
+import io
 import json
 import os
 import subprocess
@@ -98,13 +99,25 @@ class RegressionTests(unittest.TestCase):
         sentences = utils._split_sentences("Mr. Smith arrived. He spoke.")
         self.assertEqual(sentences, ["Mr. Smith arrived.", "He spoke."])
 
+    def test_estimate_tokens_heuristic_for_common_text_shapes(self):
+        self.assertAlmostEqual(utils._estimate_tokens("hello world"), 3, delta=1)
+        self.assertAlmostEqual(utils._estimate_tokens("你好世界"), 4, delta=1)
+        self.assertAlmostEqual(utils._estimate_tokens("Hello 世界"), 4, delta=1)
+        self.assertEqual(utils._estimate_tokens("abc", mode="chars"), 3)
+
     def test_chunk_text_hard_splits_overlong_sentence(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             source = Path(tmpdir) / "raw.txt"
             out_dir = Path(tmpdir) / "chunks"
+            config_path = Path(tmpdir) / "config.yaml"
             source.write_text("甲" * 25, encoding="utf-8")
+            config_path.write_text(
+                f'output_dir: "{tmpdir}"\n'
+                'chunk_mode: "chars"\n',
+                encoding="utf-8",
+            )
 
-            result = utils.chunk_text(str(source), str(out_dir), chunk_size=10)
+            result = utils.chunk_text(str(source), str(out_dir), chunk_size=10, config_path=str(config_path))
 
             self.assertEqual(result["total_chunks"], 3)
             self.assertTrue(any("split into 3 fixed-width segment" in warning for warning in result["warnings"]))
@@ -116,10 +129,16 @@ class RegressionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             source = Path(tmpdir) / "raw.txt"
             out_dir = Path(tmpdir) / "chunks"
+            config_path = Path(tmpdir) / "config.yaml"
             text = "这是一段没有标点的中文转录文本" * 50
             source.write_text(text, encoding="utf-8")
+            config_path.write_text(
+                f'output_dir: "{tmpdir}"\n'
+                'chunk_mode: "chars"\n',
+                encoding="utf-8",
+            )
 
-            result = utils.chunk_text(str(source), str(out_dir), chunk_size=80)
+            result = utils.chunk_text(str(source), str(out_dir), chunk_size=80, config_path=str(config_path))
 
             self.assertGreater(result["total_chunks"], 1)
             chunks = [path.read_text(encoding="utf-8") for path in sorted(out_dir.glob("chunk_*.txt"))]
@@ -130,10 +149,16 @@ class RegressionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             source = Path(tmpdir) / "raw.txt"
             out_dir = Path(tmpdir) / "chunks"
+            config_path = Path(tmpdir) / "config.yaml"
             text = (FIXTURES_DIR / "chinese_transcript_sample.txt").read_text(encoding="utf-8").strip()
             source.write_text(text, encoding="utf-8")
+            config_path.write_text(
+                f'output_dir: "{tmpdir}"\n'
+                'chunk_mode: "chars"\n',
+                encoding="utf-8",
+            )
 
-            result = utils.chunk_text(str(source), str(out_dir), chunk_size=70)
+            result = utils.chunk_text(str(source), str(out_dir), chunk_size=70, config_path=str(config_path))
 
             self.assertGreater(result["total_chunks"], 1)
             chunks = [path.read_text(encoding="utf-8") for path in sorted(out_dir.glob("chunk_*.txt"))]
@@ -578,7 +603,99 @@ class RegressionTests(unittest.TestCase):
             self.assertEqual(config["llm_probe_max_tokens"], 7)
             self.assertEqual(config["llm_stop_after_consecutive_timeouts"], 4)
 
-    def test_chunk_text_uses_prompt_aware_default_size(self):
+    def test_load_config_parses_chunk_tuning_fields(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "config.yaml"
+            config_path.write_text(
+                f'output_dir: "{tmpdir}"\n'
+                'chunk_mode: "chars"\n'
+                'chunk_size_override: "777"\n'
+                'chunk_tokens_structure_only: "1111"\n'
+                'chunk_tokens_quick_cleanup: "888"\n'
+                'chunk_tokens_translate_only: "999"\n'
+                'chunk_tokens_summarize: "2222"\n'
+                'chunk_hard_cap_multiplier: "1.5"\n'
+                'chunk_safety_buffer_tokens: "321"\n'
+                'chunk_overlap_sentences: "0"\n'
+                'chunk_context_tail_sentences: "2"\n'
+                'chunk_context_summary_tokens: "70"\n'
+                'output_ratio_structure_only: "1.2"\n'
+                'output_ratio_quick_cleanup: "1.08"\n'
+                'output_ratio_translate_only: "1.12"\n'
+                'output_ratio_summarize: "0.2"\n'
+                'max_output_tokens_structure_only: "1900"\n'
+                'max_output_tokens_quick_cleanup: "1450"\n'
+                'max_output_tokens_translate_only: "1550"\n'
+                'max_output_tokens_summarize: "512"\n'
+                'enable_token_count_probe: "false"\n'
+                'enable_chunk_autotune: "true"\n',
+                encoding="utf-8",
+            )
+
+            config = utils.load_config(str(config_path))
+
+            self.assertEqual(config["chunk_mode"], "chars")
+            self.assertEqual(config["chunk_size_override"], 777)
+            self.assertEqual(config["chunk_tokens_structure_only"], 1111)
+            self.assertEqual(config["chunk_tokens_quick_cleanup"], 888)
+            self.assertEqual(config["chunk_tokens_translate_only"], 999)
+            self.assertEqual(config["chunk_tokens_summarize"], 2222)
+            self.assertEqual(config["chunk_hard_cap_multiplier"], 1.5)
+            self.assertEqual(config["chunk_safety_buffer_tokens"], 321)
+            self.assertEqual(config["chunk_context_tail_sentences"], 2)
+            self.assertEqual(config["chunk_context_summary_tokens"], 70)
+            self.assertEqual(config["output_ratio_structure_only"], 1.2)
+            self.assertEqual(config["output_ratio_quick_cleanup"], 1.08)
+            self.assertEqual(config["output_ratio_translate_only"], 1.12)
+            self.assertEqual(config["output_ratio_summarize"], 0.2)
+            self.assertEqual(config["max_output_tokens_structure_only"], 1900)
+            self.assertEqual(config["max_output_tokens_quick_cleanup"], 1450)
+            self.assertEqual(config["max_output_tokens_translate_only"], 1550)
+            self.assertEqual(config["max_output_tokens_summarize"], 512)
+            self.assertFalse(config["enable_token_count_probe"])
+            self.assertTrue(config["enable_chunk_autotune"])
+
+    def test_load_config_invalid_chunk_values_fall_back(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "config.yaml"
+            config_path.write_text(
+                f'output_dir: "{tmpdir}"\n'
+                'chunk_mode: "weird"\n'
+                'chunk_size_override: "oops"\n'
+                'chunk_tokens_structure_only: "bad"\n'
+                'chunk_hard_cap_multiplier: "10.0"\n'
+                'chunk_safety_buffer_tokens: "-1"\n'
+                'chunk_context_tail_sentences: "-1"\n'
+                'chunk_context_summary_tokens: "-1"\n'
+                'output_ratio_summarize: "bad"\n'
+                'max_output_tokens_summarize: "0"\n'
+                'enable_token_count_probe: "banana"\n'
+                'enable_chunk_autotune: "banana"\n',
+                encoding="utf-8",
+            )
+
+            with mock.patch('sys.stderr', new_callable=io.StringIO) as fake_stderr:
+                config = utils.load_config(str(config_path))
+
+            self.assertEqual(config["chunk_mode"], "tokens")
+            self.assertEqual(config["chunk_size_override"], 0)
+            self.assertEqual(config["chunk_tokens_structure_only"], 1200)
+            self.assertEqual(config["chunk_hard_cap_multiplier"], 1.33)
+            self.assertEqual(config["chunk_safety_buffer_tokens"], 400)
+            self.assertEqual(config["chunk_context_tail_sentences"], 1)
+            self.assertEqual(config["chunk_context_summary_tokens"], 60)
+            self.assertEqual(config["output_ratio_summarize"], 0.15)
+            self.assertEqual(config["max_output_tokens_summarize"], 384)
+            self.assertTrue(config["enable_token_count_probe"])
+            self.assertFalse(config["enable_chunk_autotune"])
+            self.assertGreaterEqual(len(config["config_warnings"]), 6)
+            warning_output = fake_stderr.getvalue()
+            self.assertIn("Warning: Invalid numeric config values", warning_output)
+            self.assertIn("chunk_size_override='oops'", warning_output)
+            self.assertIn("chunk_hard_cap_multiplier='10.0'", warning_output)
+            self.assertIn("max_output_tokens_summarize='0'", warning_output)
+
+    def test_chunk_text_uses_token_aware_default_budget(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             source = Path(tmpdir) / "raw.txt"
             out_dir = Path(tmpdir) / "chunks"
@@ -587,9 +704,111 @@ class RegressionTests(unittest.TestCase):
             result = utils.chunk_text(str(source), str(out_dir), 0, "structure_only")
             manifest = json.loads((out_dir / "manifest.json").read_text(encoding="utf-8"))
 
+            self.assertEqual(result["chunk_mode"], "tokens")
+            self.assertEqual(manifest["chunk_mode"], "tokens")
+            self.assertEqual(result["target_tokens"], manifest["target_tokens"])
+            self.assertLess(manifest["planned_max_output_tokens"], 1800)
+            self.assertGreater(result["total_chunks"], 1)
+
+    def test_chunk_text_chars_mode_preserves_legacy_prompt_default(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source = Path(tmpdir) / "raw.txt"
+            out_dir = Path(tmpdir) / "chunks"
+            config_path = Path(tmpdir) / "config.yaml"
+            source.write_text("甲" * 9000, encoding="utf-8")
+            config_path.write_text(
+                f'output_dir: "{tmpdir}"\n'
+                'chunk_mode: "chars"\n',
+                encoding="utf-8",
+            )
+
+            result = utils.chunk_text(str(source), str(out_dir), 0, "structure_only", str(config_path))
+            manifest = json.loads((out_dir / "manifest.json").read_text(encoding="utf-8"))
+
+            self.assertEqual(result["chunk_mode"], "chars")
             self.assertEqual(result["chunk_size"], 4000)
             self.assertEqual(manifest["recommended_chunk_size"], 4000)
-            self.assertGreater(result["total_chunks"], 1)
+
+    def test_chunk_text_varies_by_prompt_in_token_mode(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source = Path(tmpdir) / "raw.txt"
+            structure_dir = Path(tmpdir) / "structure"
+            summary_dir = Path(tmpdir) / "summary"
+            source.write_text(("这是一个用于测试分块预算的句子。" * 800), encoding="utf-8")
+
+            structure_result = utils.chunk_text(str(source), str(structure_dir), 0, "structure_only")
+            summary_result = utils.chunk_text(str(source), str(summary_dir), 0, "summarize")
+
+            self.assertEqual(structure_result["chunk_mode"], "tokens")
+            self.assertEqual(summary_result["chunk_mode"], "tokens")
+            self.assertLess(structure_result["chunk_size"], summary_result["chunk_size"])
+            self.assertGreater(structure_result["total_chunks"], summary_result["total_chunks"])
+
+    def test_chunk_text_explicit_size_without_prompt_uses_legacy_char_sizing(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source = Path(tmpdir) / "raw.txt"
+            out_dir = Path(tmpdir) / "chunks"
+            source.write_text("甲" * 25, encoding="utf-8")
+
+            result = utils.chunk_text(str(source), str(out_dir), 10)
+            manifest = json.loads((out_dir / "manifest.json").read_text(encoding="utf-8"))
+            chunks = [path.read_text(encoding="utf-8") for path in sorted(out_dir.glob("chunk_*.txt"))]
+
+            self.assertEqual(result["chunk_mode"], "chars")
+            self.assertEqual(manifest["chunk_mode"], "chars")
+            self.assertEqual(result["total_chunks"], 3)
+            self.assertEqual([len(chunk) for chunk in chunks], [10, 10, 5])
+
+    def test_chunk_text_missing_explicit_config_path_fails_fast(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source = Path(tmpdir) / "raw.txt"
+            out_dir = Path(tmpdir) / "chunks"
+            source.write_text("第一句。第二句。", encoding="utf-8")
+
+            with self.assertRaises(SystemExit):
+                utils.chunk_text(str(source), str(out_dir), 0, "structure_only", "/no/such/config.yaml")
+
+    def test_chunk_text_unknown_prompt_fails_fast(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source = Path(tmpdir) / "raw.txt"
+            out_dir = Path(tmpdir) / "chunks"
+            source.write_text("第一句。第二句。", encoding="utf-8")
+
+            with self.assertRaises(SystemExit):
+                utils.chunk_text(str(source), str(out_dir), 0, "not_a_prompt")
+
+    def test_chunk_text_rejects_prompt_path_traversal(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source = Path(tmpdir) / "raw.txt"
+            out_dir = Path(tmpdir) / "chunks"
+            source.write_text("第一句。第二句。", encoding="utf-8")
+
+            with self.assertRaises(SystemExit):
+                utils.chunk_text(str(source), str(out_dir), 0, "../CODE_REVIEW")
+
+    def test_calculate_chunk_budget_varies_by_prompt_and_override(self):
+        default_config = utils._default_config_values()
+        structure_prompt = (PROJECT_ROOT / "prompts" / "structure_only.md").read_text(encoding="utf-8")
+        summary_prompt = (PROJECT_ROOT / "prompts" / "summarize.md").read_text(encoding="utf-8")
+
+        structure_budget = utils._calculate_chunk_budget("structure_only", structure_prompt, default_config)
+        summary_budget = utils._calculate_chunk_budget("summarize", summary_prompt, default_config)
+
+        self.assertLess(structure_budget["target_tokens"], summary_budget["target_tokens"])
+        self.assertLess(structure_budget["planned_max_output_tokens"], 1800)
+        self.assertEqual(summary_budget["planned_max_output_tokens"], 384)
+
+        structure_total = (
+            structure_budget["prompt_tokens"]
+            + structure_budget["target_tokens"]
+            + structure_budget["planned_max_output_tokens"]
+            + structure_budget["safety_buffer_tokens"]
+        )
+        self.assertLessEqual(structure_total, structure_budget["effective_budget_tokens"])
+
+        override_config = utils._default_config_values()
+        override_config["chunk_size_override"] = 777
+        self.assertEqual(utils._get_task_chunk_target("structure_only", override_config), 777)
 
     def test_call_llm_api_retries_timeout_then_succeeds(self):
         with mock.patch.object(utils, "_execute_llm_request") as mocked_request, mock.patch("time.sleep"):
@@ -658,6 +877,86 @@ class RegressionTests(unittest.TestCase):
             self.assertTrue(result["success"])
             self.assertEqual(result["skipped_count"], 1)
             mocked_call.assert_not_called()
+
+    def test_process_chunks_uses_prompt_specific_max_output_tokens(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source = Path(tmpdir) / "raw.txt"
+            work_dir = Path(tmpdir) / "chunks"
+            source.write_text("第一句。第二句。", encoding="utf-8")
+            utils.chunk_text(str(source), str(work_dir), 50, "summarize")
+
+            config = utils._default_config_values()
+            config.update({
+                "llm_api_key": "key",
+                "llm_base_url": "https://api.example.com",
+                "llm_model": "demo",
+                "llm_api_format": "openai",
+                "llm_timeout_sec": 30,
+                "llm_max_retries": 0,
+                "llm_backoff_sec": 0.1,
+                "llm_stream": "false",
+                "llm_stop_after_consecutive_timeouts": 2,
+            })
+
+            with mock.patch.object(utils, "load_config", return_value=config), mock.patch.object(
+                utils,
+                "_call_llm_api",
+                return_value={
+                    "text": "总结结果",
+                    "latency_ms": 12,
+                    "request_url": "https://api.example.com/v1/chat/completions",
+                    "streaming_used": False,
+                    "attempts": 1,
+                },
+            ) as mocked_call:
+                result = utils.process_chunks(str(work_dir), "summarize")
+
+            manifest = json.loads((work_dir / "manifest.json").read_text(encoding="utf-8"))
+            self.assertTrue(result["success"])
+            self.assertEqual(mocked_call.call_args.kwargs["max_tokens"], 384)
+            self.assertEqual(manifest["planned_max_output_tokens"], 384)
+            self.assertEqual(manifest["chunks"][0]["planned_max_output_tokens"], 384)
+
+    def test_process_chunks_dry_run_preserves_char_manifest_units(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source = Path(tmpdir) / "raw.txt"
+            work_dir = Path(tmpdir) / "chunks"
+            source.write_text(("第一句。第二句。第三句。第四句。" * 200), encoding="utf-8")
+            utils.chunk_text(str(source), str(work_dir), 4000)
+
+            config = utils._default_config_values()
+            config.update({
+                "llm_api_key": "key",
+                "llm_base_url": "https://api.example.com",
+                "llm_model": "demo",
+                "llm_api_format": "openai",
+            })
+
+            with mock.patch.object(utils, "load_config", return_value=config):
+                result = utils.process_chunks(str(work_dir), "structure_only", dry_run=True)
+
+            self.assertTrue(result["success"])
+            self.assertEqual(result["chunk_mode"], "chars")
+            self.assertEqual(result["recommended_chunk_size"], 4000)
+            self.assertFalse(any("1200" in warning for warning in result["warnings"]))
+
+    def test_process_chunks_rejects_prompt_path_traversal(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source = Path(tmpdir) / "raw.txt"
+            work_dir = Path(tmpdir) / "chunks"
+            source.write_text("第一句。第二句。", encoding="utf-8")
+            utils.chunk_text(str(source), str(work_dir), 50, "structure_only")
+
+            config = utils._default_config_values()
+            config.update({
+                "llm_api_key": "key",
+                "llm_base_url": "https://api.example.com",
+                "llm_model": "demo",
+                "llm_api_format": "openai",
+            })
+
+            with mock.patch.object(utils, "load_config", return_value=config), self.assertRaises(SystemExit):
+                utils.process_chunks(str(work_dir), "../CODE_REVIEW", dry_run=True)
 
     def test_process_chunks_aborts_after_consecutive_timeouts(self):
         with tempfile.TemporaryDirectory() as tmpdir:

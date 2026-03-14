@@ -152,6 +152,11 @@ This keeps workflow logic in scripts instead of ad-hoc shell parsing inside the 
 - YAML frontmatter values are always quoted on purpose to favor safe parsing over prettier formatting
 - Markdown header text is escaped and link destinations are encoded so edge-case titles/channels do not break output structure
 - `chunk-text` force-splits very long unpunctuated passages to stay within downstream LLM chunk budgets
+- `chunk-text` now defaults to token-aware planning when `--prompt` is provided, while an explicit `--chunk-size` without `--prompt` keeps legacy character sizing for workflow compatibility
+- prompt names are validated eagerly for chunk planning, so typos fail fast instead of silently falling back to generic budgets
+- `process-chunks` now assigns prompt-specific `max_output_tokens` from the same planning budget instead of using one large shared default
+- token estimation is heuristic rather than exact; the current fallback intentionally overestimates common transcript shapes and relies on safety buffers until provider-side token counting is available
+- `chunk_hard_cap_multiplier` is constrained to a conservative `1.0-2.0` range so misconfiguration cannot silently blow up chunk envelopes
 - `preflight.sh` is staged so subtitle-only workflows do not require Deepgram or LLM credentials up front, while `--require-llm` now performs a real probe
 - `transcribe-deepgram` is the only supported Deepgram entry point; split / merge behavior is owned by the Python utility
 - `verify-quality` is a hard gate only when `hard_failures` is non-empty; `warnings` are advisory review signals
@@ -356,7 +361,12 @@ bash scripts/preflight.sh --require-llm
 - `config.yaml` 被刻意限制为扁平的顶层键值配置，不支持嵌套结构或多行 YAML
 - YAML frontmatter 的值会统一加引号，优先保证解析安全，而不是追求最简洁的展示
 - Markdown 头部里的标题/频道文本会做转义，链接目标会做编码，避免边界字符破坏结构
-- `chunk-text` 会对超长且缺少标点的段落做强制切分，并可按 prompt 自动选择更保守的 chunk 大小
+- `chunk-text` 会对超长且缺少标点的段落做强制切分，并在提供 `--prompt` 时默认启用 token-aware 规划
+- 如果只传显式 `--chunk-size` 而不传 `--prompt`，`chunk-text` 会继续按 legacy 字符大小解释，避免现有 workflow 被静默改变
+- 分块阶段会提前校验 prompt 名称，避免因为 prompt 拼写错误而静默回退到通用预算
+- `process-chunks` 现在按 prompt 预算单独设置 `max_output_tokens`，不再复用单一的大默认值
+- 当前 token 估算仍是启发式 fallback，不是精确 tokenizer；在 provider 级 token count 可用前，主要依靠 safety buffer 保守规划
+- `chunk_hard_cap_multiplier` 会被限制在保守的 `1.0-2.0` 区间，避免配置失误把 chunk 包络静默放大
 - `preflight.sh` 采用分层校验，确保只走字幕路径时不必预先配置 Deepgram 或 LLM 凭据
 - `transcribe-deepgram` 是唯一支持的 Deepgram 统一入口，分片与合并逻辑由 Python 工具统一负责
 - `verify-quality` 只有在 `hard_failures` 非空时才阻断流程；`warnings` 仅用于人工复核提示

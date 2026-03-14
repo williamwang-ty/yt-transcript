@@ -30,3 +30,29 @@ llm_probe_timeout_sec: 20
 llm_probe_max_tokens: 16
 # Stop batch if provider times out repeatedly
 llm_stop_after_consecutive_timeouts: 2
+
+# Chunk planning
+# Default mode is token-aware. Set to "chars" for legacy character chunking.
+chunk_mode: "tokens"
+# Override the per-task chunk target in the active mode. 0 disables override.
+chunk_size_override: 0
+chunk_tokens_structure_only: 1200
+chunk_tokens_quick_cleanup: 1000
+chunk_tokens_translate_only: 900
+chunk_tokens_summarize: 2500
+# Soft target * multiplier for forced split guardrail. Valid range: 1.0-2.0.
+chunk_hard_cap_multiplier: 1.33
+chunk_safety_buffer_tokens: 400
+chunk_overlap_sentences: 0
+chunk_context_tail_sentences: 1
+chunk_context_summary_tokens: 60
+output_ratio_structure_only: 1.15
+output_ratio_quick_cleanup: 1.05
+output_ratio_translate_only: 1.10
+output_ratio_summarize: 0.15
+max_output_tokens_structure_only: 1800
+max_output_tokens_quick_cleanup: 1400
+max_output_tokens_translate_only: 1500
+max_output_tokens_summarize: 384
+enable_token_count_probe: true
+enable_chunk_autotune: false
