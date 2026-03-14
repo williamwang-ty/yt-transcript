@@ -170,6 +170,21 @@ if [ "$REQUIRE_LLM" = true ]; then
         exit 1
     fi
     echo "✅ LLM API configuration is present"
+
+    echo "🌐 Probing LLM API reachability..."
+    if LLM_PROBE_JSON=$(python3 "$ROOT_DIR/yt_transcript_utils.py" test-llm-api --config-path "$CONFIG_FILE" 2>/dev/null); then
+        LLM_PROBE_LATENCY=$(printf '%s' "$LLM_PROBE_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin).get('latency_ms', ''))")
+        LLM_PROBE_URL=$(printf '%s' "$LLM_PROBE_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin).get('request_url', ''))")
+        LLM_PROBE_STREAM=$(printf '%s' "$LLM_PROBE_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin).get('streaming_used', False))")
+        echo "✅ LLM API probe succeeded (${LLM_PROBE_LATENCY} ms, stream=${LLM_PROBE_STREAM})"
+        if [ -n "$LLM_PROBE_URL" ]; then
+            echo "ℹ️  LLM request URL: $LLM_PROBE_URL"
+        fi
+    else
+        echo "❌ Error: LLM API probe failed. Check your key, model, base URL, provider latency, or gateway settings"
+        python3 "$ROOT_DIR/yt_transcript_utils.py" test-llm-api --config-path "$CONFIG_FILE"
+        exit 1
+    fi
 elif [ -n "$LLM_API_KEY" ] && [ -n "$LLM_BASE_URL" ] && [ -n "$LLM_MODEL" ]; then
     echo "✅ LLM API configuration is present (not required for this run)"
 else

@@ -17,6 +17,7 @@ Commands:
     transcribe-deepgram <audio_path>  Call Deepgram API and auto-merge split chunks
     sanitize-filename "<title>"    Clean illegal filename characters
     test-deepgram-api <api_key>    Test Deepgram API key validity
+    test-llm-api                   Probe configured LLM API reachability
     split-audio <audio_path>       Split large audio at silence points (--max-size, --max-deviation)
     chunk-text <input> <output_dir> Split text file into chunks by sentence boundary
     get-chapters <video_url>       Fetch YouTube video chapter metadata
@@ -33,9 +34,12 @@ import bisect
 import json
 import math
 import os
+import random
 import re
+import socket
 import subprocess
 import sys
+import time
 import urllib.parse
 from pathlib import Path
 
@@ -122,6 +126,267 @@ def _build_api_url(base_url: str, api_format: str = "openai") -> str:
     if base.endswith("/v1"):
         return f"{base}/chat/completions"
     return f"{base}/v1/chat/completions"
+
+
+class LLMRequestError(Exception):
+    def __init__(self, message: str, *, error_type: str = "unknown",
+                 status_code: int = None, retryable: bool = False,
+                 request_url: str = "", response_body: str = ""):
+        super().__init__(message)
+        self.error_type = error_type
+        self.status_code = status_code
+        self.retryable = retryable
+        self.request_url = request_url
+        self.response_body = response_body
+
+
+def _parse_bool(value, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _parse_int(value, default: int) -> int:
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return default
+
+
+def _parse_float(value, default: float) -> float:
+    try:
+        return float(str(value).strip())
+    except (TypeError, ValueError):
+        return default
+
+
+def _normalize_stream_mode(value) -> str:
+    if value is None:
+        return "auto"
+    text = str(value).strip().lower()
+    if text in {"auto", "true", "false"}:
+        return text
+    return "auto"
+
+
+def _now_iso() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime())
+
+
+def _recommended_chunk_size(prompt_name: str = "") -> int:
+    prompt = (prompt_name or "").strip().lower()
+    if prompt == "translate_only":
+        return 3000
+    if prompt in {"structure_only", "quick_cleanup"}:
+        return 4000
+    if prompt == "summarize":
+        return 8000
+    return 8000
+
+
+def _atomic_write_text(path: Path, content: str) -> None:
+    tmp_path = path.with_name(f".{path.name}.tmp")
+    tmp_path.write_text(content, encoding="utf-8")
+    os.replace(tmp_path, path)
+
+
+def _write_manifest(manifest_path: Path, manifest: dict) -> None:
+    _atomic_write_text(manifest_path, json.dumps(manifest, ensure_ascii=False, indent=2))
+
+
+def _is_retryable_status(status_code: int) -> bool:
+    return status_code in {408, 409, 425, 429} or status_code >= 500
+
+
+def _is_timeout_error(error: Exception) -> bool:
+    if isinstance(error, LLMRequestError):
+        if error.status_code in {408, 504}:
+            return True
+        return error.error_type in {"timeout", "socket_timeout", "read_timeout"}
+    return False
+
+
+def _extract_openai_stream_text(payload: dict) -> str:
+    choices = payload.get("choices") or []
+    if not choices:
+        return ""
+    delta = choices[0].get("delta") or {}
+    content = delta.get("content", "")
+    if isinstance(content, list):
+        return "".join(part.get("text", "") for part in content if isinstance(part, dict))
+    return content or ""
+
+
+def _extract_anthropic_stream_text(payload: dict) -> str:
+    event_type = payload.get("type", "")
+    if event_type == "content_block_start":
+        block = payload.get("content_block") or {}
+        if block.get("type") == "text":
+            return block.get("text", "")
+    if event_type == "content_block_delta":
+        delta = payload.get("delta") or {}
+        if delta.get("type") == "text_delta":
+            return delta.get("text", "")
+    return ""
+
+
+def _extract_llm_text(result: dict, api_format: str) -> str:
+    if api_format == "anthropic":
+        content = result.get("content") or []
+        text_parts = []
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                text_parts.append(block.get("text", ""))
+        if text_parts:
+            return "".join(text_parts)
+        raise KeyError("content")
+    return result["choices"][0]["message"]["content"]
+
+
+def _read_streaming_response(response, api_format: str) -> str:
+    text_parts = []
+    for raw_line in response:
+        line = raw_line.decode("utf-8", errors="replace").strip()
+        if not line or line.startswith("event:"):
+            continue
+        if not line.startswith("data:"):
+            continue
+        data = line[5:].strip()
+        if data == "[DONE]":
+            break
+        try:
+            payload = json.loads(data)
+        except json.JSONDecodeError:
+            continue
+        if api_format == "anthropic":
+            text = _extract_anthropic_stream_text(payload)
+        else:
+            text = _extract_openai_stream_text(payload)
+        if text:
+            text_parts.append(text)
+    return "".join(text_parts)
+
+
+def _build_llm_request(api_key: str, base_url: str, model: str, messages: list,
+                       api_format: str = "openai", max_tokens: int = 8192,
+                       temperature: float = 0.3, use_stream: bool = False) -> tuple[str, dict, bytes]:
+    if api_format == "anthropic":
+        url = _build_api_url(base_url, api_format)
+        headers = {
+            "x-api-key": api_key,
+            "Content-Type": "application/json",
+            "anthropic-version": "2023-06-01",
+            "User-Agent": "yt-transcript/4.0"
+        }
+        body = {
+            "model": model,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "messages": messages
+        }
+    else:
+        url = _build_api_url(base_url, api_format)
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "User-Agent": "yt-transcript/4.0"
+        }
+        body = {
+            "model": model,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "messages": messages
+        }
+
+    if use_stream:
+        body["stream"] = True
+
+    return url, headers, json.dumps(body).encode("utf-8")
+
+
+def _execute_llm_request(api_key: str, base_url: str, model: str, messages: list,
+                         api_format: str = "openai", max_tokens: int = 8192,
+                         temperature: float = 0.3, timeout_sec: int = 120,
+                         use_stream: bool = False) -> dict:
+    import urllib.error
+    import urllib.request
+
+    url, headers, data = _build_llm_request(
+        api_key=api_key,
+        base_url=base_url,
+        model=model,
+        messages=messages,
+        api_format=api_format,
+        max_tokens=max_tokens,
+        temperature=temperature,
+        use_stream=use_stream,
+    )
+    req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+
+    try:
+        started_at = time.monotonic()
+        with urllib.request.urlopen(req, timeout=timeout_sec) as response:
+            content_type = (response.headers.get("Content-Type") or "").lower()
+            if use_stream and "text/event-stream" in content_type:
+                text = _read_streaming_response(response, api_format)
+                streaming_used = True
+            else:
+                result = json.loads(response.read().decode("utf-8"))
+                text = _extract_llm_text(result, api_format)
+                streaming_used = False
+        latency_ms = int((time.monotonic() - started_at) * 1000)
+        return {
+            "text": text,
+            "latency_ms": latency_ms,
+            "request_url": url,
+            "streaming_used": streaming_used,
+        }
+    except urllib.error.HTTPError as e:
+        error_body = e.read().decode("utf-8", errors="replace")
+        status_code = e.code
+        raise LLMRequestError(
+            f"HTTP {status_code}: {error_body}",
+            error_type=f"http_{status_code}",
+            status_code=status_code,
+            retryable=_is_retryable_status(status_code),
+            request_url=url,
+            response_body=error_body,
+        ) from e
+    except urllib.error.URLError as e:
+        reason = getattr(e, "reason", e)
+        message = str(reason)
+        retryable = isinstance(reason, socket.timeout) or "timed out" in message.lower()
+        raise LLMRequestError(
+            f"Cannot reach LLM API: {message}",
+            error_type="timeout" if retryable else "network",
+            retryable=retryable,
+            request_url=url,
+        ) from e
+    except (socket.timeout, TimeoutError) as e:
+        raise LLMRequestError(
+            f"LLM API call timed out: {e}",
+            error_type="timeout",
+            retryable=True,
+            request_url=url,
+        ) from e
+    except (KeyError, IndexError) as e:
+        raise LLMRequestError(
+            f"Unexpected API response structure: {e}",
+            error_type="bad_response",
+            retryable=False,
+            request_url=url,
+        ) from e
+    except Exception as e:
+        message = str(e)
+        is_timeout = "timed out" in message.lower()
+        raise LLMRequestError(
+            f"LLM API call failed: {e}",
+            error_type="timeout" if is_timeout else "unknown",
+            retryable=is_timeout,
+            request_url=url,
+        ) from e
 
 
 def _split_sentences(text: str) -> list[str]:
@@ -562,117 +827,113 @@ def test_deepgram_api(api_key: str) -> dict:
         return {"valid": False, "error": f"Unexpected error: {e}", "balance_warning": False}
 
 
-def chunk_text(input_path: str, output_dir: str, chunk_size: int = 8000) -> dict:
+def chunk_text(input_path: str, output_dir: str, chunk_size: int = 0,
+               prompt_name: str = "") -> dict:
     """
-    Split text file into chunks by sentence boundary
-    
-    Algorithm:
-    1. Read entire text file
-    2. Split by sentence-ending punctuation (.!?。！？)
-    3. Accumulate sentences until reaching chunk_size
-    4. Write each chunk to separate file
-    5. Generate manifest.json for tracking
-    
-    Args:
-        input_path: Path to raw text file
-        output_dir: Directory to write chunks
-        chunk_size: Target size per chunk in characters (default 8000)
-    
-    Returns:
-        {"total_chunks": N, "manifest_path": "...", "chunks": [...], "warnings": [...]}
+    Split text file into chunks by sentence boundary.
+
+    When chunk_size is omitted or non-positive, choose a prompt-aware default.
     """
     path = Path(input_path)
     if not path.exists():
         print(f"Error: File does not exist {input_path}", file=sys.stderr)
         sys.exit(1)
-    
-    # Create output directory
+
+    effective_chunk_size = chunk_size if chunk_size and chunk_size > 0 else _recommended_chunk_size(prompt_name)
+
     out_dir = Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    
-    # Read text content
+
     try:
         text = path.read_text(encoding='utf-8')
     except Exception as e:
         print(f"Error: Cannot read file {e}", file=sys.stderr)
         sys.exit(2)
-    
+
     sentences = _split_sentences(text)
-    
-    # Accumulate sentences into chunks
+
     chunks = []
     current_chunk = []
     current_size = 0
     warnings = []
-    
+
     for i, sentence in enumerate(sentences):
         sentence_segments = [sentence]
         sentence_len = len(sentence)
 
-        if sentence_len > chunk_size:
-            # This is an intentional degradation path for long unpunctuated
-            # transcripts (common in raw STT output). Preserving the exact
-            # sentence boundary is less important than keeping chunk size within
-            # the downstream LLM budget.
-            sentence_segments = _hard_split_text(sentence, chunk_size)
+        if sentence_len > effective_chunk_size:
+            sentence_segments = _hard_split_text(sentence, effective_chunk_size)
             warnings.append(
-                f"Sentence {i} exceeds chunk_size ({sentence_len} > {chunk_size}), split into {len(sentence_segments)} fixed-width segment(s)"
+                f"Sentence {i} exceeds chunk_size ({sentence_len} > {effective_chunk_size}), split into {len(sentence_segments)} fixed-width segment(s)"
             )
 
         for segment in sentence_segments:
             segment_len = len(segment)
-
-            # If adding this segment exceeds chunk_size and we have content, start new chunk
-            if current_size + segment_len > chunk_size and current_chunk:
+            if current_size + segment_len > effective_chunk_size and current_chunk:
                 chunks.append('\n\n'.join(current_chunk))
                 current_chunk = [segment]
                 current_size = segment_len
             else:
                 current_chunk.append(segment)
-                current_size += segment_len + 2  # +2 for '\n\n' separator
-    
-    # Don't forget the last chunk
+                current_size += segment_len + 2
+
     if current_chunk:
         chunks.append('\n\n'.join(current_chunk))
-    
-    # Write chunks to files and build manifest
+
     manifest = {
         "total_chunks": len(chunks),
-        "chunk_size": chunk_size,
-        "source_file": str(path.absolute()),  # Use absolute path for clarity
-        "work_dir": str(out_dir.absolute()),   # Record work directory
+        "chunk_size": effective_chunk_size,
+        "recommended_chunk_size": _recommended_chunk_size(prompt_name),
+        "prompt_name": prompt_name,
+        "source_file": str(path.absolute()),
+        "work_dir": str(out_dir.absolute()),
         "chunks": []
     }
-    
+
     for i, chunk_content in enumerate(chunks):
         chunk_filename = f"chunk_{i:03d}.txt"
         chunk_path = out_dir / chunk_filename
-        chunk_path.write_text(chunk_content, encoding='utf-8')
-        
+        _atomic_write_text(chunk_path, chunk_content)
+
         manifest["chunks"].append({
             "id": i,
             "raw_path": chunk_filename,
             "processed_path": f"processed_{i:03d}.md",
             "char_count": len(chunk_content),
-            "status": "pending"
+            "input_chars": len(chunk_content),
+            "output_chars": 0,
+            "status": "pending",
+            "attempts": 0,
+            "last_error": "",
+            "last_error_type": "",
+            "latency_ms": None,
+            "request_url": "",
+            "streaming_used": False,
+            "updated_at": "",
+            "started_at": "",
+            "completed_at": "",
         })
-    
-    # Write manifest
+
     manifest_path = out_dir / "manifest.json"
-    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
-    
-    # Print warnings if any
+    _write_manifest(manifest_path, manifest)
+
     for warning in warnings:
         print(f"⚠️ {warning}", file=sys.stderr)
-    
+
+    if prompt_name and chunk_size <= 0:
+        print(
+            f"ℹ️ Auto-selected chunk_size={effective_chunk_size} for prompt '{prompt_name}'",
+            file=sys.stderr,
+        )
+
     return {
         "total_chunks": len(chunks),
         "manifest_path": str(manifest_path),
         "chunks": [c["raw_path"] for c in manifest["chunks"]],
-        "warnings": warnings
+        "warnings": warnings,
+        "chunk_size": effective_chunk_size,
+        "recommended_chunk_size": manifest["recommended_chunk_size"],
     }
-
-
 def get_chapters(video_url: str, timeout: int = 30) -> dict:
     """
     Fetch YouTube video chapter metadata using yt-dlp
@@ -833,145 +1094,201 @@ def merge_content(work_dir: str, output_file: str, header_content: str = "") -> 
 
 def _call_llm_api(api_key: str, base_url: str, model: str, messages: list,
                   api_format: str = "openai", max_tokens: int = 8192,
-                  temperature: float = 0.3) -> str:
+                  temperature: float = 0.3, timeout_sec: int = 120,
+                  max_retries: int = 3, backoff_sec: float = 1.5,
+                  stream_mode: str = "auto") -> dict:
     """
-    Call LLM API with support for both OpenAI and Anthropic formats.
-    
-    Uses urllib (no external dependencies) to make HTTP requests.
-    
-    Args:
-        api_key: API key for authentication
-        base_url: Base URL of the API endpoint
-        model: Model identifier
-        messages: List of message dicts [{"role": "user", "content": "..."}]
-        api_format: "openai" or "anthropic"
-        max_tokens: Maximum tokens in response
-        temperature: Sampling temperature
-    
+    Call LLM API with configurable timeout, bounded retries, and optional streaming.
+
     Returns:
-        Response text content
+        {
+            "text": "...",
+            "latency_ms": 1234,
+            "request_url": "...",
+            "streaming_used": True,
+            "attempts": 2,
+        }
     """
-    import urllib.request
-    import urllib.error
-    
-    if api_format == "anthropic":
-        url = _build_api_url(base_url, api_format)
-        headers = {
-            "x-api-key": api_key,
-            "Content-Type": "application/json",
-            "anthropic-version": "2023-06-01",
-            "User-Agent": "yt-transcript/4.0"
+    stream_mode = _normalize_stream_mode(stream_mode)
+    use_stream = stream_mode in {"auto", "true"}
+    last_error = None
+
+    for attempt in range(1, max_retries + 2):
+        try:
+            result = _execute_llm_request(
+                api_key=api_key,
+                base_url=base_url,
+                model=model,
+                messages=messages,
+                api_format=api_format,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                timeout_sec=timeout_sec,
+                use_stream=use_stream,
+            )
+            result["attempts"] = attempt
+            result["stream_mode"] = stream_mode
+            return result
+        except LLMRequestError as error:
+            error.attempts = attempt
+            last_error = error
+
+            response_hint = (error.response_body or "").lower()
+            stream_unsupported = any(token in response_hint for token in ("stream", "sse", "event-stream"))
+            if stream_mode == "auto" and use_stream and error.status_code in {400, 422} and stream_unsupported:
+                print(
+                    f"ℹ️ Streaming unsupported at {error.request_url or _build_api_url(base_url, api_format)}; retrying once without stream.",
+                    file=sys.stderr,
+                )
+                use_stream = False
+                continue
+
+            if not error.retryable or attempt > max_retries:
+                raise error
+
+            sleep_sec = (backoff_sec * (2 ** (attempt - 1))) + random.uniform(0, max(backoff_sec, 0.1))
+            print(
+                f"Retrying LLM request after {error.error_type} in {sleep_sec:.1f}s "
+                f"(attempt {attempt}/{max_retries}, url={error.request_url or _build_api_url(base_url, api_format)})",
+                file=sys.stderr,
+            )
+            time.sleep(sleep_sec)
+
+    raise last_error or LLMRequestError("LLM API request failed", retryable=False)
+
+
+def test_llm_api(config_path: str = None, api_key: str = "", base_url: str = "",
+                 model: str = "", api_format: str = "", timeout_sec: int = 0,
+                 stream_mode: str = "") -> dict:
+    config = load_config(config_path)
+    api_key = api_key or config.get("llm_api_key", "")
+    base_url = base_url or config.get("llm_base_url", "")
+    model = model or config.get("llm_model", "")
+    api_format = api_format or config.get("llm_api_format", "openai")
+    timeout_sec = timeout_sec or config.get("llm_probe_timeout_sec", 20)
+    stream_mode = stream_mode or config.get("llm_stream", "auto")
+    max_tokens = config.get("llm_probe_max_tokens", 16)
+
+    if not api_key or not base_url or not model:
+        return {
+            "valid": False,
+            "error": "LLM API is not fully configured",
+            "error_type": "config",
+            "request_url": _build_api_url(base_url, api_format) if base_url else "",
         }
-        body = {
-            "model": model,
-            "max_tokens": max_tokens,
-            "temperature": temperature,
-            "messages": messages
-        }
-    else:  # openai format
-        url = _build_api_url(base_url, api_format)
-        headers = {
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-            "User-Agent": "yt-transcript/4.0"
-        }
-        body = {
-            "model": model,
-            "max_tokens": max_tokens,
-            "temperature": temperature,
-            "messages": messages
-        }
-    
-    data = json.dumps(body).encode('utf-8')
-    req = urllib.request.Request(url, data=data, headers=headers, method='POST')
-    
+
     try:
-        with urllib.request.urlopen(req, timeout=120) as response:
-            result = json.loads(response.read().decode('utf-8'))
-    except urllib.error.HTTPError as e:
-        error_body = e.read().decode('utf-8', errors='replace')
-        print(f"Error: LLM API returned HTTP {e.code}: {error_body}", file=sys.stderr)
-        sys.exit(1)
-    except urllib.error.URLError as e:
-        print(f"Error: Cannot reach LLM API: {e.reason}", file=sys.stderr)
-        sys.exit(1)
-    except Exception as e:
-        print(f"Error: LLM API call failed: {e}", file=sys.stderr)
-        sys.exit(1)
-    
-    # Extract response text based on format
-    try:
-        if api_format == "anthropic":
-            return result["content"][0]["text"]
-        else:
-            return result["choices"][0]["message"]["content"]
-    except (KeyError, IndexError) as e:
-        print(f"Error: Unexpected API response structure: {e}", file=sys.stderr)
-        print(f"Response: {json.dumps(result, ensure_ascii=False)[:500]}", file=sys.stderr)
-        sys.exit(1)
+        result = _call_llm_api(
+            api_key=api_key,
+            base_url=base_url,
+            model=model,
+            messages=[{"role": "user", "content": "Reply with OK only."}],
+            api_format=api_format,
+            max_tokens=max_tokens,
+            temperature=0.0,
+            timeout_sec=timeout_sec,
+            max_retries=1,
+            backoff_sec=min(config.get("llm_backoff_sec", 1.5), 1.0),
+            stream_mode=stream_mode,
+        )
+        return {
+            "valid": True,
+            "model": model,
+            "api_format": api_format,
+            "request_url": result["request_url"],
+            "latency_ms": result["latency_ms"],
+            "attempts": result["attempts"],
+            "streaming_used": result["streaming_used"],
+            "preview": result["text"][:80],
+        }
+    except LLMRequestError as error:
+        return {
+            "valid": False,
+            "model": model,
+            "api_format": api_format,
+            "request_url": error.request_url,
+            "status_code": error.status_code,
+            "error_type": error.error_type,
+            "error": str(error),
+            "attempts": getattr(error, "attempts", 1),
+        }
 
 
 def process_chunks(work_dir: str, prompt_name: str, extra_instruction: str = "",
                    config_path: str = None, dry_run: bool = False,
-                   input_key: str = "raw_path") -> dict:
+                   input_key: str = "raw_path", force: bool = False) -> dict:
     """
     Process each chunk with isolated LLM API calls for context isolation.
 
-    Each chunk is processed in a completely independent API call, preventing
-    cognitive drift and instruction forgetting across chunks.
-
-    Args:
-        work_dir: Directory containing manifest.json and chunk_*.txt files
-        prompt_name: Name of prompt template (e.g., 'structure_only', 'translate_only', 'summarize')
-        extra_instruction: Optional additional instruction to append to prompt
-        config_path: Optional path to config.yaml
-        dry_run: If True, only validate setup without calling API
-        input_key: Manifest key for input files. Default 'raw_path' reads chunk_*.txt.
-                   Use 'processed_path' to read from previous pass output (for chained processing).
-
-    Returns:
-        {"success": bool, "processed_count": int, "failed_count": int,
-         "warnings": [...], "output_files": [...]}
+    Adds resumability, bounded retries, atomic writes, and chunk-level telemetry.
     """
     work_path = Path(work_dir)
-    
-    # 1. Read manifest
     manifest_path = work_path / "manifest.json"
     if not manifest_path.exists():
         print(f"Error: manifest.json not found in {work_dir}", file=sys.stderr)
         sys.exit(1)
-    
-    manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
-    
-    # 2. Load prompt template
+
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+
     skill_dir = Path(__file__).parent
     prompt_path = skill_dir / "prompts" / f"{prompt_name}.md"
     if not prompt_path.exists():
         print(f"Error: Prompt template not found: {prompt_path}", file=sys.stderr)
         print(f"Available prompts: {[p.stem for p in (skill_dir / 'prompts').glob('*.md')]}", file=sys.stderr)
         sys.exit(1)
-    
-    prompt_template = prompt_path.read_text(encoding='utf-8')
-    
-    # Append extra instruction if provided
+
+    prompt_template = prompt_path.read_text(encoding="utf-8")
     if extra_instruction:
         prompt_template += f"\n\n**Additional Instructions**: {extra_instruction}\n"
-    
-    # 3. Load LLM config
+
     config = load_config(config_path)
-    api_key = config.get('llm_api_key', '')
-    base_url = config.get('llm_base_url', '')
-    model = config.get('llm_model', '')
-    api_format = config.get('llm_api_format', 'openai')
-    
+    api_key = config.get("llm_api_key", "")
+    base_url = config.get("llm_base_url", "")
+    model = config.get("llm_model", "")
+    api_format = config.get("llm_api_format", "openai")
+    timeout_sec = config.get("llm_timeout_sec", 120)
+    max_retries = config.get("llm_max_retries", 3)
+    backoff_sec = config.get("llm_backoff_sec", 1.5)
+    stream_mode = config.get("llm_stream", "auto")
+    stop_after_timeouts = config.get("llm_stop_after_consecutive_timeouts", 2)
+
     if not api_key or not base_url or not model:
         print("Error: LLM API not configured. Set llm_api_key, llm_base_url, llm_model in config.yaml", file=sys.stderr)
         sys.exit(1)
-    
-    # Determine output file pattern based on prompt type
+
     is_summary = (prompt_name == "summarize")
-    
-    # 4. Dry run - just validate and return
+    request_url = _build_api_url(base_url, api_format)
+    recommended_chunk_size = _recommended_chunk_size(prompt_name)
+    manifest_chunk_size = manifest.get("chunk_size") or 0
+    setup_warnings = []
+
+    if manifest_chunk_size and manifest_chunk_size > recommended_chunk_size:
+        setup_warning = (
+            f"⚠️ Chunk size {manifest_chunk_size} is larger than the recommended {recommended_chunk_size} "
+            f"for prompt '{prompt_name}'. Long outputs may time out."
+        )
+        setup_warnings.append(setup_warning)
+        print(setup_warning, file=sys.stderr)
+
+    for chunk_info in manifest.get("chunks", []):
+        chunk_info.setdefault("status", "pending")
+        chunk_info.setdefault("attempts", 0)
+        chunk_info.setdefault("last_error", "")
+        chunk_info.setdefault("last_error_type", "")
+        chunk_info.setdefault("latency_ms", None)
+        chunk_info.setdefault("input_chars", chunk_info.get("char_count", 0))
+        chunk_info.setdefault("output_chars", 0)
+        chunk_info.setdefault("request_url", request_url)
+        chunk_info.setdefault("streaming_used", False)
+        chunk_info.setdefault("updated_at", "")
+        chunk_info.setdefault("started_at", "")
+        chunk_info.setdefault("completed_at", "")
+
+    manifest["last_prompt"] = prompt_name
+    manifest["last_request_url"] = request_url
+    manifest["recommended_chunk_size"] = recommended_chunk_size
+    _write_manifest(manifest_path, manifest)
+
     if dry_run:
         return {
             "success": True,
@@ -981,115 +1298,180 @@ def process_chunks(work_dir: str, prompt_name: str, extra_instruction: str = "",
             "prompt_length": len(prompt_template),
             "model": model,
             "api_format": api_format,
+            "request_url": request_url,
+            "recommended_chunk_size": recommended_chunk_size,
+            "warnings": setup_warnings,
             "message": "Dry run: all validations passed"
         }
-    
-    # 5. Process each chunk
+
     processed_count = 0
     failed_count = 0
-    warnings = []
+    skipped_count = 0
+    warnings = list(setup_warnings)
     output_files = []
-    
+    aborted = False
+    aborted_reason = ""
+    consecutive_timeouts = 0
     total = manifest["total_chunks"]
-    
+
     for chunk_info in manifest["chunks"]:
         chunk_id = chunk_info["id"]
         input_filename = chunk_info.get(input_key, chunk_info["raw_path"])
         input_path = work_path / input_filename
 
-        if not input_path.exists():
-            print(f"Error: Input file not found: {input_path}", file=sys.stderr)
-            failed_count += 1
+        if is_summary:
+            out_filename = f"summary_chunk_{chunk_id:03d}.txt"
+        else:
+            out_filename = chunk_info["processed_path"]
+        out_path = work_path / out_filename
+
+        if not force and chunk_info.get("status") == "done" and out_path.exists():
+            skipped_count += 1
+            print(f"Skipping chunk {chunk_id + 1}/{total} (already done, output exists at {out_path.name})", file=sys.stderr)
             continue
 
-        # Read chunk content
-        chunk_text = input_path.read_text(encoding='utf-8')
+        if not input_path.exists():
+            error_message = f"Input file not found: {input_path}"
+            print(f"Error: {error_message}", file=sys.stderr)
+            failed_count += 1
+            consecutive_timeouts = 0
+            chunk_info["status"] = "failed"
+            chunk_info["last_error"] = error_message
+            chunk_info["last_error_type"] = "input_missing"
+            chunk_info["updated_at"] = _now_iso()
+            _write_manifest(manifest_path, manifest)
+            continue
+
+        chunk_text = input_path.read_text(encoding="utf-8")
         chunk_char_count = len(chunk_text)
-        
-        # Build prompt with chunk content
+        chunk_info["input_chars"] = chunk_char_count
+
         if "{RAW_TEXT}" in prompt_template:
             prompt = prompt_template.replace("{RAW_TEXT}", chunk_text)
         elif "{STRUCTURED_TEXT}" in prompt_template:
             prompt = prompt_template.replace("{STRUCTURED_TEXT}", chunk_text)
         else:
             prompt = prompt_template + "\n\n" + chunk_text
-        
-        # Determine output path
-        if is_summary:
-            out_filename = f"summary_chunk_{chunk_id:03d}.txt"
-        else:
-            out_filename = chunk_info["processed_path"]
-        out_path = work_path / out_filename
-        
-        # Call LLM API (isolated context per chunk)
-        print(f"Processing chunk {chunk_id + 1}/{total}...", file=sys.stderr)
-        
+
+        chunk_info["status"] = "running"
+        chunk_info["started_at"] = _now_iso()
+        chunk_info["updated_at"] = chunk_info["started_at"]
+        chunk_info["request_url"] = request_url
+        _write_manifest(manifest_path, manifest)
+
+        print(
+            f"Processing chunk {chunk_id + 1}/{total} chars={chunk_char_count} model={model} url={request_url}",
+            file=sys.stderr,
+        )
+
         try:
-            result_text = _call_llm_api(
+            llm_result = _call_llm_api(
                 api_key=api_key,
                 base_url=base_url,
                 model=model,
                 messages=[{"role": "user", "content": prompt}],
-                api_format=api_format
+                api_format=api_format,
+                timeout_sec=timeout_sec,
+                max_retries=max_retries,
+                backoff_sec=backoff_sec,
+                stream_mode=stream_mode,
             )
-        except SystemExit:
-            print(f"Failed on chunk {chunk_id}, skipping...", file=sys.stderr)
-            failed_count += 1
-            continue
-        
-        # Output validation (for non-summary tasks)
-        if not is_summary:
+            result_text = llm_result["text"]
             result_char_count = len(result_text)
             ratio = result_char_count / chunk_char_count if chunk_char_count > 0 else 0
-            
-            # Check 1: Output size ratio (detect accidental summarization)
-            if ratio < 0.5:
-                warning = (f"⚠️ Chunk {chunk_id}: output is only {ratio:.0%} of input size "
-                          f"({result_char_count} vs {chunk_char_count} chars). "
-                          f"Possible summarization instead of structuring.")
-                warnings.append(warning)
-                print(warning, file=sys.stderr)
-            
-            # Check 2: Section headers present (for structure tasks)
-            if prompt_name in ("structure_only", "quick_cleanup"):
-                if '##' not in result_text and chunk_char_count > 2000:
-                    warning = (f"⚠️ Chunk {chunk_id}: no section headers (##) found in output "
-                              f"({chunk_char_count} chars input). Structuring may have failed.")
+            consecutive_timeouts = 0
+
+            if not is_summary:
+                if ratio < 0.5:
+                    warning = (
+                        f"⚠️ Chunk {chunk_id}: output is only {ratio:.0%} of input size "
+                        f"({result_char_count} vs {chunk_char_count} chars). Possible summarization instead of structuring."
+                    )
                     warnings.append(warning)
                     print(warning, file=sys.stderr)
-            
-            # Check 3: Chinese character ratio (for translation tasks)
-            if prompt_name == "translate_only":
-                cn_chars = sum(1 for c in result_text if '\u4e00' <= c <= '\u9fff')
-                cn_ratio = cn_chars / result_char_count if result_char_count > 0 else 0
-                if cn_ratio < 0.1:
-                    warning = (f"⚠️ Chunk {chunk_id}: Chinese character ratio is only {cn_ratio:.0%}. "
-                              f"Translation may have been skipped.")
+
+                if prompt_name in ("structure_only", "quick_cleanup") and "##" not in result_text and chunk_char_count > 2000:
+                    warning = (
+                        f"⚠️ Chunk {chunk_id}: no section headers (##) found in output "
+                        f"({chunk_char_count} chars input). Structuring may have failed."
+                    )
                     warnings.append(warning)
                     print(warning, file=sys.stderr)
-        
-        # Write output
-        out_path.write_text(result_text, encoding='utf-8')
-        output_files.append(str(out_path))
-        processed_count += 1
-        
-        # Update manifest status
-        chunk_info["status"] = "done"
-        manifest_path.write_text(
-            json.dumps(manifest, ensure_ascii=False, indent=2),
-            encoding='utf-8'
-        )
-    
+
+                if prompt_name == "translate_only":
+                    cn_chars = sum(1 for c in result_text if '一' <= c <= '鿿')
+                    cn_ratio = cn_chars / result_char_count if result_char_count > 0 else 0
+                    if cn_ratio < 0.1:
+                        warning = (
+                            f"⚠️ Chunk {chunk_id}: Chinese character ratio is only {cn_ratio:.0%}. "
+                            f"Translation may have been skipped."
+                        )
+                        warnings.append(warning)
+                        print(warning, file=sys.stderr)
+
+            _atomic_write_text(out_path, result_text)
+            output_files.append(str(out_path))
+            processed_count += 1
+
+            chunk_info["status"] = "done"
+            chunk_info["attempts"] = chunk_info.get("attempts", 0) + llm_result["attempts"]
+            chunk_info["last_error"] = ""
+            chunk_info["last_error_type"] = ""
+            chunk_info["latency_ms"] = llm_result["latency_ms"]
+            chunk_info["output_chars"] = result_char_count
+            chunk_info["request_url"] = llm_result["request_url"]
+            chunk_info["streaming_used"] = llm_result["streaming_used"]
+            chunk_info["completed_at"] = _now_iso()
+            chunk_info["updated_at"] = chunk_info["completed_at"]
+            print(
+                f"Completed chunk {chunk_id + 1}/{total} latency={llm_result['latency_ms']}ms "
+                f"attempts={llm_result['attempts']} streaming={llm_result['streaming_used']} output_chars={result_char_count}",
+                file=sys.stderr,
+            )
+        except LLMRequestError as error:
+            failed_count += 1
+            chunk_info["status"] = "failed"
+            chunk_info["attempts"] = chunk_info.get("attempts", 0) + getattr(error, "attempts", 1)
+            chunk_info["last_error"] = str(error)
+            chunk_info["last_error_type"] = error.error_type
+            chunk_info["request_url"] = error.request_url or request_url
+            chunk_info["updated_at"] = _now_iso()
+            print(
+                f"Chunk {chunk_id + 1}/{total} failed error_type={error.error_type} "
+                f"attempts={getattr(error, 'attempts', 1)} url={error.request_url or request_url} error={error}",
+                file=sys.stderr,
+            )
+
+            if _is_timeout_error(error):
+                consecutive_timeouts += 1
+            else:
+                consecutive_timeouts = 0
+
+            if stop_after_timeouts > 0 and consecutive_timeouts >= stop_after_timeouts:
+                aborted = True
+                aborted_reason = (
+                    f"Stopped after {consecutive_timeouts} consecutive timeout failures. "
+                    f"Check provider/gateway latency or reduce chunk size."
+                )
+                print(f"Error: {aborted_reason}", file=sys.stderr)
+                _write_manifest(manifest_path, manifest)
+                break
+        finally:
+            _write_manifest(manifest_path, manifest)
+
     return {
-        "success": failed_count == 0 and len(warnings) == 0,
+        "success": failed_count == 0 and not aborted,
         "processed_count": processed_count,
         "failed_count": failed_count,
+        "skipped_count": skipped_count,
         "total_chunks": total,
         "warnings": warnings,
-        "output_files": output_files
+        "warning_count": len(warnings),
+        "output_files": output_files,
+        "aborted": aborted,
+        "aborted_reason": aborted_reason,
+        "request_url": request_url,
     }
-
-
 def detect_audio_content_type(audio_path: str) -> str:
     ext = Path(audio_path).suffix.lower().lstrip(".")
     return {
@@ -1670,32 +2052,28 @@ def plan_optimization(state_path: str) -> dict:
 def load_config(config_path: str = None) -> dict:
     """
     Load configuration from config.yaml
-    
+
     Args:
-        config_path: Optional path to config file. 
+        config_path: Optional path to config file.
                      Defaults to <skill-root>/config.yaml
-    
+
     Returns:
-        {"output_dir": "...", "deepgram_api_key": "...", "config_path": "..."}
+        Parsed flat config with typed LLM tuning settings.
     """
-    # Default config path
     if config_path is None:
         config_path = str(_default_config_path())
-    
+
     path = Path(config_path)
     if not path.exists():
         print(f"Error: Config file not found: {config_path}", file=sys.stderr)
         sys.exit(1)
-    
+
     try:
         content = path.read_text(encoding='utf-8')
     except Exception as e:
         print(f"Error: Cannot read config file: {e}", file=sys.stderr)
         sys.exit(2)
-    
-    # Intentionally support only a restricted flat key/value config format.
-    # This is not a general YAML parser; nested structures and multi-line YAML
-    # are out of scope for the skill's config surface.
+
     config = {}
     for line in content.split('\n'):
         line = line.strip()
@@ -1708,14 +2086,20 @@ def load_config(config_path: str = None) -> dict:
             value = _strip_wrapping_quotes(value.strip())
             if key:
                 config[key] = value
-    
-    # Expand ~ in output_dir
+
     output_dir = config.get('output_dir', '')
     if output_dir:
         output_dir = os.path.expanduser(output_dir)
         if not os.path.isdir(output_dir):
             print(f"Warning: output_dir does not exist: {output_dir}", file=sys.stderr)
-    
+
+    llm_timeout_sec = max(1, _parse_int(config.get('llm_timeout_sec'), 120))
+    llm_max_retries = max(0, _parse_int(config.get('llm_max_retries'), 3))
+    llm_backoff_sec = max(0.1, _parse_float(config.get('llm_backoff_sec'), 1.5))
+    llm_probe_timeout_sec = max(1, _parse_int(config.get('llm_probe_timeout_sec'), 20))
+    llm_probe_max_tokens = max(1, _parse_int(config.get('llm_probe_max_tokens'), 16))
+    llm_stop_after_consecutive_timeouts = max(1, _parse_int(config.get('llm_stop_after_consecutive_timeouts'), 2))
+
     return {
         "output_dir": output_dir,
         "deepgram_api_key": config.get('deepgram_api_key', ''),
@@ -1723,10 +2107,15 @@ def load_config(config_path: str = None) -> dict:
         "llm_base_url": config.get('llm_base_url', ''),
         "llm_model": config.get('llm_model', ''),
         "llm_api_format": config.get('llm_api_format', 'openai'),
+        "llm_timeout_sec": llm_timeout_sec,
+        "llm_max_retries": llm_max_retries,
+        "llm_backoff_sec": llm_backoff_sec,
+        "llm_stream": _normalize_stream_mode(config.get('llm_stream', 'auto')),
+        "llm_probe_timeout_sec": llm_probe_timeout_sec,
+        "llm_probe_max_tokens": llm_probe_max_tokens,
+        "llm_stop_after_consecutive_timeouts": llm_stop_after_consecutive_timeouts,
         "config_path": str(path.absolute())
     }
-
-
 def main():
     parser = argparse.ArgumentParser(
         description='yt-transcript utility script',
@@ -1780,6 +2169,19 @@ def main():
     )
     api_parser.add_argument('api_key', help='Deepgram API key')
 
+    # test-llm-api command
+    llm_api_parser = subparsers.add_parser(
+        'test-llm-api',
+        help='Test configured LLM API reachability and latency'
+    )
+    llm_api_parser.add_argument('--config-path', default=None, help='Optional path to config.yaml')
+    llm_api_parser.add_argument('--api-key', default='', help='Optional LLM API key override')
+    llm_api_parser.add_argument('--base-url', default='', help='Optional LLM base URL override')
+    llm_api_parser.add_argument('--model', default='', help='Optional model override')
+    llm_api_parser.add_argument('--api-format', default='', help='Optional API format override')
+    llm_api_parser.add_argument('--timeout', type=int, default=0, help='Probe timeout in seconds')
+    llm_api_parser.add_argument('--stream', default='', help='Streaming mode override: auto|true|false')
+
     # split-audio command
     split_parser = subparsers.add_parser(
         'split-audio',
@@ -1798,8 +2200,10 @@ def main():
     )
     chunk_parser.add_argument('input_path', help='Input text file path')
     chunk_parser.add_argument('output_dir', help='Output directory for chunks')
-    chunk_parser.add_argument('--chunk-size', type=int, default=8000,
-                              help='Target chunk size in characters (default: 8000)')
+    chunk_parser.add_argument('--chunk-size', type=int, default=0,
+                              help='Target chunk size in characters (default: auto by prompt, fallback 8000)')
+    chunk_parser.add_argument('--prompt', default='',
+                              help='Optional prompt name for task-aware auto chunk sizing')
 
     # get-chapters command
     chapters_parser = subparsers.add_parser(
@@ -1833,6 +2237,8 @@ def main():
                            help='Optional path to config file')
     pc_parser.add_argument('--dry-run', action='store_true',
                            help='Validate setup without calling API')
+    pc_parser.add_argument('--force', action='store_true',
+                           help='Reprocess chunks even if manifest status is done and output exists')
 
     # assemble-final command
     af_parser = subparsers.add_parser(
@@ -1927,12 +2333,26 @@ def main():
         if not result['valid']:
             sys.exit(1)
 
+    elif args.command == 'test-llm-api':
+        result = test_llm_api(
+            config_path=args.config_path,
+            api_key=args.api_key,
+            base_url=args.base_url,
+            model=args.model,
+            api_format=args.api_format,
+            timeout_sec=args.timeout,
+            stream_mode=args.stream,
+        )
+        print(json.dumps(result, ensure_ascii=False))
+        if not result['valid']:
+            sys.exit(1)
+
     elif args.command == 'split-audio':
         result = split_audio(args.audio_path, args.max_size, args.max_deviation)
         print(json.dumps(result, ensure_ascii=False))
 
     elif args.command == 'chunk-text':
-        result = chunk_text(args.input_path, args.output_dir, args.chunk_size)
+        result = chunk_text(args.input_path, args.output_dir, args.chunk_size, args.prompt)
         print(json.dumps(result, ensure_ascii=False))
 
     elif args.command == 'get-chapters':
@@ -1946,7 +2366,7 @@ def main():
     elif args.command == 'process-chunks':
         result = process_chunks(
             args.work_dir, args.prompt, args.extra_instruction,
-            args.config_path, args.dry_run, args.input_key
+            args.config_path, args.dry_run, args.input_key, args.force
         )
         print(json.dumps(result, ensure_ascii=False))
         if not result.get('success', False) and not result.get('dry_run', False):

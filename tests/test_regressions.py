@@ -4,6 +4,7 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import yt_transcript_utils as utils
 
@@ -553,6 +554,168 @@ class RegressionTests(unittest.TestCase):
             Path("/tmp/vid001.en.vtt").unlink(missing_ok=True)
             Path("/tmp/vid001.en-US.vtt").unlink(missing_ok=True)
             Path("/tmp/vid001.zh-Hans.vtt").unlink(missing_ok=True)
+
+    def test_load_config_parses_llm_tuning_fields(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "config.yaml"
+            config_path.write_text(
+                f'output_dir: "{tmpdir}"\n'
+                'llm_timeout_sec: "180"\n'
+                'llm_max_retries: "5"\n'
+                'llm_backoff_sec: "2.5"\n'
+                'llm_stream: "false"\n'
+                'llm_probe_timeout_sec: "9"\n'
+                'llm_probe_max_tokens: "7"\n'
+                'llm_stop_after_consecutive_timeouts: "4"\n',
+                encoding="utf-8",
+            )
+            config = utils.load_config(str(config_path))
+            self.assertEqual(config["llm_timeout_sec"], 180)
+            self.assertEqual(config["llm_max_retries"], 5)
+            self.assertEqual(config["llm_backoff_sec"], 2.5)
+            self.assertEqual(config["llm_stream"], "false")
+            self.assertEqual(config["llm_probe_timeout_sec"], 9)
+            self.assertEqual(config["llm_probe_max_tokens"], 7)
+            self.assertEqual(config["llm_stop_after_consecutive_timeouts"], 4)
+
+    def test_chunk_text_uses_prompt_aware_default_size(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source = Path(tmpdir) / "raw.txt"
+            out_dir = Path(tmpdir) / "chunks"
+            source.write_text("甲" * 9000, encoding="utf-8")
+
+            result = utils.chunk_text(str(source), str(out_dir), 0, "structure_only")
+            manifest = json.loads((out_dir / "manifest.json").read_text(encoding="utf-8"))
+
+            self.assertEqual(result["chunk_size"], 4000)
+            self.assertEqual(manifest["recommended_chunk_size"], 4000)
+            self.assertGreater(result["total_chunks"], 1)
+
+    def test_call_llm_api_retries_timeout_then_succeeds(self):
+        with mock.patch.object(utils, "_execute_llm_request") as mocked_request, mock.patch("time.sleep"):
+            mocked_request.side_effect = [
+                utils.LLMRequestError("timeout", error_type="timeout", retryable=True, request_url="https://api.example.com/v1/chat/completions"),
+                {"text": "ok", "latency_ms": 12, "request_url": "https://api.example.com/v1/chat/completions", "streaming_used": True},
+            ]
+
+            result = utils._call_llm_api(
+                api_key="key",
+                base_url="https://api.example.com",
+                model="demo",
+                messages=[{"role": "user", "content": "hello"}],
+            )
+
+            self.assertEqual(result["text"], "ok")
+            self.assertEqual(result["attempts"], 2)
+            self.assertEqual(mocked_request.call_count, 2)
+
+    def test_call_llm_api_fails_fast_on_http_400(self):
+        with mock.patch.object(utils, "_execute_llm_request") as mocked_request, mock.patch("time.sleep"):
+            mocked_request.side_effect = utils.LLMRequestError(
+                "bad request",
+                error_type="http_400",
+                status_code=400,
+                retryable=False,
+                request_url="https://api.example.com/v1/chat/completions",
+            )
+
+            with self.assertRaises(utils.LLMRequestError):
+                utils._call_llm_api(
+                    api_key="key",
+                    base_url="https://api.example.com",
+                    model="demo",
+                    messages=[{"role": "user", "content": "hello"}],
+                )
+
+            self.assertEqual(mocked_request.call_count, 1)
+
+    def test_process_chunks_skips_done_chunks_by_default(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source = Path(tmpdir) / "raw.txt"
+            work_dir = Path(tmpdir) / "chunks"
+            source.write_text("第一句。第二句。", encoding="utf-8")
+            utils.chunk_text(str(source), str(work_dir), 50, "structure_only")
+
+            manifest_path = work_dir / "manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["chunks"][0]["status"] = "done"
+            manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+            (work_dir / "processed_000.md").write_text("## 已完成\n\n内容", encoding="utf-8")
+
+            with mock.patch.object(utils, "load_config", return_value={
+                "llm_api_key": "key",
+                "llm_base_url": "https://api.example.com",
+                "llm_model": "demo",
+                "llm_api_format": "openai",
+                "llm_timeout_sec": 30,
+                "llm_max_retries": 0,
+                "llm_backoff_sec": 0.1,
+                "llm_stream": "false",
+                "llm_stop_after_consecutive_timeouts": 2,
+            }), mock.patch.object(utils, "_call_llm_api") as mocked_call:
+                result = utils.process_chunks(str(work_dir), "structure_only")
+
+            self.assertTrue(result["success"])
+            self.assertEqual(result["skipped_count"], 1)
+            mocked_call.assert_not_called()
+
+    def test_process_chunks_aborts_after_consecutive_timeouts(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source = Path(tmpdir) / "raw.txt"
+            work_dir = Path(tmpdir) / "chunks"
+            source.write_text("第一句。第二句。第三句。第四句。", encoding="utf-8")
+            utils.chunk_text(str(source), str(work_dir), 4, "structure_only")
+
+            timeout_error = utils.LLMRequestError(
+                "timed out",
+                error_type="timeout",
+                retryable=True,
+                request_url="https://api.example.com/v1/chat/completions",
+            )
+            timeout_error.attempts = 1
+
+            with mock.patch.object(utils, "load_config", return_value={
+                "llm_api_key": "key",
+                "llm_base_url": "https://api.example.com",
+                "llm_model": "demo",
+                "llm_api_format": "openai",
+                "llm_timeout_sec": 30,
+                "llm_max_retries": 0,
+                "llm_backoff_sec": 0.1,
+                "llm_stream": "false",
+                "llm_stop_after_consecutive_timeouts": 2,
+            }), mock.patch.object(utils, "_call_llm_api", side_effect=timeout_error):
+                result = utils.process_chunks(str(work_dir), "structure_only")
+
+            manifest = json.loads((work_dir / "manifest.json").read_text(encoding="utf-8"))
+            self.assertFalse(result["success"])
+            self.assertTrue(result["aborted"])
+            self.assertEqual(result["failed_count"], 2)
+            self.assertEqual(manifest["chunks"][0]["status"], "failed")
+            self.assertEqual(manifest["chunks"][1]["status"], "failed")
+
+    def test_test_llm_api_returns_probe_metadata(self):
+        with mock.patch.object(utils, "load_config", return_value={
+            "llm_api_key": "key",
+            "llm_base_url": "https://api.example.com",
+            "llm_model": "demo",
+            "llm_api_format": "openai",
+            "llm_probe_timeout_sec": 10,
+            "llm_probe_max_tokens": 8,
+            "llm_backoff_sec": 0.5,
+            "llm_stream": "auto",
+        }), mock.patch.object(utils, "_call_llm_api", return_value={
+            "text": "OK",
+            "latency_ms": 42,
+            "request_url": "https://api.example.com/v1/chat/completions",
+            "streaming_used": True,
+            "attempts": 1,
+        }):
+            result = utils.test_llm_api()
+
+        self.assertTrue(result["valid"])
+        self.assertEqual(result["latency_ms"], 42)
+        self.assertTrue(result["streaming_used"])
 
 
 if __name__ == "__main__":

@@ -57,12 +57,18 @@ pip install yt-dlp
    llm_api_key: "your_llm_api_key"
    llm_base_url: "https://api.openai.com"
    llm_model: "gpt-4o-mini"
+   llm_timeout_sec: 180
+   llm_max_retries: 3
+   llm_backoff_sec: 1.5
+   llm_stream: "auto"
    ```
 
    > **Note**:
    > - `deepgram_api_key` is only required when the video has no usable subtitles and audio transcription is needed.
    > - LLM API config is only needed for long video chunk processing, or when bilingual translation is required.
    > - `llm_base_url` can be either a provider root URL or a `/v1` URL. The tool normalizes both.
+   > - `llm_stream: "auto"` prefers SSE streaming when the provider supports it.
+   > - `bash scripts/preflight.sh --require-llm` now performs a real low-cost LLM probe and reports latency.
 
 ### 🚀 Usage
 
@@ -146,7 +152,7 @@ This keeps workflow logic in scripts instead of ad-hoc shell parsing inside the 
 - YAML frontmatter values are always quoted on purpose to favor safe parsing over prettier formatting
 - Markdown header text is escaped and link destinations are encoded so edge-case titles/channels do not break output structure
 - `chunk-text` force-splits very long unpunctuated passages to stay within downstream LLM chunk budgets
-- `preflight.sh` is staged so subtitle-only workflows do not require Deepgram or LLM credentials up front
+- `preflight.sh` is staged so subtitle-only workflows do not require Deepgram or LLM credentials up front, while `--require-llm` now performs a real probe
 - `transcribe-deepgram` is the only supported Deepgram entry point; split / merge behavior is owned by the Python utility
 - `verify-quality` is a hard gate only when `hard_failures` is non-empty; `warnings` are advisory review signals
 
@@ -256,12 +262,18 @@ pip install yt-dlp
    llm_api_key: "your_llm_api_key"
    llm_base_url: "https://api.openai.com"
    llm_model: "gpt-4o-mini"
+   llm_timeout_sec: 180
+   llm_max_retries: 3
+   llm_backoff_sec: 1.5
+   llm_stream: "auto"
    ```
 
    > **注意**：
    > - `deepgram_api_key` 仅在没有可用字幕、需要音频转录时才必需。
    > - LLM API 配置仅用于长视频 chunk 处理，或需要双语翻译时。
    > - `llm_base_url` 可以填写服务根地址或带 `/v1` 的地址，工具会自动归一化。
+   > - `llm_stream: "auto"` 会在 provider 支持时优先走流式响应。
+   > - `bash scripts/preflight.sh --require-llm` 现在会执行一次低成本真实探活并输出延迟。
 
 ### 🚀 使用方法
 
@@ -344,7 +356,7 @@ bash scripts/preflight.sh --require-llm
 - `config.yaml` 被刻意限制为扁平的顶层键值配置，不支持嵌套结构或多行 YAML
 - YAML frontmatter 的值会统一加引号，优先保证解析安全，而不是追求最简洁的展示
 - Markdown 头部里的标题/频道文本会做转义，链接目标会做编码，避免边界字符破坏结构
-- `chunk-text` 会对超长且缺少标点的段落做强制切分，以控制后续 LLM 的 chunk 大小
+- `chunk-text` 会对超长且缺少标点的段落做强制切分，并可按 prompt 自动选择更保守的 chunk 大小
 - `preflight.sh` 采用分层校验，确保只走字幕路径时不必预先配置 Deepgram 或 LLM 凭据
 - `transcribe-deepgram` 是唯一支持的 Deepgram 统一入口，分片与合并逻辑由 Python 工具统一负责
 - `verify-quality` 只有在 `hard_failures` 非空时才阻断流程；`warnings` 仅用于人工复核提示

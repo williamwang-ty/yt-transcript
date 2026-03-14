@@ -64,7 +64,7 @@ To survive context loss or session interruptions, we maintain a lightweight **St
 
 Weak models tend to loop indefinitely when errors occur.
 
-*   **Fail-Fast**: Instructions explicitly say "If step X fails, STOP. Do not retry."
+*   **Fail-Fast**: Irreversible failures still stop the workflow immediately, but transient LLM transport failures (for example timeouts, `429`, and `5xx`) are retried a small bounded number of times in the script layer before the chunk is marked failed.
 *   **Safety Net**: In `quick_cleanup.md`, we added a trigger: "If text has ZERO punctuation, ignore minimal-change rules and fully punctuate."
 
 ---
@@ -85,7 +85,8 @@ To bypass API limits (25MB) and improve reliability, large audio files are split
 To handle arbitrarily long videos (e.g., >2 hours) without hitting LLM context limits, we use a **Map-Reduce inspired hybrid pipeline**:
 
 1.  **Structural Chunking (Script)**:
-    - The `chunk-text` command splits raw text into semantic chunks (~8000 chars) based on sentence boundaries.
+    - The `chunk-text` command splits raw text into semantic chunks based on sentence boundaries.
+    - The current implementation is still character-budgeted, but now uses prompt-aware defaults: smaller chunks for rewrite / translation paths and larger chunks for summarize-only paths.
     - Uses an idempotent `manifest.json` to track processing status, allowing resumability.
 
 2.  **Two-Stage Chapter Planning**:
@@ -141,8 +142,10 @@ After (hard isolation, no drift):
 Key design decisions:
 
 *   **Dual API format support**: `_call_llm_api()` supports both OpenAI (`/v1/chat/completions`) and Anthropic (`/v1/messages`) formats, controlled by `llm_api_format` in `config.yaml`. The URL builder accepts either a provider root URL or a `/v1` URL.
+*   **Bounded retry + streaming**: LLM calls now use configurable timeout / retry / backoff settings and prefer streaming when the provider supports it, reducing read-timeout risk for long outputs.
 *   **Output validation**: For non-summary tasks, the script checks that output character count >= 50% of input. If below, a warning is raised (possible accidental summarization).
-*   **Manifest-based progress tracking**: Each chunk's status is updated in `manifest.json` after processing, enabling resumability.
+*   **Manifest-based progress tracking**: `manifest.json` now tracks chunk status, attempts, latency, and last error metadata. Completed chunks are skipped by default on re-runs, making resumability operational instead of theoretical.
+*   **Real LLM preflight**: `scripts/preflight.sh --require-llm` now performs a small live probe instead of checking config presence only.
 *   **No external dependencies**: Uses only `urllib.request` for HTTP calls.
 *   **Script-owned routing**: `plan-optimization` is the canonical source for text-optimization branching and `transcribe-deepgram` is the only supported Deepgram transcription entry.
 
@@ -282,7 +285,7 @@ yt-transcript/
 
 弱模型在出错时倾向于无限循环。
 
-*   **Fail-Fast**: 指令显式说明 "如果步骤 X 失败，停止 (STOP)。不要重试。"
+*   **Fail-Fast**: 不可恢复的失败仍然立即 STOP；但对 LLM 传输层的瞬时故障（例如 timeout、`429`、`5xx`），脚本层会做小次数、有上限的重试后再判定该 chunk 失败。
 *   **Safety Net**: 在 `quick_cleanup.md` 中，我们添加了一个触发器："如果文本包含零标点，忽略最小修改规则并完全添加标点。"
 
 ---
@@ -303,7 +306,8 @@ yt-transcript/
 为了在不突破 LLM 上下文限制的情况下处理超长视频（如 >2小时），我们采用了 **Map-Reduce 思想的混合流水线**：
 
 1.  **结构化分块（脚本）**：
-    - `chunk-text` 命令按句子边界将原始文本切分为语义块（~8000字符）。
+    - `chunk-text` 命令按句子边界将原始文本切分为语义块。
+    - 当前实现仍然以字符预算为主，但已经按 prompt 类型采用更保守的默认值：rewrite / translation 路径更小，summarize-only 路径更大。
     - 使用幂等的 `manifest.json` 追踪状态，支持断点续传。
 
 2.  **两阶段章节规划**：
@@ -359,8 +363,10 @@ yt-transcript/
 关键设计决策：
 
 *   **双 API 格式支持**：`_call_llm_api()` 同时支持 OpenAI（`/v1/chat/completions`）和 Anthropic（`/v1/messages`）格式，通过 `config.yaml` 中的 `llm_api_format` 切换，并兼容填写服务根地址或 `/v1` 地址两种配置方式。
+*   **有上限的重试 + 流式优先**：LLM 调用现在支持可配置的 timeout / retry / backoff，并在 provider 支持时优先使用 streaming，以降低长输出场景的 read-timeout 风险。
 *   **输出验证**：非摘要任务中，脚本检查输出字符数 >= 输入的 50%。低于阈值则发出警告（可能误做了摘要）。
-*   **Manifest 进度追踪**：每个 chunk 处理后更新 `manifest.json` 中的状态，支持断点续传。
+*   **Manifest 进度追踪**：`manifest.json` 现在会记录 chunk 的状态、attempts、latency 和 last error；重跑时默认跳过已完成 chunk，使断点续传从“设计意图”变成“实际行为”。
+*   **真实 LLM preflight**：`scripts/preflight.sh --require-llm` 现在会执行一次低成本实时探活，而不只是检查配置项是否存在。
 *   **零外部依赖**：仅使用 `urllib.request` 进行 HTTP 调用。
 *   **脚本拥有最终路由权**：`plan-optimization` 是文本优化分支的唯一口径，`transcribe-deepgram` 是唯一支持的 Deepgram 转录入口。
 
