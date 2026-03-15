@@ -19,6 +19,20 @@ video_id_for_url() {
     yt-dlp --print "%(id)s" "$VIDEO_URL" 2>/dev/null
 }
 
+require_valid_video_id() {
+    local video_id="$1"
+    if [ -z "$video_id" ]; then
+        echo "❌ Error: Could not resolve a video ID for: $VIDEO_URL" >&2
+        exit 1
+    fi
+    case "$video_id" in
+        *[!A-Za-z0-9_-]*)
+            echo "❌ Error: Resolved video ID contains unsafe characters: $video_id" >&2
+            exit 1
+            ;;
+    esac
+}
+
 download_root_for_video() {
     local video_id="$1"
     printf '/tmp/%s_downloads' "$video_id"
@@ -196,6 +210,7 @@ case "$MODE" in
     metadata)
         echo "📋 Fetching video metadata..." >&2
         VIDEO_ID=$(video_id_for_url)
+        require_valid_video_id "$VIDEO_ID"
         TITLE=$(yt-dlp --print "%(title)s" "$VIDEO_URL" 2>/dev/null)
         DURATION=$(yt-dlp --print "%(duration)s" "$VIDEO_URL" 2>/dev/null || echo "0")
         [ -z "$DURATION" ] || [ "$DURATION" = "NA" ] && DURATION=0
@@ -220,6 +235,7 @@ PY
     subtitle-info)
         echo "🔎 Inspecting subtitle availability..." >&2
         VIDEO_ID=$(video_id_for_url)
+        require_valid_video_id "$VIDEO_ID"
         METADATA_JSON=$(yt-dlp -J "$VIDEO_URL" 2>/dev/null || true)
         if [ -n "$METADATA_JSON" ]; then
             if SUB_INFO_JSON=$(printf '%s' "$METADATA_JSON" | emit_subtitle_info_from_metadata_json "$VIDEO_ID" 2>/dev/null); then
@@ -239,6 +255,7 @@ PY
     subtitles)
         echo "📥 Downloading subtitles..." >&2
         VIDEO_ID=$(video_id_for_url)
+        require_valid_video_id "$VIDEO_ID"
         SUBTITLE_DIR="$(download_root_for_video "$VIDEO_ID")/subtitles"
         reset_download_dir "$SUBTITLE_DIR"
 
@@ -383,6 +400,7 @@ PY
     audio)
         echo "🎵 Downloading audio..." >&2
         VIDEO_ID=$(video_id_for_url)
+        require_valid_video_id "$VIDEO_ID"
         AUDIO_DIR="$(download_root_for_video "$VIDEO_ID")/audio"
         reset_download_dir "$AUDIO_DIR"
 

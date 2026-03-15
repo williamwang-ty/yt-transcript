@@ -16,6 +16,19 @@ CONFIG_FILE="$ROOT_DIR/config.yaml"
 REQUIRE_DEEPGRAM=false
 REQUIRE_LLM=false
 
+file_mtime_epoch() {
+    local path="$1"
+    if stat -f %m "$path" >/dev/null 2>&1; then
+        stat -f %m "$path"
+        return 0
+    fi
+    if stat -c %Y "$path" >/dev/null 2>&1; then
+        stat -c %Y "$path"
+        return 0
+    fi
+    echo 0
+}
+
 while [ $# -gt 0 ]; do
     case "$1" in
         --require-deepgram)
@@ -51,7 +64,7 @@ CACHE_MAX_AGE=3600  # 1 hour in seconds
 
 SHOULD_CHECK_UPDATE=true
 if [ -f "$VERSION_CACHE" ]; then
-    CACHE_AGE=$(($(date +%s) - $(stat -f %m "$VERSION_CACHE" 2>/dev/null || echo 0)))
+    CACHE_AGE=$(($(date +%s) - $(file_mtime_epoch "$VERSION_CACHE")))
     if [ "$CACHE_AGE" -lt "$CACHE_MAX_AGE" ]; then
         CACHED_VERSION=$(cat "$VERSION_CACHE")
         if [ "$CURRENT_VERSION" = "$CACHED_VERSION" ]; then

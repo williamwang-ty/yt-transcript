@@ -509,6 +509,16 @@ class RegressionTests(unittest.TestCase):
         finally:
             state_file.unlink(missing_ok=True)
 
+    def test_cleanup_script_rejects_unsafe_video_id(self):
+        result = subprocess.run(
+            ["bash", str(PROJECT_ROOT / "scripts/cleanup.sh"), "../bad-id"],
+            cwd=PROJECT_ROOT,
+            capture_output=True,
+            text=True,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("unsafe characters", result.stderr)
+
     def test_download_metadata_returns_valid_json(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             fake_bin = Path(tmpdir) / "yt-dlp"
@@ -543,6 +553,31 @@ class RegressionTests(unittest.TestCase):
             self.assertEqual(payload["video_id"], "abc123")
             self.assertEqual(payload["title"], 'He said "hi"')
             self.assertEqual(payload["channel"], 'A "B"')
+
+    def test_download_metadata_fails_when_video_id_is_missing(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fake_bin = Path(tmpdir) / "yt-dlp"
+            fake_bin.write_text(
+                "#!/usr/bin/env bash\n"
+                "if [ \"$1\" = \"--print\" ] && [ \"$2\" = '%(id)s' ]; then\n"
+                "  exit 0\n"
+                "fi\n"
+                "exit 1\n",
+                encoding="utf-8",
+            )
+            fake_bin.chmod(0o755)
+
+            env = os.environ.copy()
+            env["PATH"] = f"{tmpdir}:{env['PATH']}"
+            result = subprocess.run(
+                ["bash", str(PROJECT_ROOT / "scripts/download.sh"), "https://example.com/video", "metadata"],
+                cwd=PROJECT_ROOT,
+                env=env,
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("Could not resolve a video ID", result.stderr)
 
     def test_process_chunks_dry_run_does_not_require_llm_credentials(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -987,6 +1022,79 @@ exit 0
 
             self.assertEqual(result.returncode, 0)
             self.assertIn("Could not check for updates", result.stdout)
+            self.assertIn("All pre-flight checks passed", result.stdout)
+
+    def test_preflight_supports_gnu_stat_for_cache_age(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fake_yt_dlp = Path(tmpdir) / "yt-dlp"
+            fake_yt_dlp.write_text(
+                """#!/usr/bin/env bash
+if [ "$1" = "--version" ]; then
+  echo '2025.01.01'
+  exit 0
+fi
+exit 0
+""",
+                encoding="utf-8",
+            )
+            fake_yt_dlp.chmod(0o755)
+
+            fake_ffmpeg = Path(tmpdir) / "ffmpeg"
+            fake_ffmpeg.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+            fake_ffmpeg.chmod(0o755)
+
+            fake_stat = Path(tmpdir) / "stat"
+            fake_stat.write_text(
+                """#!/usr/bin/env bash
+if [ "$1" = "-f" ]; then
+  exit 1
+fi
+if [ "$1" = "-c" ] && [ "$2" = "%Y" ]; then
+  date +%s
+  exit 0
+fi
+exit 1
+""",
+                encoding="utf-8",
+            )
+            fake_stat.chmod(0o755)
+
+            version_cache = Path("/tmp/yt-dlp-version-cache")
+            previous_cache = None
+            if version_cache.exists():
+                previous_cache = version_cache.read_text(encoding="utf-8")
+            version_cache.write_text("2025.01.01", encoding="utf-8")
+
+            config_path = PROJECT_ROOT / "config.yaml"
+            backup_path = None
+            if config_path.exists():
+                backup_path = Path(tmpdir) / "config.yaml.backup"
+                shutil.copy2(config_path, backup_path)
+
+            config_path.write_text('output_dir: "/tmp/yt-transcript-preflight-test"\n', encoding="utf-8")
+            try:
+                env = os.environ.copy()
+                env["PATH"] = f"{tmpdir}:{env['PATH']}"
+                result = subprocess.run(
+                    ["bash", str(PROJECT_ROOT / "scripts/preflight.sh")],
+                    cwd=PROJECT_ROOT,
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                )
+            finally:
+                if backup_path is not None and backup_path.exists():
+                    shutil.copy2(backup_path, config_path)
+                else:
+                    config_path.unlink(missing_ok=True)
+                shutil.rmtree("/tmp/yt-transcript-preflight-test", ignore_errors=True)
+                if previous_cache is None:
+                    version_cache.unlink(missing_ok=True)
+                else:
+                    version_cache.write_text(previous_cache, encoding="utf-8")
+
+            self.assertEqual(result.returncode, 0)
+            self.assertIn("yt-dlp is up to date (cached)", result.stdout)
             self.assertIn("All pre-flight checks passed", result.stdout)
     def test_audio_download_uses_isolated_dir(self):
         with tempfile.TemporaryDirectory() as tmpdir:

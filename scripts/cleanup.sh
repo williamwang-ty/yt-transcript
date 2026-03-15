@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+set -euo pipefail
 
 # cleanup.sh - Clean up temporary files
 # Usage: ./cleanup.sh <VIDEO_ID> [--keep-state]
@@ -8,12 +9,24 @@
 # chunk-text so the next run starts from a clean temp workspace.
 
 if [ $# -lt 1 ]; then
-    echo "Usage: $0 <VIDEO_ID> [--keep-state]"
+    echo "Usage: $0 <VIDEO_ID> [--keep-state]" >&2
     exit 1
 fi
 
 VIDEO_ID="$1"
 KEEP_STATE=false
+
+if [ -z "$VIDEO_ID" ]; then
+    echo "❌ Error: VIDEO_ID must not be empty" >&2
+    exit 1
+fi
+
+case "$VIDEO_ID" in
+    *[!A-Za-z0-9_-]*)
+        echo "❌ Error: VIDEO_ID contains unsafe characters: $VIDEO_ID" >&2
+        exit 1
+        ;;
+esac
 
 if [ "${2:-}" = "--keep-state" ]; then
     KEEP_STATE=true
