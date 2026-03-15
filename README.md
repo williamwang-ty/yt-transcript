@@ -169,6 +169,8 @@ Current policy is intentional and explicit:
 - `process-chunks` also injects a short continuity context from the previous chunk (tail sentence + optional section title) without enabling body overlap, and chunk budgeting now reserves a small token allowance for that carry-over context
 - `process-chunks --dry-run` validates prompts, manifests, and chunk budgets without requiring live LLM credentials; actual execution still requires `llm_api_key`, `llm_base_url`, and `llm_model`
 - `download.sh` now writes subtitle and audio artifacts into per-video isolated temp directories under `/tmp/${VIDEO_ID}_downloads/...` and exposes `download_dir` in JSON for deterministic selection and cleanup
+- `download.sh subtitles` now requests the exact selected subtitle language codes, so regional variants such as `en-GB` / `zh-TW` work instead of being dropped by a hard-coded whitelist
+- subtitle-driven workflows intentionally support only English-source bilingual mode and Chinese-source monolingual mode; when only other subtitle languages exist, the workflow should stop and fall back to audio transcription
 - `plan-optimization` is the canonical short/long router with `< 1800s = short` and `>= 1800s = long`; the Quick Mode shortcut from `SKILL.md` is a narrower `< 900s` subset for subtitle-friendly videos
 - `manifest.json` now separates immutable `plan` metadata from `runtime` state, and `process-chunks` records attempt-level telemetry (`attempt_logs`) in addition to chunk-level fields
 - `process-chunks` no longer rewrites the current batch budget on the fly; when canary chunks or retry history show the plan is unhealthy, it aborts with `replan_required=true` so `replan-remaining` can generate a new plan for unfinished raw chunks

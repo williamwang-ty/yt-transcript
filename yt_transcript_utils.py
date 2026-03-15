@@ -2315,7 +2315,7 @@ def _call_llm_api(api_key: str, base_url: str, model: str, messages: list,
 def test_llm_api(config_path: str = None, api_key: str = "", base_url: str = "",
                  model: str = "", api_format: str = "", timeout_sec: int = 0,
                  stream_mode: str = "") -> dict:
-    config = load_config(config_path)
+    config = _load_optional_config(config_path)
     api_key = api_key or config.get("llm_api_key", "")
     base_url = base_url or config.get("llm_base_url", "")
     model = model or config.get("llm_model", "")
@@ -2513,7 +2513,7 @@ def _count_tokens_via_provider(text: str, config: dict | None = None,
 def test_token_count(config_path: str = None, api_key: str = "", base_url: str = "",
                      model: str = "", api_format: str = "", timeout_sec: int = 0,
                      sample_text: str = "Reply with OK only.") -> dict:
-    config = load_config(config_path)
+    config = _load_optional_config(config_path)
     api_key = api_key or config.get("llm_api_key", "")
     base_url = base_url or config.get("llm_base_url", "")
     model = model or config.get("llm_model", "")
@@ -2615,7 +2615,10 @@ def process_chunks(work_dir: str, prompt_name: str, extra_instruction: str = "",
     if extra_instruction:
         prompt_template += f"\n\n**Additional Instructions**: {extra_instruction}\n"
 
-    config = load_config(config_path)
+    if dry_run:
+        config = _load_optional_config(config_path)
+    else:
+        config = load_config(config_path)
     api_key = config.get("llm_api_key", "")
     base_url = config.get("llm_base_url", "")
     model = config.get("llm_model", "")
@@ -4265,6 +4268,8 @@ def load_config(config_path: str = None, allow_missing: bool = False) -> dict:
         for warning in config_warnings:
             print(f"  - {warning}", file=sys.stderr)
     return parsed
+
+
 def main():
     parser = argparse.ArgumentParser(
         description='yt-transcript utility script',

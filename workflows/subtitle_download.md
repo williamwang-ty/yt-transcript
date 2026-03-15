@@ -37,6 +37,7 @@ Rules:
 - If English subtitles are available, set `mode=bilingual` and use English as the source text
 - Else if Chinese subtitles are available, set `mode=chinese` and use Chinese as the source text
 - Else STOP
+- If only unsupported subtitle languages exist, `subtitle-info` may still report `has_any=true`, but `mode` remains empty and this workflow must STOP and switch to audio transcription
 
 Explicit product rule:
 
@@ -69,6 +70,8 @@ Record:
 - `selected_source_kind`
 
 `download_dir` points to the per-video isolated temp directory used by the script.
+
+The script downloads the exact selected subtitle language codes instead of a fixed whitelist, so regional variants such as `en-GB` and `zh-TW` are preserved.
 
 If no VTT files were downloaded, STOP.
 

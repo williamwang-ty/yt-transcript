@@ -559,7 +559,11 @@ class RegressionTests(unittest.TestCase):
                 "llm_api_format": "openai",
             })
 
-            with mock.patch.object(utils, "load_config", return_value=config):
+            with mock.patch.object(utils, "load_config", side_effect=AssertionError("dry-run should not require load_config")), mock.patch.object(
+                utils,
+                "_load_optional_config",
+                return_value=config,
+            ):
                 result = utils.process_chunks(str(work_dir), "structure_only", dry_run=True)
 
             self.assertTrue(result["success"])
@@ -609,6 +613,45 @@ class RegressionTests(unittest.TestCase):
             self.assertEqual(payload["preferred_source_language"], "en")
             self.assertEqual(payload["preferred_source_kind"], "manual")
             self.assertEqual(payload["mode"], "bilingual")
+
+    def test_subtitle_info_stops_routing_unsupported_languages_as_chinese(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fake_bin = Path(tmpdir) / "yt-dlp"
+            fake_bin.write_text(
+                """#!/usr/bin/env bash
+if [ "$1" = "--print" ] && [ "$2" = '%(id)s' ]; then
+  echo 'vides'
+  exit 0
+fi
+if [ "$1" = "-J" ]; then
+  cat <<'EOF'
+{"id":"vides","subtitles":{"es":[{"ext":"vtt"}]}}
+EOF
+  exit 0
+fi
+exit 1
+""",
+                encoding="utf-8",
+            )
+            fake_bin.chmod(0o755)
+
+            env = os.environ.copy()
+            env["PATH"] = f"{tmpdir}:{env['PATH']}"
+            result = subprocess.run(
+                ["bash", str(PROJECT_ROOT / "scripts/download.sh"), "https://example.com/video", "subtitle-info"],
+                cwd=PROJECT_ROOT,
+                env=env,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            payload = json.loads(result.stdout)
+            self.assertTrue(payload["has_any"])
+            self.assertFalse(payload["english_available"])
+            self.assertFalse(payload["chinese_available"])
+            self.assertEqual(payload["preferred_source_language"], "")
+            self.assertEqual(payload["preferred_source_kind"], "")
+            self.assertEqual(payload["mode"], "")
 
     def test_subtitle_info_propagates_yt_dlp_failure(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -797,6 +840,154 @@ exit 1
             finally:
                 stale.unlink(missing_ok=True)
                 shutil.rmtree("/tmp/vid001_downloads", ignore_errors=True)
+
+    def test_subtitles_downloads_supported_english_variant(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fake_bin = Path(tmpdir) / "yt-dlp"
+            fake_bin.write_text(
+                """#!/usr/bin/env bash
+if [ "$1" = "--print" ] && [ "$2" = '%(id)s' ]; then
+  echo 'vidgb'
+  exit 0
+fi
+if [ "$1" = "-J" ]; then
+  cat <<'EOF'
+{"id":"vidgb","subtitles":{"en-GB":[{"ext":"vtt"}]}}
+EOF
+  exit 0
+fi
+if [ "$1" = "--write-sub" ]; then
+  out=''
+  langs=''
+  while [ $# -gt 0 ]; do
+    if [ "$1" = "-o" ]; then
+      out="$2"
+      shift 2
+      continue
+    fi
+    if [ "$1" = "--sub-lang" ]; then
+      langs="$2"
+      shift 2
+      continue
+    fi
+    shift
+  done
+  mkdir -p "$(dirname "$out")"
+  case ",$langs," in
+    *,en-GB,*) : > "${out}.en-GB.vtt" ;;
+  esac
+  exit 0
+fi
+exit 1
+""",
+                encoding="utf-8",
+            )
+            fake_bin.chmod(0o755)
+
+            env = os.environ.copy()
+            env["PATH"] = f"{tmpdir}:{env['PATH']}"
+            result = subprocess.run(
+                ["bash", str(PROJECT_ROOT / "scripts/download.sh"), "https://example.com/video", "subtitles"],
+                cwd=PROJECT_ROOT,
+                env=env,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            payload = json.loads(result.stdout)
+            self.assertEqual(payload["selected_source_vtt"], "/tmp/vidgb_downloads/subtitles/vidgb.en-GB.vtt")
+            self.assertEqual(payload["selected_source_language"], "en-GB")
+            self.assertEqual(payload["selected_source_kind"], "manual")
+            shutil.rmtree("/tmp/vidgb_downloads", ignore_errors=True)
+
+    def test_subtitles_rejects_unsupported_languages_before_download(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fake_bin = Path(tmpdir) / "yt-dlp"
+            fake_bin.write_text(
+                """#!/usr/bin/env bash
+if [ "$1" = "--print" ] && [ "$2" = '%(id)s' ]; then
+  echo 'vides'
+  exit 0
+fi
+if [ "$1" = "-J" ]; then
+  cat <<'EOF'
+{"id":"vides","subtitles":{"es":[{"ext":"vtt"}]}}
+EOF
+  exit 0
+fi
+if [ "$1" = "--write-sub" ]; then
+  echo 'unexpected subtitle download' >&2
+  exit 99
+fi
+exit 1
+""",
+                encoding="utf-8",
+            )
+            fake_bin.chmod(0o755)
+
+            env = os.environ.copy()
+            env["PATH"] = f"{tmpdir}:{env['PATH']}"
+            result = subprocess.run(
+                ["bash", str(PROJECT_ROOT / "scripts/download.sh"), "https://example.com/video", "subtitles"],
+                cwd=PROJECT_ROOT,
+                env=env,
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("supports English or Chinese subtitle tracks only", result.stderr)
+            self.assertNotIn("unexpected subtitle download", result.stderr)
+
+    def test_preflight_treats_update_check_as_best_effort(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fake_yt_dlp = Path(tmpdir) / "yt-dlp"
+            fake_yt_dlp.write_text(
+                """#!/usr/bin/env bash
+if [ "$1" = "--version" ]; then
+  echo '2025.01.01'
+  exit 0
+fi
+exit 0
+""",
+                encoding="utf-8",
+            )
+            fake_yt_dlp.chmod(0o755)
+
+            fake_ffmpeg = Path(tmpdir) / "ffmpeg"
+            fake_ffmpeg.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+            fake_ffmpeg.chmod(0o755)
+
+            fake_curl = Path(tmpdir) / "curl"
+            fake_curl.write_text("#!/usr/bin/env bash\nexit 127\n", encoding="utf-8")
+            fake_curl.chmod(0o755)
+
+            config_path = PROJECT_ROOT / "config.yaml"
+            backup_path = None
+            if config_path.exists():
+                backup_path = Path(tmpdir) / "config.yaml.backup"
+                shutil.copy2(config_path, backup_path)
+
+            config_path.write_text('output_dir: "/tmp/yt-transcript-preflight-test"\n', encoding="utf-8")
+            try:
+                env = os.environ.copy()
+                env["PATH"] = f"{tmpdir}:{env['PATH']}"
+                result = subprocess.run(
+                    ["bash", str(PROJECT_ROOT / "scripts/preflight.sh")],
+                    cwd=PROJECT_ROOT,
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                )
+            finally:
+                if backup_path is not None and backup_path.exists():
+                    shutil.copy2(backup_path, config_path)
+                else:
+                    config_path.unlink(missing_ok=True)
+                shutil.rmtree("/tmp/yt-transcript-preflight-test", ignore_errors=True)
+
+            self.assertEqual(result.returncode, 0)
+            self.assertIn("Could not check for updates", result.stdout)
+            self.assertIn("All pre-flight checks passed", result.stdout)
     def test_audio_download_uses_isolated_dir(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             fake_bin = Path(tmpdir) / "yt-dlp"
@@ -1416,7 +1607,11 @@ exit 1
                 "llm_api_format": "openai",
             })
 
-            with mock.patch.object(utils, "load_config", return_value=config):
+            with mock.patch.object(utils, "load_config", side_effect=AssertionError("dry-run should not require load_config")), mock.patch.object(
+                utils,
+                "_load_optional_config",
+                return_value=config,
+            ):
                 result = utils.process_chunks(str(work_dir), "structure_only", dry_run=True)
 
             self.assertTrue(result["success"])
@@ -1907,6 +2102,28 @@ exit 1
         self.assertEqual(result["latency_ms"], 42)
         self.assertTrue(result["streaming_used"])
 
+    def test_test_llm_api_can_run_from_explicit_overrides_without_config(self):
+        with mock.patch.object(utils, "load_config", side_effect=AssertionError("explicit overrides should not require load_config")), mock.patch.object(
+            utils,
+            "_load_optional_config",
+            return_value=utils._default_config_values(),
+        ), mock.patch.object(utils, "_call_llm_api", return_value={
+            "text": "OK",
+            "latency_ms": 42,
+            "request_url": "https://api.example.com/v1/chat/completions",
+            "streaming_used": False,
+            "attempts": 1,
+        }):
+            result = utils.test_llm_api(
+                api_key="key",
+                base_url="https://api.example.com",
+                model="demo",
+                api_format="openai",
+            )
+
+        self.assertTrue(result["valid"])
+        self.assertEqual(result["request_url"], "https://api.example.com/v1/chat/completions")
+
     def test_count_tokens_via_provider_uses_anthropic_endpoint(self):
         config = utils._default_config_values()
         config.update({
@@ -2030,6 +2247,34 @@ exit 1
         self.assertEqual(result["token_count_source"], "local_estimate")
         self.assertTrue(result["fallback_used"])
         self.assertGreater(result["token_count"], 0)
+
+    def test_test_token_count_can_run_from_explicit_overrides_without_config(self):
+        with mock.patch.object(utils, "load_config", side_effect=AssertionError("explicit overrides should not require load_config")), mock.patch.object(
+            utils,
+            "_load_optional_config",
+            return_value=utils._default_config_values(),
+        ), mock.patch.object(utils, "_count_tokens_via_provider", return_value={
+            "valid": False,
+            "provider_supported": False,
+            "token_count": 5,
+            "token_count_source": "local_estimate",
+            "request_url": "",
+            "latency_ms": None,
+            "api_format": "openai",
+            "error_type": "unsupported_api_format",
+            "error": "Provider token counting is not implemented",
+        }):
+            result = utils.test_token_count(
+                api_key="key",
+                base_url="https://api.example.com",
+                model="demo",
+                api_format="openai",
+                sample_text="Hello 世界",
+            )
+
+        self.assertTrue(result["valid"])
+        self.assertFalse(result["provider_supported"])
+        self.assertEqual(result["token_count"], 5)
 
 
 if __name__ == "__main__":

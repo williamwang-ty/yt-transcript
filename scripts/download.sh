@@ -48,8 +48,8 @@ if not manual and not automatic:
     raise SystemExit(1)
 
 all_langs = manual + [lang for lang in automatic if lang not in manual]
-english_like = [lang for lang in all_langs if lang.startswith('en')]
-chinese_like = [lang for lang in all_langs if lang.startswith('zh')]
+english_like = [lang for lang in all_langs if lang == 'en' or lang.startswith('en-')]
+chinese_like = [lang for lang in all_langs if lang == 'zh' or lang.startswith('zh-')]
 
 preferred_source_language = ''
 preferred_source_kind = ''
@@ -60,10 +60,6 @@ if english_like:
     mode = 'bilingual'
 elif chinese_like:
     preferred_source_language = chinese_like[0]
-    preferred_source_kind = 'manual' if preferred_source_language in manual else 'auto'
-    mode = 'chinese'
-elif all_langs:
-    preferred_source_language = all_langs[0]
     preferred_source_kind = 'manual' if preferred_source_language in manual else 'auto'
     mode = 'chinese'
 
@@ -121,8 +117,8 @@ for raw_line in text.splitlines():
         automatic.append(lang)
 
 all_langs = manual + [lang for lang in automatic if lang not in manual]
-english_like = [lang for lang in all_langs if lang.startswith('en')]
-chinese_like = [lang for lang in all_langs if lang.startswith('zh')]
+english_like = [lang for lang in all_langs if lang == 'en' or lang.startswith('en-')]
+chinese_like = [lang for lang in all_langs if lang == 'zh' or lang.startswith('zh-')]
 
 preferred_source_language = ''
 preferred_source_kind = ''
@@ -133,10 +129,6 @@ if english_like:
     mode = 'bilingual'
 elif chinese_like:
     preferred_source_language = chinese_like[0]
-    preferred_source_kind = 'manual' if preferred_source_language in manual else 'auto'
-    mode = 'chinese'
-elif all_langs:
-    preferred_source_language = all_langs[0]
     preferred_source_kind = 'manual' if preferred_source_language in manual else 'auto'
     mode = 'chinese'
 
@@ -250,14 +242,53 @@ PY
         SUBTITLE_DIR="$(download_root_for_video "$VIDEO_ID")/subtitles"
         reset_download_dir "$SUBTITLE_DIR"
 
+        SUB_INFO_JSON=$(bash "$SCRIPT_DIR/download.sh" "$VIDEO_URL" subtitle-info)
+        if ! SUB_LANGS=$(SUB_INFO_JSON="$SUB_INFO_JSON" python3 - <<'PY'
+import json
+import os
+
+sub_info = json.loads(os.environ['SUB_INFO_JSON'])
+mode = sub_info.get('mode', '')
+preferred_source_language = str(sub_info.get('preferred_source_language', '') or '').strip()
+manual_languages = sub_info.get('manual_languages', [])
+automatic_languages = sub_info.get('automatic_languages', [])
+all_langs = manual_languages + [lang for lang in automatic_languages if lang not in manual_languages]
+chinese_like = [lang for lang in all_langs if lang == 'zh' or lang.startswith('zh-')]
+
+requested = []
+if mode == 'bilingual' and preferred_source_language:
+    requested.append(preferred_source_language)
+    requested.extend(chinese_like)
+elif mode == 'chinese' and preferred_source_language:
+    requested.append(preferred_source_language)
+else:
+    raise SystemExit(1)
+
+deduped = []
+seen = set()
+for lang in requested:
+    normalized = str(lang or '').strip()
+    if not normalized or normalized in seen:
+        continue
+    seen.add(normalized)
+    deduped.append(normalized)
+
+if not deduped:
+    raise SystemExit(1)
+
+print(','.join(deduped))
+PY
+); then
+            echo "❌ Error: Subtitle workflow supports English or Chinese subtitle tracks only; use audio transcription fallback for other languages" >&2
+            exit 1
+        fi
+
         yt-dlp --write-sub --write-auto-sub \
-               --sub-lang "en,en-orig,en-US,zh,zh-Hans,zh-CN,zh-Hant" \
+               --sub-lang "$SUB_LANGS" \
                --sub-format "vtt" \
                --skip-download \
                -o "$SUBTITLE_DIR/${VIDEO_ID}" \
                "$VIDEO_URL" >&2
-
-        SUB_INFO_JSON=$(bash "$SCRIPT_DIR/download.sh" "$VIDEO_URL" subtitle-info)
 
         VIDEO_ID="$VIDEO_ID" SUB_INFO_JSON="$SUB_INFO_JSON" SUBTITLE_DIR="$SUBTITLE_DIR" python3 - <<'PY'
 import json

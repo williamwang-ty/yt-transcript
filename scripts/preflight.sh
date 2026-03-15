@@ -63,9 +63,14 @@ fi
 
 if [ "$SHOULD_CHECK_UPDATE" = true ]; then
     echo "🌐 Checking for yt-dlp updates..."
-    # Fetch latest release tag from GitHub API
-    LATEST_VERSION_JSON=$(curl -s --max-time 5 https://api.github.com/repos/yt-dlp/yt-dlp/releases/latest)
-    
+    if ! command -v curl &> /dev/null; then
+        echo "⚠️  Skipping update check because curl is not installed"
+        LATEST_VERSION_JSON=""
+    else
+        # Fetch latest release tag from GitHub API (best effort only)
+        LATEST_VERSION_JSON=$(curl -fsS --max-time 5 https://api.github.com/repos/yt-dlp/yt-dlp/releases/latest 2>/dev/null || true)
+    fi
+
     if [ -n "$LATEST_VERSION_JSON" ]; then
         # Parse tag_name using python to avoid jq dependency
         LATEST_VERSION=$(echo "$LATEST_VERSION_JSON" | python3 -c "import sys, json; print(json.load(sys.stdin).get('tag_name', ''))" 2>/dev/null)
