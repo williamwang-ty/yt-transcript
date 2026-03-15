@@ -155,9 +155,10 @@ This keeps workflow logic in scripts instead of ad-hoc shell parsing inside the 
 - `chunk-text` now defaults to token-aware planning when `--prompt` is provided, while an explicit `--chunk-size` without `--prompt` keeps legacy character sizing for workflow compatibility
 - prompt names are validated eagerly for chunk planning, so typos fail fast instead of silently falling back to generic budgets
 - `process-chunks` now assigns prompt-specific `max_output_tokens` from the same planning budget instead of using one large shared default
-- token estimation is heuristic rather than exact; the current fallback intentionally overestimates common transcript shapes and relies on safety buffers until provider-side token counting is available
+- `process-chunks` also injects a short continuity context from the previous chunk (tail sentence + optional section title) without enabling body overlap, and chunk budgeting now reserves a small token allowance for that carry-over context
+- runtime token estimation remains heuristic by default; `test-token-count` / `preflight.sh --require-llm` probe provider-side token counting and clearly fall back to local estimates when unavailable
 - `chunk_hard_cap_multiplier` is constrained to a conservative `1.0-2.0` range so misconfiguration cannot silently blow up chunk envelopes
-- `preflight.sh` is staged so subtitle-only workflows do not require Deepgram or LLM credentials up front, while `--require-llm` now performs a real probe
+- `preflight.sh` is staged so subtitle-only workflows do not require Deepgram or LLM credentials up front, while `--require-llm` now performs both reachability and token-count capability probes
 - `transcribe-deepgram` is the only supported Deepgram entry point; split / merge behavior is owned by the Python utility
 - `verify-quality` is a hard gate only when `hard_failures` is non-empty; `warnings` are advisory review signals
 
@@ -365,9 +366,10 @@ bash scripts/preflight.sh --require-llm
 - 如果只传显式 `--chunk-size` 而不传 `--prompt`，`chunk-text` 会继续按 legacy 字符大小解释，避免现有 workflow 被静默改变
 - 分块阶段会提前校验 prompt 名称，避免因为 prompt 拼写错误而静默回退到通用预算
 - `process-chunks` 现在按 prompt 预算单独设置 `max_output_tokens`，不再复用单一的大默认值
-- 当前 token 估算仍是启发式 fallback，不是精确 tokenizer；在 provider 级 token count 可用前，主要依靠 safety buffer 保守规划
+- `process-chunks` 还会注入上一块的轻量 continuity context（尾句 + 可选 section title），但不会启用正文 overlap；同时分块预算也会为这段 carry-over context 预留一小段 token 成本
+- 运行时 token 估算默认仍是本地启发式 fallback；`test-token-count` / `preflight.sh --require-llm` 会探测 provider 级 token count，并在不可用时明确回退到 local estimate
 - `chunk_hard_cap_multiplier` 会被限制在保守的 `1.0-2.0` 区间，避免配置失误把 chunk 包络静默放大
-- `preflight.sh` 采用分层校验，确保只走字幕路径时不必预先配置 Deepgram 或 LLM 凭据
+- `preflight.sh` 采用分层校验，确保只走字幕路径时不必预先配置 Deepgram 或 LLM 凭据；进入 `--require-llm` 时会同时做连通性和 token count 能力探测
 - `transcribe-deepgram` 是唯一支持的 Deepgram 统一入口，分片与合并逻辑由 Python 工具统一负责
 - `verify-quality` 只有在 `hard_failures` 非空时才阻断流程；`warnings` 仅用于人工复核提示
 

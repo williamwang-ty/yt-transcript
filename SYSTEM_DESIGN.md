@@ -93,6 +93,7 @@ To handle arbitrarily long videos (e.g., >2 hours) without hitting LLM context l
 
 2.  **Budgeted Chunk Processing**:
     - `process-chunks` uses prompt-specific `max_output_tokens` computed from the same request budget as chunk planning.
+    - It also injects a lightweight continuity block from the previous chunk (tail sentence + optional section title) so adjacent chunks stay coherent without enabling overlap, and the chunk budget reserves a small token allowance for that context.
     - This keeps request envelopes conservative instead of sending one oversized output cap for every task.
 
 3.  **Two-Stage Chapter Planning**:
@@ -320,6 +321,7 @@ yt-transcript/
 
 2.  **预算化 Chunk 处理**：
     - `process-chunks` 会使用与分块规划同一套请求预算，为不同 prompt 单独计算 `max_output_tokens`。
+    - 它还会注入上一块的轻量 continuity block（尾句 + 可选 section title），在不启用 overlap 的前提下提升相邻块的一致性；同时 chunk budget 也会为这段上下文预留一小段 token 成本。
     - 这样可以避免所有任务都带着同一个偏大的输出上限发请求。
 
 3.  **两阶段章节规划**：

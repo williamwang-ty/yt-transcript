@@ -44,7 +44,9 @@ chunk_tokens_summarize: 2500
 chunk_hard_cap_multiplier: 1.33
 chunk_safety_buffer_tokens: 400
 chunk_overlap_sentences: 0
+# Continuity context uses the last N sentence(s) from the previous chunk.
 chunk_context_tail_sentences: 1
+# Soft token cap for the carried continuity excerpt.
 chunk_context_summary_tokens: 60
 output_ratio_structure_only: 1.15
 output_ratio_quick_cleanup: 1.05

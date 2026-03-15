@@ -49,6 +49,24 @@ class RegressionTests(unittest.TestCase):
             "https://api.anthropic.com/v1/messages",
         )
 
+    def test_build_token_count_url_accepts_root_v1_and_messages(self):
+        self.assertEqual(
+            utils._build_token_count_url("https://api.anthropic.com", "anthropic"),
+            "https://api.anthropic.com/v1/messages/count_tokens",
+        )
+        self.assertEqual(
+            utils._build_token_count_url("https://api.anthropic.com/v1", "anthropic"),
+            "https://api.anthropic.com/v1/messages/count_tokens",
+        )
+        self.assertEqual(
+            utils._build_token_count_url("https://api.anthropic.com/v1/messages", "anthropic"),
+            "https://api.anthropic.com/v1/messages/count_tokens",
+        )
+        self.assertEqual(
+            utils._build_token_count_url("https://api.example.com", "openai"),
+            "",
+        )
+
     def test_load_config_preserves_hash_inside_quotes(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             config_path = Path(tmpdir) / "config.yaml"
@@ -810,6 +828,29 @@ class RegressionTests(unittest.TestCase):
         override_config["chunk_size_override"] = 777
         self.assertEqual(utils._get_task_chunk_target("structure_only", override_config), 777)
 
+    def test_calculate_chunk_budget_reserves_continuity_context(self):
+        structure_prompt = (PROJECT_ROOT / "prompts" / "structure_only.md").read_text(encoding="utf-8")
+        with_continuity = utils._default_config_values()
+        without_continuity = utils._default_config_values()
+        without_continuity["chunk_context_tail_sentences"] = 0
+
+        budget_with = utils._calculate_chunk_budget("structure_only", structure_prompt, with_continuity)
+        budget_without = utils._calculate_chunk_budget("structure_only", structure_prompt, without_continuity)
+
+        self.assertGreater(budget_with["continuity_reserve_tokens"], 0)
+        self.assertEqual(budget_without["continuity_reserve_tokens"], 0)
+        self.assertGreater(budget_with["prompt_tokens"], budget_without["prompt_tokens"])
+        self.assertLess(budget_with["target_tokens"], budget_without["target_tokens"])
+
+    def test_inject_continuity_context_appends_when_no_anchor(self):
+        result = utils._inject_continuity_context("Prompt header", "## Continuity Context\ncontext")
+        self.assertEqual(result, "Prompt header\n\n## Continuity Context\ncontext\n")
+
+    def test_truncate_tail_text_to_tokens_handles_boundary_cases(self):
+        self.assertEqual(utils._truncate_tail_text_to_tokens("", 10), "")
+        self.assertEqual(utils._truncate_tail_text_to_tokens(" 甲乙 ", 0), "甲乙")
+        self.assertEqual(utils._truncate_tail_text_to_tokens("甲乙丙丁", 2), "丙丁")
+
     def test_call_llm_api_retries_timeout_then_succeeds(self):
         with mock.patch.object(utils, "_execute_llm_request") as mocked_request, mock.patch("time.sleep"):
             mocked_request.side_effect = [
@@ -917,6 +958,170 @@ class RegressionTests(unittest.TestCase):
             self.assertEqual(manifest["planned_max_output_tokens"], 384)
             self.assertEqual(manifest["chunks"][0]["planned_max_output_tokens"], 384)
 
+    def test_process_chunks_injects_continuity_context(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source = Path(tmpdir) / "raw.txt"
+            work_dir = Path(tmpdir) / "chunks"
+            config_path = Path(tmpdir) / "config.yaml"
+            source.write_text("第一句。第二句。第三句。第四句。", encoding="utf-8")
+            config_path.write_text(
+                f'output_dir: "{tmpdir}"\n'
+                'chunk_mode: "chars"\n'
+                'chunk_context_tail_sentences: 1\n'
+                'chunk_context_summary_tokens: 20\n',
+                encoding="utf-8",
+            )
+            utils.chunk_text(str(source), str(work_dir), 8, config_path=str(config_path))
+            manifest_before = json.loads((work_dir / "manifest.json").read_text(encoding="utf-8"))
+
+            recorded_prompts = []
+            fake_outputs = iter([
+                "## Intro\n\n整理后的第一部分。",
+                "## Follow-up\n\n整理后的第二部分。",
+                "## Third\n\n整理后的第三部分。",
+                "## Final\n\n整理后的第四部分。",
+            ])
+
+            def fake_call(**kwargs):
+                recorded_prompts.append(kwargs["messages"][0]["content"])
+                return {
+                    "text": next(fake_outputs),
+                    "latency_ms": 12,
+                    "request_url": "https://api.example.com/v1/chat/completions",
+                    "streaming_used": False,
+                    "attempts": 1,
+                }
+
+            config = utils._default_config_values()
+            config.update({
+                "llm_api_key": "key",
+                "llm_base_url": "https://api.example.com",
+                "llm_model": "demo",
+                "llm_api_format": "openai",
+                "chunk_context_tail_sentences": 1,
+                "chunk_context_summary_tokens": 20,
+            })
+
+            with mock.patch.object(utils, "load_config", return_value=config), mock.patch.object(
+                utils, "_call_llm_api", side_effect=fake_call
+            ):
+                result = utils.process_chunks(str(work_dir), "structure_only")
+
+            manifest = json.loads((work_dir / "manifest.json").read_text(encoding="utf-8"))
+            self.assertTrue(result["success"])
+            self.assertNotIn("## Continuity Context", recorded_prompts[0])
+            self.assertIn("## Continuity Context", recorded_prompts[1])
+            self.assertIn("Do not repeat or rewrite this context in the output.", recorded_prompts[1])
+            self.assertIn(manifest_before["chunks"][0]["tail_context_text"], recorded_prompts[1])
+            self.assertEqual(manifest["chunks"][1]["continuity_prev_chunk_id"], 0)
+            self.assertGreater(manifest["chunks"][1]["continuity_context_tokens"], 0)
+            self.assertEqual(manifest["chunks"][0]["last_section_title"], "## Intro")
+
+    def test_process_chunks_reuses_manifest_token_estimates_without_remote_probe(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source = Path(tmpdir) / "raw.txt"
+            work_dir = Path(tmpdir) / "chunks"
+            source.write_text("第一句。第二句。", encoding="utf-8")
+            utils.chunk_text(str(source), str(work_dir), 5000)
+
+            config = utils._default_config_values()
+            config.update({
+                "llm_api_key": "key",
+                "llm_base_url": "https://api.example.com",
+                "llm_model": "demo",
+                "llm_api_format": "openai",
+            })
+
+            stderr = io.StringIO()
+            with mock.patch.object(utils, "load_config", return_value=config), \
+                mock.patch.object(utils, "_count_tokens_via_provider", side_effect=AssertionError("should not be called")), \
+                mock.patch.object(utils, "_call_llm_api", return_value={
+                    "text": "## Done\n\n处理完成。",
+                    "latency_ms": 12,
+                    "request_url": "https://api.example.com/v1/chat/completions",
+                    "streaming_used": False,
+                    "attempts": 1,
+                }), \
+                mock.patch("sys.stderr", stderr):
+                result = utils.process_chunks(str(work_dir), "structure_only")
+
+            manifest = json.loads((work_dir / "manifest.json").read_text(encoding="utf-8"))
+            self.assertTrue(result["success"])
+            self.assertEqual(manifest["chunks"][0]["token_count_source"], "manifest_cached_input")
+            self.assertEqual(manifest["token_count_source"], "manifest_cached_input")
+            self.assertIn("est_source=manifest_cached_input", stderr.getvalue())
+
+    def test_process_chunks_uses_processed_tail_for_chained_continuity(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source = Path(tmpdir) / "raw.txt"
+            work_dir = Path(tmpdir) / "chunks"
+            source.write_text("原始甲。原始乙。原始丙。原始丁。", encoding="utf-8")
+            utils.chunk_text(str(source), str(work_dir), 8)
+            manifest_before = json.loads((work_dir / "manifest.json").read_text(encoding="utf-8"))
+            raw_tail = manifest_before["chunks"][0]["tail_context_text"]
+
+            config = utils._default_config_values()
+            config.update({
+                "llm_api_key": "key",
+                "llm_base_url": "https://api.example.com",
+                "llm_model": "demo",
+                "llm_api_format": "openai",
+                "chunk_context_tail_sentences": 1,
+                "chunk_context_summary_tokens": 20,
+            })
+
+            structured_outputs = iter([
+                "## Intro\n\n结构化第一块。PROCESSED_TAIL_ONE。",
+                "## Follow-up\n\n结构化第二块。PROCESSED_TAIL_TWO。",
+                "## Third\n\n结构化第三块。PROCESSED_TAIL_THREE。",
+                "## Final\n\n结构化第四块。PROCESSED_TAIL_FOUR。",
+            ])
+            with mock.patch.object(utils, "load_config", return_value=config), mock.patch.object(
+                utils,
+                "_call_llm_api",
+                side_effect=lambda **kwargs: {
+                    "text": next(structured_outputs),
+                    "latency_ms": 12,
+                    "request_url": "https://api.example.com/v1/chat/completions",
+                    "streaming_used": False,
+                    "attempts": 1,
+                },
+            ):
+                first_pass = utils.process_chunks(str(work_dir), "structure_only")
+
+            self.assertTrue(first_pass["success"])
+
+            translate_prompts = []
+            translated_outputs = iter([
+                "[EN1]\n\n[ZH1]",
+                "[EN2]\n\n[ZH2]",
+                "[EN3]\n\n[ZH3]",
+                "[EN4]\n\n[ZH4]",
+            ])
+            stderr = io.StringIO()
+            with mock.patch.object(utils, "load_config", return_value=config), mock.patch.object(
+                utils,
+                "_call_llm_api",
+                side_effect=lambda **kwargs: translate_prompts.append(kwargs["messages"][0]["content"]) or {
+                    "text": next(translated_outputs),
+                    "latency_ms": 12,
+                    "request_url": "https://api.example.com/v1/chat/completions",
+                    "streaming_used": False,
+                    "attempts": 1,
+                },
+            ), mock.patch("sys.stderr", stderr):
+                second_pass = utils.process_chunks(str(work_dir), "translate_only", input_key="processed_path", force=True)
+
+            manifest_after = json.loads((work_dir / "manifest.json").read_text(encoding="utf-8"))
+            self.assertTrue(second_pass["success"])
+            self.assertIn("Previous section title:", translate_prompts[1])
+            self.assertIn("## Intro", translate_prompts[1])
+            self.assertIn("PROCESSED_TAIL_ONE", translate_prompts[1])
+            self.assertNotIn(raw_tail, translate_prompts[1])
+            self.assertEqual(manifest_after["chunks"][0]["token_count_source"], "manifest_cached_output")
+            self.assertEqual(manifest_after["token_count_source"], "manifest_cached_output")
+            self.assertIn("est_source=manifest_cached_output", stderr.getvalue())
+
     def test_process_chunks_dry_run_preserves_char_manifest_units(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             source = Path(tmpdir) / "raw.txt"
@@ -1015,6 +1220,130 @@ class RegressionTests(unittest.TestCase):
         self.assertTrue(result["valid"])
         self.assertEqual(result["latency_ms"], 42)
         self.assertTrue(result["streaming_used"])
+
+    def test_count_tokens_via_provider_uses_anthropic_endpoint(self):
+        config = utils._default_config_values()
+        config.update({
+            "enable_token_count_probe": True,
+            "llm_api_key": "key",
+            "llm_base_url": "https://api.anthropic.com",
+            "llm_model": "claude-demo",
+            "llm_api_format": "anthropic",
+            "llm_probe_timeout_sec": 5,
+        })
+        requests = []
+
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def read(self):
+                return b'{"input_tokens": 7}'
+
+        def fake_urlopen(req, timeout=0):
+            requests.append((req.full_url, timeout, req.data.decode("utf-8")))
+            return FakeResponse()
+
+        with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            result = utils._count_tokens_via_provider("Hello world", config=config)
+
+        self.assertTrue(result["valid"])
+        self.assertTrue(result["provider_supported"])
+        self.assertEqual(result["token_count_source"], "provider")
+        self.assertEqual(result["token_count"], 7)
+        self.assertEqual(requests[0][0], "https://api.anthropic.com/v1/messages/count_tokens")
+        self.assertIn('"model": "claude-demo"', requests[0][2])
+
+    def test_count_tokens_via_provider_http_error_falls_back_cleanly(self):
+        import urllib.error
+
+        config = utils._default_config_values()
+        config.update({
+            "enable_token_count_probe": True,
+            "llm_api_key": "key",
+            "llm_base_url": "https://api.anthropic.com",
+            "llm_model": "claude-demo",
+            "llm_api_format": "anthropic",
+            "llm_probe_timeout_sec": 5,
+        })
+        http_error = urllib.error.HTTPError(
+            "https://api.anthropic.com/v1/messages/count_tokens",
+            429,
+            "rate limited",
+            hdrs=None,
+            fp=io.BytesIO(b'{"error":"rate limited"}'),
+        )
+
+        with mock.patch("urllib.request.urlopen", side_effect=http_error):
+            result = utils._count_tokens_via_provider("Hello world", config=config)
+
+        self.assertFalse(result["valid"])
+        self.assertEqual(result["error_type"], "http_429")
+        self.assertEqual(result["status_code"], 429)
+        self.assertEqual(result["token_count_source"], "local_estimate")
+        self.assertGreater(result["token_count"], 0)
+
+    def test_count_tokens_via_provider_network_error_falls_back_cleanly(self):
+        import urllib.error
+
+        config = utils._default_config_values()
+        config.update({
+            "enable_token_count_probe": True,
+            "llm_api_key": "key",
+            "llm_base_url": "https://api.anthropic.com",
+            "llm_model": "claude-demo",
+            "llm_api_format": "anthropic",
+            "llm_probe_timeout_sec": 5,
+        })
+
+        with mock.patch("urllib.request.urlopen", side_effect=urllib.error.URLError("dns failed")):
+            result = utils._count_tokens_via_provider("Hello world", config=config)
+
+        self.assertFalse(result["valid"])
+        self.assertEqual(result["error_type"], "network")
+        self.assertEqual(result["token_count_source"], "local_estimate")
+        self.assertIn("dns failed", result["error"])
+
+    def test_count_tokens_via_provider_timeout_falls_back_cleanly(self):
+        import socket
+
+        config = utils._default_config_values()
+        config.update({
+            "enable_token_count_probe": True,
+            "llm_api_key": "key",
+            "llm_base_url": "https://api.anthropic.com",
+            "llm_model": "claude-demo",
+            "llm_api_format": "anthropic",
+            "llm_probe_timeout_sec": 5,
+        })
+
+        with mock.patch("urllib.request.urlopen", side_effect=socket.timeout("probe timed out")):
+            result = utils._count_tokens_via_provider("Hello world", config=config)
+
+        self.assertFalse(result["valid"])
+        self.assertEqual(result["error_type"], "timeout")
+        self.assertEqual(result["token_count_source"], "local_estimate")
+        self.assertIn("probe timed out", result["error"])
+
+    def test_test_token_count_falls_back_to_local_estimate(self):
+        with mock.patch.object(utils, "load_config", return_value={
+            "enable_token_count_probe": True,
+            "llm_api_key": "key",
+            "llm_base_url": "https://api.example.com",
+            "llm_model": "demo",
+            "llm_api_format": "openai",
+            "llm_probe_timeout_sec": 5,
+        }):
+            result = utils.test_token_count(sample_text="Hello 世界")
+
+        self.assertTrue(result["valid"])
+        self.assertFalse(result["provider_supported"])
+        self.assertEqual(result["token_count_source"], "local_estimate")
+        self.assertTrue(result["fallback_used"])
+        self.assertGreater(result["token_count"], 0)
 
 
 if __name__ == "__main__":

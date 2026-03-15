@@ -18,6 +18,7 @@ Commands:
     sanitize-filename "<title>"    Clean illegal filename characters
     test-deepgram-api <api_key>    Test Deepgram API key validity
     test-llm-api                   Probe configured LLM API reachability
+    test-token-count               Probe provider token counting support with local fallback
     split-audio <audio_path>       Split large audio at silence points (--max-size, --max-deviation)
     chunk-text <input> <output_dir> Split text file into chunks by sentence boundary
     get-chapters <video_url>       Fetch YouTube video chapter metadata
@@ -126,6 +127,20 @@ def _build_api_url(base_url: str, api_format: str = "openai") -> str:
     if base.endswith("/v1"):
         return f"{base}/chat/completions"
     return f"{base}/v1/chat/completions"
+
+
+def _build_token_count_url(base_url: str, api_format: str = "openai") -> str:
+    base = base_url.rstrip("/")
+
+    if api_format != "anthropic":
+        return ""
+    if base.endswith("/messages/count_tokens"):
+        return base
+    if base.endswith("/messages"):
+        return f"{base}/count_tokens"
+    if base.endswith("/v1"):
+        return f"{base}/messages/count_tokens"
+    return f"{base}/v1/messages/count_tokens"
 
 
 class LLMRequestError(Exception):
@@ -395,7 +410,7 @@ def _advance_token_estimate_state(state: dict, char: str, next_char: str = "") -
 
 
 
-def _estimate_tokens(text: str, mode: str = "tokens", config: dict | None = None) -> int:
+def _estimate_tokens_local(text: str, mode: str = "tokens", config: dict | None = None) -> int:
     # Heuristic estimation only. This intentionally over-approximates common
     # transcript shapes and is not a substitute for provider-side token counting.
     del config
@@ -411,10 +426,222 @@ def _estimate_tokens(text: str, mode: str = "tokens", config: dict | None = None
     return max(1, state["tokens"])
 
 
+# Runtime chunk planning still uses the local estimator to avoid one remote
+# token-count round trip per sentence or segment. Provider probing is wired via
+# _count_tokens_via_provider()/test_token_count() and can be promoted later.
+def _estimate_tokens(text: str, mode: str = "tokens", config: dict | None = None) -> int:
+    return _estimate_tokens_local(text, mode, config)
+
+
+def _truncate_tail_text_to_tokens(text: str, max_tokens: int,
+                                  config: dict | None = None) -> str:
+    """Keep the tail-most portion of text within a soft token cap."""
+    if not text:
+        return ""
+    if max_tokens <= 0 or _estimate_tokens(text, "tokens", config) <= max_tokens:
+        return text.strip()
+    segments = _force_split_text_by_tokens(text.strip(), max_tokens, config)
+    return segments[-1].strip() if segments else text.strip()
+
+
+def _extract_tail_sentences(text: str, sentence_count: int,
+                            config: dict | None = None) -> str:
+    if not text or sentence_count <= 0:
+        return ""
+    sentences = _split_sentences(text)
+    if sentences:
+        tail_text = " ".join(sentences[-sentence_count:]).strip()
+    else:
+        tail_text = text.strip()
+
+    summary_token_cap = _parse_int_min(
+        (config or {}).get("chunk_context_summary_tokens"),
+        DEFAULT_CHUNK_CONTEXT_SUMMARY_TOKENS,
+        0,
+    )
+    if summary_token_cap > 0:
+        tail_text = _truncate_tail_text_to_tokens(tail_text, summary_token_cap, config)
+    return tail_text
+
+
+def _extract_last_section_title(text: str) -> str:
+    matches = re.findall(r"^##\s+(.+?)\s*$", text or "", re.MULTILINE)
+    if not matches:
+        return ""
+    return f"## {matches[-1].strip()}"
+
+
+def _resolve_previous_section_title(previous_chunk: dict | None,
+                                    work_path: Path,
+                                    input_key: str = "raw_path") -> str:
+    previous_chunk = previous_chunk or {}
+
+    if input_key == "processed_path":
+        cached_processed_title = str(previous_chunk.get("processed_input_section_title", "")).strip()
+        if cached_processed_title:
+            return cached_processed_title
+
+    cached_title = str(previous_chunk.get("last_section_title", "")).strip()
+    if cached_title:
+        return cached_title
+
+    processed_name = str(previous_chunk.get("processed_path", "")).strip()
+    if not processed_name:
+        return ""
+
+    processed_path = work_path / processed_name
+    if not processed_path.exists():
+        return ""
+
+    try:
+        return _extract_last_section_title(processed_path.read_text(encoding="utf-8"))
+    except OSError:
+        return ""
+
+
+def _resolve_previous_tail_text(previous_chunk: dict | None, work_path: Path,
+                                input_key: str, config: dict | None = None) -> str:
+    """Resolve continuity tail text for the previous chunk.
+
+    Priority for `processed_path` chains:
+    1. cached processed-input tail captured from the previous stage
+    2. cached tail from the previous stage output file
+    3. re-read previous `processed_path` and derive a tail on demand
+    4. raw-stage tail as a last-resort fallback
+    """
+    previous_chunk = previous_chunk or {}
+    config = config or {}
+
+    if input_key == "processed_path":
+        cached_input_tail = str(previous_chunk.get("processed_input_tail_context_text", "")).strip()
+        if cached_input_tail:
+            return cached_input_tail
+
+        cached_tail = str(previous_chunk.get("processed_tail_context_text", "")).strip()
+        if cached_tail:
+            return cached_tail
+
+        processed_name = str(previous_chunk.get("processed_path", "")).strip()
+        if processed_name:
+            processed_path = work_path / processed_name
+            if processed_path.exists():
+                try:
+                    processed_text = processed_path.read_text(encoding="utf-8")
+                    return _extract_tail_sentences(
+                        processed_text,
+                        _parse_int_min(
+                            config.get("chunk_context_tail_sentences"),
+                            DEFAULT_CHUNK_CONTEXT_TAIL_SENTENCES,
+                            0,
+                        ),
+                        config,
+                    )
+                except OSError:
+                    pass
+
+    return str(previous_chunk.get("tail_context_text", "")).strip()
+
+
+def _build_continuity_context(previous_chunk: dict | None, work_path: Path,
+                              config: dict | None = None,
+                              input_key: str = "raw_path") -> dict:
+    """Build the lightweight continuity block inserted before the next chunk.
+
+    `input_key` decides whether continuity should be derived from the raw-stage
+    chunk files (`raw_path`) or from prior-stage processed files (`processed_path`).
+    """
+    previous_chunk = previous_chunk or {}
+    tail_text = _resolve_previous_tail_text(previous_chunk, work_path, input_key, config)
+    section_title = _resolve_previous_section_title(previous_chunk, work_path, input_key)
+    if not tail_text and not section_title:
+        return {
+            "text": "",
+            "tail_text": "",
+            "section_title": "",
+            "source_chunk_id": None,
+            "token_count": 0,
+        }
+
+    parts = [
+        "## Continuity Context",
+        "",
+        "Use this only as continuity reference from the previous chunk.",
+        "Do not repeat or rewrite this context in the output.",
+        "",
+    ]
+    if section_title:
+        parts.extend(["Previous section title:", section_title, ""])
+    if tail_text:
+        parts.extend(["Previous chunk tail:", tail_text])
+
+    context_text = "\n".join(parts).strip()
+    return {
+        "text": context_text,
+        "tail_text": tail_text,
+        "section_title": section_title,
+        "source_chunk_id": previous_chunk.get("id"),
+        "token_count": _estimate_tokens(context_text, "tokens", config),
+    }
+
+
+def _inject_continuity_context(prompt_template: str, continuity_text: str) -> str:
+    if not continuity_text:
+        return prompt_template
+
+    input_anchor = "\n## Input Text\n"
+    if input_anchor in prompt_template:
+        return prompt_template.replace(input_anchor, f"\n{continuity_text}\n\n## Input Text\n", 1)
+    return prompt_template.rstrip() + "\n\n" + continuity_text + "\n"
+
+
+def _build_chunk_prompt(prompt_template: str, chunk_body: str,
+                        continuity_text: str = "") -> str:
+    template = _inject_continuity_context(prompt_template, continuity_text)
+    if "{RAW_TEXT}" in template:
+        return template.replace("{RAW_TEXT}", chunk_body)
+    if "{STRUCTURED_TEXT}" in template:
+        return template.replace("{STRUCTURED_TEXT}", chunk_body)
+    return template.rstrip() + "\n\n" + chunk_body
+
+
+def _estimate_continuity_reserve_tokens(config: dict | None = None) -> int:
+    config = config or {}
+    tail_sentences = _parse_int_min(
+        config.get("chunk_context_tail_sentences"),
+        DEFAULT_CHUNK_CONTEXT_TAIL_SENTENCES,
+        0,
+    )
+    summary_token_cap = _parse_int_min(
+        config.get("chunk_context_summary_tokens"),
+        DEFAULT_CHUNK_CONTEXT_SUMMARY_TOKENS,
+        0,
+    )
+    if tail_sentences <= 0:
+        return 0
+
+    placeholder_previous_chunk = {
+        "id": 0,
+        "tail_context_text": _truncate_tail_text_to_tokens(
+            "Reference continuity tail sentence for planning.",
+            max(1, summary_token_cap),
+            config,
+        ),
+        "last_section_title": "## Previous Section",
+    }
+    continuity_text = _build_continuity_context(
+        placeholder_previous_chunk,
+        _skill_root(),
+        config,
+    )["text"]
+    return _estimate_tokens(continuity_text, "tokens", config)
+
+
 def _calculate_chunk_budget(prompt_name: str, prompt_template: str,
                             config: dict | None = None, model_info: dict = None) -> dict:
     config = config or {}
-    prompt_tokens = _estimate_tokens(prompt_template or "", "tokens", config)
+    prompt_template_tokens = _estimate_tokens(prompt_template or "", "tokens", config)
+    continuity_reserve_tokens = _estimate_continuity_reserve_tokens(config)
+    prompt_tokens = prompt_template_tokens + continuity_reserve_tokens
     target_tokens = _get_task_chunk_target(prompt_name, config)
     output_ratio = _get_task_output_ratio(prompt_name, config)
     task_max_output_tokens = _get_task_max_output_tokens(prompt_name, config)
@@ -450,6 +677,8 @@ def _calculate_chunk_budget(prompt_name: str, prompt_template: str,
 
     return {
         "prompt_name": prompt_name,
+        "prompt_template_tokens": prompt_template_tokens,
+        "continuity_reserve_tokens": continuity_reserve_tokens,
         "prompt_tokens": prompt_tokens,
         "target_tokens": target_tokens,
         "hard_cap_tokens": hard_cap_tokens,
@@ -461,6 +690,7 @@ def _calculate_chunk_budget(prompt_name: str, prompt_template: str,
         "safety_buffer_tokens": safety_buffer_tokens,
         "chunk_mode": _normalize_chunk_mode(config.get("chunk_mode", DEFAULT_CHUNK_MODE)),
         "request_cap_tokens": task_request_cap,
+        "token_count_source": "local_estimate",
     }
 
 
@@ -1317,6 +1547,13 @@ def chunk_text(input_path: str, output_dir: str, chunk_size: int = 0,
         "effective_budget_tokens": budget["effective_budget_tokens"],
         "output_ratio": budget["output_ratio"],
         "chunk_safety_buffer_tokens": budget["safety_buffer_tokens"],
+        "continuity_reserve_tokens": budget["continuity_reserve_tokens"],
+        "chunk_context_tail_sentences": _parse_int_min(
+            config.get("chunk_context_tail_sentences"),
+            DEFAULT_CHUNK_CONTEXT_TAIL_SENTENCES,
+            0,
+        ),
+        "token_count_source": budget["token_count_source"],
         "source_file": str(path.absolute()),
         "work_dir": str(out_dir.absolute()),
         "chunks": []
@@ -1334,6 +1571,24 @@ def chunk_text(input_path: str, output_dir: str, chunk_size: int = 0,
             "char_count": len(chunk_content),
             "input_chars": len(chunk_content),
             "estimated_input_tokens": _estimate_tokens(chunk_content, "tokens", config),
+            "token_count_source": budget["token_count_source"],
+            "tail_context_text": _extract_tail_sentences(
+                chunk_content,
+                _parse_int_min(
+                    config.get("chunk_context_tail_sentences"),
+                    DEFAULT_CHUNK_CONTEXT_TAIL_SENTENCES,
+                    0,
+                ),
+                config,
+            ),
+            "processed_tail_context_text": "",
+            "processed_input_tail_context_text": "",
+            "processed_input_section_title": "",
+            "continuity_prev_chunk_id": i - 1 if i > 0 else None,
+            "continuity_context_chars": 0,
+            "continuity_context_tokens": 0,
+            "continuity_section_title": "",
+            "last_section_title": "",
             "output_chars": 0,
             "actual_output_tokens": 0,
             "planned_max_output_tokens": budget["planned_max_output_tokens"],
@@ -1658,6 +1913,225 @@ def test_llm_api(config_path: str = None, api_key: str = "", base_url: str = "",
         }
 
 
+def _count_tokens_via_provider(text: str, config: dict | None = None,
+                               api_key: str = "", base_url: str = "",
+                               model: str = "", api_format: str = "",
+                               timeout_sec: int = 0) -> dict:
+    import urllib.error
+    import urllib.request
+
+    config = config or {}
+    local_estimate = _estimate_tokens_local(text, "tokens", config)
+    api_format = (api_format or config.get("llm_api_format", "openai") or "openai").strip().lower()
+    api_key = api_key or config.get("llm_api_key", "")
+    base_url = base_url or config.get("llm_base_url", "")
+    model = model or config.get("llm_model", "")
+    timeout_sec = timeout_sec or config.get("llm_probe_timeout_sec", 20)
+
+    if not _parse_bool(config.get("enable_token_count_probe"), DEFAULT_ENABLE_TOKEN_COUNT_PROBE):
+        return {
+            "valid": False,
+            "provider_supported": False,
+            "token_count": local_estimate,
+            "token_count_source": "local_estimate",
+            "error_type": "disabled",
+            "error": "Token count probe disabled in config",
+            "request_url": "",
+            "latency_ms": None,
+            "api_format": api_format,
+        }
+
+    if api_format != "anthropic":
+        return {
+            "valid": False,
+            "provider_supported": False,
+            "token_count": local_estimate,
+            "token_count_source": "local_estimate",
+            "error_type": "unsupported_api_format",
+            "error": f"Provider token counting is not implemented for api_format={api_format}",
+            "request_url": "",
+            "latency_ms": None,
+            "api_format": api_format,
+        }
+
+    if not api_key or not base_url or not model:
+        return {
+            "valid": False,
+            "provider_supported": False,
+            "token_count": local_estimate,
+            "token_count_source": "local_estimate",
+            "error_type": "config",
+            "error": "LLM API is not fully configured",
+            "request_url": _build_token_count_url(base_url, api_format) if base_url else "",
+            "latency_ms": None,
+            "api_format": api_format,
+        }
+
+    url = _build_token_count_url(base_url, api_format)
+    headers = {
+        "x-api-key": api_key,
+        "Content-Type": "application/json",
+        "anthropic-version": "2023-06-01",
+        "User-Agent": "yt-transcript/4.0",
+    }
+    body = {
+        "model": model,
+        "messages": [{"role": "user", "content": text or " "}],
+    }
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(body).encode("utf-8"),
+        headers=headers,
+        method="POST",
+    )
+
+    try:
+        started_at = time.monotonic()
+        with urllib.request.urlopen(req, timeout=timeout_sec) as response:
+            result = json.loads(response.read().decode("utf-8"))
+        latency_ms = int((time.monotonic() - started_at) * 1000)
+        input_tokens = max(0, _parse_int(result.get("input_tokens"), 0))
+        return {
+            "valid": True,
+            "provider_supported": True,
+            "token_count": input_tokens,
+            "token_count_source": "provider",
+            "request_url": url,
+            "latency_ms": latency_ms,
+            "api_format": api_format,
+            "model": model,
+        }
+    except urllib.error.HTTPError as error:
+        error_body = error.read().decode("utf-8", errors="replace")
+        return {
+            "valid": False,
+            "provider_supported": False,
+            "token_count": local_estimate,
+            "token_count_source": "local_estimate",
+            "request_url": url,
+            "latency_ms": None,
+            "api_format": api_format,
+            "status_code": error.code,
+            "error_type": f"http_{error.code}",
+            "error": error_body,
+        }
+    except urllib.error.URLError as error:
+        reason = getattr(error, "reason", error)
+        return {
+            "valid": False,
+            "provider_supported": False,
+            "token_count": local_estimate,
+            "token_count_source": "local_estimate",
+            "request_url": url,
+            "latency_ms": None,
+            "api_format": api_format,
+            "error_type": "network",
+            "error": str(reason),
+        }
+    except (socket.timeout, TimeoutError) as error:
+        return {
+            "valid": False,
+            "provider_supported": False,
+            "token_count": local_estimate,
+            "token_count_source": "local_estimate",
+            "request_url": url,
+            "latency_ms": None,
+            "api_format": api_format,
+            "error_type": "timeout",
+            "error": str(error),
+        }
+    except Exception as error:
+        return {
+            "valid": False,
+            "provider_supported": False,
+            "token_count": local_estimate,
+            "token_count_source": "local_estimate",
+            "request_url": url,
+            "latency_ms": None,
+            "api_format": api_format,
+            "error_type": "unknown",
+            "error": str(error),
+        }
+
+
+def test_token_count(config_path: str = None, api_key: str = "", base_url: str = "",
+                     model: str = "", api_format: str = "", timeout_sec: int = 0,
+                     sample_text: str = "Reply with OK only.") -> dict:
+    config = load_config(config_path)
+    api_key = api_key or config.get("llm_api_key", "")
+    base_url = base_url or config.get("llm_base_url", "")
+    model = model or config.get("llm_model", "")
+    api_format = api_format or config.get("llm_api_format", "openai")
+    timeout_sec = timeout_sec or config.get("llm_probe_timeout_sec", 20)
+    sample_text = sample_text or "Reply with OK only."
+
+    provider_probe = _count_tokens_via_provider(
+        sample_text,
+        config=config,
+        api_key=api_key,
+        base_url=base_url,
+        model=model,
+        api_format=api_format,
+        timeout_sec=timeout_sec,
+    )
+    provider_probe["sample_text"] = sample_text
+    provider_probe["probe_enabled"] = _parse_bool(
+        config.get("enable_token_count_probe"),
+        DEFAULT_ENABLE_TOKEN_COUNT_PROBE,
+    )
+    provider_probe["fallback_used"] = not provider_probe.get("valid", False)
+
+    if provider_probe.get("valid", False):
+        return provider_probe
+
+    provider_probe["valid"] = True
+    provider_probe.setdefault("provider_supported", False)
+    provider_probe.setdefault("token_count_source", "local_estimate")
+    provider_probe.setdefault(
+        "error",
+        "Provider token count unavailable; using local heuristic fallback",
+    )
+    return provider_probe
+
+
+def _estimate_chunk_input_tokens(chunk_info: dict, input_key: str, text: str,
+                                 config: dict | None = None) -> tuple[int, str]:
+    """Estimate input tokens without adding another network probe.
+
+    For `processed_path` chains we reuse `actual_output_tokens`, because that is
+    the closest measurement of the text now being fed into the next stage.
+    """
+    chunk_info = chunk_info or {}
+    config = config or {}
+
+    if input_key == "processed_path":
+        cached_tokens = max(0, _parse_int(chunk_info.get("actual_output_tokens"), 0))
+        if cached_tokens > 0:
+            return cached_tokens, "manifest_cached_output"
+    else:
+        cached_tokens = max(0, _parse_int(chunk_info.get("estimated_input_tokens"), 0))
+        if cached_tokens > 0:
+            return cached_tokens, "manifest_cached_input"
+
+    return _estimate_tokens(text, "tokens", config), "local_estimate"
+
+
+def _refresh_manifest_token_source_summary(manifest: dict) -> None:
+    chunks = manifest.get("chunks", []) if isinstance(manifest, dict) else []
+    sources = sorted({
+        str(chunk.get("token_count_source", "")).strip()
+        for chunk in chunks
+        if str(chunk.get("token_count_source", "")).strip()
+    })
+    manifest["token_count_sources"] = sources
+    if not sources:
+        manifest["token_count_source"] = ""
+    elif len(sources) == 1:
+        manifest["token_count_source"] = sources[0]
+    else:
+        manifest["token_count_source"] = "mixed"
+
+
 def process_chunks(work_dir: str, prompt_name: str, extra_instruction: str = "",
                    config_path: str = None, dry_run: bool = False,
                    input_key: str = "raw_path", force: bool = False) -> dict:
@@ -1737,6 +2211,16 @@ def process_chunks(work_dir: str, prompt_name: str, extra_instruction: str = "",
         chunk_info.setdefault("latency_ms", None)
         chunk_info.setdefault("input_chars", chunk_info.get("char_count", 0))
         chunk_info.setdefault("estimated_input_tokens", 0)
+        chunk_info.setdefault("token_count_source", prompt_budget["token_count_source"])
+        chunk_info.setdefault("tail_context_text", "")
+        chunk_info.setdefault("processed_tail_context_text", "")
+        chunk_info.setdefault("processed_input_tail_context_text", "")
+        chunk_info.setdefault("processed_input_section_title", "")
+        chunk_info.setdefault("continuity_prev_chunk_id", None)
+        chunk_info.setdefault("continuity_context_chars", 0)
+        chunk_info.setdefault("continuity_context_tokens", 0)
+        chunk_info.setdefault("continuity_section_title", "")
+        chunk_info.setdefault("last_section_title", "")
         chunk_info.setdefault("output_chars", 0)
         chunk_info.setdefault("actual_output_tokens", 0)
         chunk_info.setdefault("prompt_tokens", prompt_budget["prompt_tokens"])
@@ -1758,6 +2242,8 @@ def process_chunks(work_dir: str, prompt_name: str, extra_instruction: str = "",
     manifest["effective_budget_tokens"] = prompt_budget["effective_budget_tokens"]
     manifest["output_ratio"] = prompt_budget["output_ratio"]
     manifest["chunk_safety_buffer_tokens"] = prompt_budget["safety_buffer_tokens"]
+    manifest["continuity_reserve_tokens"] = prompt_budget["continuity_reserve_tokens"]
+    _refresh_manifest_token_source_summary(manifest)
     _write_manifest(manifest_path, manifest)
 
     if dry_run:
@@ -1774,8 +2260,11 @@ def process_chunks(work_dir: str, prompt_name: str, extra_instruction: str = "",
             "recommended_chunk_size": recommended_chunk_size,
             "planned_max_output_tokens": planned_max_output_tokens,
             "prompt_tokens": prompt_budget["prompt_tokens"],
+            "prompt_template_tokens": prompt_budget["prompt_template_tokens"],
+            "continuity_reserve_tokens": prompt_budget["continuity_reserve_tokens"],
             "target_tokens": prompt_budget["target_tokens"],
             "hard_cap_tokens": prompt_budget["hard_cap_tokens"],
+            "token_count_source": manifest.get("token_count_source", ""),
             "warnings": setup_warnings,
             "message": "Dry run: all validations passed"
         }
@@ -1820,29 +2309,41 @@ def process_chunks(work_dir: str, prompt_name: str, extra_instruction: str = "",
 
         chunk_text = input_path.read_text(encoding="utf-8")
         chunk_char_count = len(chunk_text)
-        estimated_input_tokens = _estimate_tokens(chunk_text, "tokens", config)
+        estimated_input_tokens, token_count_source = _estimate_chunk_input_tokens(
+            chunk_info,
+            input_key,
+            chunk_text,
+            config,
+        )
+        previous_chunk = manifest["chunks"][chunk_id - 1] if chunk_id > 0 else None
+        continuity_context = _build_continuity_context(previous_chunk, work_path, config, input_key=input_key)
+        prompt = _build_chunk_prompt(prompt_template, chunk_text, continuity_context["text"])
+        actual_prompt_tokens = (
+            prompt_budget["prompt_template_tokens"] + continuity_context["token_count"]
+        )
+
         chunk_info["input_chars"] = chunk_char_count
         chunk_info["estimated_input_tokens"] = estimated_input_tokens
-        chunk_info["prompt_tokens"] = prompt_budget["prompt_tokens"]
+        chunk_info["token_count_source"] = token_count_source
+        chunk_info["prompt_tokens"] = actual_prompt_tokens
         chunk_info["planned_max_output_tokens"] = planned_max_output_tokens
-
-        if "{RAW_TEXT}" in prompt_template:
-            prompt = prompt_template.replace("{RAW_TEXT}", chunk_text)
-        elif "{STRUCTURED_TEXT}" in prompt_template:
-            prompt = prompt_template.replace("{STRUCTURED_TEXT}", chunk_text)
-        else:
-            prompt = prompt_template + "\n\n" + chunk_text
+        chunk_info["continuity_prev_chunk_id"] = continuity_context["source_chunk_id"]
+        chunk_info["continuity_context_chars"] = len(continuity_context["text"])
+        chunk_info["continuity_context_tokens"] = continuity_context["token_count"]
+        chunk_info["continuity_section_title"] = continuity_context["section_title"]
 
         chunk_info["status"] = "running"
         chunk_info["started_at"] = _now_iso()
         chunk_info["updated_at"] = chunk_info["started_at"]
         chunk_info["request_url"] = request_url
+        _refresh_manifest_token_source_summary(manifest)
         _write_manifest(manifest_path, manifest)
 
         print(
             f"Processing chunk {chunk_id + 1}/{total} chars={chunk_char_count} "
-            f"est_tokens={estimated_input_tokens} max_output_tokens={planned_max_output_tokens} "
-            f"model={model} url={request_url}",
+            f"est_tokens={estimated_input_tokens} est_source={token_count_source} "
+            f"prompt_tokens={actual_prompt_tokens} continuity_tokens={continuity_context['token_count']} "
+            f"max_output_tokens={planned_max_output_tokens} model={model} url={request_url}",
             file=sys.stderr,
         )
 
@@ -1904,6 +2405,19 @@ def process_chunks(work_dir: str, prompt_name: str, extra_instruction: str = "",
             chunk_info["latency_ms"] = llm_result["latency_ms"]
             chunk_info["output_chars"] = result_char_count
             chunk_info["actual_output_tokens"] = actual_output_tokens
+            chunk_info["processed_tail_context_text"] = _extract_tail_sentences(
+                result_text,
+                _parse_int_min(
+                    config.get("chunk_context_tail_sentences"),
+                    DEFAULT_CHUNK_CONTEXT_TAIL_SENTENCES,
+                    0,
+                ),
+                config,
+            )
+            if input_key == "raw_path":
+                chunk_info["processed_input_tail_context_text"] = chunk_info["processed_tail_context_text"]
+                chunk_info["processed_input_section_title"] = _extract_last_section_title(result_text)
+            chunk_info["last_section_title"] = _extract_last_section_title(result_text)
             chunk_info["request_url"] = llm_result["request_url"]
             chunk_info["streaming_used"] = llm_result["streaming_used"]
             chunk_info["completed_at"] = _now_iso()
@@ -1943,6 +2457,7 @@ def process_chunks(work_dir: str, prompt_name: str, extra_instruction: str = "",
                 _write_manifest(manifest_path, manifest)
                 break
         finally:
+            _refresh_manifest_token_source_summary(manifest)
             _write_manifest(manifest_path, manifest)
 
     return {
@@ -2746,6 +3261,18 @@ def main():
     llm_api_parser.add_argument('--timeout', type=int, default=0, help='Probe timeout in seconds')
     llm_api_parser.add_argument('--stream', default='', help='Streaming mode override: auto|true|false')
 
+    token_probe_parser = subparsers.add_parser(
+        'test-token-count',
+        help='Probe provider token counting support with local fallback'
+    )
+    token_probe_parser.add_argument('--config-path', default=None, help='Optional path to config.yaml')
+    token_probe_parser.add_argument('--api-key', default='', help='Optional LLM API key override')
+    token_probe_parser.add_argument('--base-url', default='', help='Optional LLM base URL override')
+    token_probe_parser.add_argument('--model', default='', help='Optional model override')
+    token_probe_parser.add_argument('--api-format', default='', help='Optional API format override')
+    token_probe_parser.add_argument('--timeout', type=int, default=0, help='Probe timeout in seconds')
+    token_probe_parser.add_argument('--sample-text', default='Reply with OK only.', help='Sample text for token probe')
+
     # split-audio command
     split_parser = subparsers.add_parser(
         'split-audio',
@@ -2912,6 +3439,18 @@ def main():
         print(json.dumps(result, ensure_ascii=False))
         if not result['valid']:
             sys.exit(1)
+
+    elif args.command == 'test-token-count':
+        result = test_token_count(
+            config_path=args.config_path,
+            api_key=args.api_key,
+            base_url=args.base_url,
+            model=args.model,
+            api_format=args.api_format,
+            timeout_sec=args.timeout,
+            sample_text=args.sample_text,
+        )
+        print(json.dumps(result, ensure_ascii=False))
 
     elif args.command == 'split-audio':
         result = split_audio(args.audio_path, args.max_size, args.max_deviation)

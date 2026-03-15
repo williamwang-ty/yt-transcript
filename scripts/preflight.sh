@@ -180,6 +180,25 @@ if [ "$REQUIRE_LLM" = true ]; then
         if [ -n "$LLM_PROBE_URL" ]; then
             echo "ℹ️  LLM request URL: $LLM_PROBE_URL"
         fi
+
+        echo "🔢 Probing token count capability..."
+        if TOKEN_PROBE_JSON=$(python3 "$ROOT_DIR/yt_transcript_utils.py" test-token-count --config-path "$CONFIG_FILE" 2>/dev/null); then
+            TOKEN_COUNT=$(printf '%s' "$TOKEN_PROBE_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin).get('token_count', ''))")
+            TOKEN_SOURCE=$(printf '%s' "$TOKEN_PROBE_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin).get('token_count_source', ''))")
+            TOKEN_SUPPORTED=$(printf '%s' "$TOKEN_PROBE_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin).get('provider_supported', False))")
+            TOKEN_URL=$(printf '%s' "$TOKEN_PROBE_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin).get('request_url', ''))")
+            TOKEN_ERROR_TYPE=$(printf '%s' "$TOKEN_PROBE_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin).get('error_type', ''))")
+            if [ "$TOKEN_SOURCE" = "provider" ] && [ "$TOKEN_SUPPORTED" = "True" ]; then
+                echo "✅ Token count probe succeeded (${TOKEN_COUNT} tokens, source=${TOKEN_SOURCE})"
+                if [ -n "$TOKEN_URL" ]; then
+                    echo "ℹ️  Token count URL: $TOKEN_URL"
+                fi
+            else
+                echo "ℹ️  Token count probe fell back to ${TOKEN_SOURCE:-local_estimate} (${TOKEN_ERROR_TYPE:-provider_unavailable})"
+            fi
+        else
+            echo "ℹ️  Token count probe failed unexpectedly; chunk planning will use local estimate fallback"
+        fi
     else
         echo "❌ Error: LLM API probe failed. Check your key, model, base URL, provider latency, or gateway settings"
         python3 "$ROOT_DIR/yt_transcript_utils.py" test-llm-api --config-path "$CONFIG_FILE"
