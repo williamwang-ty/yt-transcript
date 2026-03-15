@@ -30,6 +30,7 @@ rm -f /tmp/${VIDEO_ID}_structured.txt
 rm -f /tmp/${VIDEO_ID}_optimized.txt
 rm -f /tmp/${VIDEO_ID}_combined_transcript.txt
 rm -rf /tmp/${VIDEO_ID}_chunks/
+rm -rf /tmp/${VIDEO_ID}_downloads/
 if [ "$KEEP_STATE" != true ]; then
     rm -f /tmp/${VIDEO_ID}_state.md
 fi

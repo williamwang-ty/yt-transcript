@@ -94,7 +94,10 @@ To handle arbitrarily long videos (e.g., >2 hours) without hitting LLM context l
 2.  **Budgeted Chunk Processing**:
     - `process-chunks` uses prompt-specific `max_output_tokens` computed from the same request budget as chunk planning.
     - It also injects a lightweight continuity block from the previous chunk (tail sentence + optional section title) so adjacent chunks stay coherent without enabling overlap, and the chunk budget reserves a small token allowance for that context.
-    - This keeps request envelopes conservative instead of sending one oversized output cap for every task.
+    - `manifest.json` now separates immutable `plan` metadata from mutable `runtime` state, and chunk entries also retain `attempt_logs` so retries are observable instead of being hidden behind final chunk status.
+    - The controller no longer mutates the current batch plan in place. When canary chunks or retry history indicate the plan is unhealthy, `process-chunks` stops with `replan_required=true`, and `replan-remaining` generates a new plan for unfinished raw chunks.
+    - Runtime completion is now explicit (`completed`, `completed_with_errors`, `aborted`), and raw-path replans also remap any existing `chapter_plan.json` chunk starts so downstream merges preserve chapter headers.
+    - This keeps request envelopes conservative without pretending that an already-materialized batch has been resized at runtime.
 
 3.  **Two-Stage Chapter Planning**:
     - **Priority 1**: Use YouTube Chapters if available (via `get-chapters`).
@@ -105,7 +108,8 @@ To handle arbitrarily long videos (e.g., >2 hours) without hitting LLM context l
     - Script (`merge-content`) handles the re-assembly and injection of chapter headers.
 
 5.  **Structured Optimization Planning**:
-    - `plan-optimization` reads validated state and emits the canonical short/long path, required operations, and whether `--require-llm` preflight is needed.
+    - `plan-optimization` reads validated state and emits the canonical short/long path, required operations, per-operation execution contracts, and whether `--require-llm` preflight is needed.
+    - The short/long split is canonical at `< 1800s = short` and `>= 1800s = long`; the separate Quick Mode shortcut is a narrower `< 900s` fast path for subtitle-friendly videos.
     - Workflow docs consume this JSON instead of re-deriving prompt branches in prose.
 
 #### 2.3 Serial Processing for Multiple Links
@@ -140,9 +144,9 @@ Before (shared context, cognitive drift):
 
 After (hard isolation, no drift):
   Agent conversation
-    +-- run: process-chunks --prompt summarize        <-- one command
+    +-- run: process-chunks --prompt summarize --auto-replan        <-- one command
     |     +-- Script: API call per chunk (isolated)
-    +-- run: process-chunks --prompt structure_only   <-- one command
+    +-- run: process-chunks --prompt structure_only --auto-replan   <-- one command
           +-- Script: API call per chunk (isolated)
 ```
 
@@ -154,7 +158,7 @@ Key design decisions:
 *   **Manifest-based progress tracking**: `manifest.json` now tracks chunk status, attempts, latency, and last error metadata. Completed chunks are skipped by default on re-runs, making resumability operational instead of theoretical.
 *   **Real LLM preflight**: `scripts/preflight.sh --require-llm` now performs a small live probe instead of checking config presence only.
 *   **No external dependencies**: Uses only `urllib.request` for HTTP calls.
-*   **Script-owned routing**: `plan-optimization` is the canonical source for text-optimization branching and `transcribe-deepgram` is the only supported Deepgram transcription entry.
+*   **Script-owned routing**: `plan-optimization` is the canonical source for text-optimization branching, chunk execution contracts, and `replan_required` handling; `transcribe-deepgram` is the only supported Deepgram transcription entry.
 
 #### 2.5 Deterministic File Assembly & Quality Verification
 
@@ -322,7 +326,10 @@ yt-transcript/
 2.  **预算化 Chunk 处理**：
     - `process-chunks` 会使用与分块规划同一套请求预算，为不同 prompt 单独计算 `max_output_tokens`。
     - 它还会注入上一块的轻量 continuity block（尾句 + 可选 section title），在不启用 overlap 的前提下提升相邻块的一致性；同时 chunk budget 也会为这段上下文预留一小段 token 成本。
-    - 这样可以避免所有任务都带着同一个偏大的输出上限发请求。
+    - `manifest.json` 现在会把不可变 `plan` 元数据和可变 `runtime` 状态分开，chunk 条目也会保留 `attempt_logs`，这样 retry 历史不会再被最终状态吞掉。
+    - controller 不再在当前 batch 内改写 plan；当 canary chunk 或 retry 历史表明 plan 不健康时，`process-chunks` 会以 `replan_required=true` 停止，而 `replan-remaining` 会为未完成的原始 chunk 生成新计划。
+    - runtime 完成态现在会明确区分 `completed` / `completed_with_errors` / `aborted`；同时 raw replan 也会重映射已有 `chapter_plan.json` 的 chunk 起点，保证后续 merge 时章节标题不丢。
+    - `process-chunks --auto-replan` 则提供一个更高层的编排入口，在不破坏上述边界的前提下自动串起 `process -> replan-remaining -> resume`。
 
 3.  **两阶段章节规划**：
     - **优先级 1**：如果有 YouTube 章节（通过 `get-chapters` 获取），直接使用。
@@ -333,7 +340,7 @@ yt-transcript/
     - 最终由脚本（`merge-content`）负责按顺序组装并插入章节标题。
 
 5.  **结构化优化规划**：
-    - `plan-optimization` 读取已校验的 state，输出 canonical 的短视频/长视频路径、操作序列，以及是否需要 `--require-llm`。
+    - `plan-optimization` 读取已校验的 state，输出 canonical 的短视频/长视频路径、操作序列、每步 chunk 执行契约，以及是否需要 `--require-llm`。
     - workflow 文档消费这份 JSON，而不是再次用 prose 推导分支。
 
 #### 2.3 多链接串行处理
@@ -368,9 +375,9 @@ yt-transcript/
 
 改造后（硬隔离，无漂移）：
   Agent 对话
-    +-- 执行: process-chunks --prompt summarize      <-- 一条命令
+    +-- 执行: process-chunks --prompt summarize --auto-replan      <-- 一条命令
     |     +-- 脚本: 每个 chunk 独立 API 调用（隔离）
-    +-- 执行: process-chunks --prompt structure_only  <-- 一条命令
+    +-- 执行: process-chunks --prompt structure_only --auto-replan  <-- 一条命令
           +-- 脚本: 每个 chunk 独立 API 调用（隔离）
 ```
 
@@ -382,7 +389,7 @@ yt-transcript/
 *   **Manifest 进度追踪**：`manifest.json` 现在会记录 chunk 的状态、attempts、latency 和 last error；重跑时默认跳过已完成 chunk，使断点续传从“设计意图”变成“实际行为”。
 *   **真实 LLM preflight**：`scripts/preflight.sh --require-llm` 现在会执行一次低成本实时探活，而不只是检查配置项是否存在。
 *   **零外部依赖**：仅使用 `urllib.request` 进行 HTTP 调用。
-*   **脚本拥有最终路由权**：`plan-optimization` 是文本优化分支的唯一口径，`transcribe-deepgram` 是唯一支持的 Deepgram 转录入口。
+*   **脚本拥有最终路由权**：`plan-optimization` 是文本优化分支、chunk 执行契约与 `replan_required` 处理策略的唯一口径，`transcribe-deepgram` 是唯一支持的 Deepgram 转录入口。
 
 #### 2.5 确定性文件组装与质量验证
 

@@ -1,6 +1,7 @@
 import io
 import json
 import os
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -205,6 +206,51 @@ class RegressionTests(unittest.TestCase):
             self.assertIn('channel: "A \\"B\\""', content)
             self.assertIn("# He said \"hi\"", content)
 
+    def test_transcribe_deepgram_merges_chunk_outputs_and_writes_artifacts(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            audio_path = Path(tmpdir) / "source.mp3"
+            chunk_a = Path(tmpdir) / "chunk_a.mp3"
+            chunk_b = Path(tmpdir) / "chunk_b.mp3"
+            output_json = Path(tmpdir) / "deepgram.json"
+            output_text = Path(tmpdir) / "raw.txt"
+            audio_path.write_bytes(b"src")
+            chunk_a.write_bytes(b"a")
+            chunk_b.write_bytes(b"b")
+
+            payloads = [
+                {"results": {"channels": [{"alternatives": [{"transcript": "first"}]}]}},
+                {"results": {"channels": [{"alternatives": [{"transcript": "second"}]}]}},
+            ]
+            processed = [
+                {"transcript": "Alpha", "speaker_count": 1},
+                {"transcript": "Beta", "speaker_count": 2},
+            ]
+
+            with mock.patch.object(utils, "split_audio", return_value={
+                "chunks": [str(chunk_a), str(chunk_b)],
+                "split_points": [12.5],
+            }), mock.patch.object(utils, "_call_deepgram_api", side_effect=payloads), mock.patch.object(
+                utils,
+                "process_deepgram_payload",
+                side_effect=processed,
+            ):
+                result = utils.transcribe_deepgram(
+                    str(audio_path),
+                    "en",
+                    api_key="key",
+                    output_json=str(output_json),
+                    output_text=str(output_text),
+                )
+
+            self.assertEqual(result["transcript"], "Alpha\n\nBeta")
+            self.assertEqual(result["speaker_count"], 2)
+            self.assertEqual(output_text.read_text(encoding="utf-8"), "Alpha\n\nBeta")
+            self.assertEqual(result["chunk_count"], 2)
+            self.assertTrue(result["used_split_mode"])
+            self.assertEqual(len(result["json_outputs"]), 2)
+            self.assertTrue(output_text.exists())
+            self.assertTrue(all(Path(item).exists() for item in result["json_outputs"]))
+
     def test_assemble_final_escapes_markdown_header_text(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             optimized = Path(tmpdir) / "opt.txt"
@@ -367,6 +413,8 @@ class RegressionTests(unittest.TestCase):
             self.assertEqual(result["video_path"], "short")
             self.assertEqual([op["prompt"] for op in result["operations"]], ["structure_only", "translate_only"])
             self.assertFalse(result["requires_llm_preflight"])
+            self.assertTrue(all(op["execution"]["mode"] == "single_pass" for op in result["operations"]))
+            self.assertTrue(all(not op["execution"]["supports_auto_replan"] for op in result["operations"]))
 
     def test_plan_optimization_returns_long_deepgram_operations(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -395,6 +443,39 @@ class RegressionTests(unittest.TestCase):
             self.assertTrue(result["requires_llm_preflight"])
             self.assertEqual(result["operations"][0]["prompt"], "structure_only")
             self.assertIn("Chinese character spacing", result["operations"][0]["extra_instruction"])
+            self.assertTrue(result["operations"][0]["execution"]["supports_auto_replan"])
+            self.assertEqual(result["operations"][0]["execution"]["recommended_cli_flags"], ["--auto-replan"])
+            self.assertEqual(result["operations"][0]["execution"]["on_replan_required"], "auto_replan_remaining")
+            self.assertTrue(result["replan_contract"]["raw_path"]["supports_auto_replan"])
+
+    def test_plan_optimization_marks_processed_path_chunk_stage_for_manual_review(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state = Path(tmpdir) / "state.md"
+            state.write_text(
+                "# State\n"
+                "vid: vid001\n"
+                "url: https://example.com/watch?v=1\n"
+                "title: Sample\n"
+                "channel: Channel\n"
+                "upload_date: 20260308\n"
+                "duration: 3600\n"
+                "output_dir: /tmp/out\n"
+                "mode: bilingual\n"
+                "src: youtube\n"
+                "source_language: en\n"
+                "subtitle_source: YouTube Subtitles\n"
+                "work_dir: /tmp/vid001_chunks\n",
+                encoding="utf-8",
+            )
+
+            result = utils.plan_optimization(str(state))
+
+            self.assertTrue(result["passed"], result)
+            self.assertEqual([op["prompt"] for op in result["operations"]], ["structure_only", "translate_only"])
+            self.assertTrue(result["operations"][0]["execution"]["supports_auto_replan"])
+            self.assertFalse(result["operations"][1]["execution"]["supports_auto_replan"])
+            self.assertEqual(result["operations"][1]["execution"]["on_replan_required"], "stop_and_review")
+            self.assertEqual(result["replan_contract"]["processed_path"]["on_replan_required"], "stop_and_review")
 
     def test_cleanup_script_removes_state_by_default(self):
         video_id = "cleanup_state_test"
@@ -462,6 +543,28 @@ class RegressionTests(unittest.TestCase):
             self.assertEqual(payload["video_id"], "abc123")
             self.assertEqual(payload["title"], 'He said "hi"')
             self.assertEqual(payload["channel"], 'A "B"')
+
+    def test_process_chunks_dry_run_does_not_require_llm_credentials(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source = Path(tmpdir) / "raw.txt"
+            work_dir = Path(tmpdir) / "chunks"
+            source.write_text("第一句。第二句。第三句。第四句。", encoding="utf-8")
+            utils.chunk_text(str(source), str(work_dir), 50, "structure_only")
+
+            config = utils._default_config_values()
+            config.update({
+                "llm_api_key": "",
+                "llm_base_url": "",
+                "llm_model": "",
+                "llm_api_format": "openai",
+            })
+
+            with mock.patch.object(utils, "load_config", return_value=config):
+                result = utils.process_chunks(str(work_dir), "structure_only", dry_run=True)
+
+            self.assertTrue(result["success"])
+            self.assertTrue(result["dry_run"])
+            self.assertEqual(result["request_url"], "")
 
     def test_subtitle_info_prefers_english_for_bilingual(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -537,48 +640,146 @@ class RegressionTests(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("network failed", result.stderr)
 
-    def test_subtitles_selects_manual_english_source_file(self):
-        try:
-            with tempfile.TemporaryDirectory() as tmpdir:
-                fake_bin = Path(tmpdir) / "yt-dlp"
-                fake_bin.write_text(
-                    "#!/usr/bin/env bash\n"
-                    "if [ \"$1\" = \"--print\" ] && [ \"$2\" = '%(id)s' ]; then\n"
-                    "  echo 'vid001'\n"
-                    "  exit 0\n"
-                    "fi\n"
-                    "if [ \"$1\" = \"--list-subs\" ]; then\n"
-                    "  cat <<'EOF'\n"
-                    "[info] Available subtitles for vid001:\n"
-                    "Language Name                  Formats\n"
-                    "zh-Hans  Chinese (Simplified)  vtt, ttml\n"
-                    "en       English              vtt, ttml\n"
-                    "[info] Available automatic captions for vid001:\n"
-                    "Language Name                  Formats\n"
-                    "en-US    English (US)         vtt, ttml\n"
-                    "EOF\n"
-                    "  exit 0\n"
-                    "fi\n"
-                    "if [ \"$1\" = \"--write-sub\" ]; then\n"
-                    "  out=''\n"
-                    "  while [ $# -gt 0 ]; do\n"
-                    "    if [ \"$1\" = \"-o\" ]; then\n"
-                    "      out=\"$2\"\n"
-                    "      shift 2\n"
-                    "      continue\n"
-                    "    fi\n"
-                    "    shift\n"
-                    "  done\n"
-                    "  : > \"${out}.en.vtt\"\n"
-                    "  : > \"${out}.en-US.vtt\"\n"
-                    "  : > \"${out}.zh-Hans.vtt\"\n"
-                    "  exit 0\n"
-                    "fi\n"
-                    "exit 1\n",
-                    encoding="utf-8",
-                )
-                fake_bin.chmod(0o755)
+    def test_subtitle_info_reads_structured_metadata_when_json_available(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fake_bin = Path(tmpdir) / "yt-dlp"
+            fake_bin.write_text(
+                """#!/usr/bin/env bash
+if [ "$1" = "--print" ] && [ "$2" = '%(id)s' ]; then
+  echo 'vidjson'
+  exit 0
+fi
+if [ "$1" = "-J" ]; then
+  cat <<'EOF'
+{"id":"vidjson","subtitles":{"en":[{"ext":"vtt"}],"zh-Hans":[{"ext":"vtt"}]},"automatic_captions":{"en-US":[{"ext":"vtt"}]}}
+EOF
+  exit 0
+fi
+if [ "$1" = "--list-subs" ]; then
+  echo 'should not be used' >&2
+  exit 99
+fi
+exit 1
+""",
+                encoding="utf-8",
+            )
+            fake_bin.chmod(0o755)
 
+            env = os.environ.copy()
+            env["PATH"] = f"{tmpdir}:{env['PATH']}"
+            result = subprocess.run(
+                ["bash", str(PROJECT_ROOT / "scripts/download.sh"), "https://example.com/video", "subtitle-info"],
+                cwd=PROJECT_ROOT,
+                env=env,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            payload = json.loads(result.stdout)
+            self.assertEqual(payload["video_id"], "vidjson")
+            self.assertTrue(payload["english_available"])
+            self.assertTrue(payload["chinese_available"])
+            self.assertEqual(payload["preferred_source_language"], "en")
+            self.assertEqual(payload["preferred_source_kind"], "manual")
+            self.assertEqual(payload["mode"], "bilingual")
+    def test_subtitles_selects_manual_english_source_file(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fake_bin = Path(tmpdir) / "yt-dlp"
+            fake_bin.write_text(
+                """#!/usr/bin/env bash
+if [ "$1" = "--print" ] && [ "$2" = '%(id)s' ]; then
+  echo 'vid001'
+  exit 0
+fi
+if [ "$1" = "--list-subs" ]; then
+  cat <<'EOF'
+[info] Available subtitles for vid001:
+Language Name                  Formats
+zh-Hans  Chinese (Simplified)  vtt, ttml
+en       English              vtt, ttml
+[info] Available automatic captions for vid001:
+Language Name                  Formats
+en-US    English (US)         vtt, ttml
+EOF
+  exit 0
+fi
+if [ "$1" = "--write-sub" ]; then
+  out=''
+  while [ $# -gt 0 ]; do
+    if [ "$1" = "-o" ]; then
+      out="$2"
+      shift 2
+      continue
+    fi
+    shift
+  done
+  mkdir -p "$(dirname "$out")"
+  : > "${out}.en.vtt"
+  : > "${out}.en-US.vtt"
+  : > "${out}.zh-Hans.vtt"
+  exit 0
+fi
+exit 1
+""",
+                encoding="utf-8",
+            )
+            fake_bin.chmod(0o755)
+
+            env = os.environ.copy()
+            env["PATH"] = f"{tmpdir}:{env['PATH']}"
+            result = subprocess.run(
+                ["bash", str(PROJECT_ROOT / "scripts/download.sh"), "https://example.com/video", "subtitles"],
+                cwd=PROJECT_ROOT,
+                env=env,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            payload = json.loads(result.stdout)
+            self.assertEqual(payload["selected_source_vtt"], "/tmp/vid001_downloads/subtitles/vid001.en.vtt")
+            self.assertEqual(payload["selected_source_language"], "en")
+            self.assertEqual(payload["selected_source_kind"], "manual")
+            shutil.rmtree("/tmp/vid001_downloads", ignore_errors=True)
+    def test_subtitles_selects_manual_english_source_file_from_isolated_dir(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fake_bin = Path(tmpdir) / "yt-dlp"
+            fake_bin.write_text(
+                """#!/usr/bin/env bash
+if [ "$1" = "--print" ] && [ "$2" = '%(id)s' ]; then
+  echo 'vid001'
+  exit 0
+fi
+if [ "$1" = "-J" ]; then
+  cat <<'EOF'
+{"id":"vid001","subtitles":{"en":[{"ext":"vtt"}],"zh-Hans":[{"ext":"vtt"}]},"automatic_captions":{"en-US":[{"ext":"vtt"}]}}
+EOF
+  exit 0
+fi
+if [ "$1" = "--write-sub" ]; then
+  out=''
+  while [ $# -gt 0 ]; do
+    if [ "$1" = "-o" ]; then
+      out="$2"
+      shift 2
+      continue
+    fi
+    shift
+  done
+  mkdir -p "$(dirname "$out")"
+  : > "${out}.en.vtt"
+  : > "${out}.en-US.vtt"
+  : > "${out}.zh-Hans.vtt"
+  exit 0
+fi
+exit 1
+""",
+                encoding="utf-8",
+            )
+            fake_bin.chmod(0o755)
+
+            stale = Path("/tmp/vid001.en.vtt")
+            stale.write_text("stale", encoding="utf-8")
+            try:
                 env = os.environ.copy()
                 env["PATH"] = f"{tmpdir}:{env['PATH']}"
                 result = subprocess.run(
@@ -590,14 +791,68 @@ class RegressionTests(unittest.TestCase):
                     text=True,
                 )
                 payload = json.loads(result.stdout)
-                self.assertEqual(payload["selected_source_vtt"], "/tmp/vid001.en.vtt")
-                self.assertEqual(payload["selected_source_language"], "en")
-                self.assertEqual(payload["selected_source_kind"], "manual")
-        finally:
-            Path("/tmp/vid001.en.vtt").unlink(missing_ok=True)
-            Path("/tmp/vid001.en-US.vtt").unlink(missing_ok=True)
-            Path("/tmp/vid001.zh-Hans.vtt").unlink(missing_ok=True)
+                self.assertEqual(payload["selected_source_vtt"], "/tmp/vid001_downloads/subtitles/vid001.en.vtt")
+                self.assertNotEqual(payload["selected_source_vtt"], str(stale))
+                self.assertTrue(Path(payload["selected_source_vtt"]).exists())
+            finally:
+                stale.unlink(missing_ok=True)
+                shutil.rmtree("/tmp/vid001_downloads", ignore_errors=True)
+    def test_audio_download_uses_isolated_dir(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fake_bin = Path(tmpdir) / "yt-dlp"
+            fake_bin.write_text(
+                """#!/usr/bin/env bash
+if [ "$1" = "--print" ] && [ "$2" = '%(id)s' ]; then
+  echo 'vidaudio'
+  exit 0
+fi
+if [ "$1" = "-J" ]; then
+  cat <<'EOF'
+{"id":"vidaudio","formats":[{"format_id":"251","language":"zh","vcodec":"none","acodec":"opus"},{"format_id":"140","language":"en","vcodec":"none","acodec":"mp4a.40.2"}]}
+EOF
+  exit 0
+fi
+if [ "$1" = "-f" ]; then
+  out=''
+  while [ $# -gt 0 ]; do
+    if [ "$1" = "-o" ]; then
+      out="$2"
+      shift 2
+      continue
+    fi
+    shift
+  done
+  mkdir -p "$(dirname "$out")"
+  : > "${out//%(ext)s/mp3}"
+  exit 0
+fi
+exit 1
+""",
+                encoding="utf-8",
+            )
+            fake_bin.chmod(0o755)
 
+            stale = Path("/tmp/vidaudio.mp3")
+            stale.write_text("stale", encoding="utf-8")
+            try:
+                env = os.environ.copy()
+                env["PATH"] = f"{tmpdir}:{env['PATH']}"
+                result = subprocess.run(
+                    ["bash", str(PROJECT_ROOT / "scripts/download.sh"), "https://example.com/video", "audio"],
+                    cwd=PROJECT_ROOT,
+                    env=env,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+                payload = json.loads(result.stdout)
+                self.assertEqual(payload["audio_file"], "/tmp/vidaudio_downloads/audio/vidaudio.mp3")
+                self.assertNotEqual(payload["audio_file"], str(stale))
+                self.assertEqual(payload["audio_format"], "251")
+                self.assertTrue(Path(payload["audio_file"]).exists())
+            finally:
+                stale.unlink(missing_ok=True)
+                shutil.rmtree("/tmp/vidaudio_downloads", ignore_errors=True)
     def test_load_config_parses_llm_tuning_fields(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             config_path = Path(tmpdir) / "config.yaml"
@@ -646,7 +901,12 @@ class RegressionTests(unittest.TestCase):
                 'max_output_tokens_translate_only: "1550"\n'
                 'max_output_tokens_summarize: "512"\n'
                 'enable_token_count_probe: "false"\n'
-                'enable_chunk_autotune: "true"\n',
+                'enable_chunk_autotune: "true"\n'
+                'autotune_reduce_percent: "0.3"\n'
+                'autotune_increase_percent: "0.15"\n'
+                'autotune_success_window: "9"\n'
+                'autotune_p95_latency_threshold_ms: "12345"\n'
+                'autotune_canary_chunks: "4"\n',
                 encoding="utf-8",
             )
 
@@ -672,6 +932,11 @@ class RegressionTests(unittest.TestCase):
             self.assertEqual(config["max_output_tokens_summarize"], 512)
             self.assertFalse(config["enable_token_count_probe"])
             self.assertTrue(config["enable_chunk_autotune"])
+            self.assertEqual(config["autotune_reduce_percent"], 0.3)
+            self.assertEqual(config["autotune_increase_percent"], 0.15)
+            self.assertEqual(config["autotune_success_window"], 9)
+            self.assertEqual(config["autotune_p95_latency_threshold_ms"], 12345)
+            self.assertEqual(config["autotune_canary_chunks"], 4)
 
     def test_load_config_invalid_chunk_values_fall_back(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -688,7 +953,12 @@ class RegressionTests(unittest.TestCase):
                 'output_ratio_summarize: "bad"\n'
                 'max_output_tokens_summarize: "0"\n'
                 'enable_token_count_probe: "banana"\n'
-                'enable_chunk_autotune: "banana"\n',
+                'enable_chunk_autotune: "banana"\n'
+                'autotune_reduce_percent: "1.2"\n'
+                'autotune_increase_percent: "0"\n'
+                'autotune_success_window: "0"\n'
+                'autotune_p95_latency_threshold_ms: "-1"\n'
+                'autotune_canary_chunks: "0"\n',
                 encoding="utf-8",
             )
 
@@ -706,12 +976,18 @@ class RegressionTests(unittest.TestCase):
             self.assertEqual(config["max_output_tokens_summarize"], 384)
             self.assertTrue(config["enable_token_count_probe"])
             self.assertFalse(config["enable_chunk_autotune"])
-            self.assertGreaterEqual(len(config["config_warnings"]), 6)
+            self.assertEqual(config["autotune_reduce_percent"], 0.25)
+            self.assertEqual(config["autotune_increase_percent"], 0.10)
+            self.assertEqual(config["autotune_success_window"], 20)
+            self.assertEqual(config["autotune_p95_latency_threshold_ms"], 45000)
+            self.assertEqual(config["autotune_canary_chunks"], 3)
+            self.assertGreaterEqual(len(config["config_warnings"]), 10)
             warning_output = fake_stderr.getvalue()
             self.assertIn("Warning: Invalid numeric config values", warning_output)
             self.assertIn("chunk_size_override='oops'", warning_output)
             self.assertIn("chunk_hard_cap_multiplier='10.0'", warning_output)
             self.assertIn("max_output_tokens_summarize='0'", warning_output)
+            self.assertIn("autotune_reduce_percent='1.2'", warning_output)
 
     def test_chunk_text_uses_token_aware_default_budget(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -867,6 +1143,9 @@ class RegressionTests(unittest.TestCase):
 
             self.assertEqual(result["text"], "ok")
             self.assertEqual(result["attempts"], 2)
+            self.assertEqual(len(result["attempt_history"]), 2)
+            self.assertEqual(result["attempt_history"][0]["error_type"], "timeout")
+            self.assertEqual(result["attempt_history"][1]["result"], "success")
             self.assertEqual(mocked_request.call_count, 2)
 
     def test_call_llm_api_fails_fast_on_http_400(self):
@@ -1194,9 +1473,416 @@ class RegressionTests(unittest.TestCase):
             manifest = json.loads((work_dir / "manifest.json").read_text(encoding="utf-8"))
             self.assertFalse(result["success"])
             self.assertTrue(result["aborted"])
-            self.assertEqual(result["failed_count"], 2)
+            self.assertTrue(result["replan_required"])
+            self.assertEqual(result["failed_count"], 1)
             self.assertEqual(manifest["chunks"][0]["status"], "failed")
-            self.assertEqual(manifest["chunks"][1]["status"], "failed")
+            self.assertEqual(manifest["chunks"][1]["status"], "pending")
+            self.assertTrue(manifest["runtime"]["replan_required"])
+            self.assertEqual(manifest["runtime"]["status"], "aborted")
+
+    def test_process_chunks_autotune_shrinks_after_timeout(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source = Path(tmpdir) / "raw.txt"
+            work_dir = Path(tmpdir) / "chunks"
+            source.write_text("第一句。第二句。第三句。第四句。第五句。第六句。", encoding="utf-8")
+            utils.chunk_text(str(source), str(work_dir), 4, "structure_only")
+
+            timeout_error = utils.LLMRequestError(
+                "timed out",
+                error_type="timeout",
+                retryable=True,
+                request_url="https://api.example.com/v1/chat/completions",
+            )
+            timeout_error.attempts = 1
+            call_counter = {"count": 0}
+
+            def fake_call(**kwargs):
+                if call_counter["count"] == 0:
+                    call_counter["count"] += 1
+                    raise timeout_error
+                call_counter["count"] += 1
+                return {
+                    "text": "## Done\n\n处理完成。",
+                    "latency_ms": 12,
+                    "request_url": "https://api.example.com/v1/chat/completions",
+                    "streaming_used": False,
+                    "attempts": 1,
+                }
+
+            config = utils._default_config_values()
+            config.update({
+                "llm_api_key": "key",
+                "llm_base_url": "https://api.example.com",
+                "llm_model": "demo",
+                "llm_api_format": "openai",
+                "enable_chunk_autotune": True,
+                "llm_stop_after_consecutive_timeouts": 99,
+            })
+
+            stderr = io.StringIO()
+            with mock.patch.object(utils, "load_config", return_value=config), \
+                mock.patch.object(utils, "_call_llm_api", side_effect=fake_call), \
+                mock.patch("sys.stderr", stderr):
+                result = utils.process_chunks(str(work_dir), "structure_only")
+
+            manifest = json.loads((work_dir / "manifest.json").read_text(encoding="utf-8"))
+            first_chunk = manifest["chunks"][0]
+
+            self.assertFalse(result["success"])
+            self.assertTrue(result["replan_required"])
+            self.assertEqual(first_chunk["error_type"], "timeout")
+            self.assertEqual(first_chunk["autotune_event"], "shrink")
+            self.assertLess(first_chunk["autotune_next_target_tokens"], first_chunk["autotune_target_tokens"])
+            self.assertEqual(manifest["autotune"]["current_target_tokens"], first_chunk["autotune_next_target_tokens"])
+            self.assertIn("chunk_id=0", stderr.getvalue())
+            self.assertIn("planned_max_output_tokens=", stderr.getvalue())
+            self.assertIn("Autotune chunk_id=0 event=shrink", stderr.getvalue())
+
+    def test_process_chunks_autotune_increases_after_success_window(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source = Path(tmpdir) / "raw.txt"
+            work_dir = Path(tmpdir) / "chunks"
+            source.write_text(("第一句。第二句。第三句。第四句。" * 6), encoding="utf-8")
+            utils.chunk_text(str(source), str(work_dir), 4, "structure_only")
+            manifest_before = json.loads((work_dir / "manifest.json").read_text(encoding="utf-8"))
+            base_target = manifest_before["autotune"]["current_target_tokens"]
+
+            config = utils._default_config_values()
+            config.update({
+                "llm_api_key": "key",
+                "llm_base_url": "https://api.example.com",
+                "llm_model": "demo",
+                "llm_api_format": "openai",
+                "enable_chunk_autotune": True,
+                "autotune_success_window": 2,
+                "autotune_increase_percent": 0.10,
+                "autotune_p95_latency_threshold_ms": 1000,
+            })
+
+            stderr = io.StringIO()
+            with mock.patch.object(utils, "load_config", return_value=config), mock.patch.object(
+                utils,
+                "_call_llm_api",
+                side_effect=lambda **kwargs: {
+                    "text": "## Done\n\n处理完成。",
+                    "latency_ms": 12,
+                    "request_url": "https://api.example.com/v1/chat/completions",
+                    "streaming_used": False,
+                    "attempts": 1,
+                },
+            ), mock.patch("sys.stderr", stderr):
+                result = utils.process_chunks(str(work_dir), "structure_only")
+
+            manifest = json.loads((work_dir / "manifest.json").read_text(encoding="utf-8"))
+
+            self.assertTrue(result["success"])
+            self.assertGreater(manifest["autotune"]["current_target_tokens"], base_target)
+            self.assertIn("Autotune", stderr.getvalue())
+            self.assertTrue(
+                any(chunk["autotune_event"] == "increase" for chunk in manifest["chunks"] if chunk["status"] == "done")
+            )
+            self.assertTrue(
+                all("input_tokens" in chunk and "error_type" in chunk for chunk in manifest["chunks"])
+            )
+
+    def test_process_chunks_records_attempt_logs_and_aborts_for_retry_timeout(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source = Path(tmpdir) / "raw.txt"
+            work_dir = Path(tmpdir) / "chunks"
+            source.write_text("第一句。第二句。第三句。第四句。", encoding="utf-8")
+            utils.chunk_text(str(source), str(work_dir), 4, "structure_only")
+
+            config = utils._default_config_values()
+            config.update({
+                "llm_api_key": "key",
+                "llm_base_url": "https://api.example.com",
+                "llm_model": "demo",
+                "llm_api_format": "openai",
+                "enable_chunk_autotune": True,
+                "llm_max_retries": 1,
+                "llm_backoff_sec": 0.01,
+            })
+
+            with mock.patch.object(utils, "load_config", return_value=config), \
+                mock.patch("time.sleep"), \
+                mock.patch.object(utils, "_execute_llm_request") as mocked_request:
+                mocked_request.side_effect = [
+                    utils.LLMRequestError(
+                        "timed out",
+                        error_type="timeout",
+                        retryable=True,
+                        request_url="https://api.example.com/v1/chat/completions",
+                    ),
+                    {
+                        "text": "## Done\n\n处理完成。",
+                        "latency_ms": 12,
+                        "request_url": "https://api.example.com/v1/chat/completions",
+                        "streaming_used": False,
+                    },
+                ]
+                result = utils.process_chunks(str(work_dir), "structure_only")
+
+            manifest = json.loads((work_dir / "manifest.json").read_text(encoding="utf-8"))
+            first_chunk = manifest["chunks"][0]
+
+            self.assertFalse(result["success"])
+            self.assertTrue(result["replan_required"])
+            self.assertEqual(first_chunk["status"], "done")
+            self.assertEqual(len(first_chunk["attempt_logs"]), 2)
+            self.assertEqual(first_chunk["attempt_logs"][0]["error_type"], "timeout")
+            self.assertEqual(first_chunk["attempt_logs"][1]["result"], "success")
+            self.assertTrue(manifest["runtime"]["replan_required"])
+
+    def test_replan_remaining_supersedes_pending_chunks_and_appends_new_plan(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source = Path(tmpdir) / "raw.txt"
+            work_dir = Path(tmpdir) / "chunks"
+            source.write_text("第一句。第二句。第三句。第四句。第五句。第六句。", encoding="utf-8")
+            utils.chunk_text(str(source), str(work_dir), 4, "structure_only")
+
+            manifest_path = work_dir / "manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["chunks"][0]["status"] = "done"
+            manifest["runtime"]["replan_required"] = True
+            manifest["runtime"]["replan_reason"] = "timeout on chunk 1"
+            manifest["autotune"]["current_target_tokens"] = 3
+            manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+
+            result = utils.replan_remaining(str(work_dir), prompt_name="structure_only")
+
+            manifest_after = json.loads(manifest_path.read_text(encoding="utf-8"))
+            superseded = [chunk for chunk in manifest_after["chunks"] if chunk.get("status") == utils.SUPERSEDED_CHUNK_STATUS]
+            active_pending = [chunk for chunk in manifest_after["chunks"] if chunk.get("status") == "pending"]
+            first_pending_index = next(
+                index for index, chunk in enumerate(manifest_after["chunks"])
+                if chunk.get("status") == "pending"
+            )
+
+            self.assertTrue(result["success"])
+            self.assertTrue(result["replanned"])
+            self.assertEqual(len(superseded), 5)
+            self.assertGreater(len(active_pending), 0)
+            self.assertEqual(manifest_after["runtime"]["active_plan_id"], result["plan_id"])
+            self.assertEqual(manifest_after["runtime"]["current_chunk_index"], first_pending_index)
+            self.assertFalse(manifest_after["runtime"]["replan_required"])
+            self.assertEqual(result["chunk_size"], 3)
+
+    def test_process_chunks_clears_stale_replan_flags_after_success(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source = Path(tmpdir) / "raw.txt"
+            work_dir = Path(tmpdir) / "chunks"
+            source.write_text("第一句。第二句。第三句。第四句。", encoding="utf-8")
+            utils.chunk_text(str(source), str(work_dir), 4, "structure_only")
+
+            manifest_path = work_dir / "manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["runtime"]["replan_required"] = True
+            manifest["runtime"]["replan_reason"] = "stale flag"
+            manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+
+            config = utils._default_config_values()
+            config.update({
+                "llm_api_key": "key",
+                "llm_base_url": "https://api.example.com",
+                "llm_model": "demo",
+                "llm_api_format": "openai",
+            })
+
+            with mock.patch.object(utils, "load_config", return_value=config), mock.patch.object(
+                utils,
+                "_call_llm_api",
+                return_value={
+                    "text": "## Done\n\n处理完成。",
+                    "latency_ms": 12,
+                    "request_url": "https://api.example.com/v1/chat/completions",
+                    "streaming_used": False,
+                    "attempts": 1,
+                },
+            ):
+                result = utils.process_chunks(str(work_dir), "structure_only")
+
+            manifest_after = json.loads(manifest_path.read_text(encoding="utf-8"))
+
+            self.assertTrue(result["success"])
+            self.assertFalse(result["replan_required"])
+            self.assertFalse(manifest_after["runtime"]["replan_required"])
+            self.assertEqual(manifest_after["runtime"]["replan_reason"], "")
+            self.assertEqual(manifest_after["runtime"]["status"], "completed")
+
+    def test_process_chunks_marks_completed_with_errors_for_nonfatal_failures(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source = Path(tmpdir) / "raw.txt"
+            work_dir = Path(tmpdir) / "chunks"
+            source.write_text("第一句。第二句。第三句。第四句。", encoding="utf-8")
+            utils.chunk_text(str(source), str(work_dir), 4, "structure_only")
+
+            manifest_path = work_dir / "manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            missing_raw_path = work_dir / manifest["chunks"][1]["raw_path"]
+            missing_raw_path.unlink()
+
+            config = utils._default_config_values()
+            config.update({
+                "llm_api_key": "key",
+                "llm_base_url": "https://api.example.com",
+                "llm_model": "demo",
+                "llm_api_format": "openai",
+            })
+
+            with mock.patch.object(utils, "load_config", return_value=config), mock.patch.object(
+                utils,
+                "_call_llm_api",
+                return_value={
+                    "text": "## Done\n\n处理完成。",
+                    "latency_ms": 12,
+                    "request_url": "https://api.example.com/v1/chat/completions",
+                    "streaming_used": False,
+                    "attempts": 1,
+                },
+            ):
+                result = utils.process_chunks(str(work_dir), "structure_only")
+
+            manifest_after = json.loads(manifest_path.read_text(encoding="utf-8"))
+
+            self.assertFalse(result["success"])
+            self.assertFalse(result["aborted"])
+            self.assertEqual(result["failed_count"], 1)
+            self.assertEqual(manifest_after["runtime"]["status"], "completed_with_errors")
+            self.assertFalse(manifest_after["runtime"]["replan_required"])
+
+    def test_process_chunks_with_replans_auto_recovers_after_canary_abort(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source = Path(tmpdir) / "raw.txt"
+            work_dir = Path(tmpdir) / "chunks"
+            source.write_text("第一句。第二句。第三句。第四句。第五句。第六句。", encoding="utf-8")
+            utils.chunk_text(str(source), str(work_dir), 4, "structure_only")
+
+            timeout_error = utils.LLMRequestError(
+                "timed out",
+                error_type="timeout",
+                retryable=True,
+                request_url="https://api.example.com/v1/chat/completions",
+            )
+            timeout_error.attempts = 1
+            call_counter = {"count": 0}
+
+            def fake_call(**kwargs):
+                if call_counter["count"] == 0:
+                    call_counter["count"] += 1
+                    raise timeout_error
+                call_counter["count"] += 1
+                return {
+                    "text": "## Done\n\n处理完成。",
+                    "latency_ms": 12,
+                    "request_url": "https://api.example.com/v1/chat/completions",
+                    "streaming_used": False,
+                    "attempts": 1,
+                }
+
+            config = utils._default_config_values()
+            config.update({
+                "llm_api_key": "key",
+                "llm_base_url": "https://api.example.com",
+                "llm_model": "demo",
+                "llm_api_format": "openai",
+                "enable_chunk_autotune": True,
+                "autotune_canary_chunks": 1,
+                "llm_stop_after_consecutive_timeouts": 99,
+            })
+
+            with mock.patch.object(utils, "load_config", return_value=config), \
+                mock.patch.object(utils, "_call_llm_api", side_effect=fake_call):
+                result = utils.process_chunks_with_replans(
+                    str(work_dir),
+                    "structure_only",
+                    max_replans=1,
+                )
+
+            manifest = json.loads((work_dir / "manifest.json").read_text(encoding="utf-8"))
+            self.assertTrue(result["success"])
+            self.assertEqual(result["replan_count"], 1)
+            self.assertEqual(
+                result["superseded_count"],
+                sum(1 for chunk in manifest["chunks"] if chunk.get("status") == utils.SUPERSEDED_CHUNK_STATUS),
+            )
+            self.assertFalse(manifest["runtime"]["replan_required"])
+            self.assertEqual(manifest["runtime"]["status"], "completed")
+            self.assertTrue(any(chunk["status"] == utils.SUPERSEDED_CHUNK_STATUS for chunk in manifest["chunks"]))
+
+    def test_process_chunks_with_replans_stops_when_replan_step_fails(self):
+        with mock.patch.object(utils, "process_chunks", side_effect=[
+            {
+                "success": False,
+                "processed_count": 0,
+                "failed_count": 1,
+                "skipped_count": 0,
+                "superseded_count": 0,
+                "warnings": [],
+                "output_files": [],
+                "request_url": "https://api.example.com/v1/chat/completions",
+                "aborted": True,
+                "aborted_reason": "need replan",
+                "replan_required": True,
+                "replan_reason": "timeout on chunk 0",
+                "plan": {"plan_id": "plan_a"},
+            },
+        ]), mock.patch.object(utils, "replan_remaining", return_value={
+            "success": False,
+            "replanned": False,
+            "error": "failed to generate replacement plan",
+            "warnings": ["controller warning"],
+        }):
+            result = utils.process_chunks_with_replans("/tmp/demo", "structure_only", max_replans=1)
+
+        self.assertFalse(result["success"])
+        self.assertTrue(result["aborted"])
+        self.assertTrue(result["replan_required"])
+        self.assertIn("failed to generate replacement plan", result["aborted_reason"])
+        self.assertEqual(result["warning_count"], 1)
+
+    def test_merge_content_keeps_chapter_headers_after_replan_remaining(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source = Path(tmpdir) / "raw.txt"
+            work_dir = Path(tmpdir) / "chunks"
+            output_file = Path(tmpdir) / "merged.md"
+            source.write_text("第一句。第二句。第三句。第四句。第五句。第六句。", encoding="utf-8")
+            utils.chunk_text(str(source), str(work_dir), 4, "structure_only")
+
+            manifest_path = work_dir / "manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            (work_dir / "chapter_plan.json").write_text(
+                json.dumps([
+                    {"start_chunk": 1, "title_en": "Chapter One", "title_zh": "第一章"},
+                ], ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            manifest["chunks"][0]["status"] = "done"
+            (work_dir / manifest["chunks"][0]["processed_path"]).write_text("done-0", encoding="utf-8")
+            manifest["runtime"]["replan_required"] = True
+            manifest["autotune"]["current_target_tokens"] = 3
+            manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+
+            result = utils.replan_remaining(str(work_dir), prompt_name="structure_only")
+            manifest_after = json.loads(manifest_path.read_text(encoding="utf-8"))
+            for chunk in manifest_after["chunks"]:
+                if chunk.get("status") == "pending":
+                    (work_dir / chunk["processed_path"]).write_text(
+                        f"content-{chunk['chunk_id']}",
+                        encoding="utf-8",
+                    )
+                    chunk["status"] = "done"
+            manifest_path.write_text(json.dumps(manifest_after, ensure_ascii=False, indent=2), encoding="utf-8")
+
+            merge_result = utils.merge_content(str(work_dir), str(output_file))
+            merged_text = output_file.read_text(encoding="utf-8")
+            chapter_plan = json.loads((work_dir / "chapter_plan.json").read_text(encoding="utf-8"))
+
+            self.assertTrue(result["success"])
+            self.assertTrue(merge_result["success"])
+            self.assertEqual(merge_result["chapters_inserted"], 1)
+            self.assertIn("Chapter One", merged_text)
+            self.assertIn("第一章", merged_text)
+            self.assertNotEqual(chapter_plan[0]["start_chunk"], 1)
 
     def test_test_llm_api_returns_probe_metadata(self):
         with mock.patch.object(utils, "load_config", return_value={

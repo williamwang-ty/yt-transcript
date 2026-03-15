@@ -144,6 +144,17 @@ The helper scripts now emit machine-readable JSON on stdout:
 
 This keeps workflow logic in scripts instead of ad-hoc shell parsing inside the prompt instructions.
 
+`plan-optimization` also emits the canonical chunk execution contract:
+
+- `operations[*].execution.supports_auto_replan`
+- `operations[*].execution.recommended_cli_flags`
+- `operations[*].execution.on_replan_required`
+
+Current policy is intentional and explicit:
+
+- `raw_path` chunk stages use `process-chunks --auto-replan`
+- `processed_path` chunk stages do **not** auto-replan; if `replan_required=true`, stop and review manually
+
 ### 🧭 Intentional Design Decisions
 
 - `bilingual` means English source text plus Chinese translation, not subtitle file merging
@@ -156,6 +167,13 @@ This keeps workflow logic in scripts instead of ad-hoc shell parsing inside the 
 - prompt names are validated eagerly for chunk planning, so typos fail fast instead of silently falling back to generic budgets
 - `process-chunks` now assigns prompt-specific `max_output_tokens` from the same planning budget instead of using one large shared default
 - `process-chunks` also injects a short continuity context from the previous chunk (tail sentence + optional section title) without enabling body overlap, and chunk budgeting now reserves a small token allowance for that carry-over context
+- `process-chunks --dry-run` validates prompts, manifests, and chunk budgets without requiring live LLM credentials; actual execution still requires `llm_api_key`, `llm_base_url`, and `llm_model`
+- `download.sh` now writes subtitle and audio artifacts into per-video isolated temp directories under `/tmp/${VIDEO_ID}_downloads/...` and exposes `download_dir` in JSON for deterministic selection and cleanup
+- `plan-optimization` is the canonical short/long router with `< 1800s = short` and `>= 1800s = long`; the Quick Mode shortcut from `SKILL.md` is a narrower `< 900s` subset for subtitle-friendly videos
+- `manifest.json` now separates immutable `plan` metadata from `runtime` state, and `process-chunks` records attempt-level telemetry (`attempt_logs`) in addition to chunk-level fields
+- `process-chunks` no longer rewrites the current batch budget on the fly; when canary chunks or retry history show the plan is unhealthy, it aborts with `replan_required=true` so `replan-remaining` can generate a new plan for unfinished raw chunks
+- `process-chunks --auto-replan` preserves that architecture boundary while automating the orchestration loop (`process -> replan-remaining -> resume`) for raw-path plans
+- `runtime.status` now distinguishes `completed`, `completed_with_errors`, and `aborted`, and raw-path replans remap existing `chapter_plan.json` chunk starts so merged chapter headers still land on valid chunk boundaries
 - runtime token estimation remains heuristic by default; `test-token-count` / `preflight.sh --require-llm` probe provider-side token counting and clearly fall back to local estimates when unavailable
 - `chunk_hard_cap_multiplier` is constrained to a conservative `1.0-2.0` range so misconfiguration cannot silently blow up chunk envelopes
 - `preflight.sh` is staged so subtitle-only workflows do not require Deepgram or LLM credentials up front, while `--require-llm` now performs both reachability and token-count capability probes
@@ -177,7 +195,7 @@ This keeps workflow logic in scripts instead of ad-hoc shell parsing inside the 
 |----------|--------------------------|--------------|
 | Short video with subtitles | `preflight.sh` → `download.sh metadata` → create state → `validate-state --stage metadata` → `download.sh subtitle-info` → `download.sh subtitles` → `validate-state --stage post-source` → optimize → `verify-quality` | Stop only if `validate-state` or `verify-quality` returns non-empty `hard_failures` |
 | Video without usable subtitles | `preflight.sh` → `download.sh metadata` → `download.sh subtitle-info` → `preflight.sh --require-deepgram` → `transcribe-deepgram` → `validate-state --stage post-source` → optimize → `verify-quality` | Stop on any command failure or non-empty `hard_failures` |
-| Long video | `validate-state --stage post-source` → `plan-optimization` → if `requires_llm_preflight=true`, run `preflight.sh --require-llm` → chunk / process / merge → `verify-quality` → `validate-state --stage pre-assemble` | `warnings` alone do not block; `hard_failures` block |
+| Long video | `validate-state --stage post-source` → `plan-optimization` → if `requires_llm_preflight=true`, run `preflight.sh --require-llm` → chunk → raw-path `process-chunks --auto-replan` → optional processed-path translation → merge → `verify-quality` → `validate-state --stage pre-assemble` | `warnings` alone do not block; `hard_failures` block |
 
 ### 🛠️ Minimum Commands
 
@@ -195,6 +213,10 @@ python3 yt_transcript_utils.py validate-state /tmp/${VIDEO_ID}_state.md --stage 
 
 # 4. Optimization planning
 python3 yt_transcript_utils.py plan-optimization /tmp/${VIDEO_ID}_state.md
+
+# 4b. Long-video raw chunk stages follow the plan contract
+#     use process-chunks --auto-replan for raw_path,
+#     but stop-and-review for processed_path replan_required
 
 # 5. Audio fallback when needed
 bash scripts/preflight.sh --require-deepgram
@@ -355,6 +377,17 @@ bash scripts/preflight.sh --require-llm
 
 这样 workflow 文档只保留调用顺序，具体判断逻辑下沉到脚本中。
 
+`plan-optimization` 现在还会输出标准化的 chunk 执行契约：
+
+- `operations[*].execution.supports_auto_replan`
+- `operations[*].execution.recommended_cli_flags`
+- `operations[*].execution.on_replan_required`
+
+当前约定是明确固定的：
+
+- `raw_path` 阶段统一使用 `process-chunks --auto-replan`
+- `processed_path` 阶段不做自动 replan；若返回 `replan_required=true`，必须先停下人工检查
+
 ### 🧭 设计上的刻意取舍
 
 - `bilingual` 表示“英文源文本 + 中文翻译”，不是直接合并双字幕文件
@@ -367,6 +400,10 @@ bash scripts/preflight.sh --require-llm
 - 分块阶段会提前校验 prompt 名称，避免因为 prompt 拼写错误而静默回退到通用预算
 - `process-chunks` 现在按 prompt 预算单独设置 `max_output_tokens`，不再复用单一的大默认值
 - `process-chunks` 还会注入上一块的轻量 continuity context（尾句 + 可选 section title），但不会启用正文 overlap；同时分块预算也会为这段 carry-over context 预留一小段 token 成本
+- `manifest.json` 现在会把不可变 `plan` 和可变 `runtime` 状态分开，同时为每个 chunk 记录 `attempt_logs` 级别的请求观测数据
+- `process-chunks` 不再在当前 batch 内偷偷改预算；如果 canary 或重试历史表明当前 plan 不健康，会以 `replan_required=true` 终止，并通过 `replan-remaining` 为剩余原始 chunk 生成新计划
+- `process-chunks --auto-replan` 会在不破坏上述边界的前提下，自动编排 `process -> replan-remaining -> resume` 这一恢复链路（仅适用于 `raw_path` 计划）
+- `runtime.status` 现在会区分 `completed` / `completed_with_errors` / `aborted`，而 raw replan 也会同步重映射已有 `chapter_plan.json` 的 chunk 起点，保证 merge 阶段的章节标题仍落在有效 chunk 边界上
 - 运行时 token 估算默认仍是本地启发式 fallback；`test-token-count` / `preflight.sh --require-llm` 会探测 provider 级 token count，并在不可用时明确回退到 local estimate
 - `chunk_hard_cap_multiplier` 会被限制在保守的 `1.0-2.0` 区间，避免配置失误把 chunk 包络静默放大
 - `preflight.sh` 采用分层校验，确保只走字幕路径时不必预先配置 Deepgram 或 LLM 凭据；进入 `--require-llm` 时会同时做连通性和 token count 能力探测
@@ -388,7 +425,7 @@ bash scripts/preflight.sh --require-llm
 |------|--------------|--------------|
 | 有字幕短视频 | `preflight.sh` → `download.sh metadata` → 创建 state → `validate-state --stage metadata` → `download.sh subtitle-info` → `download.sh subtitles` → `validate-state --stage post-source` → 优化 → `verify-quality` | 只有 `validate-state` 或 `verify-quality` 返回非空 `hard_failures` 才停止 |
 | 无可用字幕视频 | `preflight.sh` → `download.sh metadata` → `download.sh subtitle-info` → `preflight.sh --require-deepgram` → `transcribe-deepgram` → `validate-state --stage post-source` → 优化 → `verify-quality` | 任一命令失败或 `hard_failures` 非空都必须停止 |
-| 长视频 | `validate-state --stage post-source` → `plan-optimization` → 若 `requires_llm_preflight=true` 则执行 `preflight.sh --require-llm` → 分块 / 处理 / 合并 → `verify-quality` → `validate-state --stage pre-assemble` | `warnings` 不自动阻断，`hard_failures` 阻断 |
+| 长视频 | `validate-state --stage post-source` → `plan-optimization` → 若 `requires_llm_preflight=true` 则执行 `preflight.sh --require-llm` → 分块 → `raw_path` 阶段使用 `process-chunks --auto-replan` → 需要时执行 `processed_path` 翻译阶段 → 合并 → `verify-quality` → `validate-state --stage pre-assemble` | `warnings` 不自动阻断，`hard_failures` 阻断 |
 
 ### 🛠️ 最小命令集
 
@@ -406,6 +443,10 @@ python3 yt_transcript_utils.py validate-state /tmp/${VIDEO_ID}_state.md --stage 
 
 # 4. 优化计划
 python3 yt_transcript_utils.py plan-optimization /tmp/${VIDEO_ID}_state.md
+
+# 4b. 长视频 raw chunk 阶段遵循 plan contract
+#     raw_path 用 process-chunks --auto-replan,
+#     processed_path 若出现 replan_required 则停下人工检查
 
 # 5. 需要时走音频兜底
 bash scripts/preflight.sh --require-deepgram

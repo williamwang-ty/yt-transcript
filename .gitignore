@@ -1,6 +1,10 @@
 # Local config (contains sensitive data)
 config.yaml
 
+# Local workspace artifacts
+.claude/
+work-note.md
+
 # Python
 __pycache__/
 *.py[cod]

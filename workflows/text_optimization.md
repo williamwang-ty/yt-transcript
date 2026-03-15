@@ -38,6 +38,7 @@ Read from JSON:
 - `video_path`
 - `requires_llm_preflight`
 - `operations`
+- `replan_contract`
 - `outputs`
 
 If `hard_failures` is non-empty, STOP.
@@ -47,6 +48,8 @@ If `requires_llm_preflight=true`, ensure:
 ```bash
 bash <skill-root>/scripts/preflight.sh --require-llm
 ```
+
+`plan-optimization` is the canonical router here: `video_path=short` means duration `< 1800` seconds, while `video_path=long` means `>= 1800` seconds. The separate Quick Mode from `SKILL.md` is a narrower `< 900` second shortcut inside the short-video bucket.
 
 ---
 
@@ -108,7 +111,7 @@ Update state:
 
 - If YouTube chapters exist, map them to chunk indices and write `/tmp/${VIDEO_ID}_chunks/chapter_plan.json`
 - Else:
-  1. `process-chunks --prompt summarize`
+  1. `process-chunks --prompt summarize --auto-replan`
   2. Aggregate `summary_chunk_*.txt`
   3. Create `/tmp/${VIDEO_ID}_chunks/chapter_plan.json`
 
@@ -118,7 +121,32 @@ Read `operations` from `PLAN_JSON`.
 
 - The first chunk operation always uses `prompt=structure_only`
 - If its `extra_instruction` is non-empty, pass it through `--extra-instruction`
-- If a second chunk operation exists, it uses `prompt=translate_only` and `--input-key processed_path`
+- Every chunk operation includes an `execution` object; follow it instead of re-deriving replan behavior in prose
+- When `execution.supports_auto_replan=true`, include every flag in `execution.recommended_cli_flags`
+- When `execution.on_replan_required=stop_and_review`, do not call `replan-remaining`; STOP and surface the manifest/runtime state for manual review
+
+Canonical command shape:
+
+- Raw structure stage:
+  ```bash
+  python3 <skill-root>/yt_transcript_utils.py process-chunks \
+      /tmp/${VIDEO_ID}_chunks \
+      --prompt structure_only \
+      --auto-replan
+  ```
+- Processed translation stage (when present):
+  ```bash
+  python3 <skill-root>/yt_transcript_utils.py process-chunks \
+      /tmp/${VIDEO_ID}_chunks \
+      --prompt translate_only \
+      --input-key processed_path
+  ```
+
+Current contract:
+
+- `input_key=raw_path` → use `--auto-replan`
+- Existing `chapter_plan.json` mappings remain valid after raw-path replans because `replan-remaining` remaps chapter start chunks onto the replacement plan
+- `input_key=processed_path` → auto-replan is unsupported; if JSON reports `replan_required=true`, STOP and review before continuing
 
 ### Step 5: Merge
 

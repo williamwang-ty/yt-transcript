@@ -60,12 +60,15 @@ SUB_DOWNLOAD_JSON=$(bash <skill-root>/scripts/download.sh "$VIDEO_URL" subtitles
 
 Record:
 
+- `download_dir`
 - `downloaded_files`
 - `english_files`
 - `chinese_files`
 - `selected_source_vtt`
 - `selected_source_language`
 - `selected_source_kind`
+
+`download_dir` points to the per-video isolated temp directory used by the script.
 
 If no VTT files were downloaded, STOP.
 

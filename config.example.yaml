@@ -58,3 +58,9 @@ max_output_tokens_translate_only: 1500
 max_output_tokens_summarize: 384
 enable_token_count_probe: true
 enable_chunk_autotune: false
+autotune_reduce_percent: 0.25
+autotune_increase_percent: 0.10
+autotune_success_window: 20
+autotune_p95_latency_threshold_ms: 45000
+# Number of early chunks to treat as canaries before the plan is considered stable.
+autotune_canary_chunks: 3

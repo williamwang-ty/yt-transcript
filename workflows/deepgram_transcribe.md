@@ -27,10 +27,13 @@ AUDIO_JSON=$(bash <skill-root>/scripts/download.sh "$VIDEO_URL" audio)
 
 Record from JSON:
 
+- `download_dir`
 - `audio_file`
 - `audio_format`
 - `extension`
 - `size_bytes`
+
+`download_dir` points to the per-video isolated temp directory used by the script.
 
 If `audio_file` is missing, STOP.
 
