@@ -10,6 +10,33 @@ deepgram_api_key: "your_deepgram_api_key_here"
 # Output directory for transcribed files. This is the only always-required field.
 output_dir: "~/Downloads"
 
+# yt-dlp tuning (optional)
+# These default to conservative values to avoid long hangs.
+# Set to a positive integer to enable. Use -1 to keep yt-dlp defaults.
+yt_dlp_socket_timeout_sec: -1
+yt_dlp_retries: -1
+yt_dlp_extractor_retries: -1
+
+# YouTube anti-bot / login handling (optional)
+# Default behavior: yt-transcript does NOT read browser cookies up front.
+# If yt-dlp hits "Sign in to confirm you're not a bot", download.sh will
+# automatically retry (up to 3 attempts) with: --cookies-from-browser chrome
+#
+# Leave these blank unless you want to force a specific auth source.
+# This is useful when:
+# - Chrome is not installed in the current environment
+# - Chrome is installed but not logged into YouTube
+# - You are running remotely / inside a container
+#
+# Option A: force a browser profile explicitly
+#   yt_dlp_cookies_from_browser: "chrome"
+#   # Examples: "chrome", "edge", "firefox", "safari" (depends on yt-dlp support)
+#
+# Option B: use an exported Netscape-format cookies.txt (most portable)
+#   yt_dlp_cookies_file: "~/Downloads/youtube_cookies.txt"
+yt_dlp_cookies_from_browser: ""
+yt_dlp_cookies_file: ""
+
 # LLM API Configuration
 # Required only when plan-optimization selects long-video chunk processing,
 # or when bilingual translation is needed.

@@ -12,11 +12,179 @@ if [ $# -lt 2 ]; then
 fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+CONFIG_FILE="$ROOT_DIR/config.yaml"
 VIDEO_URL="$1"
 MODE="$2"
 
+CONFIG_JSON=""
+if [ -f "$CONFIG_FILE" ]; then
+    CONFIG_JSON=$(python3 "$ROOT_DIR/yt_transcript_utils.py" load-config --config-path "$CONFIG_FILE" 2>/dev/null || true)
+fi
+
+YT_DLP_SOCKET_TIMEOUT_SEC="${YT_DLP_SOCKET_TIMEOUT_SEC:-}"
+YT_DLP_RETRIES="${YT_DLP_RETRIES:-}"
+YT_DLP_EXTRACTOR_RETRIES="${YT_DLP_EXTRACTOR_RETRIES:-}"
+YT_DLP_COOKIES_FROM_BROWSER="${YT_DLP_COOKIES_FROM_BROWSER:-}"
+YT_DLP_COOKIES_FILE="${YT_DLP_COOKIES_FILE:-}"
+YTDLP_SESSION_BROWSER_COOKIES=""
+YTDLP_CHROME_COOKIES_RETRY_MAX=3
+
+if [ -n "$CONFIG_JSON" ]; then
+    if [ -z "$YT_DLP_SOCKET_TIMEOUT_SEC" ]; then
+        YT_DLP_SOCKET_TIMEOUT_SEC=$(printf '%s' "$CONFIG_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin).get('yt_dlp_socket_timeout_sec',''))" 2>/dev/null)
+    fi
+    if [ -z "$YT_DLP_RETRIES" ]; then
+        YT_DLP_RETRIES=$(printf '%s' "$CONFIG_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin).get('yt_dlp_retries',''))" 2>/dev/null)
+    fi
+    if [ -z "$YT_DLP_EXTRACTOR_RETRIES" ]; then
+        YT_DLP_EXTRACTOR_RETRIES=$(printf '%s' "$CONFIG_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin).get('yt_dlp_extractor_retries',''))" 2>/dev/null)
+    fi
+    if [ -z "$YT_DLP_COOKIES_FROM_BROWSER" ]; then
+        YT_DLP_COOKIES_FROM_BROWSER=$(printf '%s' "$CONFIG_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin).get('yt_dlp_cookies_from_browser',''))" 2>/dev/null)
+    fi
+    if [ -z "$YT_DLP_COOKIES_FILE" ]; then
+        YT_DLP_COOKIES_FILE=$(printf '%s' "$CONFIG_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin).get('yt_dlp_cookies_file',''))" 2>/dev/null)
+    fi
+fi
+
+YTDLP_ARGS=()
+if [[ "$YT_DLP_SOCKET_TIMEOUT_SEC" =~ ^-?[0-9]+$ ]] && [ "$YT_DLP_SOCKET_TIMEOUT_SEC" -gt 0 ]; then
+    YTDLP_ARGS+=(--socket-timeout "$YT_DLP_SOCKET_TIMEOUT_SEC")
+fi
+if [[ "$YT_DLP_RETRIES" =~ ^-?[0-9]+$ ]] && [ "$YT_DLP_RETRIES" -ge 0 ]; then
+    YTDLP_ARGS+=(--retries "$YT_DLP_RETRIES")
+fi
+if [[ "$YT_DLP_EXTRACTOR_RETRIES" =~ ^-?[0-9]+$ ]] && [ "$YT_DLP_EXTRACTOR_RETRIES" -ge 0 ]; then
+    YTDLP_ARGS+=(--extractor-retries "$YT_DLP_EXTRACTOR_RETRIES")
+fi
+if [ -n "$YT_DLP_COOKIES_FILE" ]; then
+    YTDLP_ARGS+=(--cookies "$YT_DLP_COOKIES_FILE")
+elif [ -n "$YT_DLP_COOKIES_FROM_BROWSER" ]; then
+    YTDLP_ARGS+=(--cookies-from-browser "$YT_DLP_COOKIES_FROM_BROWSER")
+fi
+
+is_not_a_bot_error() {
+    local text="$1"
+    case "$text" in
+        *"Sign in to confirm you're not a bot"*|*"Sign in to confirm you’re not a bot"*|*"LOGIN_REQUIRED"*)
+            return 0
+            ;;
+    esac
+    return 1
+}
+
+emit_cookies_import_guidance() {
+    local attempts="${1:-}"
+    local suffix=""
+    if [[ "$attempts" =~ ^[0-9]+$ ]] && [ "$attempts" -gt 0 ]; then
+        suffix=" after ${attempts} attempt(s)"
+    fi
+
+    echo "ℹ️  Automatic Chrome cookies retry failed${suffix}." >&2
+    cat >&2 <<'EOF'
+   Common causes:
+   - Chrome is not installed in this environment
+   - Chrome is installed but not logged into YouTube
+   - This is a remote or container environment without browser profile access
+
+   To continue, export a Netscape-format cookies.txt from a logged-in browser and configure one of:
+   - config.yaml: yt_dlp_cookies_file: "/path/to/youtube_cookies.txt"
+   - env var: YT_DLP_COOKIES_FILE=/path/to/youtube_cookies.txt
+
+   Recommended import flow:
+   1. Open YouTube in a logged-in browser on your local machine
+   2. Export youtube.com cookies in Netscape cookies.txt format
+   3. Copy the file to this machine/container
+   4. Point yt-transcript to that file and retry
+EOF
+}
+
+run_yt_dlp_command() {
+    local stdout_file="$1"
+    local stderr_file="$2"
+    shift 2
+
+    local -a args=()
+    if (( ${#YTDLP_ARGS[@]} )); then
+        args+=("${YTDLP_ARGS[@]}")
+    fi
+    if [ -n "$YTDLP_SESSION_BROWSER_COOKIES" ] && [ -z "$YT_DLP_COOKIES_FILE" ] && [ -z "$YT_DLP_COOKIES_FROM_BROWSER" ]; then
+        args+=(--cookies-from-browser "$YTDLP_SESSION_BROWSER_COOKIES")
+    fi
+
+    command yt-dlp ${args[@]+"${args[@]}"} "$@" >"$stdout_file" 2>"$stderr_file"
+}
+
+yt_dlp() {
+    local stdout_file stderr_file status stderr_text
+    stdout_file=$(mktemp)
+    stderr_file=$(mktemp)
+
+    if run_yt_dlp_command "$stdout_file" "$stderr_file" "$@"; then
+        cat "$stdout_file"
+        if [ -s "$stderr_file" ]; then
+            cat "$stderr_file" >&2
+        fi
+        rm -f "$stdout_file" "$stderr_file"
+        return 0
+    else
+        status=$?
+    fi
+
+    stderr_text=$(cat "$stderr_file")
+    rm -f "$stdout_file" "$stderr_file"
+
+    if [ -z "$YT_DLP_COOKIES_FILE" ] && [ -z "$YT_DLP_COOKIES_FROM_BROWSER" ] && [ -z "$YTDLP_SESSION_BROWSER_COOKIES" ] && is_not_a_bot_error "$stderr_text"; then
+        local attempt retry_stdout retry_stderr retry_status retry_stderr_text
+
+        printf '%s\n' "$stderr_text" >&2
+
+        attempt=0
+        retry_status="$status"
+        while [ "$attempt" -lt "$YTDLP_CHROME_COOKIES_RETRY_MAX" ]; do
+            attempt=$((attempt + 1))
+            echo "ℹ️  yt-dlp hit YouTube bot verification; retrying with Chrome cookies (attempt ${attempt}/${YTDLP_CHROME_COOKIES_RETRY_MAX})..." >&2
+
+            retry_stdout=$(mktemp)
+            retry_stderr=$(mktemp)
+
+            if command yt-dlp ${YTDLP_ARGS[@]+"${YTDLP_ARGS[@]}"} --cookies-from-browser chrome "$@" >"$retry_stdout" 2>"$retry_stderr"; then
+                YTDLP_SESSION_BROWSER_COOKIES="chrome"
+                cat "$retry_stdout"
+                if [ -s "$retry_stderr" ]; then
+                    cat "$retry_stderr" >&2
+                fi
+                rm -f "$retry_stdout" "$retry_stderr"
+                return 0
+            else
+                retry_status=$?
+            fi
+
+            retry_stderr_text=$(cat "$retry_stderr")
+            rm -f "$retry_stdout" "$retry_stderr"
+
+            if [ -n "$retry_stderr_text" ]; then
+                printf '%s\n' "$retry_stderr_text" >&2
+            fi
+
+            if ! is_not_a_bot_error "$retry_stderr_text"; then
+                break
+            fi
+        done
+
+        emit_cookies_import_guidance "$attempt"
+        return "$retry_status"
+    fi
+
+    if [ -n "$stderr_text" ]; then
+        printf '%s\n' "$stderr_text" >&2
+    fi
+    return "$status"
+}
+
 video_id_for_url() {
-    yt-dlp --print "%(id)s" "$VIDEO_URL" 2>/dev/null
+    yt_dlp --print "%(id)s" "$VIDEO_URL"
 }
 
 require_valid_video_id() {
@@ -211,11 +379,17 @@ case "$MODE" in
         echo "📋 Fetching video metadata..." >&2
         VIDEO_ID=$(video_id_for_url)
         require_valid_video_id "$VIDEO_ID"
-        TITLE=$(yt-dlp --print "%(title)s" "$VIDEO_URL" 2>/dev/null)
-        DURATION=$(yt-dlp --print "%(duration)s" "$VIDEO_URL" 2>/dev/null || echo "0")
+        if ! TITLE=$(yt_dlp --print "%(title)s" "$VIDEO_URL"); then
+            exit 1
+        fi
+        DURATION=$(yt_dlp --print "%(duration)s" "$VIDEO_URL" 2>/dev/null || echo "0")
         [ -z "$DURATION" ] || [ "$DURATION" = "NA" ] && DURATION=0
-        UPLOAD_DATE=$(yt-dlp --print "%(upload_date)s" "$VIDEO_URL" 2>/dev/null)
-        CHANNEL=$(yt-dlp --print "%(channel)s" "$VIDEO_URL" 2>/dev/null)
+        if ! UPLOAD_DATE=$(yt_dlp --print "%(upload_date)s" "$VIDEO_URL"); then
+            exit 1
+        fi
+        if ! CHANNEL=$(yt_dlp --print "%(channel)s" "$VIDEO_URL"); then
+            exit 1
+        fi
 
         VIDEO_ID="$VIDEO_ID" TITLE="$TITLE" DURATION="$DURATION" UPLOAD_DATE="$UPLOAD_DATE" CHANNEL="$CHANNEL" \
             python3 - <<'PY'
@@ -236,7 +410,7 @@ PY
         echo "🔎 Inspecting subtitle availability..." >&2
         VIDEO_ID=$(video_id_for_url)
         require_valid_video_id "$VIDEO_ID"
-        METADATA_JSON=$(yt-dlp -J "$VIDEO_URL" 2>/dev/null || true)
+        METADATA_JSON=$(yt_dlp -J "$VIDEO_URL" 2>/dev/null || true)
         if [ -n "$METADATA_JSON" ]; then
             if SUB_INFO_JSON=$(printf '%s' "$METADATA_JSON" | emit_subtitle_info_from_metadata_json "$VIDEO_ID" 2>/dev/null); then
                 printf '%s\n' "$SUB_INFO_JSON"
@@ -244,7 +418,7 @@ PY
             fi
         fi
 
-        if ! LIST_OUTPUT=$(yt-dlp --list-subs "$VIDEO_URL" 2>&1); then
+        if ! LIST_OUTPUT=$(yt_dlp --list-subs "$VIDEO_URL" 2>&1); then
             printf '%s\n' "$LIST_OUTPUT" >&2
             exit 1
         fi
@@ -300,7 +474,7 @@ PY
             exit 1
         fi
 
-        yt-dlp --write-sub --write-auto-sub \
+        yt_dlp --write-sub --write-auto-sub \
                --sub-lang "$SUB_LANGS" \
                --sub-format "vtt" \
                --skip-download \
@@ -405,23 +579,23 @@ PY
         reset_download_dir "$AUDIO_DIR"
 
         AUDIO_FORMAT=""
-        METADATA_JSON=$(yt-dlp -J "$VIDEO_URL" 2>/dev/null || true)
+        METADATA_JSON=$(yt_dlp -J "$VIDEO_URL" 2>/dev/null || true)
         if [ -n "$METADATA_JSON" ]; then
             AUDIO_FORMAT=$(printf '%s' "$METADATA_JSON" | select_audio_format_from_metadata_json 2>/dev/null || true)
         fi
 
         if [ -z "$AUDIO_FORMAT" ]; then
-            AUDIO_FORMAT=$(yt-dlp --list-formats "$VIDEO_URL" 2>&1 | grep -E "audio.*zh" | head -1 | awk '{print $1}' || true)
+            AUDIO_FORMAT=$(yt_dlp --list-formats "$VIDEO_URL" 2>&1 | grep -E "audio.*zh" | head -1 | awk '{print $1}' || true)
         fi
         if [ -z "$AUDIO_FORMAT" ]; then
-            AUDIO_FORMAT=$(yt-dlp --list-formats "$VIDEO_URL" 2>&1 | grep -E "^140-0|^140 " | head -1 | awk '{print $1}' || true)
+            AUDIO_FORMAT=$(yt_dlp --list-formats "$VIDEO_URL" 2>&1 | grep -E "^140-0|^140 " | head -1 | awk '{print $1}' || true)
         fi
         if [ -z "$AUDIO_FORMAT" ]; then
             AUDIO_FORMAT="bestaudio"
         fi
 
         echo "Using audio format: $AUDIO_FORMAT" >&2
-        yt-dlp -f "$AUDIO_FORMAT" -o "$AUDIO_DIR/${VIDEO_ID}.%(ext)s" "$VIDEO_URL" >&2
+        yt_dlp -f "$AUDIO_FORMAT" -o "$AUDIO_DIR/${VIDEO_ID}.%(ext)s" "$VIDEO_URL" >&2
 
         AUDIO_FILE=$(find "$AUDIO_DIR" -maxdepth 1 -type f ! -name '*.part' ! -name '*.ytdl' | sort | head -1 || true)
         if [ -z "$AUDIO_FILE" ]; then

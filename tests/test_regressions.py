@@ -579,6 +579,107 @@ class RegressionTests(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("Could not resolve a video ID", result.stderr)
 
+    def test_download_metadata_retries_with_chrome_after_not_a_bot(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fake_bin = Path(tmpdir) / "yt-dlp"
+            fake_bin.write_text(
+                """#!/usr/bin/env bash
+has_chrome=false
+print_field=''
+while [ $# -gt 0 ]; do
+  if [ "$1" = "--cookies-from-browser" ] && [ $# -ge 2 ] && [ "$2" = "chrome" ]; then
+    has_chrome=true
+    shift 2
+    continue
+  fi
+  if [ "$1" = "--print" ] && [ $# -ge 2 ]; then
+    print_field="$2"
+    shift 2
+    continue
+  fi
+  shift
+done
+
+if [ "$has_chrome" != true ]; then
+  echo "ERROR: [youtube] abc123: Sign in to confirm you're not a bot" >&2
+  exit 1
+fi
+
+case "$print_field" in
+  '%(id)s') echo 'abc123' ;;
+  '%(title)s') echo 'Recovered title' ;;
+  '%(duration)s') echo '42' ;;
+  '%(upload_date)s') echo '20260316' ;;
+  '%(channel)s') echo 'Recovered channel' ;;
+  *) exit 1 ;;
+esac
+""",
+                encoding="utf-8",
+            )
+            fake_bin.chmod(0o755)
+
+            env = os.environ.copy()
+            env["PATH"] = f"{tmpdir}:{env['PATH']}"
+            result = subprocess.run(
+                ["bash", str(PROJECT_ROOT / "scripts/download.sh"), "https://example.com/video", "metadata"],
+                cwd=PROJECT_ROOT,
+                env=env,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+            payload = json.loads(result.stdout)
+            self.assertEqual(payload["video_id"], "abc123")
+            self.assertEqual(payload["title"], "Recovered title")
+            self.assertEqual(payload["channel"], "Recovered channel")
+            self.assertIn("retrying with Chrome cookies", result.stderr)
+            self.assertIn("attempt 1/3", result.stderr)
+
+    def test_download_metadata_guides_cookie_file_when_chrome_retry_fails(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fake_bin = Path(tmpdir) / "yt-dlp"
+            fake_bin.write_text(
+                """#!/usr/bin/env bash
+has_chrome=false
+while [ $# -gt 0 ]; do
+  if [ "$1" = "--cookies-from-browser" ] && [ $# -ge 2 ] && [ "$2" = "chrome" ]; then
+    has_chrome=true
+    shift 2
+    continue
+  fi
+  shift
+done
+
+if [ "$has_chrome" = true ]; then
+  echo "ERROR: could not find chrome cookies database" >&2
+  exit 1
+fi
+
+echo "ERROR: [youtube] abc123: Sign in to confirm you're not a bot" >&2
+exit 1
+""",
+                encoding="utf-8",
+            )
+            fake_bin.chmod(0o755)
+
+            env = os.environ.copy()
+            env["PATH"] = f"{tmpdir}:{env['PATH']}"
+            result = subprocess.run(
+                ["bash", str(PROJECT_ROOT / "scripts/download.sh"), "https://example.com/video", "metadata"],
+                cwd=PROJECT_ROOT,
+                env=env,
+                capture_output=True,
+                text=True,
+            )
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("retrying with Chrome cookies", result.stderr)
+            self.assertIn("attempt 1/3", result.stderr)
+            self.assertIn("Automatic Chrome cookies retry failed", result.stderr)
+            self.assertIn("yt_dlp_cookies_file", result.stderr)
+            self.assertIn("Netscape-format cookies.txt", result.stderr)
+
     def test_process_chunks_dry_run_does_not_require_llm_credentials(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             source = Path(tmpdir) / "raw.txt"

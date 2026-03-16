@@ -316,6 +316,8 @@ When processing multiple URLs:
 | Symptom | Likely Cause | Action |
 |---------|--------------|--------|
 | `download.sh metadata` or `subtitle-info` fails | `yt-dlp` unavailable, outdated, or video unavailable | Run `bash <skill-root>/scripts/preflight.sh`, then retry once |
+| `yt-dlp` says "Sign in to confirm you’re not a bot" | YouTube requires cookies/login for this IP or video | Let `download.sh` auto-retry with Chrome (up to 3 attempts); if it still fails, export a Netscape `cookies.txt`, set `yt_dlp_cookies_file`, then retry |
+| Automatic Chrome cookies retry failed | Chrome is unavailable, not logged in, or inaccessible in this environment | Export `youtube.com` cookies from a logged-in browser, copy the file here, set `yt_dlp_cookies_file` or `YT_DLP_COOKIES_FILE`, then retry |
 | `subtitle-info` returns `has_any=false` | No usable manual or auto subtitles | Switch to Deepgram path and run `bash <skill-root>/scripts/preflight.sh --require-deepgram` |
 | Deepgram transcription fails | Invalid key, network issue, or API rejection | Stop, surface the error, and ask whether to retry |
 | `verify-quality` returns non-empty `hard_failures` | Hard structural gate failed | Do not assemble final output; fix the optimization step |

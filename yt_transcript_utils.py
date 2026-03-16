@@ -296,6 +296,11 @@ def _default_config_values(config_path: str = "") -> dict:
         "llm_base_url": "",
         "llm_model": "",
         "llm_api_format": "openai",
+        "yt_dlp_socket_timeout_sec": -1,
+        "yt_dlp_retries": -1,
+        "yt_dlp_extractor_retries": -1,
+        "yt_dlp_cookies_from_browser": "",
+        "yt_dlp_cookies_file": "",
         "llm_timeout_sec": 120,
         "llm_max_retries": 3,
         "llm_backoff_sec": 1.5,
@@ -4207,6 +4212,16 @@ def load_config(config_path: str = None, allow_missing: bool = False) -> dict:
         if not os.path.isdir(output_dir):
             print(f"Warning: output_dir does not exist: {output_dir}", file=sys.stderr)
 
+    yt_dlp_socket_timeout_sec = parse_int_field('yt_dlp_socket_timeout_sec', -1, minimum=-1)
+    yt_dlp_retries = parse_int_field('yt_dlp_retries', -1, minimum=-1)
+    yt_dlp_extractor_retries = parse_int_field('yt_dlp_extractor_retries', -1, minimum=-1)
+    yt_dlp_cookies_from_browser = str(config.get('yt_dlp_cookies_from_browser', '') or '').strip()
+    yt_dlp_cookies_file = str(config.get('yt_dlp_cookies_file', '') or '').strip()
+    if yt_dlp_cookies_file:
+        yt_dlp_cookies_file = os.path.expanduser(yt_dlp_cookies_file)
+        if not os.path.isfile(yt_dlp_cookies_file):
+            print(f"Warning: yt_dlp_cookies_file does not exist: {yt_dlp_cookies_file}", file=sys.stderr)
+
     llm_timeout_sec = parse_int_field('llm_timeout_sec', 120, minimum=1)
     llm_max_retries = parse_int_field('llm_max_retries', 3, minimum=0)
     llm_backoff_sec = parse_float_field('llm_backoff_sec', 1.5, minimum=0.1)
@@ -4222,6 +4237,11 @@ def load_config(config_path: str = None, allow_missing: bool = False) -> dict:
         "llm_base_url": config.get('llm_base_url', ''),
         "llm_model": config.get('llm_model', ''),
         "llm_api_format": config.get('llm_api_format', 'openai'),
+        "yt_dlp_socket_timeout_sec": yt_dlp_socket_timeout_sec,
+        "yt_dlp_retries": yt_dlp_retries,
+        "yt_dlp_extractor_retries": yt_dlp_extractor_retries,
+        "yt_dlp_cookies_from_browser": yt_dlp_cookies_from_browser,
+        "yt_dlp_cookies_file": yt_dlp_cookies_file,
         "llm_timeout_sec": llm_timeout_sec,
         "llm_max_retries": llm_max_retries,
         "llm_backoff_sec": llm_backoff_sec,

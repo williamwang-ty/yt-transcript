@@ -63,6 +63,45 @@ pip install yt-dlp
    llm_stream: "auto"
    ```
 
+   #### YouTube "Sign in to confirm you're not a bot"
+
+   `yt-transcript` now uses this policy by default:
+
+   1. Start anonymously (do **not** read browser cookies up front)
+   2. If `yt-dlp` returns `Sign in to confirm you're not a bot`, automatically retry (up to 3 attempts) with:
+      - `--cookies-from-browser chrome`
+   3. If that Chrome retry also fails, surface a clear error and tell you how to provide a `cookies.txt` file
+
+   This means local desktop setups may recover automatically, while remote/container setups remain explicit and safe.
+
+   If the automatic Chrome retry fails, the most portable fix is an exported Netscape-format `cookies.txt`:
+
+   ```yaml
+   yt_dlp_cookies_file: "~/.config/yt-transcript/youtube_cookies.txt"
+   ```
+
+   Or for a one-off run:
+
+   ```bash
+   YT_DLP_COOKIES_FILE=~/.config/yt-transcript/youtube_cookies.txt \
+     bash scripts/download.sh "$URL" metadata
+   ```
+
+   You can still force browser-cookie mode explicitly:
+
+   ```yaml
+   yt_dlp_cookies_from_browser: "chrome"
+   ```
+
+   Recommended `cookies.txt` import flow:
+
+   1. Open `youtube.com` in a logged-in browser on your local machine
+   2. Export cookies for YouTube in Netscape `cookies.txt` format
+   3. Copy that file to the machine/container running this skill
+   4. Set `yt_dlp_cookies_file` in `config.yaml` or `YT_DLP_COOKIES_FILE` in the environment
+
+   In remote or container environments, `yt_dlp_cookies_file` is usually more reliable than `--cookies-from-browser chrome`.
+
    > **Note**:
    > - `deepgram_api_key` is only required when the video has no usable subtitles and audio transcription is needed.
    > - LLM API config is only needed for long video chunk processing, or when bilingual translation is required.
