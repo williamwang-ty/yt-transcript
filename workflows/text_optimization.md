@@ -9,6 +9,7 @@ This workflow handles structure, translation, chunk processing, merge, and quali
 Read `/tmp/${VIDEO_ID}_state.md` and extract:
 
 - `vid`
+- `url` (use as `$VIDEO_URL` when calling helpers)
 - `duration`
 - `mode`
 - `src`
