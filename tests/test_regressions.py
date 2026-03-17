@@ -206,6 +206,15 @@ class RegressionTests(unittest.TestCase):
             self.assertIn('channel: "A \\"B\\""', content)
             self.assertIn("# He said \"hi\"", content)
 
+    def test_process_deepgram_payload_normalizes_chinese_spacing(self):
+        payload = {"results": {"channels": [{"alternatives": [{"transcript": "你 好 ！"}]}]}}
+        result = utils.process_deepgram_payload(payload)
+        self.assertEqual(result["transcript"], "你好！")
+
+        repeated_payload = {"results": {"channels": [{"alternatives": [{"transcript": "哈哈哈哈哈哈"}]}]}}
+        repeated_result = utils.process_deepgram_payload(repeated_payload)
+        self.assertEqual(repeated_result["transcript"], "哈哈哈")
+
     def test_transcribe_deepgram_merges_chunk_outputs_and_writes_artifacts(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             audio_path = Path(tmpdir) / "source.mp3"
@@ -213,6 +222,7 @@ class RegressionTests(unittest.TestCase):
             chunk_b = Path(tmpdir) / "chunk_b.mp3"
             output_json = Path(tmpdir) / "deepgram.json"
             output_text = Path(tmpdir) / "raw.txt"
+            output_segments = Path(tmpdir) / "segments.json"
             audio_path.write_bytes(b"src")
             chunk_a.write_bytes(b"a")
             chunk_b.write_bytes(b"b")
@@ -240,6 +250,7 @@ class RegressionTests(unittest.TestCase):
                     api_key="key",
                     output_json=str(output_json),
                     output_text=str(output_text),
+                    output_segments=str(output_segments),
                 )
 
             self.assertEqual(result["transcript"], "Alpha\n\nBeta")
@@ -255,6 +266,112 @@ class RegressionTests(unittest.TestCase):
             self.assertEqual(len(aggregate["chunks"]), 2)
             self.assertEqual(aggregate["split_points"], [12.5])
             self.assertTrue(all(Path(item).exists() for item in result["json_outputs"]))
+            self.assertTrue(output_segments.exists())
+            segments_doc = json.loads(output_segments.read_text(encoding="utf-8"))
+            self.assertEqual(segments_doc["source"], "deepgram")
+            self.assertEqual(len(segments_doc["segments"]), 2)
+            self.assertEqual(result["segment_count"], 2)
+            self.assertEqual(result["segments_output"], str(output_segments))
+
+    def test_chunk_segments_writes_timed_manifest(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            segments_path = Path(tmpdir) / "segments.json"
+            work_dir = Path(tmpdir) / "chunks"
+            config_path = Path(tmpdir) / "config.yaml"
+
+            segments_path.write_text(
+                json.dumps(
+                    {
+                        "source": "deepgram",
+                        "segments": [
+                            {"id": 0, "text": "A" * 30, "start_time": 0.0, "end_time": 10.0},
+                            {"id": 1, "text": "B" * 30, "start_time": 10.0, "end_time": 20.0},
+                        ],
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            config_path.write_text(
+                f'output_dir: "{tmpdir}"\n'
+                'chunk_mode: "chars"\n',
+                encoding="utf-8",
+            )
+
+            result = utils.chunk_segments(
+                str(segments_path),
+                str(work_dir),
+                chunk_size=35,
+                prompt_name="",
+                config_path=str(config_path),
+            )
+
+            self.assertEqual(result["total_chunks"], 2)
+            manifest = json.loads((work_dir / "manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest["total_chunks"], 2)
+            self.assertEqual(manifest["source_segments_count"], 2)
+            self.assertEqual(manifest["chunks"][0]["start_time"], 0.0)
+            self.assertEqual(manifest["chunks"][0]["end_time"], 10.0)
+            self.assertEqual(manifest["chunks"][0]["source_segment_start"], 0)
+            self.assertEqual(manifest["chunks"][1]["start_time"], 10.0)
+            self.assertEqual(manifest["chunks"][1]["end_time"], 20.0)
+            self.assertEqual(manifest["chunks"][1]["source_segment_start"], 1)
+
+    def test_build_chapter_plan_maps_chapters_to_timed_chunks(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            segments_path = Path(tmpdir) / "segments.json"
+            work_dir = Path(tmpdir) / "chunks"
+            chapters_path = Path(tmpdir) / "chapters.json"
+            output_path = Path(tmpdir) / "chapter_plan.json"
+            config_path = Path(tmpdir) / "config.yaml"
+
+            segments_path.write_text(
+                json.dumps(
+                    {
+                        "source": "deepgram",
+                        "segments": [
+                            {"id": 0, "text": "A" * 30, "start_time": 0.0, "end_time": 10.0},
+                            {"id": 1, "text": "B" * 30, "start_time": 10.0, "end_time": 20.0},
+                        ],
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            config_path.write_text(
+                f'output_dir: "{tmpdir}"\n'
+                'chunk_mode: "chars"\n',
+                encoding="utf-8",
+            )
+            utils.chunk_segments(
+                str(segments_path),
+                str(work_dir),
+                chunk_size=35,
+                prompt_name="",
+                config_path=str(config_path),
+            )
+
+            chapters_path.write_text(
+                json.dumps(
+                    {
+                        "chapters": [
+                            {"title": "Intro", "start_time": 0.0, "end_time": 10.0},
+                            {"title": "Topic", "start_time": 10.0, "end_time": 20.0},
+                        ]
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+
+            result = utils.build_chapter_plan(str(chapters_path), str(work_dir), str(output_path))
+            self.assertTrue(result["success"])
+            self.assertTrue(output_path.exists())
+
+            plan = json.loads(output_path.read_text(encoding="utf-8"))
+            self.assertEqual(plan[0]["start_chunk"], 0)
+            self.assertEqual(plan[1]["start_chunk"], 1)
+            self.assertEqual(plan[1]["anchor_segment_id"], 1)
 
     def test_assemble_final_escapes_markdown_header_text(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -2292,6 +2409,48 @@ exit 1
             self.assertIn("Chapter One", merged_text)
             self.assertIn("第一章", merged_text)
             self.assertNotEqual(chapter_plan[0]["start_chunk"], 1)
+
+
+    def test_merge_content_supports_multiple_chapters_per_chunk(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            work_dir = Path(tmpdir) / "chunks"
+            output_file = Path(tmpdir) / "merged.md"
+            work_dir.mkdir(parents=True, exist_ok=True)
+
+            (work_dir / "manifest.json").write_text(
+                json.dumps(
+                    {
+                        "chunks": [
+                            {"id": 0, "processed_path": "processed_000.md", "status": "done"},
+                        ]
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+            (work_dir / "processed_000.md").write_text("正文", encoding="utf-8")
+            (work_dir / "chapter_plan.json").write_text(
+                json.dumps(
+                    [
+                        {"start_chunk": 0, "title_en": "A", "title_zh": "甲"},
+                        {"start_chunk": 0, "title_en": "B", "title_zh": "乙"},
+                    ],
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+
+            merge_result = utils.merge_content(str(work_dir), str(output_file))
+            merged_text = output_file.read_text(encoding="utf-8")
+
+            self.assertTrue(merge_result["success"])
+            self.assertEqual(merge_result["chapters_inserted"], 2)
+            self.assertIn("## A", merged_text)
+            self.assertIn("## 甲", merged_text)
+            self.assertIn("## B", merged_text)
+            self.assertIn("## 乙", merged_text)
 
     def test_test_llm_api_returns_probe_metadata(self):
         with mock.patch.object(utils, "load_config", return_value={

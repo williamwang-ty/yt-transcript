@@ -21,7 +21,9 @@ Commands:
     test-token-count               Probe provider token counting support with local fallback
     split-audio <audio_path>       Split large audio at silence points (--max-size, --max-deviation)
     chunk-text <input> <output_dir> Split text file into chunks by sentence boundary
+    chunk-segments <segments_json> <output_dir> Split aligned source segments into timed chunks
     get-chapters <video_url>       Fetch YouTube video chapter metadata
+    build-chapter-plan <chapters_json> <work_dir> <output_json>  Map YouTube chapters onto timed chunks
     merge-content <work_dir> <output_file>  Merge processed chunks with chapter headers
     process-chunks <work_dir> --prompt <name>  Process chunks with isolated LLM API calls (--input-key for chained processing)
     replan-remaining <work_dir>    Re-plan unfinished raw chunks after canary/autotune aborts
@@ -1686,18 +1688,115 @@ def process_deepgram(json_path: str) -> dict:
         sys.exit(2)
 
 
-def process_deepgram_payload(data: dict) -> dict:
-    transcript = data['results']['channels'][0]['alternatives'][0]['transcript']
+def _coerce_float_or_none(value) -> float | None:
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _normalize_transcript_text(text: str, *, remove_repeated_phrases: bool = True) -> str:
+    transcript = str(text or "")
 
     # 1. Remove spaces between Chinese characters (multiple passes for thoroughness)
     for _ in range(10):
-        transcript = re.sub(r'([\u4e00-\u9fff])\s+([\u4e00-\u9fff])', r'\1\2', transcript)
+        transcript = re.sub(r'([一-鿿])\s+([一-鿿])', r'\1\2', transcript)
 
     # 2. Fix spaces around punctuation
     transcript = re.sub(r'\s+([。，！？、：；])', r'\1', transcript)
 
     # 3. Remove consecutive repeated phrases (3-20 characters)
-    transcript = re.sub(r'([\u4e00-\u9fff]{3,20})\1{1,5}', r'\1', transcript)
+    if remove_repeated_phrases:
+        transcript = re.sub(r'([一-鿿]{3,20})\1{1,5}', r'\1', transcript)
+
+    return transcript.strip()
+
+
+def _join_deepgram_words(words: list[dict]) -> str:
+    parts = []
+    for word in words:
+        token = str(word.get('punctuated_word') or word.get('word') or '').strip()
+        if token:
+            parts.append(token)
+    return ' '.join(parts).strip()
+
+
+def extract_deepgram_segments(data: dict, *, time_offset: float = 0.0,
+                              source_chunk_index: int = 0, starting_segment_id: int = 0) -> list[dict]:
+    alternative = data['results']['channels'][0]['alternatives'][0]
+    paragraphs = alternative.get('paragraphs', {}).get('paragraphs', [])
+    words = alternative.get('words', []) if isinstance(alternative.get('words', []), list) else []
+
+    segments = []
+    next_segment_id = starting_segment_id
+
+    for para_index, paragraph in enumerate(paragraphs):
+        paragraph_speaker = paragraph.get('speaker')
+        for sentence_index, sentence in enumerate(paragraph.get('sentences', [])):
+            speaker = sentence.get('speaker')
+            if speaker is None:
+                speaker = paragraph_speaker
+            start_time = _coerce_float_or_none(sentence.get('start'))
+            end_time = _coerce_float_or_none(sentence.get('end'))
+
+            matched_words = []
+            if start_time is not None and end_time is not None and words:
+                for word in words:
+                    word_start = _coerce_float_or_none(word.get('start'))
+                    word_end = _coerce_float_or_none(word.get('end'))
+                    if word_start is None or word_end is None:
+                        continue
+                    if word_end <= start_time - 1e-6 or word_start >= end_time + 1e-6:
+                        continue
+                    matched_words.append(word)
+
+            sentence_text = _join_deepgram_words(matched_words) or str(sentence.get('text', '')).strip()
+            normalized_text = _normalize_transcript_text(sentence_text, remove_repeated_phrases=False)
+            if not normalized_text:
+                continue
+
+            segments.append({
+                'id': next_segment_id,
+                'text': normalized_text,
+                'start_time': None if start_time is None else round(start_time + time_offset, 3),
+                'end_time': None if end_time is None else round(end_time + time_offset, 3),
+                'speaker': speaker,
+                'source_chunk_index': source_chunk_index,
+                'source_paragraph_index': para_index,
+                'source_sentence_index': sentence_index,
+            })
+            next_segment_id += 1
+
+    if segments:
+        return segments
+
+    transcript = _normalize_transcript_text(alternative.get('transcript', ''), remove_repeated_phrases=False)
+    if not transcript:
+        return []
+
+    word_starts = [_coerce_float_or_none(word.get('start')) for word in words]
+    word_ends = [_coerce_float_or_none(word.get('end')) for word in words]
+    start_time = min((value for value in word_starts if value is not None), default=None)
+    end_time = max((value for value in word_ends if value is not None), default=None)
+
+    return [{
+        'id': starting_segment_id,
+        'text': transcript,
+        'start_time': None if start_time is None else round(start_time + time_offset, 3),
+        'end_time': None if end_time is None else round(end_time + time_offset, 3),
+        'speaker': None,
+        'source_chunk_index': source_chunk_index,
+        'source_paragraph_index': 0,
+        'source_sentence_index': 0,
+    }]
+
+
+def process_deepgram_payload(data: dict) -> dict:
+    transcript = _normalize_transcript_text(
+        data['results']['channels'][0]['alternatives'][0]['transcript']
+    )
 
     speakers = set()
     try:
@@ -2083,6 +2182,267 @@ def chunk_text(input_path: str, output_dir: str, chunk_size: int = 0,
         "target_tokens": manifest["target_tokens"],
         "hard_cap_tokens": manifest["hard_cap_tokens"],
     }
+
+
+def _load_segment_document(segments_path: str) -> tuple[dict, list[dict]]:
+    path = Path(segments_path)
+    if not path.exists():
+        print(f"Error: File does not exist {segments_path}", file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as e:
+        print(f"Error: JSON parsing failed {e}", file=sys.stderr)
+        sys.exit(2)
+    except Exception as e:
+        print(f"Error: Cannot read file {e}", file=sys.stderr)
+        sys.exit(2)
+
+    if isinstance(data, dict):
+        metadata = {key: value for key, value in data.items() if key != "segments"}
+        raw_segments = data.get("segments", [])
+    elif isinstance(data, list):
+        metadata = {}
+        raw_segments = data
+    else:
+        print("Error: Segment document must be a JSON object or array", file=sys.stderr)
+        sys.exit(2)
+
+    normalized_segments = []
+    for index, raw_segment in enumerate(raw_segments):
+        if not isinstance(raw_segment, dict):
+            continue
+        segment_text = str(raw_segment.get("text", "")).strip()
+        if not segment_text:
+            continue
+        normalized_segments.append({
+            "id": _parse_int(raw_segment.get("id"), index),
+            "text": segment_text,
+            "start_time": _coerce_float_or_none(raw_segment.get("start_time")),
+            "end_time": _coerce_float_or_none(raw_segment.get("end_time")),
+            "speaker": raw_segment.get("speaker"),
+        })
+
+    if not normalized_segments:
+        print("Error: No usable segments found", file=sys.stderr)
+        sys.exit(2)
+
+    return metadata, normalized_segments
+
+
+def _split_timed_segment(segment: dict, max_size: int, chunk_mode: str,
+                         config: dict, warning_index: int) -> tuple[list[dict], list[str]]:
+    text = segment["text"]
+    segment_len = _estimate_tokens(text, chunk_mode, config)
+    if segment_len <= max_size:
+        return [segment], []
+
+    parts = _force_split_text(text, max_size, chunk_mode, config)
+    warnings = [
+        f"Segment {warning_index} exceeds chunk_size ({segment_len} > {max_size}), split into {len(parts)} fixed-width segment(s)"
+    ]
+
+    start_time = segment.get("start_time")
+    end_time = segment.get("end_time")
+    duration = None
+    if start_time is not None and end_time is not None:
+        duration = max(0.0, end_time - start_time)
+
+    total_chars = sum(len(part) for part in parts) or 1
+    offset_chars = 0
+    split_segments = []
+
+    for part_index, part in enumerate(parts):
+        part_start = start_time
+        part_end = end_time
+        if duration is not None and start_time is not None:
+            part_start = start_time + (offset_chars / total_chars) * duration
+            offset_chars += len(part)
+            part_end = start_time + (offset_chars / total_chars) * duration
+
+        split_segments.append({
+            **segment,
+            "text": part,
+            "start_time": None if part_start is None else round(part_start, 3),
+            "end_time": None if part_end is None else round(part_end, 3),
+            "segment_part_index": part_index,
+        })
+
+    return split_segments, warnings
+
+
+def chunk_segments(segments_path: str, output_dir: str, chunk_size: int = 0,
+                   prompt_name: str = "", config_path: str = None) -> dict:
+    """Split aligned source segments into timed chunks."""
+    metadata, segments = _load_segment_document(segments_path)
+
+    config = _load_optional_config(config_path)
+    prompt_template = ""
+    if prompt_name:
+        try:
+            prompt_path = _resolve_prompt_template_path(prompt_name)
+        except ValueError as error:
+            print(f"Error: {error}", file=sys.stderr)
+            print(f"Available prompts: {_available_prompt_names()}", file=sys.stderr)
+            sys.exit(1)
+        prompt_template = prompt_path.read_text(encoding="utf-8")
+
+    chunk_plan = _build_chunk_plan(prompt_name, chunk_size, config, prompt_template)
+    budget = chunk_plan["budget"]
+    chunk_mode = chunk_plan["chunk_mode"]
+    use_legacy_char_override = chunk_plan["use_legacy_char_override"]
+    recommended_chunk_size = chunk_plan["recommended_chunk_size"]
+    effective_chunk_size = chunk_plan["effective_chunk_size"]
+    hard_cap_size = chunk_plan["hard_cap_size"]
+    target_tokens = chunk_plan["target_tokens"]
+    hard_cap_tokens = chunk_plan["hard_cap_tokens"]
+
+    autotune_budget = dict(budget)
+    autotune_budget["target_tokens"] = target_tokens
+    autotune_budget["hard_cap_tokens"] = hard_cap_tokens
+    autotune_budget["chunk_mode"] = chunk_mode
+    autotune_state = _build_autotune_state(autotune_budget, config)
+    autotune_state["enabled"] = autotune_state["enabled"] and chunk_mode == "tokens"
+
+    prepared_segments = []
+    warnings = []
+    for index, segment in enumerate(segments):
+        split_segments, split_warnings = _split_timed_segment(segment, hard_cap_size, chunk_mode, config, index)
+        prepared_segments.extend(split_segments)
+        warnings.extend(split_warnings)
+
+    chunk_specs = []
+    current_parts = []
+    current_size = 0
+    separator_size = len(CHUNK_SEPARATOR) if chunk_mode == "chars" else _estimate_tokens(CHUNK_SEPARATOR, "tokens", config)
+
+    def finalize_chunk(parts: list[dict]):
+        if not parts:
+            return
+        content = CHUNK_SEPARATOR.join(part["text"] for part in parts if part.get("text"))
+        start_time = next((part.get("start_time") for part in parts if part.get("start_time") is not None), None)
+        end_time = next((part.get("end_time") for part in reversed(parts) if part.get("end_time") is not None), None)
+        segment_ids = [part.get("id") for part in parts if part.get("id") is not None]
+        chunk_specs.append({
+            "content": content,
+            "start_time": start_time,
+            "end_time": end_time,
+            "duration_sec": None if start_time is None or end_time is None else round(max(0.0, end_time - start_time), 3),
+            "source_segment_start": segment_ids[0] if segment_ids else None,
+            "source_segment_end": segment_ids[-1] if segment_ids else None,
+            "source_segments_count": len({seg_id for seg_id in segment_ids}),
+        })
+
+    for part in prepared_segments:
+        part_len = _estimate_tokens(part["text"], chunk_mode, config)
+        candidate_size = current_size + part_len + (separator_size if current_parts else 0)
+        if current_parts and (candidate_size > effective_chunk_size or candidate_size > hard_cap_size):
+            finalize_chunk(current_parts)
+            current_parts = [part]
+            current_size = part_len
+        else:
+            current_parts.append(part)
+            current_size = candidate_size
+
+    if current_parts:
+        finalize_chunk(current_parts)
+
+    out_dir = Path(output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    plan_id = _new_plan_id()
+    manifest = {
+        "schema_version": MANIFEST_SCHEMA_VERSION,
+        "total_chunks": len(chunk_specs),
+        "chunk_context_tail_sentences": _parse_int_min(
+            config.get("chunk_context_tail_sentences"),
+            DEFAULT_CHUNK_CONTEXT_TAIL_SENTENCES,
+            0,
+        ),
+        "source_file": str(Path(segments_path).absolute()),
+        "source_segments_file": str(Path(segments_path).absolute()),
+        "source_segments_count": len(segments),
+        "source_kind": str(metadata.get("source", "")).strip(),
+        "work_dir": str(out_dir.absolute()),
+        "plan": _build_manifest_plan(
+            prompt_name,
+            chunk_mode,
+            recommended_chunk_size,
+            effective_chunk_size,
+            {
+                **budget,
+                "target_tokens": target_tokens,
+                "hard_cap_tokens": hard_cap_tokens,
+            },
+            source_file=str(Path(segments_path).absolute()),
+            plan_id=plan_id,
+        ),
+        "runtime": _build_manifest_runtime(plan_id),
+        "autotune": autotune_state,
+        "plan_history": [],
+        "chunks": [],
+    }
+
+    for index, chunk_spec in enumerate(chunk_specs):
+        chunk_filename = f"chunk_{index:03d}.txt"
+        chunk_path = out_dir / chunk_filename
+        _atomic_write_text(chunk_path, chunk_spec["content"])
+
+        chunk_entry = _new_chunk_manifest_entry(
+            index,
+            chunk_spec["content"],
+            budget,
+            config,
+            raw_path=chunk_filename,
+            processed_path=f"processed_{index:03d}.md",
+            plan_id=plan_id,
+            continuity_prev_chunk_id=index - 1 if index > 0 else None,
+        )
+        chunk_entry["autotune_target_tokens"] = autotune_state["current_target_tokens"]
+        chunk_entry["autotune_next_target_tokens"] = autotune_state["current_target_tokens"]
+        chunk_entry["start_time"] = chunk_spec["start_time"]
+        chunk_entry["end_time"] = chunk_spec["end_time"]
+        chunk_entry["duration_sec"] = chunk_spec["duration_sec"]
+        chunk_entry["source_segment_start"] = chunk_spec["source_segment_start"]
+        chunk_entry["source_segment_end"] = chunk_spec["source_segment_end"]
+        chunk_entry["source_segments_count"] = chunk_spec["source_segments_count"]
+        manifest["chunks"].append(chunk_entry)
+
+    manifest_path = out_dir / "manifest.json"
+    _sync_manifest_legacy_fields(manifest)
+    _write_manifest(manifest_path, manifest)
+
+    for warning in warnings:
+        print(f"⚠️ {warning}", file=sys.stderr)
+
+    if use_legacy_char_override:
+        print(
+            "ℹ️ Interpreting explicit chunk_size as characters for backward compatibility; add --prompt to use token-aware auto sizing.",
+            file=sys.stderr,
+        )
+
+    if prompt_name and chunk_size <= 0:
+        print(
+            f"ℹ️ Auto-selected chunk_size={effective_chunk_size} ({chunk_mode}) for prompt '{prompt_name}'",
+            file=sys.stderr,
+        )
+
+    return {
+        "total_chunks": len(chunk_specs),
+        "manifest_path": str(manifest_path),
+        "plan_id": plan_id,
+        "chunks": [c["raw_path"] for c in manifest["chunks"]],
+        "warnings": warnings,
+        "chunk_size": effective_chunk_size,
+        "recommended_chunk_size": manifest["recommended_chunk_size"],
+        "chunk_mode": chunk_mode,
+        "target_tokens": manifest["target_tokens"],
+        "hard_cap_tokens": manifest["hard_cap_tokens"],
+        "source_segments_count": len(segments),
+    }
+
+
 def get_chapters(video_url: str, timeout: int = 30) -> dict:
     """
     Fetch YouTube video chapter metadata using yt-dlp
@@ -2130,6 +2490,135 @@ def get_chapters(video_url: str, timeout: int = 30) -> dict:
         return {"has_chapters": False, "chapters": [], "error": str(e)}
 
 
+def _resolve_manifest_path(manifest_ref: str) -> Path:
+    path = Path(manifest_ref)
+    if path.is_dir():
+        return path / "manifest.json"
+    return path
+
+
+def build_chapter_plan(chapters_path: str, manifest_ref: str, output_path: str = "") -> dict:
+    chapters_file = Path(chapters_path)
+    if not chapters_file.exists():
+        print(f"Error: File does not exist {chapters_path}", file=sys.stderr)
+        sys.exit(1)
+
+    manifest_path = _resolve_manifest_path(manifest_ref)
+    if not manifest_path.exists():
+        print(f"Error: manifest.json not found: {manifest_path}", file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        chapters_data = json.loads(chapters_file.read_text(encoding="utf-8"))
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as e:
+        print(f"Error: JSON parsing failed {e}", file=sys.stderr)
+        sys.exit(2)
+    except Exception as e:
+        print(f"Error: Cannot read file {e}", file=sys.stderr)
+        sys.exit(2)
+
+    if isinstance(chapters_data, dict):
+        chapters = chapters_data.get("chapters", [])
+    elif isinstance(chapters_data, list):
+        chapters = chapters_data
+    else:
+        print("Error: Chapters JSON must be an array or an object with 'chapters'", file=sys.stderr)
+        sys.exit(2)
+
+    timed_chunks = []
+    missing_timing = 0
+    for chunk in manifest.get("chunks", []):
+        status = str(chunk.get("status", "")).strip().lower()
+        if status == SUPERSEDED_CHUNK_STATUS:
+            continue
+        start_time = _coerce_float_or_none(chunk.get("start_time"))
+        end_time = _coerce_float_or_none(chunk.get("end_time"))
+        if start_time is None or end_time is None:
+            missing_timing += 1
+            continue
+        timed_chunks.append({**chunk, "start_time": start_time, "end_time": end_time})
+
+    if not timed_chunks:
+        print("Error: Manifest does not contain timed chunks; run chunk-segments first", file=sys.stderr)
+        sys.exit(2)
+
+    timed_chunks.sort(key=lambda item: int(item.get("id", 0)))
+
+    def map_time(timestamp: float | None) -> tuple[dict, str, str]:
+        if timestamp is None:
+            return timed_chunks[0], "missing_time", "low"
+        for chunk in timed_chunks:
+            start_time = chunk["start_time"]
+            end_time = chunk["end_time"]
+            if start_time <= timestamp < end_time or math.isclose(timestamp, start_time):
+                return chunk, "time_contains", "high"
+            if timestamp < start_time:
+                return chunk, "next_chunk", "medium"
+        return timed_chunks[-1], "after_last_chunk", "low"
+
+    def is_untitled(title: str) -> bool:
+        if not title:
+            return True
+        lowered = title.strip().lower()
+        return lowered.startswith("<untitled") or "untitled chapter" in lowered
+
+    warnings = []
+    plan_entries = []
+
+    if missing_timing:
+        warnings.append(f"Skipped {missing_timing} chunks without timing metadata")
+
+    for index, chapter in enumerate(chapters):
+        if not isinstance(chapter, dict):
+            continue
+
+        start_time = _coerce_float_or_none(chapter.get("start_time"))
+        end_time = _coerce_float_or_none(chapter.get("end_time"))
+        start_chunk, match_strategy, confidence = map_time(start_time)
+        end_chunk = start_chunk
+        if end_time is not None:
+            end_probe = max(start_time or end_time, end_time - 1e-6)
+            end_chunk, _, _ = map_time(end_probe)
+
+        title = str(chapter.get("title", "")).strip()
+        if title and is_untitled(title):
+            title = ""
+        title_en = str(chapter.get("title_en", "")).strip()
+        title_zh = str(chapter.get("title_zh", "")).strip()
+
+        if not title_zh and not title_en and title and not is_untitled(title):
+            title_zh = title
+
+        if match_strategy != "time_contains":
+            warnings.append(f"Chapter {index} used fallback strategy '{match_strategy}'")
+
+        plan_entries.append({
+            "chapter_index": index,
+            "title": title,
+            "title_en": title_en,
+            "title_zh": title_zh,
+            "start_time": start_time,
+            "end_time": end_time,
+            "start_chunk": int(start_chunk.get("id", 0)),
+            "end_chunk": int(end_chunk.get("id", start_chunk.get("id", 0))),
+            "anchor_segment_id": start_chunk.get("source_segment_start"),
+            "match_strategy": match_strategy,
+            "confidence": confidence,
+        })
+
+    output_file = str(output_path or (manifest_path.parent / "chapter_plan.json"))
+    Path(output_file).write_text(json.dumps(plan_entries, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    return {
+        "success": True,
+        "output_file": output_file,
+        "chapter_count": len(chapters),
+        "mapped_count": len(plan_entries),
+        "warnings": warnings,
+    }
+
+
 def merge_content(work_dir: str, output_file: str, header_content: str = "") -> dict:
     """
     Merge processed chunks with chapter headers based on chapter_plan.json
@@ -2159,10 +2648,10 @@ def merge_content(work_dir: str, output_file: str, header_content: str = "") -> 
         sys.exit(1)
     
     manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
-    
+
     # Read chapter plan (optional)
     chapter_plan_path = work_path / "chapter_plan.json"
-    chapter_starts = {}  # {chunk_id: {"title_en": ..., "title_zh": ...}}
+    chapter_starts = {}  # {chunk_id: [{"title": ..., "title_en": ..., "title_zh": ...}, ...]}
     if chapter_plan_path.exists():
         try:
             chapter_plan = json.loads(chapter_plan_path.read_text(encoding='utf-8'))
@@ -2170,21 +2659,25 @@ def merge_content(work_dir: str, output_file: str, header_content: str = "") -> 
                 for chapter in chapter_plan:
                     if not isinstance(chapter, dict):
                         continue
-                        
+
                     start_chunk = chapter.get("start_chunk")
-                    # Ensure start_chunk is an integer
-                    if start_chunk is not None:
-                        try:
-                            start_chunk_int = int(start_chunk)
-                            chapter_starts[start_chunk_int] = {
-                                "title_en": str(chapter.get("title_en", "")),
-                                "title_zh": str(chapter.get("title_zh", ""))
-                            }
-                        except (ValueError, TypeError):
-                            print(f"Warning: Invalid start_chunk value: {start_chunk}", file=sys.stderr)
+                    if start_chunk is None:
+                        continue
+
+                    try:
+                        start_chunk_int = int(start_chunk)
+                    except (ValueError, TypeError):
+                        print(f"Warning: Invalid start_chunk value: {start_chunk}", file=sys.stderr)
+                        continue
+
+                    chapter_starts.setdefault(start_chunk_int, []).append({
+                        "title": str(chapter.get("title", "")),
+                        "title_en": str(chapter.get("title_en", "")),
+                        "title_zh": str(chapter.get("title_zh", "")),
+                    })
         except (json.JSONDecodeError, KeyError) as e:
             print(f"Warning: Could not parse chapter_plan.json: {e}", file=sys.stderr)
-    
+
     # Merge content
     output_lines = []
     chapters_inserted = 0  # Counts logical chapters, not individual title lines
@@ -2210,16 +2703,28 @@ def merge_content(work_dir: str, output_file: str, header_content: str = "") -> 
 
         # Check if this is the start of a new chapter
         if chunk_id in chapter_starts:
-            chapter = chapter_starts[chunk_id]
-            title_en = chapter["title_en"]
-            title_zh = chapter["title_zh"]
-            if title_en or title_zh:
-                output_lines.append(f"\n## {title_en}\n")
-                if title_zh:
-                    output_lines.append(f"## {title_zh}\n")
+            for chapter in chapter_starts[chunk_id]:
+                title = str(chapter.get("title", "")).strip()
+                title_en = str(chapter.get("title_en", "")).strip()
+                title_zh = str(chapter.get("title_zh", "")).strip()
+
+                headings = []
+                if title_en:
+                    headings.append(title_en)
+                if title_zh and title_zh not in headings:
+                    headings.append(title_zh)
+                if not headings and title:
+                    headings.append(title)
+
+                if not headings:
+                    continue
+
+                output_lines.append("\n")
+                for heading in headings:
+                    output_lines.append(f"## {heading}\n")
                 output_lines.append("\n")
                 chapters_inserted += 1
-        
+
         # Read and append processed content
         if processed_path.exists():
             content = processed_path.read_text(encoding='utf-8')
@@ -3559,7 +4064,8 @@ def _call_deepgram_api(audio_path: str, api_key: str, language: str,
 def transcribe_deepgram(audio_path: str, language: str, config_path: str = None,
                         api_key: str = "", max_size_mb: float = 10.0,
                         max_deviation_sec: float = 60.0, timeout: int = 300,
-                        output_json: str = "", output_text: str = "") -> dict:
+                        output_json: str = "", output_text: str = "",
+                        output_segments: str = "") -> dict:
     """
     Transcribe audio via Deepgram. Automatically splits large files and merges
     chunk transcripts into one raw transcript output.
@@ -3579,11 +4085,17 @@ def transcribe_deepgram(audio_path: str, language: str, config_path: str = None,
 
     split_result = split_audio(audio_path, max_size_mb=max_size_mb, max_deviation_sec=max_deviation_sec)
     chunk_paths = split_result["chunks"]
+    split_points = [float(point) for point in split_result.get("split_points", [])]
+
+    chunk_offsets = [0.0] + split_points
+    if len(chunk_offsets) < len(chunk_paths):
+        chunk_offsets.extend([chunk_offsets[-1] if chunk_offsets else 0.0] * (len(chunk_paths) - len(chunk_offsets)))
 
     transcripts = []
     speaker_count = 1
     json_outputs = []
     raw_payloads = []
+    segments = []
 
     for idx, chunk_path in enumerate(chunk_paths):
         payload = _call_deepgram_api(chunk_path, api_key=api_key, language=language, timeout=timeout)
@@ -3591,6 +4103,16 @@ def transcribe_deepgram(audio_path: str, language: str, config_path: str = None,
         processed = process_deepgram_payload(payload)
         transcripts.append(processed["transcript"])
         speaker_count = max(speaker_count, processed["speaker_count"])
+
+        if output_segments:
+            segments.extend(
+                extract_deepgram_segments(
+                    payload,
+                    time_offset=chunk_offsets[idx],
+                    source_chunk_index=idx,
+                    starting_segment_id=len(segments),
+                )
+            )
 
         if output_json:
             output_base = Path(output_json)
@@ -3602,7 +4124,6 @@ def transcribe_deepgram(audio_path: str, language: str, config_path: str = None,
             json_outputs.append(str(json_path))
 
     transcript = "\n\n".join(t for t in transcripts if t).strip()
-    split_points = split_result.get("split_points", [])
     used_split_mode = len(chunk_paths) > 1
 
     if output_json and used_split_mode:
@@ -3630,6 +4151,23 @@ def transcribe_deepgram(audio_path: str, language: str, config_path: str = None,
     if output_text:
         Path(output_text).write_text(transcript, encoding="utf-8")
 
+    if output_segments:
+        Path(output_segments).write_text(
+            json.dumps(
+                {
+                    "source": "deepgram",
+                    "language": language,
+                    "used_split_mode": used_split_mode,
+                    "chunk_count": len(chunk_paths),
+                    "split_points": split_points,
+                    "segments": segments,
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+
     return {
         "transcript": transcript,
         "speaker_count": speaker_count,
@@ -3637,6 +4175,8 @@ def transcribe_deepgram(audio_path: str, language: str, config_path: str = None,
         "json_outputs": json_outputs,
         "split_points": split_points,
         "used_split_mode": used_split_mode,
+        "segment_count": len(segments),
+        "segments_output": output_segments,
     }
 
 
@@ -4361,6 +4901,7 @@ def main():
     tdg_parser.add_argument('--timeout', type=int, default=300, help='Request timeout in seconds')
     tdg_parser.add_argument('--output-json', default='', help='Optional JSON output path; split mode also writes sibling chunk payload files')
     tdg_parser.add_argument('--output-text', default='', help='Optional path to write merged transcript text')
+    tdg_parser.add_argument('--output-segments', default='', help='Optional path to write aligned source segments JSON')
 
     # test-deepgram-api command
     api_parser = subparsers.add_parser(
@@ -4419,12 +4960,35 @@ def main():
     chunk_parser.add_argument('--config-path', default=None,
                               help='Optional path to config file for chunk planning')
 
+    # chunk-segments command
+    chunk_segments_parser = subparsers.add_parser(
+        'chunk-segments',
+        help='Split aligned source segments into timed chunks'
+    )
+    chunk_segments_parser.add_argument('segments_path', help='Aligned source segments JSON path')
+    chunk_segments_parser.add_argument('output_dir', help='Output directory for chunks')
+    chunk_segments_parser.add_argument('--chunk-size', type=int, default=0,
+                                       help='Target chunk size in the active chunk_mode; without --prompt it keeps legacy character sizing')
+    chunk_segments_parser.add_argument('--prompt', default='',
+                                       help='Optional prompt name for task-aware auto chunk sizing')
+    chunk_segments_parser.add_argument('--config-path', default=None,
+                                       help='Optional path to config file for chunk planning')
+
     # get-chapters command
     chapters_parser = subparsers.add_parser(
         'get-chapters',
         help='Fetch YouTube video chapter metadata'
     )
     chapters_parser.add_argument('video_url', help='YouTube video URL')
+
+    # build-chapter-plan command
+    chapter_plan_parser = subparsers.add_parser(
+        'build-chapter-plan',
+        help='Map YouTube chapters onto timed chunks'
+    )
+    chapter_plan_parser.add_argument('chapters_path', help='Chapters JSON path')
+    chapter_plan_parser.add_argument('manifest_ref', help='Manifest path or work directory containing manifest.json')
+    chapter_plan_parser.add_argument('output_path', help='Output chapter_plan.json path')
 
     # merge-content command
     merge_parser = subparsers.add_parser(
@@ -4556,7 +5120,8 @@ def main():
             max_deviation_sec=args.max_deviation,
             timeout=args.timeout,
             output_json=args.output_json,
-            output_text=args.output_text
+            output_text=args.output_text,
+            output_segments=args.output_segments
         )
         print(json.dumps(result, ensure_ascii=False))
 
@@ -4600,8 +5165,16 @@ def main():
         result = chunk_text(args.input_path, args.output_dir, args.chunk_size, args.prompt, args.config_path)
         print(json.dumps(result, ensure_ascii=False))
 
+    elif args.command == 'chunk-segments':
+        result = chunk_segments(args.segments_path, args.output_dir, args.chunk_size, args.prompt, args.config_path)
+        print(json.dumps(result, ensure_ascii=False))
+
     elif args.command == 'get-chapters':
         result = get_chapters(args.video_url)
+        print(json.dumps(result, ensure_ascii=False))
+
+    elif args.command == 'build-chapter-plan':
+        result = build_chapter_plan(args.chapters_path, args.manifest_ref, args.output_path)
         print(json.dumps(result, ensure_ascii=False))
 
     elif args.command == 'merge-content':
