@@ -13,6 +13,7 @@ Usage:
 
 Commands:
     parse-vtt <vtt_path>           Parse VTT subtitle file, output plain text
+    parse-vtt-segments <vtt_path>  Parse VTT subtitle file, output aligned segments JSON
     process-deepgram <json_path>   Process Deepgram JSON, output cleaned text
     transcribe-deepgram <audio_path>  Call Deepgram API and auto-merge split chunks
     sanitize-filename "<title>"    Clean illegal filename characters
@@ -21,7 +22,7 @@ Commands:
     test-token-count               Probe provider token counting support with local fallback
     split-audio <audio_path>       Split large audio at silence points (--max-size, --max-deviation)
     chunk-text <input> <output_dir> Split text file into chunks by sentence boundary
-    chunk-segments <segments_json> <output_dir> Split aligned source segments into timed chunks
+    chunk-segments <segments_json> <output_dir> Split aligned source segments into timed chunks (--chapters for chapter-aware boundaries)
     get-chapters <video_url>       Fetch YouTube video chapter metadata
     build-chapter-plan <chapters_json> <work_dir> <output_json>  Map YouTube chapters onto timed chunks
     merge-content <work_dir> <output_file>  Merge processed chunks with chapter headers
@@ -1653,6 +1654,159 @@ def parse_vtt(vtt_path: str) -> str:
     return ' '.join(deduplicated)
 
 
+def _parse_vtt_timestamp(value: str) -> float | None:
+    token = str(value or "").strip().replace(",", ".")
+    if not token:
+        return None
+
+    parts = token.split(":")
+    if len(parts) == 3:
+        hours_str, minutes_str, seconds_str = parts
+    elif len(parts) == 2:
+        hours_str = "0"
+        minutes_str, seconds_str = parts
+    else:
+        return None
+
+    try:
+        hours = int(hours_str)
+        minutes = int(minutes_str)
+        seconds = float(seconds_str)
+    except ValueError:
+        return None
+
+    return round(hours * 3600 + minutes * 60 + seconds, 3)
+
+
+def _parse_vtt_time_range(line: str) -> tuple[float | None, float | None]:
+    if "-->" not in line:
+        return None, None
+
+    start_raw, end_raw = line.split("-->", 1)
+    start_token = start_raw.strip().split()[0] if start_raw.strip() else ""
+    end_token = end_raw.strip().split()[0] if end_raw.strip() else ""
+    return _parse_vtt_timestamp(start_token), _parse_vtt_timestamp(end_token)
+
+
+def parse_vtt_segments(vtt_path: str, *, language: str = "") -> dict:
+    """Parse a VTT file and return aligned segments with timing metadata.
+
+    Output schema matches `chunk-segments` expectations:
+
+    {
+      "source": "vtt",
+      "language": "en" | "zh" | "..." | "",
+      "segments": [{"id": 0, "text": "...", "start_time": 0.0, "end_time": 1.2}, ...]
+    }
+    """
+    path = Path(vtt_path)
+    if not path.exists():
+        print(f"Error: File does not exist {vtt_path}", file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        content = path.read_text(encoding="utf-8")
+    except Exception as e:
+        print(f"Error: Cannot read file {e}", file=sys.stderr)
+        sys.exit(2)
+
+    segments = []
+    header_language = ""
+    in_note = False
+
+    cue_start = None
+    cue_end = None
+    cue_lines = []
+
+    def flush_cue():
+        nonlocal cue_start, cue_end, cue_lines
+        if cue_start is None or cue_end is None:
+            cue_start = None
+            cue_end = None
+            cue_lines = []
+            return
+
+        joined = " ".join(line.strip() for line in cue_lines if line.strip())
+        clean = re.sub(r"<[^>]+>", "", joined)
+        clean = " ".join(clean.split()).strip()
+        if not clean:
+            cue_start = None
+            cue_end = None
+            cue_lines = []
+            return
+
+        if segments and segments[-1]["text"] == clean:
+            previous_end = _coerce_float_or_none(segments[-1].get("end_time"))
+            if previous_end is None or cue_end > previous_end:
+                segments[-1]["end_time"] = cue_end
+            cue_start = None
+            cue_end = None
+            cue_lines = []
+            return
+
+        segments.append({
+            "id": len(segments),
+            "text": clean,
+            "start_time": cue_start,
+            "end_time": cue_end,
+            "speaker": None,
+        })
+        cue_start = None
+        cue_end = None
+        cue_lines = []
+
+    for raw_line in content.splitlines():
+        line = raw_line.strip("\ufeff")
+        stripped = line.strip()
+
+        if stripped.startswith("Language:") and not language:
+            header_language = stripped.split(":", 1)[1].strip()
+
+        if in_note:
+            if not stripped:
+                in_note = False
+            continue
+
+        if stripped.startswith("NOTE"):
+            in_note = True
+            continue
+
+        if stripped.startswith("WEBVTT") or stripped.startswith("Kind:") or stripped.startswith("Style:"):
+            continue
+        if stripped.startswith("STYLE") or stripped.startswith("REGION"):
+            continue
+
+        if "-->" in stripped:
+            flush_cue()
+            cue_start, cue_end = _parse_vtt_time_range(stripped)
+            cue_lines = []
+            continue
+
+        if not stripped:
+            flush_cue()
+            continue
+
+        # Ignore cue identifiers that appear before timestamps.
+        if cue_start is None and cue_end is None:
+            continue
+
+        cue_lines.append(stripped)
+
+    flush_cue()
+
+    if not segments:
+        print("Error: No usable VTT segments found", file=sys.stderr)
+        sys.exit(2)
+
+    return {
+        "source": "vtt",
+        "language": language or header_language,
+        "vtt_path": str(path.absolute()),
+        "segment_count": len(segments),
+        "segments": segments,
+    }
+
+
 def process_deepgram(json_path: str) -> dict:
     """
     Process Deepgram API JSON result
@@ -2231,6 +2385,70 @@ def _load_segment_document(segments_path: str) -> tuple[dict, list[dict]]:
     return metadata, normalized_segments
 
 
+def _load_chapters_document(chapters_path: str) -> list[dict]:
+    path = Path(chapters_path)
+    if not path.exists():
+        print(f"Error: File does not exist {chapters_path}", file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as e:
+        print(f"Error: JSON parsing failed {e}", file=sys.stderr)
+        sys.exit(2)
+    except Exception as e:
+        print(f"Error: Cannot read file {e}", file=sys.stderr)
+        sys.exit(2)
+
+    if isinstance(data, dict):
+        chapters = data.get("chapters", [])
+    elif isinstance(data, list):
+        chapters = data
+    else:
+        print("Error: Chapters JSON must be an array or an object with 'chapters'", file=sys.stderr)
+        sys.exit(2)
+
+    return [chapter for chapter in chapters if isinstance(chapter, dict)]
+
+
+def _map_chapter_starts_to_segment_break_ids(chapters: list[dict], segments: list[dict]) -> tuple[set[int], list[str]]:
+    timed_segments = [
+        seg for seg in segments
+        if seg.get("start_time") is not None and seg.get("end_time") is not None
+    ]
+    if not timed_segments:
+        return set(), ["No timed segments found; cannot apply chapter-aware chunking"]
+
+    warnings = []
+
+    def map_time(timestamp: float | None) -> tuple[int, str]:
+        if timestamp is None:
+            return int(timed_segments[0].get("id", 0)), "missing_time"
+
+        for seg in timed_segments:
+            start_time = float(seg["start_time"])
+            end_time = float(seg["end_time"])
+            if start_time <= timestamp < end_time or math.isclose(timestamp, start_time):
+                return int(seg.get("id", 0)), "time_contains"
+            if timestamp < start_time:
+                return int(seg.get("id", 0)), "next_segment"
+
+        return int(timed_segments[-1].get("id", 0)), "after_last_segment"
+
+    break_ids = set()
+    for index, chapter in enumerate(chapters):
+        start_time = _coerce_float_or_none(chapter.get("start_time"))
+        if start_time is None:
+            continue
+
+        segment_id, match_strategy = map_time(start_time)
+        break_ids.add(segment_id)
+        if match_strategy != "time_contains":
+            warnings.append(f"Chapter {index} used fallback strategy '{match_strategy}'")
+
+    return break_ids, warnings
+
+
 def _split_timed_segment(segment: dict, max_size: int, chunk_mode: str,
                          config: dict, warning_index: int) -> tuple[list[dict], list[str]]:
     text = segment["text"]
@@ -2273,7 +2491,8 @@ def _split_timed_segment(segment: dict, max_size: int, chunk_mode: str,
 
 
 def chunk_segments(segments_path: str, output_dir: str, chunk_size: int = 0,
-                   prompt_name: str = "", config_path: str = None) -> dict:
+                   prompt_name: str = "", config_path: str = None,
+                   chapters_path: str = "") -> dict:
     """Split aligned source segments into timed chunks."""
     metadata, segments = _load_segment_document(segments_path)
 
@@ -2312,6 +2531,12 @@ def chunk_segments(segments_path: str, output_dir: str, chunk_size: int = 0,
         prepared_segments.extend(split_segments)
         warnings.extend(split_warnings)
 
+    chapter_break_ids: set[int] = set()
+    if chapters_path:
+        chapters = _load_chapters_document(chapters_path)
+        chapter_break_ids, chapter_warnings = _map_chapter_starts_to_segment_break_ids(chapters, segments)
+        warnings.extend(chapter_warnings)
+
     chunk_specs = []
     current_parts = []
     current_size = 0
@@ -2336,6 +2561,16 @@ def chunk_segments(segments_path: str, output_dir: str, chunk_size: int = 0,
 
     for part in prepared_segments:
         part_len = _estimate_tokens(part["text"], chunk_mode, config)
+
+        part_id = part.get("id")
+        part_index = part.get("segment_part_index")
+        is_first_part = part_index is None or int(part_index) == 0
+        if current_parts and is_first_part and part_id is not None and int(part_id) in chapter_break_ids:
+            finalize_chunk(current_parts)
+            current_parts = [part]
+            current_size = part_len
+            continue
+
         candidate_size = current_size + part_len + (separator_size if current_parts else 0)
         if current_parts and (candidate_size > effective_chunk_size or candidate_size > hard_cap_size):
             finalize_chunk(current_parts)
@@ -4973,6 +5208,8 @@ def main():
                                        help='Optional prompt name for task-aware auto chunk sizing')
     chunk_segments_parser.add_argument('--config-path', default=None,
                                        help='Optional path to config file for chunk planning')
+    chunk_segments_parser.add_argument('--chapters', default='',
+                                       help='Optional YouTube chapters JSON path; forces chunk boundaries at chapter starts')
 
     # get-chapters command
     chapters_parser = subparsers.add_parser(
@@ -5102,6 +5339,10 @@ def main():
         result = parse_vtt(args.vtt_path)
         print(result)
 
+    elif args.command == 'parse-vtt-segments':
+        result = parse_vtt_segments(args.vtt_path, language=args.language)
+        print(json.dumps(result, ensure_ascii=False))
+
     elif args.command == 'process-deepgram':
         result = process_deepgram(args.json_path)
         print(json.dumps(result, ensure_ascii=False))
@@ -5166,7 +5407,7 @@ def main():
         print(json.dumps(result, ensure_ascii=False))
 
     elif args.command == 'chunk-segments':
-        result = chunk_segments(args.segments_path, args.output_dir, args.chunk_size, args.prompt, args.config_path)
+        result = chunk_segments(args.segments_path, args.output_dir, args.chunk_size, args.prompt, args.config_path, chapters_path=args.chapters)
         print(json.dumps(result, ensure_ascii=False))
 
     elif args.command == 'get-chapters':

@@ -317,6 +317,101 @@ class RegressionTests(unittest.TestCase):
             self.assertEqual(manifest["chunks"][1]["end_time"], 20.0)
             self.assertEqual(manifest["chunks"][1]["source_segment_start"], 1)
 
+    def test_parse_vtt_segments_extracts_timing_and_dedupes(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            vtt_path = Path(tmpdir) / "sub.vtt"
+            vtt_path.write_text(
+                "WEBVTT\n"
+                "Kind: captions\n"
+                "Language: en\n"
+                "\n"
+                "00:00:00.000 --> 00:00:02.000\n"
+                "Hello world.\n"
+                "\n"
+                "00:00:02.000 --> 00:00:04.000\n"
+                "Hello world.\n"
+                "\n"
+                "00:00:04.000 --> 00:00:06.500\n"
+                "<c>Second</c> line\n"
+                "Third line\n",
+                encoding="utf-8",
+            )
+
+            result = utils.parse_vtt_segments(str(vtt_path), language="en")
+
+            self.assertEqual(result["source"], "vtt")
+            self.assertEqual(result["language"], "en")
+            self.assertEqual(result["segment_count"], 2)
+
+            segments = result["segments"]
+            self.assertEqual(segments[0]["text"], "Hello world.")
+            self.assertEqual(segments[0]["start_time"], 0.0)
+            self.assertEqual(segments[0]["end_time"], 4.0)
+            self.assertEqual(segments[1]["text"], "Second line Third line")
+            self.assertEqual(segments[1]["start_time"], 4.0)
+            self.assertEqual(segments[1]["end_time"], 6.5)
+
+    def test_chunk_segments_can_force_chapter_boundaries(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            segments_path = Path(tmpdir) / "segments.json"
+            chapters_path = Path(tmpdir) / "chapters.json"
+            work_dir = Path(tmpdir) / "chunks"
+            config_path = Path(tmpdir) / "config.yaml"
+
+            segments_path.write_text(
+                json.dumps(
+                    {
+                        "source": "vtt",
+                        "segments": [
+                            {"id": 0, "text": "A" * 10, "start_time": 0.0, "end_time": 10.0},
+                            {"id": 1, "text": "B" * 10, "start_time": 10.0, "end_time": 20.0},
+                            {"id": 2, "text": "C" * 10, "start_time": 20.0, "end_time": 30.0},
+                        ],
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            chapters_path.write_text(
+                json.dumps(
+                    {
+                        "chapters": [
+                            {"title": "Intro", "start_time": 0.0, "end_time": 20.0},
+                            {"title": "Part", "start_time": 20.0, "end_time": 30.0},
+                        ]
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            config_path.write_text(
+                f'output_dir: "{tmpdir}"\n'
+                'chunk_mode: "chars"\n',
+                encoding="utf-8",
+            )
+
+            result = utils.chunk_segments(
+                str(segments_path),
+                str(work_dir),
+                chunk_size=1000,
+                prompt_name="",
+                config_path=str(config_path),
+                chapters_path=str(chapters_path),
+            )
+
+            self.assertEqual(result["total_chunks"], 2)
+            chunk0 = (work_dir / "chunk_000.txt").read_text(encoding="utf-8")
+            chunk1 = (work_dir / "chunk_001.txt").read_text(encoding="utf-8")
+            self.assertIn("A" * 10, chunk0)
+            self.assertIn("B" * 10, chunk0)
+            self.assertIn("C" * 10, chunk1)
+
+            manifest = json.loads((work_dir / "manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest["total_chunks"], 2)
+            self.assertEqual(manifest["chunks"][0]["start_time"], 0.0)
+            self.assertEqual(manifest["chunks"][0]["end_time"], 20.0)
+            self.assertEqual(manifest["chunks"][1]["start_time"], 20.0)
+            self.assertEqual(manifest["chunks"][1]["end_time"], 30.0)
     def test_build_chapter_plan_maps_chapters_to_timed_chunks(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             segments_path = Path(tmpdir) / "segments.json"

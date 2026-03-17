@@ -95,13 +95,14 @@ python3 <skill-root>/yt_transcript_utils.py get-chapters "$VIDEO_URL" > /tmp/${V
 
 ### Step 2: Build Chunk Work Dir
 
-Prefer time-aligned segments when available (Deepgram `--output-segments` writes `/tmp/${VIDEO_ID}_segments.json`):
+Prefer time-aligned segments when available (`/tmp/${VIDEO_ID}_segments.json` is produced by Deepgram `--output-segments` or `parse-vtt-segments` in the subtitle workflow):
 
 ```bash
 python3 <skill-root>/yt_transcript_utils.py chunk-segments \
     /tmp/${VIDEO_ID}_segments.json \
     /tmp/${VIDEO_ID}_chunks \
-    --prompt structure_only
+    --prompt structure_only \
+    --chapters /tmp/${VIDEO_ID}_chapters.json
 ```
 
 If no segments file exists (e.g. subtitle-driven source), fall back to text-only chunking:
