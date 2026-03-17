@@ -109,7 +109,8 @@ Update state:
 
 ### Step 3: Build Chapter Plan
 
-- If YouTube chapters exist, map them to chunk indices and write `/tmp/${VIDEO_ID}_chunks/chapter_plan.json`
+- If YouTube chapters exist and you have a reliable way to map them onto chunk boundaries, write `/tmp/${VIDEO_ID}_chunks/chapter_plan.json`
+- If no reliable mapping source is available, continue without `chapter_plan.json`; `merge-content` will still succeed, just without injected YouTube chapter headers
 - Else:
   1. `process-chunks --prompt summarize --auto-replan`
   2. Aggregate `summary_chunk_*.txt`

@@ -73,6 +73,7 @@ This command automatically:
 - Calls Deepgram once per chunk
 - Processes each response
 - Merges all chunk transcripts into `/tmp/${VIDEO_ID}_raw_text.txt`
+- When `--output-json` is set, always writes the requested aggregate JSON path; split mode also writes sibling `*_chunk_XXX.json` payload files
 
 No separate split-path workflow is needed.
 

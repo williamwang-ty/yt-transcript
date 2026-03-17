@@ -3583,9 +3583,11 @@ def transcribe_deepgram(audio_path: str, language: str, config_path: str = None,
     transcripts = []
     speaker_count = 1
     json_outputs = []
+    raw_payloads = []
 
     for idx, chunk_path in enumerate(chunk_paths):
         payload = _call_deepgram_api(chunk_path, api_key=api_key, language=language, timeout=timeout)
+        raw_payloads.append(payload)
         processed = process_deepgram_payload(payload)
         transcripts.append(processed["transcript"])
         speaker_count = max(speaker_count, processed["speaker_count"])
@@ -3600,6 +3602,30 @@ def transcribe_deepgram(audio_path: str, language: str, config_path: str = None,
             json_outputs.append(str(json_path))
 
     transcript = "\n\n".join(t for t in transcripts if t).strip()
+    split_points = split_result.get("split_points", [])
+    used_split_mode = len(chunk_paths) > 1
+
+    if output_json and used_split_mode:
+        output_base = Path(output_json)
+        output_base.write_text(
+            json.dumps(
+                {
+                    "chunk_count": len(chunk_paths),
+                    "split_points": split_points,
+                    "chunks": [
+                        {
+                            "index": idx,
+                            "chunk_path": str(chunk_path),
+                            "payload": payload,
+                        }
+                        for idx, (chunk_path, payload) in enumerate(zip(chunk_paths, raw_payloads))
+                    ],
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
 
     if output_text:
         Path(output_text).write_text(transcript, encoding="utf-8")
@@ -3609,8 +3635,8 @@ def transcribe_deepgram(audio_path: str, language: str, config_path: str = None,
         "speaker_count": speaker_count,
         "chunk_count": len(chunk_paths),
         "json_outputs": json_outputs,
-        "split_points": split_result.get("split_points", []),
-        "used_split_mode": len(chunk_paths) > 1,
+        "split_points": split_points,
+        "used_split_mode": used_split_mode,
     }
 
 
@@ -4333,7 +4359,7 @@ def main():
     tdg_parser.add_argument('--max-deviation', type=float, default=60.0,
                             help='Max deviation from silence split point in seconds (default: 60)')
     tdg_parser.add_argument('--timeout', type=int, default=300, help='Request timeout in seconds')
-    tdg_parser.add_argument('--output-json', default='', help='Optional JSON output path (or prefix for chunked outputs)')
+    tdg_parser.add_argument('--output-json', default='', help='Optional JSON output path; split mode also writes sibling chunk payload files')
     tdg_parser.add_argument('--output-text', default='', help='Optional path to write merged transcript text')
 
     # test-deepgram-api command

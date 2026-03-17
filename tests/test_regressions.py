@@ -249,6 +249,11 @@ class RegressionTests(unittest.TestCase):
             self.assertTrue(result["used_split_mode"])
             self.assertEqual(len(result["json_outputs"]), 2)
             self.assertTrue(output_text.exists())
+            self.assertTrue(output_json.exists())
+            aggregate = json.loads(output_json.read_text(encoding="utf-8"))
+            self.assertEqual(aggregate["chunk_count"], 2)
+            self.assertEqual(len(aggregate["chunks"]), 2)
+            self.assertEqual(aggregate["split_points"], [12.5])
             self.assertTrue(all(Path(item).exists() for item in result["json_outputs"]))
 
     def test_assemble_final_escapes_markdown_header_text(self):
