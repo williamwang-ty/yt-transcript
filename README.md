@@ -177,6 +177,9 @@ The helper scripts now emit machine-readable JSON on stdout:
 - `scripts/download.sh "$URL" subtitle-info`
 - `scripts/download.sh "$URL" subtitles`
 - `scripts/download.sh "$URL" audio`
+- `python3 yt_transcript_utils.py get-chapters "$URL"`
+- `python3 yt_transcript_utils.py chunk-segments /tmp/${VIDEO_ID}_segments.json /tmp/${VIDEO_ID}_chunks --prompt structure_only`
+- `python3 yt_transcript_utils.py build-chapter-plan /tmp/${VIDEO_ID}_chapters.json /tmp/${VIDEO_ID}_chunks /tmp/${VIDEO_ID}_chunks/chapter_plan.json`
 - `python3 yt_transcript_utils.py validate-state /tmp/${VIDEO_ID}_state.md --stage <stage>`
 - `python3 yt_transcript_utils.py plan-optimization /tmp/${VIDEO_ID}_state.md`
 - `python3 yt_transcript_utils.py verify-quality /tmp/${VIDEO_ID}_optimized.txt --raw-text /tmp/${VIDEO_ID}_raw_text.txt`
@@ -202,6 +205,8 @@ Current policy is intentional and explicit:
 - YAML frontmatter values are always quoted on purpose to favor safe parsing over prettier formatting
 - Markdown header text is escaped and link destinations are encoded so edge-case titles/channels do not break output structure
 - `chunk-text` force-splits very long unpunctuated passages to stay within downstream LLM chunk budgets
+- `transcribe-deepgram --output-segments` can emit time-aligned segments for downstream timed chunking + YouTube chapter mapping
+- `chunk-segments` produces timed chunk manifests, and `build-chapter-plan` maps YouTube chapters onto chunk boundaries for `merge-content`
 - `chunk-text` now defaults to token-aware planning when `--prompt` is provided, while an explicit `--chunk-size` without `--prompt` keeps legacy character sizing for workflow compatibility
 - prompt names are validated eagerly for chunk planning, so typos fail fast instead of silently falling back to generic budgets
 - `process-chunks` now assigns prompt-specific `max_output_tokens` from the same planning budget instead of using one large shared default
@@ -412,6 +417,9 @@ bash scripts/preflight.sh --require-llm
 - `scripts/download.sh "$URL" subtitle-info`
 - `scripts/download.sh "$URL" subtitles`
 - `scripts/download.sh "$URL" audio`
+- `python3 yt_transcript_utils.py get-chapters "$URL"`
+- `python3 yt_transcript_utils.py chunk-segments /tmp/${VIDEO_ID}_segments.json /tmp/${VIDEO_ID}_chunks --prompt structure_only`
+- `python3 yt_transcript_utils.py build-chapter-plan /tmp/${VIDEO_ID}_chapters.json /tmp/${VIDEO_ID}_chunks /tmp/${VIDEO_ID}_chunks/chapter_plan.json`
 - `python3 yt_transcript_utils.py validate-state /tmp/${VIDEO_ID}_state.md --stage <stage>`
 - `python3 yt_transcript_utils.py plan-optimization /tmp/${VIDEO_ID}_state.md`
 - `python3 yt_transcript_utils.py verify-quality /tmp/${VIDEO_ID}_optimized.txt --raw-text /tmp/${VIDEO_ID}_raw_text.txt`
@@ -437,6 +445,8 @@ bash scripts/preflight.sh --require-llm
 - YAML frontmatter 的值会统一加引号，优先保证解析安全，而不是追求最简洁的展示
 - Markdown 头部里的标题/频道文本会做转义，链接目标会做编码，避免边界字符破坏结构
 - `chunk-text` 会对超长且缺少标点的段落做强制切分，并在提供 `--prompt` 时默认启用 token-aware 规划
+- `transcribe-deepgram --output-segments` 可选输出带时间戳的对齐 segments，用于后续 timed chunk 与 YouTube 章节映射
+- `chunk-segments` 基于 segments 生成带时间轴的 timed manifest；`build-chapter-plan` 可将 YouTube chapters 映射到 chunk 边界，供 `merge-content` 注入标题
 - 如果只传显式 `--chunk-size` 而不传 `--prompt`，`chunk-text` 会继续按 legacy 字符大小解释，避免现有 workflow 被静默改变
 - 分块阶段会提前校验 prompt 名称，避免因为 prompt 拼写错误而静默回退到通用预算
 - `process-chunks` 现在按 prompt 预算单独设置 `max_output_tokens`，不再复用单一的大默认值

@@ -64,6 +64,7 @@ python3 <skill-root>/yt_transcript_utils.py transcribe-deepgram \
     --language "$LANGUAGE" \
     --output-json "/tmp/${VIDEO_ID}_deepgram.json" \
     --output-text "/tmp/${VIDEO_ID}_raw_text.txt" \
+    --output-segments "/tmp/${VIDEO_ID}_segments.json" \
     > /tmp/${VIDEO_ID}_deepgram_result.json
 ```
 
@@ -74,6 +75,7 @@ This command automatically:
 - Processes each response
 - Merges all chunk transcripts into `/tmp/${VIDEO_ID}_raw_text.txt`
 - When `--output-json` is set, always writes the requested aggregate JSON path; split mode also writes sibling `*_chunk_XXX.json` payload files
+- When `--output-segments` is set, writes aligned sentence-level segments (with `start_time` / `end_time`) for timed chunking + chapter mapping
 
 No separate split-path workflow is needed.
 
@@ -92,6 +94,8 @@ Read `/tmp/${VIDEO_ID}_deepgram_result.json` and record:
 - `speaker_count`
 - `chunk_count`
 - `used_split_mode`
+- `segment_count` (should be > 0 when `--output-segments` is enabled)
+- `segments_output` (path to the segments JSON file, or empty)
 
 Write to state:
 

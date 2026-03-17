@@ -92,7 +92,18 @@ Write to state:
 python3 <skill-root>/yt_transcript_utils.py get-chapters "$VIDEO_URL" > /tmp/${VIDEO_ID}_chapters.json
 ```
 
-### Step 2: Chunk Raw Text
+### Step 2: Build Chunk Work Dir
+
+Prefer time-aligned segments when available (Deepgram `--output-segments` writes `/tmp/${VIDEO_ID}_segments.json`):
+
+```bash
+python3 <skill-root>/yt_transcript_utils.py chunk-segments \
+    /tmp/${VIDEO_ID}_segments.json \
+    /tmp/${VIDEO_ID}_chunks \
+    --prompt structure_only
+```
+
+If no segments file exists (e.g. subtitle-driven source), fall back to text-only chunking:
 
 ```bash
 python3 <skill-root>/yt_transcript_utils.py chunk-text \
@@ -107,14 +118,23 @@ Update state:
 - `chunk`
 - `total`
 
-### Step 3: Build Chapter Plan
+### Step 3: Build Chapter Plan (Optional)
 
-- If YouTube chapters exist and you have a reliable way to map them onto chunk boundaries, write `/tmp/${VIDEO_ID}_chunks/chapter_plan.json`
-- If no reliable mapping source is available, continue without `chapter_plan.json`; `merge-content` will still succeed, just without injected YouTube chapter headers
-- Else:
-  1. `process-chunks --prompt summarize --auto-replan`
-  2. Aggregate `summary_chunk_*.txt`
-  3. Create `/tmp/${VIDEO_ID}_chunks/chapter_plan.json`
+If `/tmp/${VIDEO_ID}_chapters.json` reports `has_chapters=true` **and** your chunk manifest includes timing metadata (i.e. you used `chunk-segments`), generate `/tmp/${VIDEO_ID}_chunks/chapter_plan.json`:
+
+```bash
+python3 <skill-root>/yt_transcript_utils.py build-chapter-plan \
+    /tmp/${VIDEO_ID}_chapters.json \
+    /tmp/${VIDEO_ID}_chunks \
+    /tmp/${VIDEO_ID}_chunks/chapter_plan.json \
+    > /tmp/${VIDEO_ID}_chapter_plan_result.json
+```
+
+Notes:
+
+- `build-chapter-plan` requires each chunk in `manifest.json` to have `start_time` / `end_time`; if you used `chunk-text`, it will STOP with an error.
+- If you cannot produce timed chunks, continue without `chapter_plan.json`; `merge-content` still succeeds, just without injected YouTube chapter headers.
+- If you must have headings but lack timing, generate a best-effort plan by summarizing chunks and creating `chapter_plan.json` manually (this is not a true YouTube-chapter mapping).
 
 ### Step 4: Process Chunks
 
