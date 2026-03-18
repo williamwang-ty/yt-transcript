@@ -152,6 +152,16 @@ Notes:
 
 Read `operations` from `PLAN_JSON`.
 
+If you are resuming after an interrupted run and want to inspect the repaired manifest explicitly first, you may run:
+
+```bash
+python3 <skill-root>/yt_transcript_utils.py prepare-resume \
+    /tmp/${VIDEO_ID}_chunks \
+    --prompt structure_only
+```
+
+This step is optional because `process-chunks` now runs the same resume repair automatically before execution starts.
+
 - The first chunk operation always uses `prompt=structure_only`
 - Read `PLAN_JSON.chunking.driver`; when it is `chunk-document`, prefer the canonical normalized-document chunking path above instead of re-deriving raw-text vs timed-segment branching manually
 - If its `extra_instruction` is non-empty, pass it through `--extra-instruction`

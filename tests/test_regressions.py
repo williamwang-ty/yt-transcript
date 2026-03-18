@@ -2147,7 +2147,7 @@ exit 1
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
             manifest["chunks"][0]["status"] = "done"
             manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
-            (work_dir / "processed_000.md").write_text("## 已完成\n\n内容", encoding="utf-8")
+            (work_dir / "processed_000.md").write_text("## 已完成" + chr(10) + chr(10) + "内容", encoding="utf-8")
 
             with mock.patch.object(utils, "load_config", return_value={
                 "llm_api_key": "key",
@@ -2165,6 +2165,116 @@ exit 1
             self.assertTrue(result["success"])
             self.assertEqual(result["skipped_count"], 1)
             mocked_call.assert_not_called()
+
+    def test_prepare_resume_marks_stale_running_chunk_interrupted(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source = Path(tmpdir) / "raw.txt"
+            work_dir = Path(tmpdir) / "chunks"
+            source.write_text("第一句。第二句。", encoding="utf-8")
+            utils.chunk_text(str(source), str(work_dir), 4, "structure_only")
+
+            manifest_path = work_dir / "manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["chunks"][0]["status"] = "running"
+            manifest["runtime"]["status"] = "running"
+            manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+
+            result = utils.prepare_resume(str(work_dir), prompt_name="structure_only")
+
+            manifest_after = json.loads(manifest_path.read_text(encoding="utf-8"))
+            self.assertTrue(result["success"])
+            self.assertTrue(result["resume"]["repaired"])
+            self.assertEqual(manifest_after["chunks"][0]["status"], utils.INTERRUPTED_CHUNK_STATUS)
+            self.assertEqual(manifest_after["runtime"]["status"], utils.RESUMABLE_RUNTIME_STATUS)
+            self.assertEqual(manifest_after["runtime"]["interrupted_count"], 1)
+            self.assertEqual(result["resume"]["interrupted_chunk_ids"], [0])
+
+    def test_prepare_resume_promotes_running_chunk_with_output_to_done(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source = Path(tmpdir) / "raw.txt"
+            work_dir = Path(tmpdir) / "chunks"
+            source.write_text("第一句。第二句。", encoding="utf-8")
+            utils.chunk_text(str(source), str(work_dir), 4, "structure_only")
+
+            manifest_path = work_dir / "manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["chunks"][0]["status"] = "running"
+            manifest["runtime"]["status"] = "running"
+            manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+            (work_dir / "processed_000.md").write_text("## 已完成" + chr(10) + chr(10) + "内容", encoding="utf-8")
+
+            result = utils.prepare_resume(str(work_dir), prompt_name="structure_only")
+
+            manifest_after = json.loads(manifest_path.read_text(encoding="utf-8"))
+            self.assertTrue(result["resume"]["repaired"])
+            self.assertEqual(manifest_after["chunks"][0]["status"], "done")
+            self.assertGreater(manifest_after["chunks"][0]["output_chars"], 0)
+            self.assertEqual(result["resume"]["promoted_done_chunk_ids"], [0])
+
+    def test_prepare_resume_demotes_done_chunk_missing_output_to_interrupted(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source = Path(tmpdir) / "raw.txt"
+            work_dir = Path(tmpdir) / "chunks"
+            source.write_text("第一句。第二句。", encoding="utf-8")
+            utils.chunk_text(str(source), str(work_dir), 4, "structure_only")
+
+            manifest_path = work_dir / "manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["chunks"][0]["status"] = "done"
+            manifest["runtime"]["status"] = "completed"
+            manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+
+            result = utils.prepare_resume(str(work_dir), prompt_name="structure_only")
+
+            manifest_after = json.loads(manifest_path.read_text(encoding="utf-8"))
+            self.assertTrue(result["resume"]["repaired"])
+            self.assertEqual(manifest_after["chunks"][0]["status"], utils.INTERRUPTED_CHUNK_STATUS)
+            self.assertIn(0, result["resume"]["demoted_missing_output_chunk_ids"])
+            self.assertEqual(manifest_after["runtime"]["status"], utils.RESUMABLE_RUNTIME_STATUS)
+
+    def test_process_chunks_auto_repairs_resume_state_before_execution(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source = Path(tmpdir) / "raw.txt"
+            work_dir = Path(tmpdir) / "chunks"
+            source.write_text("第一句。第二句。", encoding="utf-8")
+            utils.chunk_text(str(source), str(work_dir), 4, "structure_only")
+
+            manifest_path = work_dir / "manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["chunks"][0]["status"] = "running"
+            manifest["runtime"]["status"] = "running"
+            manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+            (work_dir / "processed_000.md").write_text("## 已完成" + chr(10) + chr(10) + "内容", encoding="utf-8")
+
+            config = utils._default_config_values()
+            config.update({
+                "llm_api_key": "key",
+                "llm_base_url": "https://api.example.com",
+                "llm_model": "demo",
+                "llm_api_format": "openai",
+            })
+
+            with mock.patch.object(utils, "load_config", return_value=config), mock.patch.object(
+                utils,
+                "_call_llm_api",
+                return_value={
+                    "text": "## 新结果" + chr(10) + chr(10) + "处理完成。",
+                    "latency_ms": 12,
+                    "request_url": "https://api.example.com/v1/chat/completions",
+                    "streaming_used": False,
+                    "attempts": 1,
+                },
+            ) as mocked_call:
+                result = utils.process_chunks(str(work_dir), "structure_only")
+
+            manifest_after = json.loads(manifest_path.read_text(encoding="utf-8"))
+            self.assertTrue(result["success"])
+            self.assertTrue(result["resume"]["repaired"])
+            self.assertIn(0, result["resume"]["promoted_done_chunk_ids"])
+            self.assertEqual(result["skipped_count"], 1)
+            self.assertEqual(mocked_call.call_count, 1)
+            self.assertEqual(manifest_after["chunks"][0]["status"], "done")
+            self.assertEqual(manifest_after["runtime"]["status"], "completed")
 
     def test_process_chunks_uses_prompt_specific_max_output_tokens(self):
         with tempfile.TemporaryDirectory() as tmpdir:

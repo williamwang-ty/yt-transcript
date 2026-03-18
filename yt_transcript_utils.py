@@ -28,6 +28,7 @@ Commands:
     build-chapter-plan <chapters_json> <work_dir> <output_json>  Map YouTube chapters onto timed chunks
     merge-content <work_dir> <output_file>  Merge processed chunks with chapter headers
     process-chunks <work_dir> --prompt <name>  Process chunks with isolated LLM API calls (--input-key for chained processing)
+    prepare-resume <work_dir>      Repair stale chunk/runtime state before resuming a run
     replan-remaining <work_dir>    Re-plan unfinished raw chunks after canary/autotune aborts
     assemble-final <optimized_text> <output_file>  Assemble final markdown from optimized text + metadata
     verify-quality <optimized_text>  Verify quality of optimized text (structural checks)
@@ -279,7 +280,7 @@ DEFAULT_AUTOTUNE_MIN_TARGET_RATIO = 0.5
 DEFAULT_AUTOTUNE_CANARY_CHUNKS = 3
 DEFAULT_LLM_CHUNK_RECOVERY_ATTEMPTS = 1
 DEFAULT_LLM_CHUNK_RECOVERY_BACKOFF_SEC = 1.0
-MANIFEST_SCHEMA_VERSION = 3
+MANIFEST_SCHEMA_VERSION = 4
 CHUNK_CONTRACT_SCHEMA_VERSION = 1
 DEFAULT_UNKNOWN_CHUNK_TOKENS = 900
 CHUNK_SEPARATOR = "\n\n"
@@ -288,6 +289,8 @@ DEFAULT_UNKNOWN_MAX_OUTPUT_TOKENS = 1400
 DEFAULT_UNKNOWN_REQUEST_CAP = 2600
 DEFAULT_UNKNOWN_LEGACY_CHARS = 8000
 SUPERSEDED_CHUNK_STATUS = "superseded"
+INTERRUPTED_CHUNK_STATUS = "interrupted"
+RESUMABLE_RUNTIME_STATUS = "resumable"
 SHORT_OUTPUT_WARNING_RATIO = 0.5
 TRANSLATION_WARNING_CN_RATIO = 0.1
 STRUCTURE_HEADER_WARNING_MIN_CHARS = 2000
@@ -856,10 +859,14 @@ def _build_manifest_runtime(plan_id: str, request_url: str = "") -> dict:
         "failed_count": 0,
         "skipped_count": 0,
         "superseded_count": 0,
+        "interrupted_count": 0,
         "current_chunk_index": 0,
         "replan_required": False,
         "replan_reason": "",
         "last_replanned_at": "",
+        "last_resume_check_at": "",
+        "last_resume_repair_at": "",
+        "resume_repair_count": 0,
         "updated_at": _now_iso(),
     }
 
@@ -926,6 +933,250 @@ def _new_chunk_manifest_entry(chunk_id: int, chunk_content: str, budget: dict,
     }
 
 
+def _resolve_chunk_output_filename(chunk_info: dict, prompt_name: str = "") -> str:
+    chunk_id = _parse_int(chunk_info.get("id", chunk_info.get("chunk_id", 0)), 0)
+    if prompt_name == "summarize":
+        return f"summary_chunk_{chunk_id:03d}.txt"
+    filename = str(chunk_info.get("processed_path", "")).strip()
+    return filename or f"processed_{chunk_id:03d}.md"
+
+
+def _resolve_chunk_output_path(work_path: Path, chunk_info: dict, prompt_name: str = "") -> Path:
+    return work_path / _resolve_chunk_output_filename(chunk_info, prompt_name)
+
+
+def _ensure_chunk_runtime_defaults(manifest: dict, runtime: dict, plan: dict,
+                                   prompt_budget: dict, request_url: str,
+                                   planned_max_output_tokens: int,
+                                   autotune_state: dict) -> None:
+    for chunk_info in manifest.get("chunks", []):
+        chunk_info.setdefault("chunk_id", chunk_info.get("id", 0))
+        chunk_info.setdefault("plan_id", runtime.get("active_plan_id", plan.get("plan_id", "")))
+        chunk_info.setdefault("status", "pending")
+        chunk_info.setdefault("attempts", 0)
+        chunk_info.setdefault("attempt_logs", [])
+        chunk_info.setdefault("recovery_attempts", 0)
+        chunk_info.setdefault("recovery_logs", [])
+        chunk_info.setdefault("last_error", "")
+        chunk_info.setdefault("last_error_type", "")
+        chunk_info.setdefault("error_type", chunk_info.get("last_error_type", ""))
+        chunk_info.setdefault("latency_ms", None)
+        chunk_info.setdefault("input_chars", chunk_info.get("char_count", 0))
+        chunk_info.setdefault("estimated_input_tokens", 0)
+        chunk_info.setdefault("input_tokens", chunk_info.get("estimated_input_tokens", 0))
+        chunk_info.setdefault("token_count_source", prompt_budget["token_count_source"])
+        chunk_info.setdefault("tail_context_text", "")
+        chunk_info.setdefault("processed_tail_context_text", "")
+        chunk_info.setdefault("processed_input_tail_context_text", "")
+        chunk_info.setdefault("processed_input_section_title", "")
+        chunk_info.setdefault("continuity_prev_chunk_id", None)
+        chunk_info.setdefault("continuity_context_chars", 0)
+        chunk_info.setdefault("continuity_context_tokens", 0)
+        chunk_info.setdefault("continuity_section_title", "")
+        chunk_info.setdefault("last_section_title", "")
+        chunk_info.setdefault("output_chars", 0)
+        chunk_info.setdefault("actual_output_tokens", 0)
+        chunk_info.setdefault("prompt_tokens", prompt_budget["prompt_tokens"])
+        chunk_info.setdefault("planned_max_output_tokens", planned_max_output_tokens)
+        chunk_info.setdefault("request_url", request_url)
+        chunk_info.setdefault("streaming_used", False)
+        chunk_info.setdefault("autotune_target_tokens", autotune_state["current_target_tokens"])
+        chunk_info.setdefault("autotune_next_target_tokens", autotune_state["current_target_tokens"])
+        chunk_info.setdefault("autotune_event", "")
+        chunk_info.setdefault("autotune_reason", "")
+        chunk_info.setdefault("superseded_by_plan_id", "")
+        chunk_info.setdefault("updated_at", "")
+        chunk_info.setdefault("started_at", "")
+        chunk_info.setdefault("completed_at", "")
+
+
+def _infer_resume_runtime_status(runtime: dict, chunks: list[dict]) -> str:
+    active_chunks = [chunk for chunk in (chunks or []) if chunk.get("status") != SUPERSEDED_CHUNK_STATUS]
+    active_statuses = {str(chunk.get("status", "pending")).strip() or "pending" for chunk in active_chunks}
+    previous_status = str(runtime.get("status", "pending")).strip() or "pending"
+
+    if runtime.get("replan_required", False):
+        return "aborted"
+    if active_chunks and active_statuses == {"done"}:
+        return "completed"
+    if INTERRUPTED_CHUNK_STATUS in active_statuses:
+        return RESUMABLE_RUNTIME_STATUS
+    if active_statuses and active_statuses.issubset({"done", "failed"}) and "failed" in active_statuses:
+        return "completed_with_errors"
+    if previous_status == "running":
+        return RESUMABLE_RUNTIME_STATUS
+    if "pending" in active_statuses:
+        if previous_status in {RESUMABLE_RUNTIME_STATUS, "aborted", "completed", "completed_with_errors"}:
+            return RESUMABLE_RUNTIME_STATUS
+        return "pending"
+    if "failed" in active_statuses:
+        if previous_status in {RESUMABLE_RUNTIME_STATUS, "aborted"}:
+            return RESUMABLE_RUNTIME_STATUS
+        return "completed_with_errors"
+    return previous_status
+
+
+def _prepare_manifest_for_resume(manifest: dict, work_path: Path, prompt_name: str = "") -> dict:
+    runtime = manifest.get("runtime", {}) if isinstance(manifest.get("runtime", {}), dict) else {}
+    now = _now_iso()
+    report = {
+        "repaired": False,
+        "repair_count": 0,
+        "promoted_done_chunk_ids": [],
+        "interrupted_chunk_ids": [],
+        "demoted_missing_output_chunk_ids": [],
+        "runtime_status_before": str(runtime.get("status", "pending")).strip() or "pending",
+        "runtime_status_after": "",
+        "interrupted_count": 0,
+        "warnings": [],
+    }
+
+    def mark_promoted_done(chunk_info: dict, output_path: Path, reason: str) -> None:
+        try:
+            output_text = output_path.read_text(encoding="utf-8")
+        except OSError:
+            output_text = ""
+        chunk_info["status"] = "done"
+        chunk_info["output_chars"] = len(output_text)
+        chunk_info["actual_output_tokens"] = max(
+            _parse_int(chunk_info.get("actual_output_tokens"), 0),
+            _estimate_tokens(output_text, "tokens") if output_text else 0,
+        )
+        chunk_info["last_error"] = ""
+        chunk_info["last_error_type"] = ""
+        chunk_info["error_type"] = ""
+        chunk_info["completed_at"] = str(chunk_info.get("completed_at", "")).strip() or now
+        chunk_info["updated_at"] = now
+        report["promoted_done_chunk_ids"].append(_parse_int(chunk_info.get("id"), 0))
+        report["warnings"].append(reason)
+
+    def mark_interrupted(chunk_info: dict, reason: str, bucket: str) -> None:
+        chunk_info["status"] = INTERRUPTED_CHUNK_STATUS
+        chunk_info["last_error"] = reason
+        chunk_info["last_error_type"] = "resume_interrupted"
+        chunk_info["error_type"] = "resume_interrupted"
+        chunk_info["completed_at"] = ""
+        chunk_info["updated_at"] = now
+        report[bucket].append(_parse_int(chunk_info.get("id"), 0))
+        report["warnings"].append(reason)
+
+    for chunk_info in manifest.get("chunks", []):
+        if chunk_info.get("status") == SUPERSEDED_CHUNK_STATUS:
+            continue
+        output_path = _resolve_chunk_output_path(work_path, chunk_info, prompt_name)
+        output_exists = output_path.exists()
+        status = str(chunk_info.get("status", "pending")).strip() or "pending"
+
+        if status == "running":
+            if output_exists:
+                mark_promoted_done(
+                    chunk_info,
+                    output_path,
+                    f"Resume repair: promoted stale running chunk {_parse_int(chunk_info.get('id'), 0)} to done from {output_path.name}",
+                )
+            else:
+                mark_interrupted(
+                    chunk_info,
+                    f"Resume repair: marked stale running chunk {_parse_int(chunk_info.get('id'), 0)} as interrupted because {output_path.name} is missing",
+                    "interrupted_chunk_ids",
+                )
+        elif status == "done" and not output_exists:
+            mark_interrupted(
+                chunk_info,
+                f"Resume repair: demoted done chunk {_parse_int(chunk_info.get('id'), 0)} because checkpoint file {output_path.name} is missing",
+                "demoted_missing_output_chunk_ids",
+            )
+        elif status == INTERRUPTED_CHUNK_STATUS and output_exists:
+            mark_promoted_done(
+                chunk_info,
+                output_path,
+                f"Resume repair: promoted interrupted chunk {_parse_int(chunk_info.get('id'), 0)} to done from {output_path.name}",
+            )
+
+    runtime_status_after = _infer_resume_runtime_status(runtime, manifest.get("chunks", []))
+    runtime["last_resume_check_at"] = now
+    runtime["interrupted_count"] = sum(
+        1
+        for chunk in manifest.get("chunks", [])
+        if chunk.get("status") == INTERRUPTED_CHUNK_STATUS
+    )
+    if report["promoted_done_chunk_ids"] or report["interrupted_chunk_ids"] or report["demoted_missing_output_chunk_ids"]:
+        runtime["last_resume_repair_at"] = now
+        runtime["resume_repair_count"] = max(0, _parse_int(runtime.get("resume_repair_count"), 0)) +             len(report["promoted_done_chunk_ids"]) + len(report["interrupted_chunk_ids"]) + len(report["demoted_missing_output_chunk_ids"])
+    runtime["status"] = runtime_status_after
+    runtime["updated_at"] = now
+
+    report["runtime_status_after"] = runtime_status_after
+    report["interrupted_count"] = runtime["interrupted_count"]
+    report["repair_count"] = len(report["promoted_done_chunk_ids"]) + len(report["interrupted_chunk_ids"]) + len(report["demoted_missing_output_chunk_ids"])
+    report["repaired"] = report["repair_count"] > 0 or report["runtime_status_before"] != runtime_status_after
+    return report
+
+
+def _format_resume_report(report: dict) -> str:
+    if not isinstance(report, dict) or not report.get("repaired", False):
+        return ""
+    parts = []
+    if report.get("promoted_done_chunk_ids"):
+        parts.append(f"promoted={len(report['promoted_done_chunk_ids'])}")
+    if report.get("interrupted_chunk_ids"):
+        parts.append(f"interrupted={len(report['interrupted_chunk_ids'])}")
+    if report.get("demoted_missing_output_chunk_ids"):
+        parts.append(f"demoted_missing_output={len(report['demoted_missing_output_chunk_ids'])}")
+    parts.append(f"runtime={report.get('runtime_status_before', '')}->{report.get('runtime_status_after', '')}")
+    return "Resume repair: " + ", ".join(parts)
+
+
+def prepare_resume(work_dir: str, prompt_name: str = "", config_path: str = None,
+                   input_key: str = "raw_path") -> dict:
+    del input_key
+    work_path = Path(work_dir)
+    manifest_path = work_path / "manifest.json"
+    if not manifest_path.exists():
+        print(f"Error: manifest.json not found in {work_dir}", file=sys.stderr)
+        sys.exit(1)
+
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    config = _load_optional_config(config_path)
+    resolved_prompt_name = str(prompt_name or manifest.get("plan", {}).get("prompt_name", manifest.get("prompt_name", ""))).strip()
+    prompt_template = ""
+    if resolved_prompt_name:
+        prompt_template = _resolve_prompt_template_path(resolved_prompt_name).read_text(encoding="utf-8")
+    prompt_budget = _calculate_chunk_budget(resolved_prompt_name, prompt_template, config)
+    manifest = _ensure_manifest_structure(
+        manifest,
+        prompt_name=resolved_prompt_name,
+        prompt_budget=prompt_budget,
+        recommended_chunk_size=_recommended_chunk_size(resolved_prompt_name, config),
+        source_file=str(manifest.get("source_file", "")).strip(),
+        config=config,
+    )
+    plan = manifest["plan"]
+    runtime = manifest["runtime"]
+    planned_max_output_tokens = max(1, _parse_int(plan.get("planned_max_output_tokens"), prompt_budget["planned_max_output_tokens"]))
+    autotune_state = _build_autotune_state(plan, config, manifest.get("autotune"))
+    _ensure_chunk_runtime_defaults(
+        manifest,
+        runtime,
+        plan,
+        prompt_budget,
+        request_url=str(runtime.get("last_request_url", "")).strip(),
+        planned_max_output_tokens=planned_max_output_tokens,
+        autotune_state=autotune_state,
+    )
+    resume = _prepare_manifest_for_resume(manifest, work_path, resolved_prompt_name)
+    _refresh_manifest_token_source_summary(manifest)
+    _sync_manifest_legacy_fields(manifest)
+    _write_manifest(manifest_path, manifest)
+    return {
+        "success": True,
+        "manifest_path": str(manifest_path),
+        "prompt_name": resolved_prompt_name,
+        "resume": resume,
+        "runtime": manifest.get("runtime", {}),
+    }
+
+
 def _sync_manifest_legacy_fields(manifest: dict) -> dict:
     plan = manifest.get("plan", {}) if isinstance(manifest, dict) else {}
     runtime = manifest.get("runtime", {}) if isinstance(manifest, dict) else {}
@@ -968,6 +1219,7 @@ def _sync_manifest_legacy_fields(manifest: dict) -> dict:
     manifest["autotune"] = autotune
     manifest["replan_required"] = runtime.get("replan_required", manifest.get("replan_required", False))
     manifest["replan_reason"] = runtime.get("replan_reason", manifest.get("replan_reason", ""))
+    manifest["interrupted_count"] = runtime.get("interrupted_count", manifest.get("interrupted_count", 0))
     return manifest
 
 
@@ -1058,10 +1310,14 @@ def _ensure_manifest_structure(manifest: dict, *, prompt_name: str = "", prompt_
     runtime.setdefault("failed_count", 0)
     runtime.setdefault("skipped_count", 0)
     runtime.setdefault("superseded_count", 0)
+    runtime.setdefault("interrupted_count", 0)
     runtime.setdefault("current_chunk_index", 0)
     runtime.setdefault("replan_required", False)
     runtime.setdefault("replan_reason", "")
     runtime.setdefault("last_replanned_at", "")
+    runtime.setdefault("last_resume_check_at", "")
+    runtime.setdefault("last_resume_repair_at", "")
+    runtime.setdefault("resume_repair_count", 0)
     runtime.setdefault("updated_at", _now_iso())
     manifest.setdefault("plan_history", [])
     _sync_manifest_legacy_fields(manifest)
@@ -3905,45 +4161,20 @@ def process_chunks(work_dir: str, prompt_name: str, extra_instruction: str = "",
         setup_warnings.append(setup_warning)
         print(setup_warning, file=sys.stderr)
 
-    for chunk_info in manifest.get("chunks", []):
-        chunk_info.setdefault("chunk_id", chunk_info.get("id", 0))
-        chunk_info.setdefault("plan_id", runtime.get("active_plan_id", plan.get("plan_id", "")))
-        chunk_info.setdefault("status", "pending")
-        chunk_info.setdefault("attempts", 0)
-        chunk_info.setdefault("attempt_logs", [])
-        chunk_info.setdefault("recovery_attempts", 0)
-        chunk_info.setdefault("recovery_logs", [])
-        chunk_info.setdefault("last_error", "")
-        chunk_info.setdefault("last_error_type", "")
-        chunk_info.setdefault("error_type", chunk_info.get("last_error_type", ""))
-        chunk_info.setdefault("latency_ms", None)
-        chunk_info.setdefault("input_chars", chunk_info.get("char_count", 0))
-        chunk_info.setdefault("estimated_input_tokens", 0)
-        chunk_info.setdefault("input_tokens", chunk_info.get("estimated_input_tokens", 0))
-        chunk_info.setdefault("token_count_source", prompt_budget["token_count_source"])
-        chunk_info.setdefault("tail_context_text", "")
-        chunk_info.setdefault("processed_tail_context_text", "")
-        chunk_info.setdefault("processed_input_tail_context_text", "")
-        chunk_info.setdefault("processed_input_section_title", "")
-        chunk_info.setdefault("continuity_prev_chunk_id", None)
-        chunk_info.setdefault("continuity_context_chars", 0)
-        chunk_info.setdefault("continuity_context_tokens", 0)
-        chunk_info.setdefault("continuity_section_title", "")
-        chunk_info.setdefault("last_section_title", "")
-        chunk_info.setdefault("output_chars", 0)
-        chunk_info.setdefault("actual_output_tokens", 0)
-        chunk_info.setdefault("prompt_tokens", prompt_budget["prompt_tokens"])
-        chunk_info.setdefault("planned_max_output_tokens", planned_max_output_tokens)
-        chunk_info.setdefault("request_url", request_url)
-        chunk_info.setdefault("streaming_used", False)
-        chunk_info.setdefault("autotune_target_tokens", autotune_state["current_target_tokens"])
-        chunk_info.setdefault("autotune_next_target_tokens", autotune_state["current_target_tokens"])
-        chunk_info.setdefault("autotune_event", "")
-        chunk_info.setdefault("autotune_reason", "")
-        chunk_info.setdefault("superseded_by_plan_id", "")
-        chunk_info.setdefault("updated_at", "")
-        chunk_info.setdefault("started_at", "")
-        chunk_info.setdefault("completed_at", "")
+    _ensure_chunk_runtime_defaults(
+        manifest,
+        runtime,
+        plan,
+        prompt_budget,
+        request_url,
+        planned_max_output_tokens,
+        autotune_state,
+    )
+    resume_report = _prepare_manifest_for_resume(manifest, work_path, prompt_name)
+    resume_summary = _format_resume_report(resume_report)
+    if resume_summary:
+        setup_warnings.append(resume_summary)
+        print(f"ℹ️ {resume_summary}", file=sys.stderr)
 
     runtime["active_plan_id"] = plan.get("plan_id", runtime.get("active_plan_id", _new_plan_id()))
     runtime["last_request_url"] = request_url
@@ -3966,6 +4197,8 @@ def process_chunks(work_dir: str, prompt_name: str, extra_instruction: str = "",
     manifest["autotune"] = autotune_state
     _sync_manifest_legacy_fields(manifest)
     _refresh_manifest_token_source_summary(manifest)
+    if resume_report.get("repaired", False) and not dry_run:
+        _write_manifest(manifest_path, manifest)
 
     if dry_run:
         return {
@@ -3988,6 +4221,7 @@ def process_chunks(work_dir: str, prompt_name: str, extra_instruction: str = "",
             "token_count_source": manifest.get("token_count_source", ""),
             "autotune": manifest.get("autotune", {}),
             "plan": manifest.get("plan", {}),
+            "resume": resume_report,
             "warnings": setup_warnings,
             "message": "Dry run: all validations passed"
         }
@@ -4371,6 +4605,7 @@ def process_chunks(work_dir: str, prompt_name: str, extra_instruction: str = "",
         "aborted_reason": aborted_reason,
         "replan_required": runtime.get("replan_required", False),
         "replan_reason": runtime.get("replan_reason", ""),
+        "resume": resume_report,
         "plan": manifest.get("plan", {}),
         "request_url": request_url,
     }
@@ -6255,6 +6490,19 @@ def main():
     pc_parser.add_argument('--max-replans', type=int, default=3,
                            help='Maximum automatic replans when --auto-replan is enabled')
 
+    # prepare-resume command
+    resume_parser = subparsers.add_parser(
+        'prepare-resume',
+        help='Repair stale chunk/runtime state before resuming a run'
+    )
+    resume_parser.add_argument('work_dir', help='Working directory with manifest.json')
+    resume_parser.add_argument('--prompt', default='',
+                               help='Optional prompt override; defaults to manifest plan prompt')
+    resume_parser.add_argument('--config-path', default=None,
+                               help='Optional path to config file')
+    resume_parser.add_argument('--input-key', default='raw_path',
+                               help='Reserved for future resume checks; currently informational only')
+
     # replan-remaining command
     replan_parser = subparsers.add_parser(
         'replan-remaining',
@@ -6470,6 +6718,15 @@ def main():
         print(json.dumps(result, ensure_ascii=False))
         if not result.get('success', False) and not result.get('dry_run', False):
             sys.exit(1)
+
+    elif args.command == 'prepare-resume':
+        result = prepare_resume(
+            args.work_dir,
+            prompt_name=args.prompt,
+            config_path=args.config_path,
+            input_key=args.input_key,
+        )
+        print(json.dumps(result, ensure_ascii=False))
 
     elif args.command == 'replan-remaining':
         result = replan_remaining(

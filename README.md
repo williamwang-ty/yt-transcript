@@ -182,6 +182,7 @@ The helper scripts now emit machine-readable JSON on stdout:
 - `python3 yt_transcript_utils.py get-chapters "$URL"`
 - `python3 yt_transcript_utils.py chunk-segments /tmp/${VIDEO_ID}_segments.json /tmp/${VIDEO_ID}_chunks --prompt structure_only`
 - `python3 yt_transcript_utils.py chunk-document /tmp/${VIDEO_ID}_normalized_document.json /tmp/${VIDEO_ID}_chunks --prompt structure_only`
+- `python3 yt_transcript_utils.py prepare-resume /tmp/${VIDEO_ID}_chunks --prompt structure_only`
 - `python3 yt_transcript_utils.py build-chapter-plan /tmp/${VIDEO_ID}_chapters.json /tmp/${VIDEO_ID}_chunks /tmp/${VIDEO_ID}_chunks/chapter_plan.json`
 - `python3 yt_transcript_utils.py validate-state /tmp/${VIDEO_ID}_state.md --stage <stage>`
 - `python3 yt_transcript_utils.py normalize-document /tmp/${VIDEO_ID}_state.md`
@@ -199,6 +200,8 @@ This keeps workflow logic in scripts instead of ad-hoc shell parsing inside the 
 `normalize-document` materializes `/tmp/${VIDEO_ID}_normalized_document.json` from either raw text or timed `segments.json`, and `plan-optimization` auto-materializes it when source artifacts already exist.
 
 For long-video chunking, `plan-optimization` now also emits a canonical `chunking` block; when normalization exists, `chunk-document` is the preferred driver and it keeps chunk boundary / continuity assumptions explicit in `manifest.json`.
+
+Stage 4 also adds explicit resume semantics: `prepare-resume` repairs stale manifest state manually, while `process-chunks` runs the same repair step automatically before execution continues.
 
 Current policy is intentional and explicit:
 
@@ -222,6 +225,7 @@ Current policy is intentional and explicit:
 - prompt names are validated eagerly for chunk planning, so typos fail fast instead of silently falling back to generic budgets
 - `process-chunks` now assigns prompt-specific `max_output_tokens` from the same planning budget instead of using one large shared default
 - `manifest.json` now records explicit `plan.chunk_contract` and `plan.continuity`; `process-chunks` follows that plan-owned continuity policy instead of silently drifting with later config changes
+- chunk execution now also has explicit resume semantics: stale `running` / missing-output checkpoints are repaired deterministically into `done` or `interrupted` before work resumes
 - `process-chunks` also injects a short continuity context from the previous chunk (tail sentence + optional section title) without enabling body overlap, and chunk budgeting now reserves a small token allowance for that carry-over context
 - `process-chunks` now treats transient gateway disconnects such as `Remote end closed connection without response` as retryable transport failures, and can auto-rerun suspiciously short / malformed chunk outputs before keeping a warning
 - `process-chunks --dry-run` validates prompts, manifests, and chunk budgets without requiring live LLM credentials; actual execution still requires `llm_api_key`, `llm_base_url`, and `llm_model`
@@ -435,6 +439,7 @@ bash scripts/preflight.sh --require-llm
 - `python3 yt_transcript_utils.py get-chapters "$URL"`
 - `python3 yt_transcript_utils.py chunk-segments /tmp/${VIDEO_ID}_segments.json /tmp/${VIDEO_ID}_chunks --prompt structure_only`
 - `python3 yt_transcript_utils.py chunk-document /tmp/${VIDEO_ID}_normalized_document.json /tmp/${VIDEO_ID}_chunks --prompt structure_only`
+- `python3 yt_transcript_utils.py prepare-resume /tmp/${VIDEO_ID}_chunks --prompt structure_only`
 - `python3 yt_transcript_utils.py build-chapter-plan /tmp/${VIDEO_ID}_chapters.json /tmp/${VIDEO_ID}_chunks /tmp/${VIDEO_ID}_chunks/chapter_plan.json`
 - `python3 yt_transcript_utils.py validate-state /tmp/${VIDEO_ID}_state.md --stage <stage>`
 - `python3 yt_transcript_utils.py normalize-document /tmp/${VIDEO_ID}_state.md`
@@ -452,6 +457,8 @@ bash scripts/preflight.sh --require-llm
 `normalize-document` 会基于 raw text 或带时间戳的 `segments.json` 物化 `/tmp/${VIDEO_ID}_normalized_document.json`；当源 artifact 已存在时，`plan-optimization` 也会自动完成这一步。
 
 对于长视频分块，`plan-optimization` 现在还会输出显式的 `chunking` 契约；一旦 normalization 已存在，优先使用 `chunk-document`，并把 chunk 边界 / continuity 假设显式记录到 `manifest.json`。
+
+Stage 4 还加入了显式 resume 语义：`prepare-resume` 用于手动修复 stale manifest，而 `process-chunks` 在继续执行前会自动做同样的修复。
 
 当前约定是明确固定的：
 
@@ -475,6 +482,7 @@ bash scripts/preflight.sh --require-llm
 - 分块阶段会提前校验 prompt 名称，避免因为 prompt 拼写错误而静默回退到通用预算
 - `process-chunks` 现在按 prompt 预算单独设置 `max_output_tokens`，不再复用单一的大默认值
 - `manifest.json` 现在会显式记录 `plan.chunk_contract` 与 `plan.continuity`；`process-chunks` 会遵循 plan-own 的 continuity 策略，而不是被后续 config 漂移静默改变
+- chunk 执行现在也有显式 resume 语义：在继续执行前，stale 的 `running` / 缺失输出 checkpoint 会被确定性修复为 `done` 或 `interrupted`
 - `process-chunks` 还会注入上一块的轻量 continuity context（尾句 + 可选 section title），但不会启用正文 overlap；同时分块预算也会为这段 carry-over context 预留一小段 token 成本
 - `process-chunks` 现在会把 `Remote end closed connection without response` 这类瞬时网关断连视为可重试传输错误，并可在产出异常短/结构异常的 chunk 时自动重跑一轮，再决定是否保留 warning
 - `manifest.json` 现在会把不可变 `plan` 和可变 `runtime` 状态分开，同时为每个 chunk 记录 `attempt_logs` 级别的请求观测数据
