@@ -34,6 +34,8 @@ Commands:
     cancel-run <work_dir>          Request local cancellation for an active chunk-processing run
     pause-run <work_dir>           Request a safe-boundary pause for an active chunk-processing run
     resume-run <work_dir>          Clear a local pause request and restore resumable runtime state
+    telemetry-summary <ref>        Summarize local telemetry journal from a work_dir or telemetry.jsonl path
+    telemetry-events <ref>         Query local telemetry journal events from a work_dir or telemetry.jsonl path
     assemble-final <optimized_text> <output_file>  Assemble final markdown from optimized text + metadata
     verify-quality <optimized_text>  Verify quality of optimized text (structural checks)
     sync-state <state_ref>         Sync legacy state.md and authoritative machine_state.json
@@ -64,6 +66,7 @@ from pathlib import Path
 import kernel_runtime
 import kernel_state
 import kernel_controller
+import kernel_telemetry
 
 
 def _skill_root() -> Path:
@@ -3277,6 +3280,76 @@ def _resume_run_impl(work_dir: str, reason: str = "") -> dict:
     }
 
 
+def _resolve_telemetry_ref_kwargs(telemetry_ref: str = "", *, telemetry_path: str = "", work_dir: str = "") -> dict:
+    explicit_telemetry_path = str(telemetry_path or "").strip()
+    explicit_work_dir = str(work_dir or "").strip()
+    if explicit_telemetry_path or explicit_work_dir:
+        return {
+            "telemetry_path": explicit_telemetry_path,
+            "work_dir": explicit_work_dir,
+        }
+
+    ref = str(telemetry_ref or "").strip()
+    if not ref:
+        return {
+            "telemetry_path": "",
+            "work_dir": "",
+        }
+
+    ref_path = Path(ref).expanduser()
+    if ref_path.name == kernel_telemetry.TELEMETRY_FILENAME or ref_path.suffix == ".jsonl":
+        return {
+            "telemetry_path": str(ref_path),
+            "work_dir": "",
+        }
+    return {
+        "telemetry_path": "",
+        "work_dir": str(ref_path),
+    }
+
+
+def _parse_optional_success_filter(value) -> bool | None:
+    if value is None:
+        return None
+    text = str(value).strip().lower()
+    if not text or text == "all":
+        return None
+    if text in {"1", "true", "yes", "success", "ok"}:
+        return True
+    if text in {"0", "false", "no", "failure", "fail"}:
+        return False
+    raise ValueError(f"Unsupported success filter: {value}")
+
+
+def telemetry_summary(telemetry_ref: str = "", *, telemetry_path: str = "", work_dir: str = "",
+                      command_filter: str = "", document_id: str = "", success=None,
+                      recent_limit: int = 5) -> dict:
+    resolved = _resolve_telemetry_ref_kwargs(telemetry_ref, telemetry_path=telemetry_path, work_dir=work_dir)
+    return kernel_telemetry.summarize_telemetry(
+        work_dir=resolved["work_dir"],
+        telemetry_path=resolved["telemetry_path"],
+        command=command_filter,
+        document_id=document_id,
+        success=_parse_optional_success_filter(success),
+        recent_limit=recent_limit,
+    )
+
+
+def telemetry_events(telemetry_ref: str = "", *, telemetry_path: str = "", work_dir: str = "",
+                     limit: int = 20, command_filter: str = "", trace_id: str = "",
+                     document_id: str = "", success=None) -> dict:
+    resolved = _resolve_telemetry_ref_kwargs(telemetry_ref, telemetry_path=telemetry_path, work_dir=work_dir)
+    return kernel_telemetry.read_telemetry_events(
+        work_dir=resolved["work_dir"],
+        telemetry_path=resolved["telemetry_path"],
+        limit=limit,
+        command=command_filter,
+        trace_id=trace_id,
+        document_id=document_id,
+        success=_parse_optional_success_filter(success),
+    )
+
+
 def _kernel_command_registry() -> dict[str, object]:
     return {
         "validate-state": validate_state,
@@ -3291,6 +3364,8 @@ def _kernel_command_registry() -> dict[str, object]:
         "cancel-run": cancel_run,
         "pause-run": pause_run,
         "resume-run": resume_run,
+        "telemetry-summary": telemetry_summary,
+        "telemetry-events": telemetry_events,
         "merge-content": lambda *, work_dir, output_file, header="": merge_content(work_dir, output_file, header_content=header),
         "assemble-final": assemble_final,
         "verify-quality": verify_quality,
@@ -7332,6 +7407,29 @@ def main():
     resume_run_parser.add_argument('work_dir', help='Working directory to resume')
     resume_run_parser.add_argument('--reason', default='', help='Optional resume reason')
 
+    # telemetry-summary command
+    telemetry_summary_parser = subparsers.add_parser(
+        'telemetry-summary',
+        help='Summarize local telemetry journal from a work_dir or telemetry.jsonl path'
+    )
+    telemetry_summary_parser.add_argument('telemetry_ref', help='Work directory or telemetry.jsonl path')
+    telemetry_summary_parser.add_argument('--command-filter', dest='command_filter', default='', help='Optional command filter')
+    telemetry_summary_parser.add_argument('--document-id', default='', help='Optional document_id filter')
+    telemetry_summary_parser.add_argument('--success', choices=['all', 'true', 'false'], default='all', help='Filter by success state')
+    telemetry_summary_parser.add_argument('--recent-limit', type=int, default=5, help='Number of recent events to include')
+
+    # telemetry-events command
+    telemetry_events_parser = subparsers.add_parser(
+        'telemetry-events',
+        help='Query local telemetry journal events from a work_dir or telemetry.jsonl path'
+    )
+    telemetry_events_parser.add_argument('telemetry_ref', help='Work directory or telemetry.jsonl path')
+    telemetry_events_parser.add_argument('--limit', type=int, default=20, help='Maximum number of matching recent events to return (0 = all)')
+    telemetry_events_parser.add_argument('--command-filter', dest='command_filter', default='', help='Optional command filter')
+    telemetry_events_parser.add_argument('--trace-id', default='', help='Optional trace_id filter')
+    telemetry_events_parser.add_argument('--document-id', default='', help='Optional document_id filter')
+    telemetry_events_parser.add_argument('--success', choices=['all', 'true', 'false'], default='all', help='Filter by success state')
+
     # assemble-final command
     af_parser = subparsers.add_parser(
         'assemble-final',
@@ -7610,6 +7708,35 @@ def main():
             'resume-run',
             work_dir=args.work_dir,
             reason=args.reason,
+        )
+        result = envelope['result']
+        print(json.dumps(envelope if args.api_envelope else result, ensure_ascii=False))
+        if not result.get('success', False):
+            sys.exit(1)
+
+    elif args.command == 'telemetry-summary':
+        envelope = run_kernel_command(
+            'telemetry-summary',
+            telemetry_ref=args.telemetry_ref,
+            command_filter=args.command_filter,
+            document_id=args.document_id,
+            success=args.success,
+            recent_limit=args.recent_limit,
+        )
+        result = envelope['result']
+        print(json.dumps(envelope if args.api_envelope else result, ensure_ascii=False))
+        if not result.get('success', False):
+            sys.exit(1)
+
+    elif args.command == 'telemetry-events':
+        envelope = run_kernel_command(
+            'telemetry-events',
+            telemetry_ref=args.telemetry_ref,
+            limit=args.limit,
+            command_filter=args.command_filter,
+            trace_id=args.trace_id,
+            document_id=args.document_id,
+            success=args.success,
         )
         result = envelope['result']
         print(json.dumps(envelope if args.api_envelope else result, ensure_ascii=False))

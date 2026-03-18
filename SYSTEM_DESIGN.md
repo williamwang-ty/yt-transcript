@@ -1,10 +1,10 @@
-# System Design (v5.10-stage10)
+# System Design (v5.11-stage11)
 
-**Stage**: 10
+**Stage**: 11
 
 **Status**: accepted and implemented
 
-**Behavior change in this stage**: generalized local runtime control signals in `kernel_state.py`, added public `pause-run` / `resume-run` commands, and made `process-chunks` stop cleanly on safe-boundary pause requests while preserving resumability and ownership contracts
+**Behavior change in this stage**: extracted local telemetry reading into `kernel_telemetry.py`, added public `telemetry-summary` / `telemetry-events` commands, and made append-only telemetry journals queryable without changing the existing envelope or event formats
 
 **Source of truth**: This file is the canonical system design document for the repository.
 
@@ -12,18 +12,18 @@
 
 ---
 
-## 1. Stage 10 Goal
+## 1. Stage 11 Goal
 
-Stage 10 hardens local runtime control semantics beyond cancellation-only operation.
+Stage 11 makes local telemetry a first-class inspectable subsystem rather than a write-only journal.
 
 Its goals are:
 
-- generalize local runtime control markers into a reusable signal layer in `kernel_state.py`
-- promote safe-boundary pause / resume into public local command contracts
-- keep resumability, ownership, and manifest repair semantics compatible while expanding runtime control behavior
-- strengthen inspectable runtime state so paused runs can be resumed deterministically
+- extract telemetry file reading and summarization into a dedicated `kernel_telemetry.py` module
+- expose stable public read-only query commands for local telemetry journals
+- preserve the existing append-only telemetry event format and command envelopes while improving debuggability
+- keep telemetry local-first and inspectable on disk without introducing remote backends
 
-Stage 10 remains intentionally bounded. It does **not** introduce distributed scheduling, remote workers, or a fully concurrency-safe persistent state store.
+Stage 11 remains intentionally bounded. It does **not** introduce distributed tracing, remote aggregation, or a telemetry schema rewrite.
 
 ---
 
@@ -44,6 +44,7 @@ Its current implemented use cases are:
 - explicit chunk verification, bounded repair, and bounded replan control loops
 - stable kernel command envelopes for Python and CLI consumers
 - local telemetry journals for kernel command runs
+- local telemetry summaries and filtered event queries for kernel command runs
 - local runtime ownership for manifest-mutating commands
 - local runtime status inspection for work directories
 - public local cancellation for active chunk-processing runs
@@ -57,7 +58,7 @@ Its current implemented use cases are:
 
 ### 2.3 Current Non-Goals
 
-At Stage 10, the system is **not yet**:
+At Stage 11, the system is **not yet**:
 
 - a generalized multi-source document transformation framework
 - a reusable extracted kernel package
@@ -95,6 +96,10 @@ source acquisition
   -> quality verification
   -> runtime ownership release
   -> local telemetry journal append
+
+read-only telemetry inspection
+  -> telemetry-summary and telemetry-events resolve a local telemetry journal
+  -> kernel_telemetry.py filters and summarizes append-only events without mutating them
 
 read-only runtime inspection
   -> manifest / ownership / local control snapshot
@@ -490,16 +495,16 @@ New public interfaces should prefer additive envelope layers over breaking chang
 
 ---
 
-## 5. Stage 10 Deliverables
+## 5. Stage 11 Deliverables
 
 Completed in this stage:
 
-- generalized local runtime control files in `kernel_state.py` so cancel and pause share a common signal model
-- added public `pause-run` and `resume-run` commands on the stable kernel interface
-- made `process-chunks` stop cleanly when a pause is requested before work starts or between chunks
-- recorded paused and resumed runtime details in `manifest.json` while preserving Stage 9 cancellation behavior
-- surfaced pause state through `runtime-status`, including effective local runtime state derived from control markers
-- added regression coverage for pause requests, safe-boundary pausing, resume clearing, and envelope behavior for the new commands
+- extracted local telemetry reading and aggregation into `kernel_telemetry.py`
+- added public `telemetry-summary` and `telemetry-events` commands on the stable kernel interface
+- kept `telemetry.jsonl` append-only while adding filterable event reads by command, trace, document, and success state
+- added local summary metrics such as counts, durations, warning totals, and recent event windows
+- preserved Stage 10 pause / resume behavior and Stage 6 envelope compatibility while expanding local observability
+- added regression coverage for telemetry summary reads, event filtering, and CLI envelope behavior for telemetry queries
 
 Not done in this stage:
 
@@ -507,18 +512,18 @@ Not done in this stage:
 - no fully concurrency-safe persistent state store yet
 - no subsystem test-package split yet
 - no broad extraction of the chunk-execution algorithm itself yet
-- no telemetry query / aggregation subsystem yet
+- no glossary / terminology propagation subsystem yet
 
 ---
 
 ## 6. Current Known Gaps
 
-The implementation is meaningfully stronger after Stage 10, but still not fully kernelized.
+The implementation is meaningfully stronger after Stage 11, but still not fully kernelized.
 
 The main remaining gaps are:
 
 1. runtime, state-store, and controller boundaries are extracted, but much of the chunk-execution algorithm still lives in one large script
-2. telemetry is local and append-only, but not yet a first-class subsystem with querying or aggregation
+2. telemetry now has local query surfaces, but it is still a lightweight file-based subsystem rather than a richer observability stack
 3. verification remains deterministic / heuristic only and does not yet include semantic judge layers
 4. global terminology / entity consistency is still not first-class
 5. ownership is local single-writer gating, not a general concurrent state-store protocol
@@ -586,39 +591,45 @@ Implemented scope:
 
 ### Stage 11 — Local Telemetry Query Surfaces
 
+Implemented scope:
+
+- extracted local telemetry reading and summarization into `kernel_telemetry.py`
+- added public `telemetry-summary` and `telemetry-events` query commands
+- kept append-only telemetry compatibility while making local debugging easier
+
+### Stage 12 — Glossary and Terminology Consistency
+
 Planned scope:
 
-- extract local telemetry reading and summarization into a dedicated subsystem
-- add public query surfaces for local telemetry journals
-- keep append-only telemetry compatibility while making local debugging easier
+- add a local glossary artifact for document-level terminology consistency
+- inject glossary guidance into chunk execution prompts without changing chunk boundaries
+- add deterministic terminology checks to local verification
 
 ---
 
-## 8. Stage 10 Validation
+## 8. Stage 11 Validation
 
-The Stage 10 implementation is considered valid because:
+The Stage 11 implementation is considered valid because:
 
-- `kernel_state.py` now exposes a shared local signal model for cancellation and pause control
-- `pause-run` and `resume-run` expose public local runtime-control contracts without breaking Stage 9 cancellation behavior
-- `process-chunks` now pauses cleanly at safe boundaries, without touching completed chunk outputs or clearing the pause request prematurely
-- `resume-run` clears the pause marker and restores resumable manifest runtime state under the same ownership guard used for other manifest mutations
-- Stage 6 envelope behavior remains compatible for the new runtime-control commands
+- `kernel_telemetry.py` now owns local telemetry reading, filtering, and summarization behavior
+- `telemetry-summary` and `telemetry-events` expose public read-only query contracts without changing the existing telemetry event schema
+- telemetry queries remain local-first, operating directly on `telemetry.jsonl` without mutating journal contents
+- Stage 6 envelope behavior remains compatible for the new telemetry query commands
+- Stage 10 runtime-control behavior remains intact while telemetry becomes materially more useful for debugging
 
 Representative validated behaviors in this stage include:
 
-- writing `.runtime_pause.json` through `pause-run`
-- surfacing pause markers and effective runtime state through `runtime-status`
-- pausing a run before any LLM call when a pause is already pending
-- pausing a run between chunks after the current chunk completes
-- clearing pause markers and restoring `resumable` runtime state through `resume-run`
-- emitting `yt_transcript.command_result/v1` envelopes for `pause-run` and `resume-run`
+- summarizing command counts and duration totals from a local telemetry journal
+- filtering events by command and limit from a direct `telemetry.jsonl` path
+- emitting `yt_transcript.command_result/v1` envelopes for `telemetry-summary`
+- preserving append-only `telemetry.jsonl` compatibility while adding query helpers
 
 ---
 
 ## 9. Next Stage Entry Criteria
 
-Stage 11 should begin only when the following are agreed:
+Stage 12 should begin only when the following are agreed:
 
-1. which local telemetry queries are worth making public first
-2. how much aggregation should happen in-process versus in a dedicated telemetry helper module
-3. what telemetry summaries are stable enough to treat as compatibility surfaces
+1. which glossary artifact shape is stable enough to persist in work directories
+2. how glossary hints should be injected into prompts without over-inflating chunk prompts
+3. which terminology checks are deterministic enough to enable by default

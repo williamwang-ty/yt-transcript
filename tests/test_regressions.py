@@ -574,6 +574,104 @@ class RegressionTests(unittest.TestCase):
             self.assertTrue(event["success"])
             self.assertEqual(envelope["result"]["driver"], "chunk-text")
 
+    def test_telemetry_summary_reads_local_journal(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source = Path(tmpdir) / "raw.txt"
+            work_dir = Path(tmpdir) / "chunks"
+            source.write_text("第一句。第二句。第三句。第四句。", encoding="utf-8")
+
+            utils.run_kernel_command(
+                "chunk-text",
+                input_path=str(source),
+                output_dir=str(work_dir),
+                chunk_size=4,
+                prompt_name="structure_only",
+                config_path=None,
+            )
+            utils.run_kernel_command(
+                "runtime-status",
+                work_dir=str(work_dir),
+            )
+
+            result = utils.telemetry_summary(str(work_dir), recent_limit=2)
+
+            self.assertTrue(result["success"])
+            self.assertEqual(result["summary"]["matching_event_count"], 2)
+            self.assertEqual(result["summary"]["command_counts"].get("chunk-text"), 1)
+            self.assertEqual(result["summary"]["command_counts"].get("runtime-status"), 1)
+            self.assertEqual(len(result["recent_events"]), 2)
+
+    def test_telemetry_events_filter_by_command_and_limit(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source = Path(tmpdir) / "raw.txt"
+            work_dir = Path(tmpdir) / "chunks"
+            source.write_text("第一句。第二句。第三句。第四句。", encoding="utf-8")
+
+            utils.run_kernel_command(
+                "chunk-text",
+                input_path=str(source),
+                output_dir=str(work_dir),
+                chunk_size=4,
+                prompt_name="structure_only",
+                config_path=None,
+            )
+            utils.run_kernel_command(
+                "pause-run",
+                work_dir=str(work_dir),
+                reason="query me",
+            )
+            utils.run_kernel_command(
+                "runtime-status",
+                work_dir=str(work_dir),
+            )
+
+            telemetry_path = work_dir / "telemetry.jsonl"
+            result = utils.telemetry_events(
+                str(telemetry_path),
+                command_filter="pause-run",
+                limit=1,
+            )
+
+            self.assertTrue(result["success"])
+            self.assertEqual(result["matching_event_count"], 1)
+            self.assertEqual(result["returned_count"], 1)
+            self.assertEqual(result["events"][0]["command"], "pause-run")
+
+    def test_cli_api_envelope_wraps_telemetry_summary(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source = Path(tmpdir) / "raw.txt"
+            work_dir = Path(tmpdir) / "chunks"
+            source.write_text("第一句。第二句。第三句。第四句。", encoding="utf-8")
+            utils.run_kernel_command(
+                "chunk-text",
+                input_path=str(source),
+                output_dir=str(work_dir),
+                chunk_size=4,
+                prompt_name="structure_only",
+                config_path=None,
+            )
+
+            result = subprocess.run(
+                [
+                    "python3",
+                    str(PROJECT_ROOT / "yt_transcript_utils.py"),
+                    "--api-envelope",
+                    "telemetry-summary",
+                    str(work_dir),
+                ],
+                cwd=PROJECT_ROOT,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+            payload = json.loads(result.stdout)
+            self.assertEqual(payload["format"], utils.COMMAND_RESULT_FORMAT)
+            self.assertEqual(payload["command"], "telemetry-summary")
+            self.assertTrue(payload["ok"])
+            self.assertTrue(payload["result"]["success"])
+            self.assertGreaterEqual(payload["result"]["summary"]["matching_event_count"], 1)
+
     def test_build_chapter_plan_maps_chapters_to_timed_chunks(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             segments_path = Path(tmpdir) / "segments.json"
