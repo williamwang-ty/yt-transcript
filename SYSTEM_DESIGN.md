@@ -1,10 +1,10 @@
-# System Design (v5.13-stage13)
+# System Design (v5.14-stage14)
 
-**Stage**: 13
+**Stage**: 14
 
 **Status**: accepted and implemented
 
-**Behavior change in this stage**: added deterministic semantic anchor checks via `kernel_semantic.py`, injected high-signal anchors into chunk prompts, and made both chunk-level and final quality verification detect dropped numbers, dates, URLs, and similar anchors
+**Behavior change in this stage**: split the monolithic regression suite into subsystem-oriented modules under `tests/`, kept `tests.test_regressions` as a compatibility shim, and preserved the existing `python3 -m unittest tests.test_regressions` workflow
 
 **Source of truth**: This file is the canonical system design document for the repository.
 
@@ -12,18 +12,18 @@
 
 ---
 
-## 1. Stage 13 Goal
+## 1. Stage 14 Goal
 
-Stage 13 strengthens local verification beyond terminology-only checks by tracking semantic anchors deterministically.
+Stage 14 reorganizes the test suite so it reflects the extracted subsystem boundaries more clearly.
 
 Its goals are:
 
-- add a judge-free semantic anchor subsystem in `kernel_semantic.py`
-- inject high-signal anchors such as URLs, dates, percentages, and important numbers into chunk prompts
-- make chunk-level verification retry outputs that silently drop required anchors
-- expose anchor coverage signals in final `verify-quality` checks when raw text is available
+- split the monolithic `tests/test_regressions.py` into smaller subsystem-oriented modules
+- preserve the existing `python3 -m unittest tests.test_regressions` entrypoint through a compatibility shim
+- keep test coverage equivalent while making future architecture changes easier to validate
+- avoid changing runtime behavior while improving maintainability of the test harness
 
-Stage 13 remains intentionally bounded. It does **not** introduce LLM-as-judge verification loops or model-based semantic comparison.
+Stage 14 remains intentionally bounded. It does **not** introduce new runtime features or change public kernel contracts.
 
 ---
 
@@ -60,7 +60,7 @@ Its current implemented use cases are:
 
 ### 2.3 Current Non-Goals
 
-At Stage 13, the system is **not yet**:
+At Stage 14, the system is **not yet**:
 
 - a generalized multi-source document transformation framework
 - a reusable extracted kernel package
@@ -500,30 +500,29 @@ New public interfaces should prefer additive envelope layers over breaking chang
 
 ---
 
-## 5. Stage 13 Deliverables
+## 5. Stage 14 Deliverables
 
 Completed in this stage:
 
-- added `kernel_semantic.py` with judge-free semantic anchor extraction, prompt-context generation, and anchor verification
-- made `process-chunks` inject semantic anchors into prompts and record matched anchors per chunk
-- added deterministic chunk-level anchor checks that can trigger bounded same-plan repair when anchors disappear
-- extended `verify-quality` to report semantic anchor coverage when raw text is available
-- preserved Stage 12 glossary behavior, Stage 11 telemetry queries, and existing merge/runtime contracts
-- added regression coverage for semantic prompt injection, anchor-triggered retry behavior, and final quality anchor warnings
+- split the former monolithic regression suite into `tests/regression_core.py`, `tests/regression_runtime.py`, and `tests/regression_workflow.py`
+- extracted shared imports and constants into `tests/_support.py`
+- kept `tests/test_regressions.py` as a compatibility shim that re-exports the split test classes
+- preserved the existing `python3 -m unittest tests.test_regressions` validation workflow
+- kept Stage 13 semantic verification, Stage 12 glossary behavior, and earlier runtime interfaces unchanged while improving test maintainability
+- validated that the reorganized suite still runs the same coverage footprint under the compatibility entrypoint
 
 Not done in this stage:
 
 - no distributed or remote runtime backend yet
 - no fully concurrency-safe persistent state store yet
-- no subsystem test-package split yet
 - no broad extraction of the chunk-execution algorithm itself yet
-- no package-level test suite reorganization yet
+- no P3 platformization work by design
 
 ---
 
 ## 6. Current Known Gaps
 
-The implementation is meaningfully stronger after Stage 13, but still not fully kernelized.
+The implementation is meaningfully stronger after Stage 14, but still not fully kernelized.
 
 The main remaining gaps are:
 
@@ -533,7 +532,7 @@ The main remaining gaps are:
 4. terminology consistency now has a local glossary path, but deeper semantic or human-curated terminology workflows are still not first-class
 5. ownership is local single-writer gating, not a general concurrent state-store protocol
 6. cancellation and pause / resume are public and local, but long-lived job scheduling is not formalized
-7. test coverage is stronger around runtime control, but fixtures are not yet split into dedicated suites by subsystem
+7. the test suite is now split by subsystem, but fixtures and helper utilities are still intentionally lightweight rather than fully packaged test infrastructure
 
 ---
 
@@ -620,37 +619,39 @@ Implemented scope:
 
 ### Stage 14 — Test Suite Reorganization
 
-Planned scope:
+Implemented scope:
 
 - split the monolithic regression file into smaller subsystem-oriented test modules
-- keep test coverage equivalent while making stage-specific changes easier to reason about
-- preserve the existing `python3 -m unittest` workflow while improving suite structure
+- kept test coverage equivalent while making stage-specific changes easier to reason about
+- preserved the existing `python3 -m unittest` workflow through a compatibility shim
 
 ---
 
-## 8. Stage 13 Validation
+## 8. Stage 14 Validation
 
-The Stage 13 implementation is considered valid because:
+The Stage 14 implementation is considered valid because:
 
-- `kernel_semantic.py` now owns judge-free semantic anchor extraction, prompt-context generation, and anchor verification behavior
-- `process-chunks` now injects high-signal anchors into prompts and can retry outputs that silently drop them
-- `verify-quality` now reports semantic anchor coverage when raw text is available, without adding model-based verifier loops
-- Stage 12 glossary behavior, Stage 11 telemetry queries, and Stage 10 runtime-control behavior remain intact while semantic verification becomes materially stronger
-- semantic anchor checks stay deterministic and inspectable, preserving the repository's local-first design
+- the regression suite is now split across subsystem-oriented modules rather than one large file
+- `tests.test_regressions` still works as the single compatibility entrypoint used throughout the staged refactor
+- no runtime behavior or public command contract changed while the tests were reorganized
+- the split layout better mirrors the extracted architecture boundaries introduced in Stages 7–13
+- the full regression suite still passes through the compatibility shim, preserving operator workflow
 
 Representative validated behaviors in this stage include:
 
-- injecting URLs, dates, and percentages into per-chunk semantic anchor guardrails
-- retrying a chunk when required numeric anchors disappear from output
-- reporting missing semantic anchors as final quality warnings when comparing against raw text
-- recording semantic verification metadata in manifest plan and chunk state
+- importing split test classes through `tests.test_regressions`
+- running the full suite successfully via `python3 -m unittest tests.test_regressions`
+- keeping test helper imports centralized in `tests/_support.py`
+- avoiding duplicate test execution by placing split modules outside default `test_*.py` discovery naming
 
 ---
 
 ## 9. Next Stage Entry Criteria
 
-Stage 14 should begin only when the following are agreed:
+No additional non-P3 implementation stages are currently planned in this repository snapshot.
 
-1. which subsystem split best reflects the current architecture boundaries in tests
-2. how much fixture extraction is worth doing without destabilizing the existing regression workflow
-3. what compatibility shim, if any, should remain after splitting `tests/test_regressions.py`
+Optional future work, if desired later, includes:
+
+1. deeper extraction of the remaining chunk-execution algorithm from `yt_transcript_utils.py`
+2. stronger local state-store guarantees beyond the current single-writer plus file-signal approach
+3. any consciously-scoped P3 platformization work, which is explicitly out of scope for the current request
