@@ -2260,6 +2260,145 @@ exit 1
             self.assertEqual(result["skipped_count"], 1)
             mocked_call.assert_not_called()
 
+    def test_process_chunks_rejects_active_runtime_owner(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source = Path(tmpdir) / "raw.txt"
+            work_dir = Path(tmpdir) / "chunks"
+            source.write_text("第一句。第二句。第三句。第四句。", encoding="utf-8")
+            utils.chunk_text(str(source), str(work_dir), 8, "structure_only")
+
+            owner_path = work_dir / utils.RUNTIME_OWNER_FILENAME
+            owner_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": utils.RUNTIME_OWNERSHIP_SCHEMA_VERSION,
+                        "format": utils.RUNTIME_OWNERSHIP_FORMAT,
+                        "owner_id": "other-owner",
+                        "operation": "process-chunks",
+                        "pid": os.getpid(),
+                        "work_dir": str(work_dir.resolve()),
+                        "acquired_at": utils._now_iso(),
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+
+            result = utils.process_chunks(str(work_dir), "structure_only", dry_run=True)
+
+            self.assertFalse(result["success"])
+            self.assertTrue(result["aborted"])
+            self.assertEqual(result["ownership"]["status"], "conflict")
+            self.assertEqual(result["ownership"]["active_owner"]["owner_id"], "other-owner")
+            self.assertTrue(owner_path.exists())
+
+    def test_prepare_resume_recovers_stale_runtime_owner(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source = Path(tmpdir) / "raw.txt"
+            work_dir = Path(tmpdir) / "chunks"
+            source.write_text("第一句。第二句。第三句。第四句。", encoding="utf-8")
+            utils.chunk_text(str(source), str(work_dir), 8, "structure_only")
+
+            owner_path = work_dir / utils.RUNTIME_OWNER_FILENAME
+            owner_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": utils.RUNTIME_OWNERSHIP_SCHEMA_VERSION,
+                        "format": utils.RUNTIME_OWNERSHIP_FORMAT,
+                        "owner_id": "stale-owner",
+                        "operation": "prepare-resume",
+                        "pid": 99999999,
+                        "work_dir": str(work_dir.resolve()),
+                        "acquired_at": utils._now_iso(),
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+
+            result = utils.prepare_resume(str(work_dir), prompt_name="structure_only")
+
+            self.assertTrue(result["success"])
+            self.assertEqual(result["ownership"]["status"], "acquired")
+            self.assertTrue(result["ownership"]["released"])
+            self.assertEqual(result["ownership"]["release_status"], "released")
+            self.assertEqual(result["ownership"]["recovered_stale_owner"]["stale_reason"], "dead_process")
+            self.assertFalse(owner_path.exists())
+
+    def test_process_chunks_with_replans_shares_runtime_owner_across_steps(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source = Path(tmpdir) / "raw.txt"
+            work_dir = Path(tmpdir) / "chunks"
+            source.write_text("第一句。第二句。第三句。第四句。第五句。第六句。", encoding="utf-8")
+            utils.chunk_text(str(source), str(work_dir), 4, "structure_only")
+
+            seen_calls = []
+            process_call_count = {"count": 0}
+
+            def fake_process_chunks(*args, **kwargs):
+                ownership = kwargs.get("runtime_ownership") or {}
+                seen_calls.append(("process", ownership.get("owner_id", ""), bool(ownership.get("delegated", False))))
+                if process_call_count["count"] == 0:
+                    process_call_count["count"] += 1
+                    return {
+                        "success": False,
+                        "processed_count": 0,
+                        "failed_count": 1,
+                        "skipped_count": 0,
+                        "superseded_count": 0,
+                        "warnings": [],
+                        "output_files": [],
+                        "request_url": "https://api.example.com/v1/chat/completions",
+                        "aborted": True,
+                        "aborted_reason": "need replan",
+                        "replan_required": True,
+                        "replan_reason": "timeout on chunk 0",
+                        "plan": {"plan_id": "plan_a"},
+                        "control": {"replan": {}},
+                    }
+                return {
+                    "success": True,
+                    "processed_count": 1,
+                    "failed_count": 0,
+                    "skipped_count": 0,
+                    "superseded_count": 0,
+                    "warnings": [],
+                    "output_files": [],
+                    "request_url": "https://api.example.com/v1/chat/completions",
+                    "aborted": False,
+                    "aborted_reason": "",
+                    "replan_required": False,
+                    "replan_reason": "",
+                    "plan": {"plan_id": "plan_b"},
+                    "control": {"replan": {}},
+                }
+
+            def fake_replan_remaining(*args, **kwargs):
+                ownership = kwargs.get("runtime_ownership") or {}
+                seen_calls.append(("replan", ownership.get("owner_id", ""), bool(ownership.get("delegated", False))))
+                return {
+                    "success": True,
+                    "replanned": True,
+                    "warnings": [],
+                }
+
+            with mock.patch.object(utils, "process_chunks", side_effect=fake_process_chunks), mock.patch.object(
+                utils,
+                "replan_remaining",
+                side_effect=fake_replan_remaining,
+            ):
+                result = utils.process_chunks_with_replans(str(work_dir), "structure_only", max_replans=1)
+
+            owner_ids = {owner_id for _, owner_id, _ in seen_calls}
+            self.assertTrue(result["success"])
+            self.assertEqual(result["replan_count"], 1)
+            self.assertEqual(len(owner_ids), 1)
+            self.assertEqual(result["ownership"]["owner_id"], next(iter(owner_ids)))
+            self.assertTrue(all(delegated for _, _, delegated in seen_calls))
+            self.assertTrue(result["ownership"]["released"])
+
     def test_prepare_resume_marks_stale_running_chunk_interrupted(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             source = Path(tmpdir) / "raw.txt"
@@ -3135,29 +3274,35 @@ chunk_context_summary_tokens: 20
             self.assertEqual(result["control"]["replan"]["max_auto_replans"], 1)
 
     def test_process_chunks_with_replans_stops_when_replan_step_fails(self):
-        with mock.patch.object(utils, "process_chunks", side_effect=[
-            {
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source = Path(tmpdir) / "raw.txt"
+            work_dir = Path(tmpdir) / "chunks"
+            source.write_text("第一句。第二句。第三句。第四句。", encoding="utf-8")
+            utils.chunk_text(str(source), str(work_dir), 4, "structure_only")
+
+            with mock.patch.object(utils, "process_chunks", side_effect=[
+                {
+                    "success": False,
+                    "processed_count": 0,
+                    "failed_count": 1,
+                    "skipped_count": 0,
+                    "superseded_count": 0,
+                    "warnings": [],
+                    "output_files": [],
+                    "request_url": "https://api.example.com/v1/chat/completions",
+                    "aborted": True,
+                    "aborted_reason": "need replan",
+                    "replan_required": True,
+                    "replan_reason": "timeout on chunk 0",
+                    "plan": {"plan_id": "plan_a"},
+                },
+            ]), mock.patch.object(utils, "replan_remaining", return_value={
                 "success": False,
-                "processed_count": 0,
-                "failed_count": 1,
-                "skipped_count": 0,
-                "superseded_count": 0,
-                "warnings": [],
-                "output_files": [],
-                "request_url": "https://api.example.com/v1/chat/completions",
-                "aborted": True,
-                "aborted_reason": "need replan",
-                "replan_required": True,
-                "replan_reason": "timeout on chunk 0",
-                "plan": {"plan_id": "plan_a"},
-            },
-        ]), mock.patch.object(utils, "replan_remaining", return_value={
-            "success": False,
-            "replanned": False,
-            "error": "failed to generate replacement plan",
-            "warnings": ["controller warning"],
-        }):
-            result = utils.process_chunks_with_replans("/tmp/demo", "structure_only", max_replans=1)
+                "replanned": False,
+                "error": "failed to generate replacement plan",
+                "warnings": ["controller warning"],
+            }):
+                result = utils.process_chunks_with_replans(str(work_dir), "structure_only", max_replans=1)
 
         self.assertFalse(result["success"])
         self.assertTrue(result["aborted"])

@@ -1,10 +1,10 @@
-# System Design (v5.6-stage6)
+# System Design (v5.7-stage7)
 
-**Stage**: 6
+**Stage**: 7
 
 **Status**: accepted and implemented
 
-**Behavior change in this stage**: formalized a stable kernel command envelope for Python and CLI use, added local telemetry journals, and documented a compatibility-preserving public interface layer on top of the Stage 5 control model
+**Behavior change in this stage**: extracted the Stage 6 envelope and telemetry helpers into `kernel_runtime.py`, added inspectable work-dir ownership files for manifest-mutating commands, and kept the Stage 6 Python and CLI interfaces backward compatible
 
 **Source of truth**: This file is the canonical system design document for the repository.
 
@@ -12,18 +12,18 @@
 
 ---
 
-## 1. Stage 6 Goal
+## 1. Stage 7 Goal
 
-Stage 6 hardens the interface and observability side of the long-text kernel.
+Stage 7 hardens the runtime boundary of the long-text kernel.
 
 Its goals are:
 
-- define a stable Python command API without breaking existing flat function returns
-- define a stable CLI envelope mode without breaking existing flat JSON output
-- persist lightweight command telemetry in a local journal for debugging and post-run inspection
-- turn interface-level regression checks into part of the kernel contract
+- extract stable envelope, telemetry, and command-dispatch helpers into a dedicated runtime module
+- formalize single-owner mutation semantics for manifest-mutating commands at the work-dir level
+- make runtime ownership conflicts and stale-owner recovery explicit and inspectable on disk
+- decide which envelope and telemetry fields are stable enough to preserve across future extraction work
 
-Stage 6 remains intentionally bounded. It does **not** extract a separate telemetry module, split tests into multiple packages, or solve concurrency-safe task ownership.
+Stage 7 remains intentionally bounded. It does **not** introduce cancellation, a distributed runtime, or a fully concurrency-safe persistent state store.
 
 ---
 
@@ -44,22 +44,24 @@ Its current implemented use cases are:
 - explicit chunk verification, bounded repair, and bounded replan control loops
 - stable kernel command envelopes for Python and CLI consumers
 - local telemetry journals for kernel command runs
+- local runtime ownership for manifest-mutating commands
 - deterministic merge and final markdown assembly
 - workflow validation and stop/go quality checks
 
 ### 2.2 Current Primary Design Goal
 
-> Enable reliable long-text transcript transformation under context limits, especially on weaker models, using script-owned state, explicit normalization, explicit chunk contracts, bounded continuity, explicit lifecycle semantics, explicit control contracts, deterministic verification, and compatibility-preserving command interfaces.
+> Enable reliable long-text transcript transformation under context limits, especially on weaker models, using script-owned state, explicit normalization, explicit chunk contracts, bounded continuity, explicit lifecycle semantics, explicit control contracts, deterministic verification, compatibility-preserving command interfaces, and local single-owner runtime mutation guards.
 
 ### 2.3 Current Non-Goals
 
-At Stage 6, the system is **not yet**:
+At Stage 7, the system is **not yet**:
 
 - a generalized multi-source document transformation framework
 - a reusable extracted kernel package
 - a global glossary / terminology propagation system
 - an LLM-judge semantic verification system
-- a concurrency-safe persistent state store
+- a fully concurrency-safe persistent state store beyond local single-owner work-dir mutation
+- a cancellation / pause protocol for long-running jobs
 - a telemetry-first production runtime with remote aggregation or tracing backends
 
 ---
@@ -80,6 +82,7 @@ source acquisition
   -> canonical chunk contract selection
   -> operation control contract emission
   -> stable command envelope / trace allocation
+  -> runtime ownership acquisition for manifest-mutating commands
   -> chunking
   -> resume preflight / manifest repair
   -> per-chunk prompt execution
@@ -88,6 +91,7 @@ source acquisition
   -> deterministic merge
   -> deterministic final assembly
   -> quality verification
+  -> runtime ownership release
   -> local telemetry journal append
 ```
 
@@ -103,7 +107,7 @@ The current implementation relies on these persisted artifacts:
   - normalized source artifact
 - `manifest.json` in chunk work directories
   - chunk plan, chunk contract, continuity policy, runtime state, resume / autotune / replan metadata, and explicit operation-control state
-  - manifest schema remains `v5` in Stage 6
+  - manifest schema remains `v5` in Stage 7
 - `/tmp/${VIDEO_ID}_raw_text.txt`
   - raw extracted transcript-like text
 - `/tmp/${VIDEO_ID}_segments.json`
@@ -115,6 +119,8 @@ The current implementation relies on these persisted artifacts:
 - final markdown output under configured output directory
 - `telemetry.jsonl` beside inferred kernel work artifacts when a stable local sink can be resolved
   - append-only local command journal for envelope-producing kernel commands
+- `.runtime_owner.json` inside chunk work directories during manifest-mutating operations
+  - inspectable single-owner runtime marker used by `prepare-resume`, `process-chunks`, `replan-remaining`, and `process-chunks-with-replans`
 
 ### 3.3 Current State Surfaces
 
@@ -252,7 +258,7 @@ Its current role is:
 
 `process-chunks` now calls the same repair logic automatically before execution starts and returns the resume report in its JSON result.
 
-### 3.11 Current Planning, Interface, and Control Surfaces
+### 3.11 Current Planning, Interface, Control, and Ownership Surfaces
 
 `plan-optimization` now:
 
@@ -277,13 +283,16 @@ The current per-operation `control` contract reports:
 - replan triggers and the required action (`auto_replan_remaining` or `stop_and_review`)
 - final quality-gate expectations for the operation output
 
-Stage 6 also defines a compatibility-preserving interface layer:
+Stage 7 now defines an extracted runtime boundary in `kernel_runtime.py`.
 
-- direct Python functions still return the existing flat dictionaries
-- `run_kernel_command(...)` is now the stable Python envelope API for kernel commands
-- `python3 yt_transcript_utils.py --api-envelope ...` emits the same stable envelope for kernel commands on the CLI
+Its current responsibilities are:
 
-The stable envelope currently uses:
+- stable command-envelope construction
+- local telemetry sink inference and append-only journal writes
+- compatibility-preserving command dispatch wrapping for kernel commands
+- local runtime ownership acquisition / release helpers for manifest-mutating commands
+
+The stable envelope now treated as long-term compatible uses:
 
 - `format = yt_transcript.command_result/v1`
 - `schema_version = 1`
@@ -294,9 +303,10 @@ The stable envelope currently uses:
 - `telemetry`
 - `result`
 
-The local telemetry journal currently uses:
+The local telemetry event now treated as long-term compatible uses:
 
 - `format = yt_transcript.telemetry_event/v1`
+- `schema_version = 1`
 - `event_type = command_result`
 - `trace_id`
 - `command`
@@ -304,7 +314,27 @@ The local telemetry journal currently uses:
 - `duration_ms`
 - `success`
 - `warning_count`
+- `document_id`
 - inferred local sink path in `telemetry.jsonl`
+
+Stage 7 also adds a local runtime ownership surface:
+
+- `format = yt_transcript.runtime_owner/v1`
+- `schema_version = 1`
+- `owner_id`
+- `operation`
+- `pid`
+- `work_dir`
+- `acquired_at`
+- owner file path `.runtime_owner.json`
+
+The current ownership policy is:
+
+- only one manifest-mutating command may actively own a given work directory at a time
+- `prepare-resume`, `process-chunks`, `replan-remaining`, and `process-chunks-with-replans` all claim ownership before mutation
+- a stale owner is currently recoverable when the owner file is invalid, missing a usable pid, or points to a dead process
+- `process-chunks-with-replans` acquires once and passes the same ownership through inner `process-chunks` / `replan-remaining` steps
+- ownership conflicts return structured JSON failures instead of silently racing on `manifest.json`
 
 `process-chunks` continues to persist the active operation surface into `manifest.json` via:
 
@@ -406,40 +436,41 @@ New public interfaces should prefer additive envelope layers over breaking chang
 
 ---
 
-## 5. Stage 6 Deliverables
+## 5. Stage 7 Deliverables
 
 Completed in this stage:
 
-- introduced `run_kernel_command(...)` as the stable Python envelope API for kernel commands
-- introduced CLI `--api-envelope` output mode for the same kernel command surface
-- formalized `yt_transcript.command_result/v1` as the current command envelope format
-- formalized `yt_transcript.telemetry_event/v1` as the current local telemetry event format
-- appended kernel command telemetry to local `telemetry.jsonl` sinks when a stable path can be inferred
-- kept legacy flat Python and default CLI JSON outputs compatible
-- added interface-level regression coverage for envelope behavior and telemetry persistence
+- extracted the Stage 6 envelope, telemetry, and command-dispatch helpers into `kernel_runtime.py`
+- kept `run_kernel_command(...)` and CLI `--api-envelope` behavior compatible while routing through the extracted runtime module
+- formalized `yt_transcript.runtime_owner/v1` as the current local ownership record format
+- added `.runtime_owner.json` ownership files for manifest-mutating work directories
+- gated `prepare-resume`, `process-chunks`, `replan-remaining`, and `process-chunks-with-replans` behind local ownership acquisition
+- added stale-owner recovery for invalid or dead owners before reacquiring a work-dir mutation lock
+- added regression coverage for ownership conflicts, stale-owner recovery, and shared ownership across auto-replan loops
 
 Not done in this stage:
 
-- no remote telemetry backend or distributed tracing yet
-- no extracted telemetry / interface package yet
-- no test directory split by subsystem yet
-- no concurrency-safe task ownership or cancellation protocol yet
+- no cancellation or pause protocol yet
+- no distributed or remote ownership backend yet
+- no fully concurrency-safe persistent state store yet
+- no subsystem test-package split yet
+- no controller extraction beyond the runtime boundary module yet
 
 ---
 
 ## 6. Current Known Gaps
 
-The implementation is meaningfully stronger after Stage 6, but still not fully kernelized.
+The implementation is meaningfully stronger after Stage 7, but still not fully kernelized.
 
 The main remaining gaps are:
 
-1. the stable interface layer exists, but it still wraps one large script instead of dedicated packages
+1. the runtime boundary is extracted, but most controller and state logic still lives in one large script
 2. telemetry is local and append-only, but not yet a first-class subsystem with querying or aggregation
 3. verification remains deterministic / heuristic only and does not yet include semantic judge layers
 4. global terminology / entity consistency is still not first-class
-5. runtime control is resumable, but not yet concurrency-safe
-6. cancellation, pause, and long-lived task ownership are not formalized
-7. test coverage is stronger at the interface level, but fixtures are not yet split into dedicated suites by subsystem
+5. ownership is local single-writer gating, not a general concurrent state-store protocol
+6. cancellation, pause, and long-lived job control are not formalized
+7. test coverage is stronger around the runtime boundary, but fixtures are not yet split into dedicated suites by subsystem
 
 ---
 
@@ -468,40 +499,48 @@ Implemented scope:
 - improved regression coverage for interface-level contracts
 - defined local telemetry and debugging expectations explicitly
 
-### Stage 7 — Module Extraction and Runtime Ownership
+### Stage 7 — Runtime Extraction and Ownership
+
+Implemented scope:
+
+- extracted envelope / telemetry / command-dispatch helpers into `kernel_runtime.py`
+- formalized local work-dir ownership for manifest-mutating commands
+- fixed stable envelope / telemetry fields for future extraction work
+
+### Stage 8 — Controller Extraction and Stateful Runtime Control
 
 Planned scope:
 
-- extract interface / telemetry / controller code into dedicated modules
-- formalize task ownership, cancellation, and concurrency-safe state handling
-- decide which envelope and telemetry fields are now long-term stable
+- extract more controller and state-store responsibilities from `yt_transcript_utils.py`
+- decide whether cancellation remains local-only or becomes part of the public runtime contract
+- formalize stronger multi-process state handling beyond the current owner-file gate
 
 ---
 
-## 8. Stage 6 Validation
+## 8. Stage 7 Validation
 
-The Stage 6 implementation is considered valid because:
+The Stage 7 implementation is considered valid because:
 
-- kernel commands now have one stable envelope surface for both Python and CLI consumers
-- the default flat outputs remain compatible for existing workflows
-- telemetry is persisted locally without entangling prompt logic or remote services
-- interface-level regressions now verify both the envelope surface and telemetry side effects
-- Stage 5 control semantics remain preserved underneath the new interface layer
+- Stage 6 envelope behavior remains compatible while the runtime helpers now live in `kernel_runtime.py`
+- manifest-mutating commands now reject concurrent ownership conflicts instead of mutating shared state silently
+- stale local owners can be recovered deterministically when their owner files are invalid or their pids are dead
+- auto-replan loops now reuse one outer ownership claim instead of recursively reacquiring the same work-dir lock
+- ownership artifacts remain inspectable on disk without introducing a remote runtime dependency
 
 Representative validated behaviors in this stage include:
 
-- returning `yt_transcript.command_result/v1` envelopes from `run_kernel_command(...)`
-- appending `yt_transcript.telemetry_event/v1` entries into inferred local `telemetry.jsonl` sinks
-- emitting the same envelope format from CLI kernel commands when `--api-envelope` is used
-- preserving legacy flat JSON output when `--api-envelope` is not used
-- keeping Stage 5 repair / replan behavior intact behind the new interface layer
+- returning `yt_transcript.command_result/v1` envelopes from `run_kernel_command(...)` after runtime extraction
+- appending `yt_transcript.telemetry_event/v1` entries into inferred local `telemetry.jsonl` sinks through `kernel_runtime.py`
+- writing and releasing `.runtime_owner.json` during manifest-mutating command execution
+- returning structured ownership conflicts from `process-chunks` when another active owner already holds the work directory
+- recovering stale owner files during `prepare-resume` and preserving a shared owner across `process-chunks-with-replans`
 
 ---
 
 ## 9. Next Stage Entry Criteria
 
-Stage 7 should begin only when the following are agreed:
+Stage 8 should begin only when the following are agreed:
 
-1. which envelope and telemetry fields are now stable enough to preserve across extraction
-2. how controller, interface, and telemetry responsibilities should split into modules
-3. what concurrency, ownership, and cancellation guarantees the extracted runtime must enforce
+1. which controller and state responsibilities should move out of `yt_transcript_utils.py` next
+2. whether cancellation becomes a public runtime contract or remains an internal/local concern
+3. what stronger state-store guarantees are worth adding beyond the current `.runtime_owner.json` single-owner gate

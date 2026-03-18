@@ -57,6 +57,8 @@ import time
 import urllib.parse
 from pathlib import Path
 
+import kernel_runtime
+
 
 def _skill_root() -> Path:
     return Path(__file__).resolve().parent
@@ -286,10 +288,13 @@ DEFAULT_LLM_CHUNK_RECOVERY_BACKOFF_SEC = 1.0
 MANIFEST_SCHEMA_VERSION = 5
 CHUNK_CONTRACT_SCHEMA_VERSION = 1
 CONTROL_CONTRACT_SCHEMA_VERSION = 1
-COMMAND_RESULT_SCHEMA_VERSION = 1
-COMMAND_RESULT_FORMAT = "yt_transcript.command_result/v1"
-TELEMETRY_EVENT_SCHEMA_VERSION = 1
-TELEMETRY_EVENT_FORMAT = "yt_transcript.telemetry_event/v1"
+COMMAND_RESULT_SCHEMA_VERSION = kernel_runtime.COMMAND_RESULT_SCHEMA_VERSION
+COMMAND_RESULT_FORMAT = kernel_runtime.COMMAND_RESULT_FORMAT
+TELEMETRY_EVENT_SCHEMA_VERSION = kernel_runtime.TELEMETRY_EVENT_SCHEMA_VERSION
+TELEMETRY_EVENT_FORMAT = kernel_runtime.TELEMETRY_EVENT_FORMAT
+RUNTIME_OWNERSHIP_SCHEMA_VERSION = kernel_runtime.RUNTIME_OWNERSHIP_SCHEMA_VERSION
+RUNTIME_OWNERSHIP_FORMAT = kernel_runtime.RUNTIME_OWNERSHIP_FORMAT
+RUNTIME_OWNER_FILENAME = kernel_runtime.RUNTIME_OWNER_FILENAME
 DEFAULT_UNKNOWN_CHUNK_TOKENS = 900
 CHUNK_SEPARATOR = "\n\n"
 DEFAULT_UNKNOWN_OUTPUT_RATIO = 1.0
@@ -1464,8 +1469,133 @@ def _format_resume_report(report: dict) -> str:
     return "Resume repair: " + ", ".join(parts)
 
 
+def _resolve_runtime_mutation_ownership(work_dir: str, operation: str,
+                                      runtime_ownership: dict | None = None) -> tuple[dict, bool]:
+    if isinstance(runtime_ownership, dict) and str(runtime_ownership.get("owner_id", "")).strip():
+        borrowed = dict(runtime_ownership)
+        borrowed["delegated"] = True
+        return borrowed, False
+    return kernel_runtime.acquire_runtime_ownership(work_dir, operation), True
+
+
+def _finalize_mutation_result(result: dict, ownership: dict | None,
+                              release_result: dict | None = None) -> dict:
+    if isinstance(result, dict) and isinstance(ownership, dict):
+        result["ownership"] = kernel_runtime.finalize_runtime_ownership(ownership, release_result)
+    return result
+
+
+def _runtime_ownership_error_parts(ownership: dict) -> tuple[str, str]:
+    error = str(ownership.get("error") or "Runtime ownership conflict").strip()
+    message = str(ownership.get("message") or error).strip()
+    return error, message
+
+
+def _build_prepare_resume_ownership_conflict_result(manifest_path: Path, prompt_name: str,
+                                                    ownership: dict) -> dict:
+    error, message = _runtime_ownership_error_parts(ownership)
+    return _finalize_mutation_result({
+        "success": False,
+        "manifest_path": str(manifest_path),
+        "prompt_name": str(prompt_name or "").strip(),
+        "resume": {"repaired": False, "warnings": []},
+        "runtime": {},
+        "error": error,
+        "message": message,
+    }, ownership)
+
+
+def _build_process_ownership_conflict_result(ownership: dict) -> dict:
+    error, message = _runtime_ownership_error_parts(ownership)
+    return _finalize_mutation_result({
+        "success": False,
+        "processed_count": 0,
+        "failed_count": 0,
+        "skipped_count": 0,
+        "superseded_count": 0,
+        "total_chunks": 0,
+        "warnings": [],
+        "warning_count": 0,
+        "output_files": [],
+        "aborted": True,
+        "aborted_reason": message,
+        "replan_required": False,
+        "replan_reason": "",
+        "resume": {"repaired": False, "warnings": []},
+        "plan": {},
+        "control": {},
+        "request_url": "",
+        "error": error,
+        "message": message,
+    }, ownership)
+
+
+def _build_replan_ownership_conflict_result(ownership: dict) -> dict:
+    error, message = _runtime_ownership_error_parts(ownership)
+    return _finalize_mutation_result({
+        "success": False,
+        "replanned": False,
+        "warnings": [],
+        "error": error,
+        "message": message,
+    }, ownership)
+
+
+def _build_process_with_replans_ownership_conflict_result(ownership: dict) -> dict:
+    error, message = _runtime_ownership_error_parts(ownership)
+    return _finalize_mutation_result({
+        "processed_count": 0,
+        "failed_count": 0,
+        "skipped_count": 0,
+        "superseded_count": 0,
+        "warnings": [],
+        "warning_count": 0,
+        "output_files": [],
+        "replan_count": 0,
+        "request_url": "",
+        "aborted": True,
+        "aborted_reason": message,
+        "success": False,
+        "replan_required": False,
+        "replan_reason": "",
+        "plan": {},
+        "control": {},
+        "error": error,
+        "message": message,
+    }, ownership)
+
+
 def prepare_resume(work_dir: str, prompt_name: str = "", config_path: str = None,
-                   input_key: str = "raw_path") -> dict:
+                   input_key: str = "raw_path", runtime_ownership: dict | None = None) -> dict:
+    manifest_path = Path(work_dir) / "manifest.json"
+    if not manifest_path.exists():
+        print(f"Error: manifest.json not found in {work_dir}", file=sys.stderr)
+        sys.exit(1)
+
+    ownership, owned_here = _resolve_runtime_mutation_ownership(
+        work_dir,
+        "prepare-resume",
+        runtime_ownership=runtime_ownership,
+    )
+    if owned_here and not ownership.get("success", False):
+        return _build_prepare_resume_ownership_conflict_result(manifest_path, prompt_name, ownership)
+
+    release_result = None
+    try:
+        result = _prepare_resume_impl(
+            work_dir,
+            prompt_name=prompt_name,
+            config_path=config_path,
+            input_key=input_key,
+        )
+    finally:
+        if owned_here and ownership.get("success", False):
+            release_result = kernel_runtime.release_runtime_ownership(work_dir, ownership.get("owner_id", ""))
+    return _finalize_mutation_result(result, ownership, release_result)
+
+
+def _prepare_resume_impl(work_dir: str, prompt_name: str = "", config_path: str = None,
+                         input_key: str = "raw_path") -> dict:
     del input_key
     work_path = Path(work_dir)
     manifest_path = work_path / "manifest.json"
@@ -3061,194 +3191,7 @@ def test_deepgram_api(api_key: str) -> dict:
         return {"valid": False, "error": f"Unexpected error: {e}", "balance_warning": False}
 
 
-def _new_trace_id(command: str = "") -> str:
-    payload = f"{command}:{time.time_ns()}:{os.getpid()}:{random.random()}"
-    return hashlib.sha1(payload.encode("utf-8")).hexdigest()[:16]
-
-
-def _command_warning_count(result) -> int:
-    if not isinstance(result, dict):
-        return 0
-    if "warning_count" in result:
-        return max(0, _parse_int(result.get("warning_count"), 0))
-    warnings = result.get("warnings", [])
-    return len(warnings) if isinstance(warnings, list) else 0
-
-
-def _infer_command_success(result) -> bool:
-    if isinstance(result, dict):
-        if "success" in result:
-            return bool(result.get("success"))
-        if "passed" in result:
-            return bool(result.get("passed"))
-        if "valid" in result:
-            return bool(result.get("valid"))
-        hard_failures = result.get("hard_failures")
-        if isinstance(hard_failures, list):
-            return len(hard_failures) == 0
-    return True
-
-
-def _coerce_path(value: str = "") -> str:
-    text = str(value or "").strip()
-    if not text:
-        return ""
-    return str(Path(text).expanduser().resolve())
-
-
-def _infer_command_document_id(command: str, result, context: dict | None = None) -> str:
-    context = context or {}
-    if isinstance(result, dict):
-        outputs = result.get("outputs", {}) if isinstance(result.get("outputs", {}), dict) else {}
-        if outputs.get("work_dir"):
-            return Path(str(outputs["work_dir"])).name
-        manifest_path = str(result.get("manifest_path", "") or "").strip()
-        if manifest_path:
-            return Path(manifest_path).resolve().parent.name
-        normalized_document_path = str(result.get("normalized_document_path", "") or "").strip()
-        if normalized_document_path:
-            return Path(normalized_document_path).resolve().stem
-    for key in ("work_dir", "output_dir"):
-        value = str(context.get(key, "") or "").strip()
-        if value:
-            return Path(value).resolve().name
-    for key in ("state_path", "state_ref"):
-        value = str(context.get(key, "") or "").strip()
-        if value:
-            return Path(value).resolve().stem
-    if command:
-        return command
-    return ""
-
-
-def _resolve_command_telemetry_path(command: str, result, context: dict | None = None) -> str:
-    del command
-    context = context or {}
-    candidates = []
-
-    for key in ("work_dir", "output_dir"):
-        value = str(context.get(key, "") or "").strip()
-        if value:
-            candidates.append(Path(value).expanduser())
-
-    if isinstance(result, dict):
-        manifest_path = str(result.get("manifest_path", "") or "").strip()
-        if manifest_path:
-            candidates.append(Path(manifest_path).expanduser().parent)
-        result_work_dir = str(result.get("work_dir", "") or "").strip()
-        if result_work_dir:
-            candidates.append(Path(result_work_dir).expanduser())
-        normalized_document_path = str(result.get("normalized_document_path", "") or "").strip()
-        if normalized_document_path:
-            candidates.append(Path(normalized_document_path).expanduser().parent)
-        outputs = result.get("outputs", {}) if isinstance(result.get("outputs", {}), dict) else {}
-        output_work_dir = str(outputs.get("work_dir", "") or "").strip()
-        if output_work_dir:
-            candidates.append(Path(output_work_dir).expanduser())
-        for key in ("output_file", "optimized_text"):
-            value = str(result.get(key, outputs.get(key, "")) or "").strip()
-            if value:
-                candidates.append(Path(value).expanduser().parent)
-
-    for key in ("output_file", "optimized_text_path", "output_path", "normalized_document_path", "state_path", "state_ref"):
-        value = str(context.get(key, "") or "").strip()
-        if value:
-            candidates.append(Path(value).expanduser().parent)
-
-    for candidate in candidates:
-        try:
-            resolved = candidate.resolve()
-        except OSError:
-            continue
-        return str(resolved / "telemetry.jsonl")
-    return ""
-
-
-def _build_command_telemetry_event(command: str, result, *, trace_id: str,
-                                   started_at: float, context: dict | None = None,
-                                   telemetry_path: str = "") -> dict:
-    context = context or {}
-    duration_ms = max(0, int((time.monotonic() - started_at) * 1000))
-    warning_count = _command_warning_count(result)
-    event = {
-        "schema_version": TELEMETRY_EVENT_SCHEMA_VERSION,
-        "format": TELEMETRY_EVENT_FORMAT,
-        "event_type": "command_result",
-        "command": str(command or "").strip(),
-        "trace_id": trace_id,
-        "timestamp": _now_iso(),
-        "duration_ms": duration_ms,
-        "success": _infer_command_success(result),
-        "warning_count": warning_count,
-        "document_id": _infer_command_document_id(command, result, context),
-        "telemetry_path": telemetry_path,
-    }
-    if isinstance(result, dict):
-        event["request_url"] = str(result.get("request_url", "") or "")
-        if "processed_count" in result:
-            event["processed_count"] = _parse_int(result.get("processed_count"), 0)
-        if "failed_count" in result:
-            event["failed_count"] = _parse_int(result.get("failed_count"), 0)
-        if "replan_required" in result:
-            event["replan_required"] = bool(result.get("replan_required", False))
-        if "dry_run" in result:
-            event["dry_run"] = bool(result.get("dry_run", False))
-    prompt_name = str(context.get("prompt_name", context.get("prompt", "")) or "").strip()
-    if not prompt_name and isinstance(result, dict):
-        prompt_name = str(result.get("prompt_name", result.get("plan", {}).get("prompt_name", "")) or "").strip()
-    if prompt_name:
-        event["prompt_name"] = prompt_name
-    return event
-
-
-def _append_command_telemetry_event(telemetry_path: str, event: dict) -> str:
-    path_text = str(telemetry_path or "").strip()
-    if not path_text:
-        return ""
-    telemetry_file = Path(path_text)
-    try:
-        telemetry_file.parent.mkdir(parents=True, exist_ok=True)
-        with telemetry_file.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(event, ensure_ascii=False) + "\n")
-        return str(telemetry_file)
-    except OSError:
-        return ""
-
-
-def build_command_result_envelope(command: str, result, *, trace_id: str = "",
-                                  started_at: float | None = None,
-                                  telemetry_path: str = "",
-                                  context: dict | None = None) -> dict:
-    context = context or {}
-    resolved_trace_id = str(trace_id or _new_trace_id(command)).strip()
-    started = started_at if started_at is not None else time.monotonic()
-    resolved_telemetry_path = telemetry_path or _resolve_command_telemetry_path(command, result, context)
-    event = _build_command_telemetry_event(
-        command,
-        result,
-        trace_id=resolved_trace_id,
-        started_at=started,
-        context=context,
-        telemetry_path=resolved_telemetry_path,
-    )
-    persisted_telemetry_path = _append_command_telemetry_event(resolved_telemetry_path, event)
-    event["telemetry_path"] = persisted_telemetry_path
-    return {
-        "schema_version": COMMAND_RESULT_SCHEMA_VERSION,
-        "format": COMMAND_RESULT_FORMAT,
-        "command": str(command or "").strip(),
-        "trace_id": resolved_trace_id,
-        "generated_at": event["timestamp"],
-        "ok": bool(event["success"]),
-        "telemetry": {
-            "event_type": event["event_type"],
-            "duration_ms": event["duration_ms"],
-            "warning_count": event["warning_count"],
-            "document_id": event.get("document_id", ""),
-            "telemetry_path": persisted_telemetry_path,
-        },
-        "result": result,
-    }
+build_command_result_envelope = kernel_runtime.build_command_result_envelope
 
 
 def _kernel_command_registry() -> dict[str, object]:
@@ -3293,32 +3236,12 @@ def _dispatch_process_chunks_command(*, work_dir: str, prompt_name: str, extra_i
 
 
 def run_kernel_command(command: str, **kwargs) -> dict:
-    normalized_command = str(command or "").strip()
-    started_at = time.monotonic()
-    trace_id = _new_trace_id(normalized_command)
-
-    if normalized_command == "process-chunks":
-        result = _dispatch_process_chunks_command(**kwargs)
-        return build_command_result_envelope(
-            normalized_command,
-            result,
-            trace_id=trace_id,
-            started_at=started_at,
-            context=kwargs,
-        )
-
-    registry = _kernel_command_registry()
-    if normalized_command not in registry:
-        raise ValueError(f"Unsupported kernel command: {normalized_command}")
-    result = registry[normalized_command](**kwargs)
-    return build_command_result_envelope(
-        normalized_command,
-        result,
-        trace_id=trace_id,
-        started_at=started_at,
-        context=kwargs,
+    return kernel_runtime.run_registered_kernel_command(
+        command,
+        kwargs=kwargs,
+        registry=_kernel_command_registry(),
+        process_chunks_handler=_dispatch_process_chunks_command,
     )
-
 
 def _prepare_chunking_context(prompt_name: str = "", chunk_size: int = 0,
                               config_path: str = None) -> dict:
@@ -4656,7 +4579,41 @@ def _refresh_manifest_token_source_summary(manifest: dict) -> None:
 
 def process_chunks(work_dir: str, prompt_name: str, extra_instruction: str = "",
                    config_path: str = None, dry_run: bool = False,
-                   input_key: str = "raw_path", force: bool = False) -> dict:
+                   input_key: str = "raw_path", force: bool = False,
+                   runtime_ownership: dict | None = None) -> dict:
+    manifest_path = Path(work_dir) / "manifest.json"
+    if not manifest_path.exists():
+        print(f"Error: manifest.json not found in {work_dir}", file=sys.stderr)
+        sys.exit(1)
+
+    ownership, owned_here = _resolve_runtime_mutation_ownership(
+        work_dir,
+        "process-chunks",
+        runtime_ownership=runtime_ownership,
+    )
+    if owned_here and not ownership.get("success", False):
+        return _build_process_ownership_conflict_result(ownership)
+
+    release_result = None
+    try:
+        result = _process_chunks_impl(
+            work_dir,
+            prompt_name,
+            extra_instruction=extra_instruction,
+            config_path=config_path,
+            dry_run=dry_run,
+            input_key=input_key,
+            force=force,
+        )
+    finally:
+        if owned_here and ownership.get("success", False):
+            release_result = kernel_runtime.release_runtime_ownership(work_dir, ownership.get("owner_id", ""))
+    return _finalize_mutation_result(result, ownership, release_result)
+
+
+def _process_chunks_impl(work_dir: str, prompt_name: str, extra_instruction: str = "",
+                         config_path: str = None, dry_run: bool = False,
+                         input_key: str = "raw_path", force: bool = False) -> dict:
     """
     Process each chunk with isolated LLM API calls for context isolation.
 
@@ -5264,7 +5221,38 @@ def process_chunks(work_dir: str, prompt_name: str, extra_instruction: str = "",
 
 
 def replan_remaining(work_dir: str, prompt_name: str = "", config_path: str = None,
-                     chunk_size: int = 0, input_key: str = "raw_path") -> dict:
+                     chunk_size: int = 0, input_key: str = "raw_path",
+                     runtime_ownership: dict | None = None) -> dict:
+    manifest_path = Path(work_dir) / "manifest.json"
+    if not manifest_path.exists():
+        print(f"Error: manifest.json not found in {work_dir}", file=sys.stderr)
+        sys.exit(1)
+
+    ownership, owned_here = _resolve_runtime_mutation_ownership(
+        work_dir,
+        "replan-remaining",
+        runtime_ownership=runtime_ownership,
+    )
+    if owned_here and not ownership.get("success", False):
+        return _build_replan_ownership_conflict_result(ownership)
+
+    release_result = None
+    try:
+        result = _replan_remaining_impl(
+            work_dir,
+            prompt_name=prompt_name,
+            config_path=config_path,
+            chunk_size=chunk_size,
+            input_key=input_key,
+        )
+    finally:
+        if owned_here and ownership.get("success", False):
+            release_result = kernel_runtime.release_runtime_ownership(work_dir, ownership.get("owner_id", ""))
+    return _finalize_mutation_result(result, ownership, release_result)
+
+
+def _replan_remaining_impl(work_dir: str, prompt_name: str = "", config_path: str = None,
+                           chunk_size: int = 0, input_key: str = "raw_path") -> dict:
     work_path = Path(work_dir)
     manifest_path = work_path / "manifest.json"
     if not manifest_path.exists():
@@ -5511,7 +5499,43 @@ def replan_remaining(work_dir: str, prompt_name: str = "", config_path: str = No
 
 def process_chunks_with_replans(work_dir: str, prompt_name: str, extra_instruction: str = "",
                                 config_path: str = None, input_key: str = "raw_path",
-                                force: bool = False, max_replans: int = 3) -> dict:
+                                force: bool = False, max_replans: int = 3,
+                                runtime_ownership: dict | None = None) -> dict:
+    manifest_path = Path(work_dir) / "manifest.json"
+    if not manifest_path.exists():
+        print(f"Error: manifest.json not found in {work_dir}", file=sys.stderr)
+        sys.exit(1)
+
+    ownership, owned_here = _resolve_runtime_mutation_ownership(
+        work_dir,
+        "process-chunks-with-replans",
+        runtime_ownership=runtime_ownership,
+    )
+    if owned_here and not ownership.get("success", False):
+        return _build_process_with_replans_ownership_conflict_result(ownership)
+
+    release_result = None
+    try:
+        result = _process_chunks_with_replans_impl(
+            work_dir,
+            prompt_name,
+            extra_instruction=extra_instruction,
+            config_path=config_path,
+            input_key=input_key,
+            force=force,
+            max_replans=max_replans,
+            runtime_ownership=ownership,
+        )
+    finally:
+        if owned_here and ownership.get("success", False):
+            release_result = kernel_runtime.release_runtime_ownership(work_dir, ownership.get("owner_id", ""))
+    return _finalize_mutation_result(result, ownership, release_result)
+
+
+def _process_chunks_with_replans_impl(work_dir: str, prompt_name: str, extra_instruction: str = "",
+                                      config_path: str = None, input_key: str = "raw_path",
+                                      force: bool = False, max_replans: int = 3,
+                                      runtime_ownership: dict | None = None) -> dict:
     def current_superseded_count() -> int:
         manifest_path = Path(work_dir) / "manifest.json"
         if not manifest_path.exists():
@@ -5525,6 +5549,11 @@ def process_chunks_with_replans(work_dir: str, prompt_name: str, extra_instructi
             if chunk.get("status") == SUPERSEDED_CHUNK_STATUS
         )
 
+    delegated_runtime_ownership = runtime_ownership
+    if isinstance(runtime_ownership, dict) and str(runtime_ownership.get("owner_id", "")).strip():
+        delegated_runtime_ownership = dict(runtime_ownership)
+        delegated_runtime_ownership["delegated"] = True
+
     if input_key != "raw_path":
         result = process_chunks(
             work_dir,
@@ -5534,6 +5563,7 @@ def process_chunks_with_replans(work_dir: str, prompt_name: str, extra_instructi
             dry_run=False,
             input_key=input_key,
             force=force,
+            runtime_ownership=delegated_runtime_ownership,
         )
         result.setdefault(
             "message",
@@ -5568,6 +5598,7 @@ def process_chunks_with_replans(work_dir: str, prompt_name: str, extra_instructi
             dry_run=False,
             input_key=input_key,
             force=next_force,
+            runtime_ownership=delegated_runtime_ownership,
         )
         aggregate["processed_count"] += last_result.get("processed_count", 0)
         aggregate["failed_count"] += last_result.get("failed_count", 0)
@@ -5615,6 +5646,7 @@ def process_chunks_with_replans(work_dir: str, prompt_name: str, extra_instructi
             prompt_name=prompt_name,
             config_path=config_path,
             input_key=input_key,
+            runtime_ownership=delegated_runtime_ownership,
         )
         aggregate["replan_count"] += 1
         aggregate["warnings"].extend(replan_result.get("warnings", []))
