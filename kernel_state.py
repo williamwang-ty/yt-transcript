@@ -94,7 +94,20 @@ def summarize_runtime_cancel_request(work_dir: str) -> dict:
 
 
 def request_runtime_cancel(work_dir: str, reason: str = "") -> dict:
-    cancel_path = runtime_cancel_path(work_dir)
+    work_path = Path(str(work_dir or "")).expanduser().resolve()
+    if not work_path.exists():
+        return {
+            "schema_version": RUNTIME_CANCEL_SCHEMA_VERSION,
+            "format": RUNTIME_CANCEL_FORMAT,
+            "status": "invalid_work_dir",
+            "requested": False,
+            "reason": str(reason or "").strip(),
+            "requested_at": "",
+            "cancel_path": str(runtime_cancel_path(str(work_path))),
+            "success": False,
+            "error": f"Work directory not found: {work_path}",
+        }
+    cancel_path = runtime_cancel_path(str(work_path))
     payload = {
         "schema_version": RUNTIME_CANCEL_SCHEMA_VERSION,
         "format": RUNTIME_CANCEL_FORMAT,
@@ -102,11 +115,29 @@ def request_runtime_cancel(work_dir: str, reason: str = "") -> dict:
         "requested_at": _now_iso(),
         "work_dir": str(cancel_path.parent),
     }
-    cancel_path.parent.mkdir(parents=True, exist_ok=True)
     write_json_file(cancel_path, payload)
-    result = summarize_runtime_cancel_request(work_dir)
+    result = summarize_runtime_cancel_request(str(work_path))
     result["success"] = True
     return result
+
+
+def consume_runtime_cancel(work_dir: str) -> dict:
+    current = summarize_runtime_cancel_request(work_dir)
+    if not current.get("requested", False):
+        return {
+            **current,
+            "success": True,
+            "consumed": False,
+            "cleared": False,
+        }
+    cleared = clear_runtime_cancel(work_dir)
+    return {
+        **current,
+        "success": bool(cleared.get("success", False)),
+        "consumed": True,
+        "cleared": bool(cleared.get("cleared", False)),
+        "clear_status": str(cleared.get("status", "")).strip(),
+    }
 
 
 def clear_runtime_cancel(work_dir: str) -> dict:

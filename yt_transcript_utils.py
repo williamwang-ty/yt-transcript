@@ -31,6 +31,7 @@ Commands:
     prepare-resume <work_dir>      Repair stale chunk/runtime state before resuming a run
     replan-remaining <work_dir>    Re-plan unfinished raw chunks after canary/autotune aborts
     runtime-status <work_dir>      Inspect manifest runtime, ownership, and local runtime-control status
+    cancel-run <work_dir>          Request local cancellation for an active chunk-processing run
     assemble-final <optimized_text> <output_file>  Assemble final markdown from optimized text + metadata
     verify-quality <optimized_text>  Verify quality of optimized text (structural checks)
     sync-state <state_ref>         Sync legacy state.md and authoritative machine_state.json
@@ -60,6 +61,7 @@ from pathlib import Path
 
 import kernel_runtime
 import kernel_state
+import kernel_controller
 
 
 def _skill_root() -> Path:
@@ -1471,27 +1473,9 @@ def _format_resume_report(report: dict) -> str:
     return "Resume repair: " + ", ".join(parts)
 
 
-def _resolve_runtime_mutation_ownership(work_dir: str, operation: str,
-                                      runtime_ownership: dict | None = None) -> tuple[dict, bool]:
-    if isinstance(runtime_ownership, dict) and str(runtime_ownership.get("owner_id", "")).strip():
-        borrowed = dict(runtime_ownership)
-        borrowed["delegated"] = True
-        return borrowed, False
-    return kernel_runtime.acquire_runtime_ownership(work_dir, operation), True
-
-
-def _finalize_mutation_result(result: dict, ownership: dict | None,
-                              release_result: dict | None = None) -> dict:
-    if isinstance(result, dict) and isinstance(ownership, dict):
-        result["ownership"] = kernel_runtime.finalize_runtime_ownership(ownership, release_result)
-    return result
-
-
-def _runtime_ownership_error_parts(ownership: dict) -> tuple[str, str]:
-    error = str(ownership.get("error") or "Runtime ownership conflict").strip()
-    message = str(ownership.get("message") or error).strip()
-    return error, message
-
+_resolve_runtime_mutation_ownership = kernel_controller.resolve_runtime_mutation_ownership
+_finalize_mutation_result = kernel_controller.finalize_mutation_result
+_runtime_ownership_error_parts = kernel_controller.runtime_ownership_error_parts
 
 def _build_prepare_resume_ownership_conflict_result(manifest_path: Path, prompt_name: str,
                                                     ownership: dict) -> dict:
@@ -1574,26 +1558,18 @@ def prepare_resume(work_dir: str, prompt_name: str = "", config_path: str = None
         print(f"Error: manifest.json not found in {work_dir}", file=sys.stderr)
         sys.exit(1)
 
-    ownership, owned_here = _resolve_runtime_mutation_ownership(
+    return kernel_controller.run_owned_mutation(
         work_dir,
         "prepare-resume",
         runtime_ownership=runtime_ownership,
-    )
-    if owned_here and not ownership.get("success", False):
-        return _build_prepare_resume_ownership_conflict_result(manifest_path, prompt_name, ownership)
-
-    release_result = None
-    try:
-        result = _prepare_resume_impl(
+        conflict_result_builder=lambda ownership: _build_prepare_resume_ownership_conflict_result(manifest_path, prompt_name, ownership),
+        mutation_fn=lambda ownership: _prepare_resume_impl(
             work_dir,
             prompt_name=prompt_name,
             config_path=config_path,
             input_key=input_key,
-        )
-    finally:
-        if owned_here and ownership.get("success", False):
-            release_result = kernel_runtime.release_runtime_ownership(work_dir, ownership.get("owner_id", ""))
-    return _finalize_mutation_result(result, ownership, release_result)
+        ),
+    )
 
 
 def _prepare_resume_impl(work_dir: str, prompt_name: str = "", config_path: str = None,
@@ -3194,6 +3170,10 @@ def runtime_status(work_dir: str) -> dict:
     return kernel_state.summarize_runtime_status(work_dir)
 
 
+def cancel_run(work_dir: str, reason: str = "") -> dict:
+    return kernel_state.request_runtime_cancel(work_dir, reason=reason)
+
+
 def _kernel_command_registry() -> dict[str, object]:
     return {
         "validate-state": validate_state,
@@ -3205,6 +3185,7 @@ def _kernel_command_registry() -> dict[str, object]:
         "prepare-resume": prepare_resume,
         "replan-remaining": replan_remaining,
         "runtime-status": runtime_status,
+        "cancel-run": cancel_run,
         "merge-content": lambda *, work_dir, output_file, header="": merge_content(work_dir, output_file, header_content=header),
         "assemble-final": assemble_final,
         "verify-quality": verify_quality,
@@ -4587,17 +4568,12 @@ def process_chunks(work_dir: str, prompt_name: str, extra_instruction: str = "",
         print(f"Error: manifest.json not found in {work_dir}", file=sys.stderr)
         sys.exit(1)
 
-    ownership, owned_here = _resolve_runtime_mutation_ownership(
+    return kernel_controller.run_owned_mutation(
         work_dir,
         "process-chunks",
         runtime_ownership=runtime_ownership,
-    )
-    if owned_here and not ownership.get("success", False):
-        return _build_process_ownership_conflict_result(ownership)
-
-    release_result = None
-    try:
-        result = _process_chunks_impl(
+        conflict_result_builder=_build_process_ownership_conflict_result,
+        mutation_fn=lambda ownership: _process_chunks_impl(
             work_dir,
             prompt_name,
             extra_instruction=extra_instruction,
@@ -4605,11 +4581,8 @@ def process_chunks(work_dir: str, prompt_name: str, extra_instruction: str = "",
             dry_run=dry_run,
             input_key=input_key,
             force=force,
-        )
-    finally:
-        if owned_here and ownership.get("success", False):
-            release_result = kernel_runtime.release_runtime_ownership(work_dir, ownership.get("owner_id", ""))
-    return _finalize_mutation_result(result, ownership, release_result)
+        ),
+    )
 
 
 def _process_chunks_impl(work_dir: str, prompt_name: str, extra_instruction: str = "",
@@ -4799,6 +4772,7 @@ def _process_chunks_impl(work_dir: str, prompt_name: str, extra_instruction: str
             "resume": resume_report,
             "control": _build_process_control_summary(runtime, operation_control),
             "warnings": setup_warnings,
+            "cancellation": kernel_state.summarize_runtime_cancel_request(work_dir),
             "message": "Dry run: all validations passed"
         }
 
@@ -4816,6 +4790,7 @@ def _process_chunks_impl(work_dir: str, prompt_name: str, extra_instruction: str
     output_files = []
     aborted = False
     aborted_reason = ""
+    cancellation = kernel_state.summarize_runtime_cancel_request(work_dir)
     consecutive_timeouts = 0
     active_total = sum(1 for chunk in manifest["chunks"] if chunk.get("status") != SUPERSEDED_CHUNK_STATUS)
     total = active_total
@@ -4825,11 +4800,63 @@ def _process_chunks_impl(work_dir: str, prompt_name: str, extra_instruction: str
     )
     active_index = 0
 
+    def maybe_abort_for_cancellation() -> bool:
+        nonlocal aborted, aborted_reason, cancellation
+        cancellation_snapshot = kernel_state.summarize_runtime_cancel_request(work_dir)
+        if not cancellation_snapshot.get("requested", False):
+            return False
+        cancellation = kernel_state.consume_runtime_cancel(work_dir)
+        cancel_reason = str(cancellation.get("reason", "")).strip()
+        aborted = True
+        aborted_reason = "Cancellation requested"
+        if cancel_reason:
+            aborted_reason += f": {cancel_reason}"
+        now = _now_iso()
+        runtime["status"] = "aborted"
+        runtime["replan_required"] = False
+        runtime["replan_reason"] = ""
+        runtime["updated_at"] = now
+        runtime["last_cancelled_at"] = now
+        runtime["last_cancel_reason"] = cancel_reason
+        _refresh_manifest_token_source_summary(manifest)
+        _sync_manifest_legacy_fields(manifest)
+        _write_manifest(manifest_path, manifest)
+        print(f"Error: {aborted_reason}", file=sys.stderr)
+        return True
+
+    if maybe_abort_for_cancellation():
+        runtime["processed_count"] = processed_count
+        runtime["failed_count"] = failed_count
+        runtime["skipped_count"] = skipped_count
+        runtime["superseded_count"] = superseded_count
+        return {
+            "success": False,
+            "processed_count": processed_count,
+            "failed_count": failed_count,
+            "skipped_count": skipped_count,
+            "superseded_count": superseded_count,
+            "total_chunks": total,
+            "warnings": warnings,
+            "warning_count": len(warnings),
+            "output_files": output_files,
+            "aborted": True,
+            "aborted_reason": aborted_reason,
+            "replan_required": False,
+            "replan_reason": "",
+            "resume": resume_report,
+            "plan": manifest.get("plan", {}),
+            "control": _build_process_control_summary(runtime, operation_control),
+            "request_url": request_url,
+            "cancellation": cancellation,
+        }
+
     for chunk_index, chunk_info in enumerate(manifest["chunks"]):
         chunk_id = chunk_info["id"]
         if chunk_info.get("status") == SUPERSEDED_CHUNK_STATUS:
             superseded_count += 1
             continue
+        if maybe_abort_for_cancellation():
+            break
         active_index += 1
         runtime["current_chunk_index"] = chunk_index
         input_filename = chunk_info.get(input_key, chunk_info["raw_path"])
@@ -5218,6 +5245,7 @@ def _process_chunks_impl(work_dir: str, prompt_name: str, extra_instruction: str
         "plan": manifest.get("plan", {}),
         "control": _build_process_control_summary(runtime, operation_control),
         "request_url": request_url,
+        "cancellation": cancellation,
     }
 
 
@@ -5229,27 +5257,19 @@ def replan_remaining(work_dir: str, prompt_name: str = "", config_path: str = No
         print(f"Error: manifest.json not found in {work_dir}", file=sys.stderr)
         sys.exit(1)
 
-    ownership, owned_here = _resolve_runtime_mutation_ownership(
+    return kernel_controller.run_owned_mutation(
         work_dir,
         "replan-remaining",
         runtime_ownership=runtime_ownership,
-    )
-    if owned_here and not ownership.get("success", False):
-        return _build_replan_ownership_conflict_result(ownership)
-
-    release_result = None
-    try:
-        result = _replan_remaining_impl(
+        conflict_result_builder=_build_replan_ownership_conflict_result,
+        mutation_fn=lambda ownership: _replan_remaining_impl(
             work_dir,
             prompt_name=prompt_name,
             config_path=config_path,
             chunk_size=chunk_size,
             input_key=input_key,
-        )
-    finally:
-        if owned_here and ownership.get("success", False):
-            release_result = kernel_runtime.release_runtime_ownership(work_dir, ownership.get("owner_id", ""))
-    return _finalize_mutation_result(result, ownership, release_result)
+        ),
+    )
 
 
 def _replan_remaining_impl(work_dir: str, prompt_name: str = "", config_path: str = None,
@@ -5507,17 +5527,12 @@ def process_chunks_with_replans(work_dir: str, prompt_name: str, extra_instructi
         print(f"Error: manifest.json not found in {work_dir}", file=sys.stderr)
         sys.exit(1)
 
-    ownership, owned_here = _resolve_runtime_mutation_ownership(
+    return kernel_controller.run_owned_mutation(
         work_dir,
         "process-chunks-with-replans",
         runtime_ownership=runtime_ownership,
-    )
-    if owned_here and not ownership.get("success", False):
-        return _build_process_with_replans_ownership_conflict_result(ownership)
-
-    release_result = None
-    try:
-        result = _process_chunks_with_replans_impl(
+        conflict_result_builder=_build_process_with_replans_ownership_conflict_result,
+        mutation_fn=lambda ownership: _process_chunks_with_replans_impl(
             work_dir,
             prompt_name,
             extra_instruction=extra_instruction,
@@ -5526,11 +5541,8 @@ def process_chunks_with_replans(work_dir: str, prompt_name: str, extra_instructi
             force=force,
             max_replans=max_replans,
             runtime_ownership=ownership,
-        )
-    finally:
-        if owned_here and ownership.get("success", False):
-            release_result = kernel_runtime.release_runtime_ownership(work_dir, ownership.get("owner_id", ""))
-    return _finalize_mutation_result(result, ownership, release_result)
+        ),
+    )
 
 
 def _process_chunks_with_replans_impl(work_dir: str, prompt_name: str, extra_instruction: str = "",
@@ -5550,140 +5562,19 @@ def _process_chunks_with_replans_impl(work_dir: str, prompt_name: str, extra_ins
             if chunk.get("status") == SUPERSEDED_CHUNK_STATUS
         )
 
-    delegated_runtime_ownership = runtime_ownership
-    if isinstance(runtime_ownership, dict) and str(runtime_ownership.get("owner_id", "")).strip():
-        delegated_runtime_ownership = dict(runtime_ownership)
-        delegated_runtime_ownership["delegated"] = True
-
-    if input_key != "raw_path":
-        result = process_chunks(
-            work_dir,
-            prompt_name,
-            extra_instruction=extra_instruction,
-            config_path=config_path,
-            dry_run=False,
-            input_key=input_key,
-            force=force,
-            runtime_ownership=delegated_runtime_ownership,
-        )
-        result.setdefault(
-            "message",
-            "auto-replan is available only for raw_path plans; rerun manually if replanning is required.",
-        )
-        return result
-
-    aggregate = {
-        "processed_count": 0,
-        "failed_count": 0,
-        "skipped_count": 0,
-        "superseded_count": 0,
-        "warnings": [],
-        "warning_count": 0,
-        "output_files": [],
-        "replan_count": 0,
-        "request_url": "",
-        "aborted": False,
-        "aborted_reason": "",
-        "success": False,
-        "control": {},
-    }
-
-    next_force = force
-    last_result = {}
-    for _ in range(max(0, max_replans) + 1):
-        last_result = process_chunks(
-            work_dir,
-            prompt_name,
-            extra_instruction=extra_instruction,
-            config_path=config_path,
-            dry_run=False,
-            input_key=input_key,
-            force=next_force,
-            runtime_ownership=delegated_runtime_ownership,
-        )
-        aggregate["processed_count"] += last_result.get("processed_count", 0)
-        aggregate["failed_count"] += last_result.get("failed_count", 0)
-        aggregate["skipped_count"] += last_result.get("skipped_count", 0)
-        aggregate["warnings"].extend(last_result.get("warnings", []))
-        aggregate["output_files"].extend(last_result.get("output_files", []))
-        aggregate["request_url"] = last_result.get("request_url", aggregate["request_url"])
-        aggregate["control"] = last_result.get("control", aggregate.get("control", {}))
-        aggregate["superseded_count"] = current_superseded_count()
-
-        if not last_result.get("replan_required", False):
-            aggregate.update({
-                "success": last_result.get("success", False),
-                "aborted": last_result.get("aborted", False),
-                "aborted_reason": last_result.get("aborted_reason", ""),
-                "replan_required": False,
-                "replan_reason": "",
-                "plan": last_result.get("plan", {}),
-            })
-            if isinstance(aggregate.get("control"), dict) and isinstance(aggregate["control"].get("replan"), dict):
-                aggregate["control"]["replan"]["auto_replan_count"] = aggregate["replan_count"]
-                aggregate["control"]["replan"]["max_auto_replans"] = max(0, max_replans)
-            aggregate["warning_count"] = len(aggregate["warnings"])
-            aggregate["superseded_count"] = current_superseded_count()
-            return aggregate
-
-        if aggregate["replan_count"] >= max(0, max_replans):
-            aggregate.update({
-                "success": False,
-                "aborted": True,
-                "aborted_reason": last_result.get("aborted_reason", "Reached max auto-replan limit"),
-                "replan_required": True,
-                "replan_reason": last_result.get("replan_reason", ""),
-                "plan": last_result.get("plan", {}),
-            })
-            if isinstance(aggregate.get("control"), dict) and isinstance(aggregate["control"].get("replan"), dict):
-                aggregate["control"]["replan"]["auto_replan_count"] = aggregate["replan_count"]
-                aggregate["control"]["replan"]["max_auto_replans"] = max(0, max_replans)
-            aggregate["warning_count"] = len(aggregate["warnings"])
-            aggregate["superseded_count"] = current_superseded_count()
-            return aggregate
-
-        replan_result = replan_remaining(
-            work_dir,
-            prompt_name=prompt_name,
-            config_path=config_path,
-            input_key=input_key,
-            runtime_ownership=delegated_runtime_ownership,
-        )
-        aggregate["replan_count"] += 1
-        aggregate["warnings"].extend(replan_result.get("warnings", []))
-        aggregate["superseded_count"] = current_superseded_count()
-        if not replan_result.get("success", False):
-            replan_error = replan_result.get("error") or replan_result.get("message") or "unknown error"
-            aggregate.update({
-                "success": False,
-                "aborted": True,
-                "aborted_reason": f"Auto-replan failed: {replan_error}",
-                "replan_required": True,
-                "replan_reason": last_result.get("replan_reason", "") or replan_error,
-                "plan": last_result.get("plan", {}),
-            })
-            if isinstance(aggregate.get("control"), dict) and isinstance(aggregate["control"].get("replan"), dict):
-                aggregate["control"]["replan"]["auto_replan_count"] = aggregate["replan_count"]
-                aggregate["control"]["replan"]["max_auto_replans"] = max(0, max_replans)
-            aggregate["warning_count"] = len(aggregate["warnings"])
-            return aggregate
-        next_force = False
-
-    aggregate.update({
-        "success": False,
-        "aborted": True,
-        "aborted_reason": last_result.get("aborted_reason", "Reached max auto-replan limit"),
-        "replan_required": last_result.get("replan_required", False),
-        "replan_reason": last_result.get("replan_reason", ""),
-        "plan": last_result.get("plan", {}),
-    })
-    if isinstance(aggregate.get("control"), dict) and isinstance(aggregate["control"].get("replan"), dict):
-        aggregate["control"]["replan"]["auto_replan_count"] = aggregate["replan_count"]
-        aggregate["control"]["replan"]["max_auto_replans"] = max(0, max_replans)
-    aggregate["warning_count"] = len(aggregate["warnings"])
-    aggregate["superseded_count"] = current_superseded_count()
-    return aggregate
-
+    return kernel_controller.run_auto_replan_loop(
+        work_dir=work_dir,
+        prompt_name=prompt_name,
+        extra_instruction=extra_instruction,
+        config_path=config_path,
+        input_key=input_key,
+        force=force,
+        max_replans=max_replans,
+        runtime_ownership=runtime_ownership,
+        process_chunks_fn=process_chunks,
+        replan_remaining_fn=replan_remaining,
+        current_superseded_count_fn=current_superseded_count,
+    )
 
 def detect_audio_content_type(audio_path: str) -> str:
     ext = Path(audio_path).suffix.lower().lstrip(".")
@@ -7238,6 +7129,14 @@ def main():
     )
     runtime_status_parser.add_argument('work_dir', help='Working directory to inspect')
 
+    # cancel-run command
+    cancel_parser = subparsers.add_parser(
+        'cancel-run',
+        help='Request local cancellation for an active chunk-processing run'
+    )
+    cancel_parser.add_argument('work_dir', help='Working directory to cancel')
+    cancel_parser.add_argument('--reason', default='', help='Optional cancellation reason')
+
     # assemble-final command
     af_parser = subparsers.add_parser(
         'assemble-final',
@@ -7488,6 +7387,17 @@ def main():
             work_dir=args.work_dir,
         )
         print(json.dumps(envelope if args.api_envelope else envelope['result'], ensure_ascii=False))
+
+    elif args.command == 'cancel-run':
+        envelope = run_kernel_command(
+            'cancel-run',
+            work_dir=args.work_dir,
+            reason=args.reason,
+        )
+        result = envelope['result']
+        print(json.dumps(envelope if args.api_envelope else result, ensure_ascii=False))
+        if not result.get('success', False):
+            sys.exit(1)
 
     elif args.command == 'assemble-final':
         envelope = run_kernel_command(

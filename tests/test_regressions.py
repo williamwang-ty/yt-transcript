@@ -1336,6 +1336,87 @@ exit 1
             self.assertTrue(result["ownership"]["held"])
             self.assertFalse(result["cancellation"]["requested"])
 
+    def test_cancel_run_marks_runtime_cancel_request(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source = Path(tmpdir) / "raw.txt"
+            work_dir = Path(tmpdir) / "chunks"
+            source.write_text("第一句。第二句。第三句。第四句。", encoding="utf-8")
+            utils.chunk_text(str(source), str(work_dir), 4, "structure_only")
+
+            result = utils.cancel_run(str(work_dir), reason="user requested stop")
+            status = utils.runtime_status(str(work_dir))
+
+            self.assertTrue(result["success"])
+            self.assertTrue(result["requested"])
+            self.assertEqual(result["reason"], "user requested stop")
+            self.assertTrue(status["cancellation"]["requested"])
+            self.assertEqual(status["cancellation"]["reason"], "user requested stop")
+
+    def test_process_chunks_aborts_when_cancel_requested(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source = Path(tmpdir) / "raw.txt"
+            work_dir = Path(tmpdir) / "chunks"
+            source.write_text("第一句。第二句。第三句。第四句。", encoding="utf-8")
+            utils.chunk_text(str(source), str(work_dir), 4, "structure_only")
+            utils.cancel_run(str(work_dir), reason="operator stop")
+
+            config = utils._default_config_values()
+            config.update({
+                "llm_api_key": "key",
+                "llm_base_url": "https://api.example.com",
+                "llm_model": "demo",
+                "llm_api_format": "openai",
+            })
+
+            with mock.patch.object(utils, "load_config", return_value=config), mock.patch.object(
+                utils,
+                "_call_llm_api",
+                side_effect=AssertionError("cancelled run should not call LLM"),
+            ):
+                result = utils.process_chunks(str(work_dir), "structure_only")
+
+            manifest = json.loads((work_dir / "manifest.json").read_text(encoding="utf-8"))
+            self.assertFalse(result["success"])
+            self.assertTrue(result["aborted"])
+            self.assertIn("Cancellation requested", result["aborted_reason"])
+            self.assertTrue(result["cancellation"]["consumed"])
+            self.assertTrue(result["cancellation"]["cleared"])
+            self.assertFalse((work_dir / utils.kernel_state.RUNTIME_CANCEL_FILENAME).exists())
+            self.assertEqual(manifest["runtime"]["status"], "aborted")
+            self.assertEqual(manifest["runtime"]["last_cancel_reason"], "operator stop")
+
+    def test_cli_api_envelope_wraps_cancel_run(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source = Path(tmpdir) / "raw.txt"
+            work_dir = Path(tmpdir) / "chunks"
+            source.write_text("第一句。第二句。第三句。第四句。", encoding="utf-8")
+            utils.chunk_text(str(source), str(work_dir), 4, "structure_only")
+
+            result = subprocess.run(
+                [
+                    "python3",
+                    str(PROJECT_ROOT / "yt_transcript_utils.py"),
+                    "--api-envelope",
+                    "cancel-run",
+                    str(work_dir),
+                    "--reason",
+                    "cli stop",
+                ],
+                cwd=PROJECT_ROOT,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+            payload = json.loads(result.stdout)
+            telemetry_path = Path(payload["telemetry"]["telemetry_path"])
+            self.assertEqual(payload["format"], utils.COMMAND_RESULT_FORMAT)
+            self.assertEqual(payload["command"], "cancel-run")
+            self.assertTrue(payload["ok"])
+            self.assertTrue(payload["result"]["requested"])
+            self.assertEqual(payload["result"]["reason"], "cli stop")
+            self.assertTrue(telemetry_path.exists())
+
     def test_cli_api_envelope_wraps_runtime_status(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             source = Path(tmpdir) / "raw.txt"

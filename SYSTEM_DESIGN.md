@@ -1,10 +1,10 @@
-# System Design (v5.8-stage8)
+# System Design (v5.9-stage9)
 
-**Stage**: 8
+**Stage**: 9
 
 **Status**: accepted and implemented
 
-**Behavior change in this stage**: extracted local manifest and runtime-control file handling into `kernel_state.py`, added a public `runtime-status` inspection command, and preserved the Stage 7 runtime ownership and Stage 6 envelope contracts
+**Behavior change in this stage**: extracted mutation wrappers and bounded auto-replan orchestration into `kernel_controller.py`, added a public `cancel-run` command, and made `process-chunks` consume local cancellation markers safely while preserving Stage 8 state and Stage 7 ownership contracts
 
 **Source of truth**: This file is the canonical system design document for the repository.
 
@@ -12,18 +12,18 @@
 
 ---
 
-## 1. Stage 8 Goal
+## 1. Stage 9 Goal
 
-Stage 8 hardens the local state-store boundary of the long-text kernel.
+Stage 9 hardens the controller boundary of the long-text kernel.
 
 Its goals are:
 
-- extract manifest and local runtime-control file handling into a dedicated state module
-- add a public runtime inspection command without entangling mutation logic with CLI-only behavior
-- keep ownership, envelope, and telemetry contracts compatible while making local state surfaces easier to reuse
-- keep cancellation state local and inspectable while deferring public cancellation control to the next stage
+- extract mutation wrappers and bounded replan orchestration into a dedicated controller module
+- promote local cancellation from an inspectable marker to a public command contract
+- make chunk execution observe cancellation at safe boundaries without breaking ownership or resumability semantics
+- keep state-store, envelope, and telemetry contracts compatible while expanding runtime control behavior
 
-Stage 8 remains intentionally bounded. It does **not** yet extract the controller loops or expose cancellation as a public mutation command.
+Stage 9 remains intentionally bounded. It does **not** introduce distributed scheduling, public pause/resume, or a fully concurrency-safe persistent state store.
 
 ---
 
@@ -46,6 +46,7 @@ Its current implemented use cases are:
 - local telemetry journals for kernel command runs
 - local runtime ownership for manifest-mutating commands
 - local runtime status inspection for work directories
+- public local cancellation for active chunk-processing runs
 - deterministic merge and final markdown assembly
 - workflow validation and stop/go quality checks
 
@@ -55,14 +56,14 @@ Its current implemented use cases are:
 
 ### 2.3 Current Non-Goals
 
-At Stage 8, the system is **not yet**:
+At Stage 9, the system is **not yet**:
 
 - a generalized multi-source document transformation framework
 - a reusable extracted kernel package
 - a global glossary / terminology propagation system
 - an LLM-judge semantic verification system
 - a fully concurrency-safe persistent state store beyond local single-owner work-dir mutation
-- a public cancellation / pause protocol for long-running jobs
+- a public pause / resume protocol for long-running jobs beyond cancellation
 - a telemetry-first production runtime with remote aggregation or tracing backends
 
 ---
@@ -98,6 +99,10 @@ source acquisition
 read-only runtime inspection
   -> manifest / ownership / local control snapshot
   -> stable runtime-status result
+
+public runtime cancellation
+  -> cancel-run writes local cancellation marker
+  -> process-chunks consumes marker at the next safe boundary
 ```
 
 ### 3.2 Current Persisted Artifacts
@@ -112,7 +117,7 @@ The current implementation relies on these persisted artifacts:
   - normalized source artifact
 - `manifest.json` in chunk work directories
   - chunk plan, chunk contract, continuity policy, runtime state, resume / autotune / replan metadata, and explicit operation-control state
-  - manifest schema remains `v5` in Stage 8
+  - manifest schema remains `v5` in Stage 9
 - `/tmp/${VIDEO_ID}_raw_text.txt`
   - raw extracted transcript-like text
 - `/tmp/${VIDEO_ID}_segments.json`
@@ -127,7 +132,7 @@ The current implementation relies on these persisted artifacts:
 - `.runtime_owner.json` inside chunk work directories during manifest-mutating operations
   - inspectable single-owner runtime marker used by `prepare-resume`, `process-chunks`, `replan-remaining`, and `process-chunks-with-replans`
 - optional `.runtime_cancel.json` inside chunk work directories
-  - reserved local runtime-control marker surfaced by `runtime-status`; public cancellation commands are not implemented until the next stage
+  - public local cancellation marker written by `cancel-run`, surfaced by `runtime-status`, and consumed by `process-chunks`
 
 ### 3.3 Current State Surfaces
 
@@ -265,7 +270,7 @@ Its current role is:
 
 `process-chunks` now calls the same repair logic automatically before execution starts and returns the resume report in its JSON result.
 
-### 3.11 Current Planning, Interface, State, Control, and Ownership Surfaces
+### 3.11 Current Planning, Interface, State, Controller, Control, and Ownership Surfaces
 
 `plan-optimization` now:
 
@@ -307,6 +312,16 @@ Its current responsibilities are:
 - atomic local file writes for manifest-adjacent runtime artifacts
 - local runtime-control file summaries
 - read-only runtime inspection via `runtime-status`
+- local cancellation marker read/write / consume helpers
+
+Stage 9 now also defines a controller boundary in `kernel_controller.py`.
+
+Its current responsibilities are:
+
+- owned mutation wrapper orchestration for manifest-mutating commands
+- delegated ownership propagation into nested control loops
+- bounded auto-replan loop execution for `process-chunks-with-replans`
+- compatibility-preserving mutation result finalization
 
 The stable envelope now treated as long-term compatible uses:
 
@@ -350,6 +365,13 @@ Stage 8 also adds a read-only runtime status surface:
 - it reports manifest presence, runtime state, chunk-status counts, ownership state, and local cancellation-marker state
 - it does not mutate the work directory and therefore does not acquire runtime ownership
 
+Stage 9 also adds a public local cancellation surface:
+
+- `cancel-run` is a stable kernel command for requesting cancellation of active chunk-processing work
+- it writes `.runtime_cancel.json` in the target work directory
+- `process-chunks` checks for cancellation before work starts and between chunks
+- observed cancellation markers are consumed and cleared before the runner aborts at the next safe boundary
+
 The current ownership policy is:
 
 - only one manifest-mutating command may actively own a given work directory at a time
@@ -371,6 +393,7 @@ Current control semantics remain:
 - verification = inspect produced text and classify warnings versus hard stop/go failures
 - repair = rerun the same chunk under the same active plan
 - replan = abort the current run because the active plan is no longer trusted
+- cancellation = stop an active chunk-processing run at the next safe boundary without disturbing completed chunk checkpoints
 - `process-chunks-with-replans` = bounded wrapper that auto-replans raw-path plans up to `max_replans`
 
 ### 3.12 Current Core Commands
@@ -388,6 +411,7 @@ The current Python utility surface includes the following architectural primitiv
 - `process-chunks`
 - `replan-remaining`
 - `runtime-status`
+- `cancel-run`
 - `merge-content`
 - `assemble-final`
 - `verify-quality`
@@ -459,40 +483,40 @@ New public interfaces should prefer additive envelope layers over breaking chang
 
 ---
 
-## 5. Stage 8 Deliverables
+## 5. Stage 9 Deliverables
 
 Completed in this stage:
 
-- extracted manifest and adjacent local runtime-control file handling into `kernel_state.py`
-- moved atomic manifest-adjacent file writes behind the new state-store module
-- added `runtime-status` as a read-only kernel command for inspecting work-dir runtime state
-- exposed current ownership and local cancellation-marker state through the runtime-status result
-- kept Stage 7 ownership semantics and Stage 6 envelope / telemetry contracts compatible
-- added regression coverage for runtime-status in both direct Python use and CLI envelope mode
+- extracted mutation wrappers and bounded auto-replan orchestration into `kernel_controller.py`
+- routed manifest-mutating command wrappers through the controller module while preserving Stage 7 ownership semantics
+- added `cancel-run` as a public local cancellation command on the stable kernel interface
+- made `process-chunks` consume `.runtime_cancel.json` before work starts and between chunks
+- recorded cancellation abort details in runtime state and returned cancellation details in command results
+- added regression coverage for cancellation requests, cancellation-aware chunk aborts, and CLI envelope behavior for `cancel-run`
 
 Not done in this stage:
 
-- no public cancellation command yet
-- no extracted controller module yet
-- no fully concurrency-safe persistent state store yet
+- no public pause / resume protocol yet
 - no distributed or remote runtime backend yet
+- no fully concurrency-safe persistent state store yet
 - no subsystem test-package split yet
+- no broad extraction of the chunk-execution algorithm itself yet
 
 ---
 
 ## 6. Current Known Gaps
 
-The implementation is meaningfully stronger after Stage 8, but still not fully kernelized.
+The implementation is meaningfully stronger after Stage 9, but still not fully kernelized.
 
 The main remaining gaps are:
 
-1. the runtime and state-store boundaries are extracted, but most controller logic still lives in one large script
+1. runtime, state-store, and controller boundaries are extracted, but much of the chunk-execution algorithm still lives in one large script
 2. telemetry is local and append-only, but not yet a first-class subsystem with querying or aggregation
 3. verification remains deterministic / heuristic only and does not yet include semantic judge layers
 4. global terminology / entity consistency is still not first-class
 5. ownership is local single-writer gating, not a general concurrent state-store protocol
-6. cancellation state is inspectable locally, but not yet part of the public mutation command surface
-7. test coverage is stronger around the runtime boundary, but fixtures are not yet split into dedicated suites by subsystem
+6. cancellation is public and local, but pause / resume and long-lived job scheduling are not formalized
+7. test coverage is stronger around runtime control, but fixtures are not yet split into dedicated suites by subsystem
 
 ---
 
@@ -539,38 +563,46 @@ Implemented scope:
 
 ### Stage 9 — Controller Extraction and Public Cancellation
 
+Implemented scope:
+
+- extracted mutation wrappers and bounded control-loop orchestration into `kernel_controller.py`
+- promoted local cancellation into the public `cancel-run` command surface
+- integrated safe-boundary cancellation checks into `process-chunks`
+
+### Stage 10 — Stronger Runtime Guarantees and Deeper Extraction
+
 Planned scope:
 
-- extract mutation wrappers and bounded control-loop orchestration into a controller module
-- promote local cancellation from an inspectable marker to a public command contract
-- integrate cancellation checks into long-running chunk execution without breaking current ownership guarantees
+- decide what stronger multi-process state guarantees are worth adding beyond the current owner-file gate
+- extract more of the chunk-execution algorithm from `yt_transcript_utils.py`
+- decide whether pause / resume becomes part of the public runtime contract
 
 ---
 
-## 8. Stage 8 Validation
+## 8. Stage 9 Validation
 
-The Stage 8 implementation is considered valid because:
+The Stage 9 implementation is considered valid because:
 
-- manifest-adjacent file handling now has a dedicated module in `kernel_state.py`
-- `runtime-status` exposes current runtime, ownership, and local control state without mutating the work directory
-- Stage 7 ownership semantics remain intact for mutating commands
-- Stage 6 envelope behavior remains compatible for the new read-only runtime command
-- local state artifacts remain inspectable on disk without requiring a remote runtime service
+- mutating command wrappers and bounded replan orchestration now have a dedicated controller module in `kernel_controller.py`
+- `cancel-run` exposes a public cancellation contract without breaking Stage 8 runtime inspection or Stage 7 ownership behavior
+- `process-chunks` now aborts cleanly at safe boundaries when cancellation is requested, without touching completed outputs
+- Stage 6 envelope behavior remains compatible for the new cancellation command
+- local runtime-control artifacts remain inspectable on disk while becoming operationally useful
 
 Representative validated behaviors in this stage include:
 
-- reading manifest runtime and chunk-status counts through `runtime-status`
-- reporting current `.runtime_owner.json` state through the same read-only command
-- surfacing the current `.runtime_cancel.json` marker state, even before public cancellation commands exist
-- emitting `yt_transcript.command_result/v1` envelopes for `runtime-status` in CLI `--api-envelope` mode
-- keeping existing manifest mutation and telemetry flows compatible while reusing `kernel_state.py`
+- writing `.runtime_cancel.json` through `cancel-run`
+- surfacing the same cancellation marker through `runtime-status`
+- consuming and clearing cancellation markers before `process-chunks` makes further LLM calls
+- recording cancellation abort reasons in manifest runtime state
+- emitting `yt_transcript.command_result/v1` envelopes for `cancel-run` in CLI `--api-envelope` mode
 
 ---
 
 ## 9. Next Stage Entry Criteria
 
-Stage 9 should begin only when the following are agreed:
+Stage 10 should begin only when the following are agreed:
 
-1. which mutation wrappers and orchestration helpers should move into a controller module first
-2. whether public cancellation should clear local markers automatically on consumption or preserve them for inspection
-3. how cancellation should interact with ownership and resumable manifest state transitions
+1. which parts of the chunk-execution algorithm should move out of `yt_transcript_utils.py` next
+2. what stronger state-store guarantees are worth adding beyond `.runtime_owner.json` plus local cancellation markers
+3. whether pause / resume should remain local-only or become a public runtime contract
