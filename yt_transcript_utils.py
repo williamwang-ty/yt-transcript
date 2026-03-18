@@ -31,6 +31,7 @@ Commands:
     assemble-final <optimized_text> <output_file>  Assemble final markdown from optimized text + metadata
     verify-quality <optimized_text>  Verify quality of optimized text (structural checks)
     sync-state <state_ref>         Sync legacy state.md and authoritative machine_state.json
+    normalize-document <state_ref> Materialize normalized_document.json from raw text or segments
     validate-state <state_path>    Validate workflow state fields for a given stage
     plan-optimization <state_path> Generate a structured optimization plan from workflow state
 """
@@ -4833,6 +4834,8 @@ STATE_STAGE_FIELDS = {
 
 MACHINE_STATE_SCHEMA_VERSION = 1
 MACHINE_STATE_FORMAT = "yt_transcript.machine_state/v1"
+NORMALIZED_DOCUMENT_SCHEMA_VERSION = 1
+NORMALIZED_DOCUMENT_FORMAT = "yt_transcript.normalized_document/v1"
 LEGACY_STATE_MACHINE_SUFFIX = "_machine_state.json"
 
 
@@ -4855,6 +4858,11 @@ def _derive_legacy_state_path(machine_state_path: str | Path) -> Path:
     if path.name.endswith(LEGACY_STATE_MACHINE_SUFFIX):
         return path.with_name(path.name[:-len(LEGACY_STATE_MACHINE_SUFFIX)] + "_state.md")
     return path.with_suffix(".md")
+
+
+def _default_normalized_document_path(document_id: str) -> str:
+    token = str(document_id or "").strip() or "unknown"
+    return f"/tmp/{token}_normalized_document.json"
 
 
 def _parse_legacy_state_content(content: str) -> dict:
@@ -4880,10 +4888,15 @@ def _read_legacy_state_file(state_path: str | Path) -> tuple[dict, str]:
     return _parse_legacy_state_content(content), content
 
 
-def _compat_fields_to_machine_state(compat_fields: dict, legacy_state_path: Path, machine_state_path: Path) -> dict:
+def _compat_fields_to_machine_state(compat_fields: dict, legacy_state_path: Path,
+                                 machine_state_path: Path, existing_payload: dict | None = None) -> dict:
     compat = {str(key).strip(): str(value).strip() for key, value in (compat_fields or {}).items() if str(key).strip()}
     content = "\n".join(f"{key}: {value}" for key, value in sorted(compat.items()))
     content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
+    existing_payload = existing_payload if isinstance(existing_payload, dict) else {}
+    existing_artifacts = existing_payload.get("artifacts", {}) if isinstance(existing_payload.get("artifacts", {}), dict) else {}
+    existing_normalization = existing_payload.get("normalization", {}) if isinstance(existing_payload.get("normalization", {}), dict) else {}
+
     source = {
         "type": compat.get("src", ""),
         "url": compat.get("url", ""),
@@ -4895,12 +4908,14 @@ def _compat_fields_to_machine_state(compat_fields: dict, legacy_state_path: Path
         "subtitle_source": compat.get("subtitle_source", ""),
     }
     artifacts = {
-        "output_dir": compat.get("output_dir", ""),
-        "work_dir": compat.get("work_dir", ""),
-        "output_file": compat.get("output_file", ""),
-        "raw_text": compat.get("raw_text", ""),
-        "structured_text": compat.get("structured_text", ""),
-        "optimized_text": compat.get("optimized_text", ""),
+        "output_dir": compat.get("output_dir", existing_artifacts.get("output_dir", "")),
+        "work_dir": compat.get("work_dir", existing_artifacts.get("work_dir", "")),
+        "output_file": compat.get("output_file", existing_artifacts.get("output_file", "")),
+        "raw_text": compat.get("raw_text", existing_artifacts.get("raw_text", "")),
+        "structured_text": compat.get("structured_text", existing_artifacts.get("structured_text", "")),
+        "optimized_text": compat.get("optimized_text", existing_artifacts.get("optimized_text", "")),
+        "segments_path": compat.get("segments_path", existing_artifacts.get("segments_path", "")),
+        "normalized_document": compat.get("normalized_document", existing_artifacts.get("normalized_document", "")),
     }
     workflow = {
         "mode": compat.get("mode", ""),
@@ -4923,6 +4938,7 @@ def _compat_fields_to_machine_state(compat_fields: dict, legacy_state_path: Path
         "source": source,
         "artifacts": artifacts,
         "workflow": workflow,
+        "normalization": existing_normalization,
     }
 
 
@@ -4997,7 +5013,7 @@ def sync_machine_state(state_ref: str, write_legacy: bool = False) -> dict:
         existing_hash = str(existing.get("compat_projection", {}).get("source_hash", "")).strip()
     updated_machine_state = not existing or existing_hash != content_hash
     if updated_machine_state:
-        machine_state = _compat_fields_to_machine_state(compat_fields, path, machine_state_path)
+        machine_state = _compat_fields_to_machine_state(compat_fields, path, machine_state_path, existing_payload=existing)
         _write_machine_state(machine_state_path, machine_state)
     else:
         machine_state = existing
@@ -5022,6 +5038,237 @@ def load_state(state_path: str) -> dict:
     """
     sync_result = sync_machine_state(state_path)
     return sync_result["compat_fields"]
+
+
+def _normalize_text_body(text: str) -> str:
+    normalized = str(text or "").replace("\r\n", "\n").replace("\r", "\n")
+    normalized = "\n".join(line.rstrip() for line in normalized.split("\n"))
+    normalized = re.sub(r"\n{3,}", "\n\n", normalized)
+    return normalized.strip()
+
+
+def _update_machine_state_normalization(machine_state_path: str | Path, *, normalized_document_path: str,
+                                        source_adapter: str, preferred_chunk_source: str,
+                                        segment_count: int, char_count: int,
+                                        raw_text_path: str = "", segments_path: str = "") -> None:
+    payload = _read_machine_state(machine_state_path)
+    artifacts = payload.get("artifacts", {}) if isinstance(payload.get("artifacts", {}), dict) else {}
+    if raw_text_path:
+        artifacts["raw_text"] = raw_text_path
+    if segments_path:
+        artifacts["segments_path"] = segments_path
+    artifacts["normalized_document"] = normalized_document_path
+    payload["artifacts"] = artifacts
+    payload["normalization"] = {
+        "materialized_at": _now_iso(),
+        "source_adapter": source_adapter,
+        "preferred_chunk_source": preferred_chunk_source,
+        "segment_count": segment_count,
+        "char_count": char_count,
+        "normalized_document_path": normalized_document_path,
+    }
+    payload["updated_at"] = _now_iso()
+    _write_machine_state(machine_state_path, payload)
+
+
+def normalize_document(state_ref: str, output_path: str = "", prefer: str = "auto",
+                       allow_missing: bool = False) -> dict:
+    sync_result = sync_machine_state(state_ref)
+    compat = sync_result["compat_fields"]
+    machine_state_path = sync_result["machine_state_path"]
+    machine_state = _read_machine_state(machine_state_path)
+    document_id = str(compat.get("vid", machine_state.get("document_id", ""))).strip()
+    normalized_document_path = str(output_path or _default_normalized_document_path(document_id)).strip()
+    if not document_id:
+        return {
+            "passed": False,
+            "warnings": [],
+            "hard_failures": ["Missing document id for normalization"],
+            "machine_state_path": machine_state_path,
+            "legacy_state_path": sync_result["legacy_state_path"],
+            "normalized_document_path": normalized_document_path,
+            "materialized": False,
+        }
+
+    preference = str(prefer or "auto").strip().lower()
+    if preference not in {"auto", "segments", "raw_text"}:
+        return {
+            "passed": False,
+            "warnings": [],
+            "hard_failures": [f"Unsupported normalization preference: {prefer}"],
+            "machine_state_path": machine_state_path,
+            "legacy_state_path": sync_result["legacy_state_path"],
+            "normalized_document_path": normalized_document_path,
+            "materialized": False,
+        }
+
+    machine_artifacts = machine_state.get("artifacts", {}) if isinstance(machine_state.get("artifacts", {}), dict) else {}
+    raw_text_path = str(compat.get("raw_text") or machine_artifacts.get("raw_text") or f"/tmp/{document_id}_raw_text.txt").strip()
+    segments_path = str(compat.get("segments_path") or machine_artifacts.get("segments_path") or f"/tmp/{document_id}_segments.json").strip()
+    normalized_document_path = str(output_path or machine_artifacts.get("normalized_document") or normalized_document_path).strip()
+
+    raw_text_file = Path(raw_text_path) if raw_text_path else None
+    segments_file = Path(segments_path) if segments_path else None
+    use_segments = False
+    if preference in {"auto", "segments"} and segments_file and segments_file.exists():
+        use_segments = True
+    elif preference == "segments":
+        return {
+            "passed": False,
+            "warnings": [],
+            "hard_failures": [f"Segments artifact not found: {segments_path}"],
+            "machine_state_path": machine_state_path,
+            "legacy_state_path": sync_result["legacy_state_path"],
+            "normalized_document_path": normalized_document_path,
+            "materialized": False,
+        }
+
+    if not use_segments and not (raw_text_file and raw_text_file.exists()):
+        if allow_missing:
+            return {
+                "passed": True,
+                "warnings": ["Normalization skipped: no raw text or segments artifact found"],
+                "hard_failures": [],
+                "machine_state_path": machine_state_path,
+                "legacy_state_path": sync_result["legacy_state_path"],
+                "normalized_document_path": normalized_document_path,
+                "materialized": False,
+                "source_adapter": "",
+                "preferred_chunk_source": "",
+                "segment_count": 0,
+            }
+        return {
+            "passed": False,
+            "warnings": [],
+            "hard_failures": [f"Raw text artifact not found: {raw_text_path}"],
+            "machine_state_path": machine_state_path,
+            "legacy_state_path": sync_result["legacy_state_path"],
+            "normalized_document_path": normalized_document_path,
+            "materialized": False,
+        }
+
+    normalized_segments = []
+    has_timing = False
+    source_adapter = "raw_text_file"
+    preferred_chunk_source = "text"
+
+    if use_segments:
+        try:
+            payload = json.loads(segments_file.read_text(encoding="utf-8"))
+        except Exception as e:
+            return {
+                "passed": False,
+                "warnings": [],
+                "hard_failures": [f"Cannot read segments artifact: {e}"],
+                "machine_state_path": machine_state_path,
+                "legacy_state_path": sync_result["legacy_state_path"],
+                "normalized_document_path": normalized_document_path,
+                "materialized": False,
+            }
+        if not isinstance(payload, dict) or not isinstance(payload.get("segments", []), list):
+            return {
+                "passed": False,
+                "warnings": [],
+                "hard_failures": ["Segments artifact must be a JSON object with a segments list"],
+                "machine_state_path": machine_state_path,
+                "legacy_state_path": sync_result["legacy_state_path"],
+                "normalized_document_path": normalized_document_path,
+                "materialized": False,
+            }
+        for seg in payload.get("segments", []):
+            if not isinstance(seg, dict):
+                continue
+            clean_text = " ".join(_normalize_text_body(seg.get("text", "")).split())
+            if not clean_text:
+                continue
+            start_time = _coerce_float_or_none(seg.get("start_time"))
+            end_time = _coerce_float_or_none(seg.get("end_time"))
+            has_timing = has_timing or start_time is not None or end_time is not None
+            normalized_segments.append({
+                "id": len(normalized_segments),
+                "text": clean_text,
+                "start_time": start_time,
+                "end_time": end_time,
+                "speaker": seg.get("speaker"),
+            })
+        normalized_text = "\n".join(segment["text"] for segment in normalized_segments).strip()
+        source_adapter = "segments_json"
+        preferred_chunk_source = "segments"
+    else:
+        try:
+            normalized_text = _normalize_text_body(raw_text_file.read_text(encoding="utf-8"))
+        except Exception as e:
+            return {
+                "passed": False,
+                "warnings": [],
+                "hard_failures": [f"Cannot read raw text artifact: {e}"],
+                "machine_state_path": machine_state_path,
+                "legacy_state_path": sync_result["legacy_state_path"],
+                "normalized_document_path": normalized_document_path,
+                "materialized": False,
+            }
+
+    source_payload = machine_state.get("source", {}) if isinstance(machine_state.get("source", {}), dict) else {}
+    workflow_payload = machine_state.get("workflow", {}) if isinstance(machine_state.get("workflow", {}), dict) else {}
+    normalized_doc = {
+        "schema_version": NORMALIZED_DOCUMENT_SCHEMA_VERSION,
+        "format": NORMALIZED_DOCUMENT_FORMAT,
+        "updated_at": _now_iso(),
+        "document_id": document_id,
+        "source_adapter": source_adapter,
+        "source": {
+            "type": source_payload.get("type", ""),
+            "url": source_payload.get("url", ""),
+            "title": source_payload.get("title", ""),
+            "channel": source_payload.get("channel", ""),
+            "upload_date": source_payload.get("upload_date", ""),
+            "duration": source_payload.get("duration", ""),
+            "source_language": source_payload.get("source_language", ""),
+            "subtitle_source": source_payload.get("subtitle_source", ""),
+        },
+        "workflow": {
+            "mode": workflow_payload.get("mode", compat.get("mode", "")),
+        },
+        "artifacts": {
+            "raw_text": raw_text_path if raw_text_file and raw_text_file.exists() else "",
+            "segments_path": segments_path if segments_file and segments_file.exists() else "",
+            "normalized_document": normalized_document_path,
+        },
+        "content": {
+            "text": normalized_text,
+            "char_count": len(normalized_text),
+            "line_count": len(normalized_text.splitlines()) if normalized_text else 0,
+            "segment_count": len(normalized_segments),
+            "has_timing": has_timing,
+            "preferred_chunk_source": preferred_chunk_source,
+        },
+        "segments": normalized_segments,
+    }
+    _atomic_write_text(Path(normalized_document_path), json.dumps(normalized_doc, ensure_ascii=False, indent=2))
+    _update_machine_state_normalization(
+        machine_state_path,
+        normalized_document_path=normalized_document_path,
+        source_adapter=source_adapter,
+        preferred_chunk_source=preferred_chunk_source,
+        segment_count=len(normalized_segments),
+        char_count=len(normalized_text),
+        raw_text_path=raw_text_path if raw_text_file and raw_text_file.exists() else "",
+        segments_path=segments_path if segments_file and segments_file.exists() else "",
+    )
+    return {
+        "passed": True,
+        "warnings": [],
+        "hard_failures": [],
+        "machine_state_path": machine_state_path,
+        "legacy_state_path": sync_result["legacy_state_path"],
+        "normalized_document_path": normalized_document_path,
+        "materialized": True,
+        "source_adapter": source_adapter,
+        "preferred_chunk_source": preferred_chunk_source,
+        "segment_count": len(normalized_segments),
+        "has_timing": has_timing,
+        "char_count": len(normalized_text),
+    }
 
 
 def validate_state(state_path: str, stage: str = "", require: list[str] | None = None) -> dict:
@@ -5105,6 +5352,17 @@ def plan_optimization(state_path: str) -> dict:
             "legacy_state_path": validation.get("legacy_state_path", ""),
         }
 
+    normalization = normalize_document(state_path, allow_missing=True)
+    if not normalization["passed"]:
+        return {
+            "passed": False,
+            "checks": validation["checks"],
+            "warnings": normalization.get("warnings", []),
+            "hard_failures": normalization.get("hard_failures", []),
+            "machine_state_path": validation.get("machine_state_path", ""),
+            "legacy_state_path": validation.get("legacy_state_path", ""),
+        }
+
     state = load_state(state_path)
     try:
         duration = int(state.get("duration", "0") or 0)
@@ -5118,9 +5376,10 @@ def plan_optimization(state_path: str) -> dict:
 
     video_path = "long" if duration >= 1800 else "short"
     outputs = {
-        "raw_text": f"/tmp/{video_id}_raw_text.txt",
-        "structured_text": f"/tmp/{video_id}_structured.txt",
-        "optimized_text": f"/tmp/{video_id}_optimized.txt",
+        "raw_text": str(state.get("raw_text", "") or f"/tmp/{video_id}_raw_text.txt"),
+        "structured_text": str(state.get("structured_text", "") or f"/tmp/{video_id}_structured.txt"),
+        "optimized_text": str(state.get("optimized_text", "") or f"/tmp/{video_id}_optimized.txt"),
+        "normalized_document": normalization.get("normalized_document_path", ""),
         "work_dir": work_dir,
     }
 
@@ -5219,9 +5478,16 @@ def plan_optimization(state_path: str) -> dict:
             "source": source,
             "video_path": video_path,
         },
-        "warnings": [],
+        "warnings": normalization.get("warnings", []),
         "hard_failures": [],
         "video_path": video_path,
+        "normalization": {
+            "materialized": normalization.get("materialized", False),
+            "source_adapter": normalization.get("source_adapter", ""),
+            "preferred_chunk_source": normalization.get("preferred_chunk_source", ""),
+            "segment_count": normalization.get("segment_count", 0),
+            "normalized_document_path": normalization.get("normalized_document_path", ""),
+        },
         "requires_llm_preflight": video_path == "long",
         "requires_quality_check": True,
         "replan_contract": {
@@ -5654,6 +5920,18 @@ def main():
     sync_state_parser.add_argument('--write-legacy', action='store_true',
                                    help='When given a machine_state.json, write the legacy state.md projection')
 
+    # normalize-document command
+    normalize_parser = subparsers.add_parser(
+        'normalize-document',
+        help='Materialize normalized_document.json from raw text or segments artifacts'
+    )
+    normalize_parser.add_argument('state_ref', help='Path to legacy state.md or machine_state.json')
+    normalize_parser.add_argument('--output', default='', help='Optional output path for normalized_document.json')
+    normalize_parser.add_argument('--prefer', default='auto', choices=['auto', 'segments', 'raw_text'],
+                                  help='Preferred source artifact for normalization')
+    normalize_parser.add_argument('--allow-missing', action='store_true',
+                                  help='Return success when no raw text or segments artifact is available')
+
     # validate-state command
     state_parser = subparsers.add_parser(
         'validate-state',
@@ -5827,6 +6105,17 @@ def main():
     elif args.command == 'sync-state':
         result = sync_machine_state(args.state_ref, write_legacy=args.write_legacy)
         print(json.dumps(result, ensure_ascii=False))
+
+    elif args.command == 'normalize-document':
+        result = normalize_document(
+            args.state_ref,
+            output_path=args.output,
+            prefer=args.prefer,
+            allow_missing=args.allow_missing,
+        )
+        print(json.dumps(result, ensure_ascii=False))
+        if not result['passed']:
+            sys.exit(1)
 
     elif args.command == 'validate-state':
         result = validate_state(args.state_path, stage=args.stage, require=args.require)

@@ -183,6 +183,7 @@ The helper scripts now emit machine-readable JSON on stdout:
 - `python3 yt_transcript_utils.py chunk-segments /tmp/${VIDEO_ID}_segments.json /tmp/${VIDEO_ID}_chunks --prompt structure_only`
 - `python3 yt_transcript_utils.py build-chapter-plan /tmp/${VIDEO_ID}_chapters.json /tmp/${VIDEO_ID}_chunks /tmp/${VIDEO_ID}_chunks/chapter_plan.json`
 - `python3 yt_transcript_utils.py validate-state /tmp/${VIDEO_ID}_state.md --stage <stage>`
+- `python3 yt_transcript_utils.py normalize-document /tmp/${VIDEO_ID}_state.md`
 - `python3 yt_transcript_utils.py plan-optimization /tmp/${VIDEO_ID}_state.md`
 - `python3 yt_transcript_utils.py verify-quality /tmp/${VIDEO_ID}_optimized.txt --raw-text /tmp/${VIDEO_ID}_raw_text.txt`
 
@@ -193,6 +194,8 @@ This keeps workflow logic in scripts instead of ad-hoc shell parsing inside the 
 - `operations[*].execution.supports_auto_replan`
 - `operations[*].execution.recommended_cli_flags`
 - `operations[*].execution.on_replan_required`
+
+`normalize-document` materializes `/tmp/${VIDEO_ID}_normalized_document.json` from either raw text or timed `segments.json`, and `plan-optimization` auto-materializes it when source artifacts already exist.
 
 Current policy is intentional and explicit:
 
@@ -428,6 +431,7 @@ bash scripts/preflight.sh --require-llm
 - `python3 yt_transcript_utils.py chunk-segments /tmp/${VIDEO_ID}_segments.json /tmp/${VIDEO_ID}_chunks --prompt structure_only`
 - `python3 yt_transcript_utils.py build-chapter-plan /tmp/${VIDEO_ID}_chapters.json /tmp/${VIDEO_ID}_chunks /tmp/${VIDEO_ID}_chunks/chapter_plan.json`
 - `python3 yt_transcript_utils.py validate-state /tmp/${VIDEO_ID}_state.md --stage <stage>`
+- `python3 yt_transcript_utils.py normalize-document /tmp/${VIDEO_ID}_state.md`
 - `python3 yt_transcript_utils.py plan-optimization /tmp/${VIDEO_ID}_state.md`
 - `python3 yt_transcript_utils.py verify-quality /tmp/${VIDEO_ID}_optimized.txt --raw-text /tmp/${VIDEO_ID}_raw_text.txt`
 
@@ -438,6 +442,8 @@ bash scripts/preflight.sh --require-llm
 - `operations[*].execution.supports_auto_replan`
 - `operations[*].execution.recommended_cli_flags`
 - `operations[*].execution.on_replan_required`
+
+`normalize-document` 会基于 raw text 或带时间戳的 `segments.json` 物化 `/tmp/${VIDEO_ID}_normalized_document.json`；当源 artifact 已存在时，`plan-optimization` 也会自动完成这一步。
 
 当前约定是明确固定的：
 

@@ -722,6 +722,105 @@ class RegressionTests(unittest.TestCase):
             self.assertTrue(Path(rewrite_result["legacy_state_path"]).exists())
             content = Path(rewrite_result["legacy_state_path"]).read_text(encoding="utf-8")
             self.assertIn("vid: vid001", content)
+    def test_normalize_document_materializes_from_raw_text_artifact(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state = Path(tmpdir) / "vid001_state.md"
+            raw_text = Path(tmpdir) / "vid001_raw.txt"
+            raw_text.write_text("Line one.\r\n\r\nLine two.  \n", encoding="utf-8")
+            state.write_text(
+                "# State\n"
+                "vid: vid001\n"
+                "url: https://example.com/watch?v=1\n"
+                "title: Sample\n"
+                "channel: Channel\n"
+                "upload_date: 20260308\n"
+                "duration: 120\n"
+                "output_dir: /tmp/out\n"
+                f"raw_text: {raw_text}\n",
+                encoding="utf-8",
+            )
+
+            result = utils.normalize_document(str(state))
+
+            self.assertTrue(result["passed"], result)
+            self.assertTrue(result["materialized"])
+            payload = json.loads(Path(result["normalized_document_path"]).read_text(encoding="utf-8"))
+            self.assertEqual(payload["source_adapter"], "raw_text_file")
+            self.assertEqual(payload["content"]["text"], "Line one.\n\nLine two.")
+
+    def test_normalize_document_prefers_segments_artifact_when_available(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state = Path(tmpdir) / "vid001_state.md"
+            raw_text = Path(tmpdir) / "vid001_raw.txt"
+            segments = Path(tmpdir) / "vid001_segments.json"
+            raw_text.write_text("fallback raw text", encoding="utf-8")
+            segments.write_text(
+                json.dumps({
+                    "source": "vtt",
+                    "language": "en",
+                    "segments": [
+                        {"id": 0, "text": " First line ", "start_time": 0.0, "end_time": 1.0},
+                        {"id": 1, "text": "Second line", "start_time": 1.0, "end_time": 2.0},
+                    ],
+                }, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            state.write_text(
+                "# State\n"
+                "vid: vid001\n"
+                "url: https://example.com/watch?v=1\n"
+                "title: Sample\n"
+                "channel: Channel\n"
+                "upload_date: 20260308\n"
+                "duration: 120\n"
+                "output_dir: /tmp/out\n"
+                f"raw_text: {raw_text}\n"
+                f"segments_path: {segments}\n",
+                encoding="utf-8",
+            )
+
+            result = utils.normalize_document(str(state))
+
+            self.assertTrue(result["passed"], result)
+            self.assertEqual(result["source_adapter"], "segments_json")
+            self.assertEqual(result["segment_count"], 2)
+            payload = json.loads(Path(result["normalized_document_path"]).read_text(encoding="utf-8"))
+            self.assertEqual(payload["content"]["preferred_chunk_source"], "segments")
+            self.assertEqual(payload["content"]["text"], "First line\nSecond line")
+            machine_payload = json.loads(Path(result["machine_state_path"]).read_text(encoding="utf-8"))
+            self.assertEqual(machine_payload["normalization"]["source_adapter"], "segments_json")
+
+    def test_plan_optimization_materializes_normalized_document_when_artifact_exists(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state = Path(tmpdir) / "vid001_state.md"
+            raw_text = Path(tmpdir) / "vid001_raw.txt"
+            raw_text.write_text("Hello world", encoding="utf-8")
+            state.write_text(
+                "# State\n"
+                "vid: vid001\n"
+                "url: https://example.com/watch?v=1\n"
+                "title: Sample\n"
+                "channel: Channel\n"
+                "upload_date: 20260308\n"
+                "duration: 120\n"
+                "output_dir: /tmp/out\n"
+                "mode: bilingual\n"
+                "src: youtube\n"
+                "source_language: en\n"
+                "subtitle_source: YouTube Subtitles\n"
+                f"raw_text: {raw_text}\n"
+                "work_dir: /tmp/vid001_chunks\n",
+                encoding="utf-8",
+            )
+
+            result = utils.plan_optimization(str(state))
+
+            self.assertTrue(result["passed"], result)
+            self.assertTrue(result["normalization"]["materialized"])
+            self.assertTrue(Path(result["normalization"]["normalized_document_path"]).exists())
+            self.assertEqual(result["outputs"]["normalized_document"], result["normalization"]["normalized_document_path"])
+
+
     def test_plan_optimization_returns_short_bilingual_operations(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             state = Path(tmpdir) / "state.md"
