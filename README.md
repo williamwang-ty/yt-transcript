@@ -61,6 +61,8 @@ pip install yt-dlp
    llm_max_retries: 3
    llm_backoff_sec: 1.5
    llm_stream: "auto"
+   llm_chunk_recovery_attempts: 1
+   llm_chunk_recovery_backoff_sec: 1.0
    ```
 
    #### YouTube "Sign in to confirm you're not a bot"
@@ -213,6 +215,7 @@ Current policy is intentional and explicit:
 - prompt names are validated eagerly for chunk planning, so typos fail fast instead of silently falling back to generic budgets
 - `process-chunks` now assigns prompt-specific `max_output_tokens` from the same planning budget instead of using one large shared default
 - `process-chunks` also injects a short continuity context from the previous chunk (tail sentence + optional section title) without enabling body overlap, and chunk budgeting now reserves a small token allowance for that carry-over context
+- `process-chunks` now treats transient gateway disconnects such as `Remote end closed connection without response` as retryable transport failures, and can auto-rerun suspiciously short / malformed chunk outputs before keeping a warning
 - `process-chunks --dry-run` validates prompts, manifests, and chunk budgets without requiring live LLM credentials; actual execution still requires `llm_api_key`, `llm_base_url`, and `llm_model`
 - `download.sh` now writes subtitle and audio artifacts into per-video isolated temp directories under `/tmp/${VIDEO_ID}_downloads/...` and exposes `download_dir` in JSON for deterministic selection and cleanup
 - `download.sh subtitles` now requests the exact selected subtitle language codes, so regional variants such as `en-GB` / `zh-TW` work instead of being dropped by a hard-coded whitelist
@@ -342,6 +345,8 @@ pip install yt-dlp
    llm_max_retries: 3
    llm_backoff_sec: 1.5
    llm_stream: "auto"
+   llm_chunk_recovery_attempts: 1
+   llm_chunk_recovery_backoff_sec: 1.0
    ```
 
    > **注意**：
@@ -455,6 +460,7 @@ bash scripts/preflight.sh --require-llm
 - 分块阶段会提前校验 prompt 名称，避免因为 prompt 拼写错误而静默回退到通用预算
 - `process-chunks` 现在按 prompt 预算单独设置 `max_output_tokens`，不再复用单一的大默认值
 - `process-chunks` 还会注入上一块的轻量 continuity context（尾句 + 可选 section title），但不会启用正文 overlap；同时分块预算也会为这段 carry-over context 预留一小段 token 成本
+- `process-chunks` 现在会把 `Remote end closed connection without response` 这类瞬时网关断连视为可重试传输错误，并可在产出异常短/结构异常的 chunk 时自动重跑一轮，再决定是否保留 warning
 - `manifest.json` 现在会把不可变 `plan` 和可变 `runtime` 状态分开，同时为每个 chunk 记录 `attempt_logs` 级别的请求观测数据
 - `process-chunks` 不再在当前 batch 内偷偷改预算；如果 canary 或重试历史表明当前 plan 不健康，会以 `replan_required=true` 终止，并通过 `replan-remaining` 为剩余原始 chunk 生成新计划
 - `process-chunks --auto-replan` 会在不破坏上述边界的前提下，自动编排 `process -> replan-remaining -> resume` 这一恢复链路（仅适用于 `raw_path` 计划）

@@ -57,6 +57,9 @@ llm_probe_timeout_sec: 20
 llm_probe_max_tokens: 16
 # Stop batch if provider times out repeatedly
 llm_stop_after_consecutive_timeouts: 2
+# Re-run suspiciously short / malformed chunk outputs before surfacing warnings
+llm_chunk_recovery_attempts: 1
+llm_chunk_recovery_backoff_sec: 1.0
 
 # Chunk planning
 # Default mode is token-aware. Set to "chars" for legacy character chunking.

@@ -36,6 +36,7 @@ Commands:
 
 import argparse
 import bisect
+import http.client
 import json
 import math
 import os
@@ -272,6 +273,8 @@ DEFAULT_AUTOTUNE_SUCCESS_WINDOW = 20
 DEFAULT_AUTOTUNE_P95_LATENCY_THRESHOLD_MS = 45000
 DEFAULT_AUTOTUNE_MIN_TARGET_RATIO = 0.5
 DEFAULT_AUTOTUNE_CANARY_CHUNKS = 3
+DEFAULT_LLM_CHUNK_RECOVERY_ATTEMPTS = 1
+DEFAULT_LLM_CHUNK_RECOVERY_BACKOFF_SEC = 1.0
 MANIFEST_SCHEMA_VERSION = 2
 DEFAULT_UNKNOWN_CHUNK_TOKENS = 900
 CHUNK_SEPARATOR = "\n\n"
@@ -280,6 +283,9 @@ DEFAULT_UNKNOWN_MAX_OUTPUT_TOKENS = 1400
 DEFAULT_UNKNOWN_REQUEST_CAP = 2600
 DEFAULT_UNKNOWN_LEGACY_CHARS = 8000
 SUPERSEDED_CHUNK_STATUS = "superseded"
+SHORT_OUTPUT_WARNING_RATIO = 0.5
+TRANSLATION_WARNING_CN_RATIO = 0.1
+STRUCTURE_HEADER_WARNING_MIN_CHARS = 2000
 
 
 def _normalize_chunk_mode(value) -> str:
@@ -311,6 +317,8 @@ def _default_config_values(config_path: str = "") -> dict:
         "llm_probe_timeout_sec": 20,
         "llm_probe_max_tokens": 16,
         "llm_stop_after_consecutive_timeouts": 2,
+        "llm_chunk_recovery_attempts": DEFAULT_LLM_CHUNK_RECOVERY_ATTEMPTS,
+        "llm_chunk_recovery_backoff_sec": DEFAULT_LLM_CHUNK_RECOVERY_BACKOFF_SEC,
         "chunk_mode": DEFAULT_CHUNK_MODE,
         "chunk_size_override": 0,
         "chunk_tokens_structure_only": TASK_CHUNK_TOKEN_DEFAULTS["structure_only"],
@@ -809,6 +817,8 @@ def _new_chunk_manifest_entry(chunk_id: int, chunk_content: str, budget: dict,
         "status": "pending",
         "attempts": 0,
         "attempt_logs": [],
+        "recovery_attempts": 0,
+        "recovery_logs": [],
         "last_error": "",
         "last_error_type": "",
         "error_type": "",
@@ -1145,6 +1155,46 @@ def _has_timeout_attempt(attempt_logs: list[dict]) -> bool:
     return False
 
 
+def _classify_llm_transport_issue(error_or_reason) -> tuple[str, bool]:
+    reason = getattr(error_or_reason, "reason", error_or_reason)
+    message = str(reason or error_or_reason or "").strip()
+    message_lower = message.lower()
+
+    if isinstance(reason, socket.timeout) or isinstance(error_or_reason, (socket.timeout, TimeoutError)):
+        return "timeout", True
+    if "timed out" in message_lower:
+        return "timeout", True
+
+    transient_reason_types = tuple(
+        cls for cls in (
+            getattr(http.client, "RemoteDisconnected", None),
+            getattr(http.client, "IncompleteRead", None),
+            getattr(http.client, "BadStatusLine", None),
+            ConnectionResetError,
+            ConnectionAbortedError,
+            BrokenPipeError,
+        )
+        if isinstance(cls, type)
+    )
+    transient_tokens = (
+        "remote end closed connection without response",
+        "remote disconnected",
+        "connection reset",
+        "connection aborted",
+        "broken pipe",
+        "incomplete read",
+        "bad status line",
+        "connection closed",
+        "connection lost",
+    )
+    if transient_reason_types and isinstance(reason, transient_reason_types):
+        return "remote_disconnect", True
+    if any(token in message_lower for token in transient_tokens):
+        return "remote_disconnect", True
+
+    return "network", False
+
+
 def _should_replan_after_error(error: Exception) -> bool:
     if _is_timeout_error(error):
         return True
@@ -1165,6 +1215,70 @@ def _find_previous_active_chunk(chunks: list[dict], current_index: int) -> dict 
             continue
         return previous_chunk
     return None
+
+
+def _evaluate_chunk_output_health(prompt_name: str, chunk_id: int, chunk_char_count: int,
+                                  result_text: str) -> dict:
+    result_char_count = len(result_text)
+    ratio = result_char_count / chunk_char_count if chunk_char_count > 0 else 0
+    warnings = []
+    retry_reasons = []
+
+    if prompt_name != "summarize" and ratio < SHORT_OUTPUT_WARNING_RATIO:
+        warnings.append(
+            f"⚠️ Chunk {chunk_id}: output is only {ratio:.0%} of input size "
+            f"({result_char_count} vs {chunk_char_count} chars). Possible summarization instead of structuring."
+        )
+        retry_reasons.append("short_output")
+
+    if (
+        prompt_name in ("structure_only", "quick_cleanup")
+        and "##" not in result_text
+        and chunk_char_count > STRUCTURE_HEADER_WARNING_MIN_CHARS
+    ):
+        warnings.append(
+            f"⚠️ Chunk {chunk_id}: no section headers (##) found in output "
+            f"({chunk_char_count} chars input). Structuring may have failed."
+        )
+        retry_reasons.append("missing_headers")
+
+    if prompt_name == "translate_only":
+        cn_chars = sum(1 for char in result_text if '一' <= char <= '鿿')
+        cn_ratio = cn_chars / result_char_count if result_char_count > 0 else 0
+        if cn_ratio < TRANSLATION_WARNING_CN_RATIO:
+            warnings.append(
+                f"⚠️ Chunk {chunk_id}: Chinese character ratio is only {cn_ratio:.0%}. "
+                f"Translation may have been skipped."
+            )
+            retry_reasons.append("translation_skipped")
+
+    return {
+        "warnings": warnings,
+        "retry_reasons": list(dict.fromkeys(retry_reasons)),
+        "ratio": ratio,
+        "result_chars": result_char_count,
+    }
+
+
+def _append_chunk_recovery_log(chunk_info: dict, *, action: str, reasons: list[str],
+                               details: list[str], request_attempts: int,
+                               request_url: str = "", latency_ms: int | None = None,
+                               sleep_sec: float = 0.0) -> None:
+    recovery_logs = list(chunk_info.get("recovery_logs", []))
+    recovery_logs.append({
+        "attempt_index": len(recovery_logs) + 1,
+        "action": action,
+        "reasons": [str(reason) for reason in reasons if str(reason).strip()],
+        "details": [str(detail) for detail in details if str(detail).strip()],
+        "request_attempts": max(1, _parse_int(request_attempts, 1)),
+        "request_url": str(request_url or ""),
+        "latency_ms": latency_ms,
+        "sleep_sec": round(max(0.0, _parse_float(sleep_sec, 0.0)), 2),
+        "updated_at": _now_iso(),
+    })
+    chunk_info["recovery_logs"] = recovery_logs
+    if action == "retry":
+        chunk_info["recovery_attempts"] = max(0, _parse_int(chunk_info.get("recovery_attempts"), 0)) + 1
 
 
 def _available_prompt_names() -> list[str]:
@@ -1479,10 +1593,10 @@ def _execute_llm_request(api_key: str, base_url: str, model: str, messages: list
     except urllib.error.URLError as e:
         reason = getattr(e, "reason", e)
         message = str(reason)
-        retryable = isinstance(reason, socket.timeout) or "timed out" in message.lower()
+        error_type, retryable = _classify_llm_transport_issue(reason)
         raise LLMRequestError(
             f"Cannot reach LLM API: {message}",
-            error_type="timeout" if retryable else "network",
+            error_type=error_type,
             retryable=retryable,
             request_url=url,
         ) from e
@@ -1501,12 +1615,11 @@ def _execute_llm_request(api_key: str, base_url: str, model: str, messages: list
             request_url=url,
         ) from e
     except Exception as e:
-        message = str(e)
-        is_timeout = "timed out" in message.lower()
+        error_type, retryable = _classify_llm_transport_issue(e)
         raise LLMRequestError(
             f"LLM API call failed: {e}",
-            error_type="timeout" if is_timeout else "unknown",
-            retryable=is_timeout,
+            error_type=error_type if retryable else "unknown",
+            retryable=retryable,
             request_url=url,
         ) from e
 
@@ -3373,6 +3486,16 @@ def process_chunks(work_dir: str, prompt_name: str, extra_instruction: str = "",
     backoff_sec = config.get("llm_backoff_sec", 1.5)
     stream_mode = config.get("llm_stream", "auto")
     stop_after_timeouts = config.get("llm_stop_after_consecutive_timeouts", 2)
+    chunk_recovery_attempt_limit = _parse_int_min(
+        config.get("llm_chunk_recovery_attempts"),
+        DEFAULT_LLM_CHUNK_RECOVERY_ATTEMPTS,
+        0,
+    )
+    chunk_recovery_backoff_sec = _parse_float_min(
+        config.get("llm_chunk_recovery_backoff_sec"),
+        DEFAULT_LLM_CHUNK_RECOVERY_BACKOFF_SEC,
+        0.0,
+    )
 
     request_url = _build_api_url(base_url, api_format) if base_url else ""
     if not dry_run and (not api_key or not base_url or not model):
@@ -3433,6 +3556,8 @@ def process_chunks(work_dir: str, prompt_name: str, extra_instruction: str = "",
         chunk_info.setdefault("status", "pending")
         chunk_info.setdefault("attempts", 0)
         chunk_info.setdefault("attempt_logs", [])
+        chunk_info.setdefault("recovery_attempts", 0)
+        chunk_info.setdefault("recovery_logs", [])
         chunk_info.setdefault("last_error", "")
         chunk_info.setdefault("last_error_type", "")
         chunk_info.setdefault("error_type", chunk_info.get("last_error_type", ""))
@@ -3634,208 +3759,224 @@ def process_chunks(work_dir: str, prompt_name: str, extra_instruction: str = "",
             file=sys.stderr,
         )
 
-        try:
-            llm_result = _call_llm_api(
-                api_key=api_key,
-                base_url=base_url,
-                model=model,
-                messages=[{"role": "user", "content": prompt}],
-                api_format=api_format,
-                timeout_sec=timeout_sec,
-                max_retries=max_retries,
-                backoff_sec=backoff_sec,
-                stream_mode=stream_mode,
-                max_tokens=planned_max_output_tokens,
-            )
-            attempt_logs = _collect_attempt_logs(llm_result)
-            result_text = llm_result["text"]
-            result_char_count = len(result_text)
-            actual_output_tokens = _estimate_tokens(result_text, "tokens", config)
-            ratio = result_char_count / chunk_char_count if chunk_char_count > 0 else 0
-            consecutive_timeouts = 0
+        chunk_attempt_logs = []
+        while True:
+            try:
+                llm_result = _call_llm_api(
+                    api_key=api_key,
+                    base_url=base_url,
+                    model=model,
+                    messages=[{"role": "user", "content": prompt}],
+                    api_format=api_format,
+                    timeout_sec=timeout_sec,
+                    max_retries=max_retries,
+                    backoff_sec=backoff_sec,
+                    stream_mode=stream_mode,
+                    max_tokens=planned_max_output_tokens,
+                )
+                attempt_logs = _collect_attempt_logs(llm_result)
+                request_attempts = max(len(attempt_logs), _parse_int(llm_result.get("attempts"), 1))
+                chunk_attempt_logs.extend(attempt_logs)
+                chunk_info["attempts"] = chunk_info.get("attempts", 0) + request_attempts
+                chunk_info["attempt_logs"] = list(chunk_info.get("attempt_logs", [])) + attempt_logs
 
-            if not is_summary:
-                if ratio < 0.5:
-                    warning = (
-                        f"⚠️ Chunk {chunk_id}: output is only {ratio:.0%} of input size "
-                        f"({result_char_count} vs {chunk_char_count} chars). Possible summarization instead of structuring."
+                result_text = llm_result["text"]
+                actual_output_tokens = _estimate_tokens(result_text, "tokens", config)
+                output_health = _evaluate_chunk_output_health(prompt_name, chunk_id, chunk_char_count, result_text)
+                consecutive_timeouts = 0
+
+                if output_health["retry_reasons"] and chunk_info.get("recovery_attempts", 0) < chunk_recovery_attempt_limit:
+                    _append_chunk_recovery_log(
+                        chunk_info,
+                        action="retry",
+                        reasons=output_health["retry_reasons"],
+                        details=output_health["warnings"],
+                        request_attempts=request_attempts,
+                        request_url=llm_result.get("request_url", request_url),
+                        latency_ms=llm_result.get("latency_ms"),
+                        sleep_sec=chunk_recovery_backoff_sec,
                     )
+                    chunk_info["status"] = "pending"
+                    chunk_info["last_error"] = " | ".join(output_health["warnings"])
+                    chunk_info["last_error_type"] = "quality_retry"
+                    chunk_info["error_type"] = "quality_retry"
+                    chunk_info["request_url"] = llm_result.get("request_url", request_url)
+                    chunk_info["latency_ms"] = llm_result.get("latency_ms")
+                    chunk_info["streaming_used"] = bool(llm_result.get("streaming_used", False))
+                    chunk_info["updated_at"] = _now_iso()
+                    print(
+                        f"Retrying chunk {active_index}/{total} chunk_id={chunk_id} after suspicious output "
+                        f"reasons={','.join(output_health['retry_reasons'])} recovery_attempt={chunk_info['recovery_attempts']}/{chunk_recovery_attempt_limit} "
+                        f"latency_ms={llm_result.get('latency_ms')} url={llm_result.get('request_url', request_url)}",
+                        file=sys.stderr,
+                    )
+                    _refresh_manifest_token_source_summary(manifest)
+                    _sync_manifest_legacy_fields(manifest)
+                    _write_manifest(manifest_path, manifest)
+                    if chunk_recovery_backoff_sec > 0:
+                        time.sleep(chunk_recovery_backoff_sec)
+                    continue
+
+                for warning in output_health["warnings"]:
                     warnings.append(warning)
                     print(warning, file=sys.stderr)
 
-                if prompt_name in ("structure_only", "quick_cleanup") and "##" not in result_text and chunk_char_count > 2000:
-                    warning = (
-                        f"⚠️ Chunk {chunk_id}: no section headers (##) found in output "
-                        f"({chunk_char_count} chars input). Structuring may have failed."
+                result_char_count = output_health["result_chars"]
+                _atomic_write_text(out_path, result_text)
+                output_files.append(str(out_path))
+                processed_count += 1
+
+                chunk_info["status"] = "done"
+                chunk_info["last_error"] = ""
+                chunk_info["last_error_type"] = ""
+                chunk_info["error_type"] = ""
+                chunk_info["latency_ms"] = llm_result["latency_ms"]
+                chunk_info["output_chars"] = result_char_count
+                chunk_info["actual_output_tokens"] = actual_output_tokens
+                chunk_info["processed_tail_context_text"] = _extract_tail_sentences(
+                    result_text,
+                    _parse_int_min(
+                        config.get("chunk_context_tail_sentences"),
+                        DEFAULT_CHUNK_CONTEXT_TAIL_SENTENCES,
+                        0,
+                    ),
+                    config,
+                )
+                if input_key == "raw_path":
+                    chunk_info["processed_input_tail_context_text"] = chunk_info["processed_tail_context_text"]
+                    chunk_info["processed_input_section_title"] = _extract_last_section_title(result_text)
+                chunk_info["last_section_title"] = _extract_last_section_title(result_text)
+                chunk_info["request_url"] = llm_result["request_url"]
+                chunk_info["streaming_used"] = llm_result["streaming_used"]
+                had_timeout_retry = _has_timeout_attempt(chunk_attempt_logs)
+                if had_timeout_retry:
+                    autotune_state = _update_autotune_state(
+                        autotune_state,
+                        success=False,
+                        timeout=True,
+                        error_type="timeout",
+                        chunk_id=chunk_id,
                     )
-                    warnings.append(warning)
-                    print(warning, file=sys.stderr)
-
-                if prompt_name == "translate_only":
-                    cn_chars = sum(1 for c in result_text if '一' <= c <= '鿿')
-                    cn_ratio = cn_chars / result_char_count if result_char_count > 0 else 0
-                    if cn_ratio < 0.1:
-                        warning = (
-                            f"⚠️ Chunk {chunk_id}: Chinese character ratio is only {cn_ratio:.0%}. "
-                            f"Translation may have been skipped."
-                        )
-                        warnings.append(warning)
-                        print(warning, file=sys.stderr)
-
-            _atomic_write_text(out_path, result_text)
-            output_files.append(str(out_path))
-            processed_count += 1
-
-            chunk_info["status"] = "done"
-            chunk_info["attempts"] = chunk_info.get("attempts", 0) + max(len(attempt_logs), llm_result["attempts"])
-            chunk_info["attempt_logs"] = list(chunk_info.get("attempt_logs", [])) + attempt_logs
-            chunk_info["last_error"] = ""
-            chunk_info["last_error_type"] = ""
-            chunk_info["error_type"] = ""
-            chunk_info["latency_ms"] = llm_result["latency_ms"]
-            chunk_info["output_chars"] = result_char_count
-            chunk_info["actual_output_tokens"] = actual_output_tokens
-            chunk_info["processed_tail_context_text"] = _extract_tail_sentences(
-                result_text,
-                _parse_int_min(
-                    config.get("chunk_context_tail_sentences"),
-                    DEFAULT_CHUNK_CONTEXT_TAIL_SENTENCES,
-                    0,
-                ),
-                config,
-            )
-            if input_key == "raw_path":
-                chunk_info["processed_input_tail_context_text"] = chunk_info["processed_tail_context_text"]
-                chunk_info["processed_input_section_title"] = _extract_last_section_title(result_text)
-            chunk_info["last_section_title"] = _extract_last_section_title(result_text)
-            chunk_info["request_url"] = llm_result["request_url"]
-            chunk_info["streaming_used"] = llm_result["streaming_used"]
-            had_timeout_retry = _has_timeout_attempt(attempt_logs)
-            if had_timeout_retry:
+                else:
+                    autotune_state = _update_autotune_state(
+                        autotune_state,
+                        success=True,
+                        latency_ms=llm_result["latency_ms"],
+                        chunk_id=chunk_id,
+                    )
+                autotune_state["current_planned_max_output_tokens"] = planned_max_output_tokens
+                manifest["autotune"] = autotune_state
+                chunk_info["autotune_next_target_tokens"] = autotune_state["current_target_tokens"]
+                chunk_info["autotune_event"] = autotune_state["last_event"]
+                chunk_info["autotune_reason"] = autotune_state["last_reason"]
+                chunk_info["completed_at"] = _now_iso()
+                chunk_info["updated_at"] = chunk_info["completed_at"]
+                print(
+                    f"Completed chunk {active_index}/{total} chunk_id={chunk_id} status=done "
+                    f"input_chars={chunk_char_count} estimated_input_tokens={estimated_input_tokens} "
+                    f"planned_max_output_tokens={planned_max_output_tokens} latency_ms={llm_result['latency_ms']} "
+                    f"attempts={chunk_info['attempts']} streaming_used={llm_result['streaming_used']} "
+                    f"output_chars={result_char_count} actual_output_tokens={actual_output_tokens} "
+                    f"recovery_attempts={chunk_info.get('recovery_attempts', 0)} "
+                    f"autotune_event={autotune_state['last_event']} next_autotune_target_tokens={autotune_state['current_target_tokens']}",
+                    file=sys.stderr,
+                )
+                if autotune_state["last_event"]:
+                    print(
+                        f"Autotune chunk_id={chunk_id} event={autotune_state['last_event']} "
+                        f"target_tokens={autotune_state['current_target_tokens']} reason={autotune_state['last_reason']}",
+                        file=sys.stderr,
+                    )
+                if had_timeout_retry or (autotune_state["last_event"] == "shrink" and active_index <= canary_limit):
+                    runtime["replan_required"] = True
+                    runtime["replan_reason"] = autotune_state["last_reason"] or "Observed unstable retries under the current plan"
+                    runtime["status"] = "aborted"
+                    aborted = True
+                    aborted_reason = (
+                        "Current plan requires replanning before continuing. "
+                        f"{runtime['replan_reason']}"
+                    )
+                    print(f"Error: {aborted_reason}", file=sys.stderr)
+                break
+            except LLMRequestError as error:
+                attempt_logs = _collect_attempt_logs(error)
+                request_attempts = max(len(attempt_logs), _parse_int(getattr(error, "attempts", 1), 1))
+                chunk_attempt_logs.extend(attempt_logs)
+                failed_count += 1
+                chunk_info["status"] = "failed"
+                chunk_info["attempts"] = chunk_info.get("attempts", 0) + request_attempts
+                chunk_info["attempt_logs"] = list(chunk_info.get("attempt_logs", [])) + attempt_logs
+                chunk_info["last_error"] = str(error)
+                chunk_info["last_error_type"] = error.error_type
+                chunk_info["error_type"] = error.error_type
+                chunk_info["request_url"] = error.request_url or request_url
                 autotune_state = _update_autotune_state(
                     autotune_state,
                     success=False,
-                    timeout=True,
-                    error_type="timeout",
+                    timeout=_is_timeout_error(error),
+                    error_type=error.error_type,
                     chunk_id=chunk_id,
                 )
-            else:
-                autotune_state = _update_autotune_state(
-                    autotune_state,
-                    success=True,
-                    latency_ms=llm_result["latency_ms"],
-                    chunk_id=chunk_id,
-                )
-            autotune_state["current_planned_max_output_tokens"] = planned_max_output_tokens
-            manifest["autotune"] = autotune_state
-            chunk_info["autotune_next_target_tokens"] = autotune_state["current_target_tokens"]
-            chunk_info["autotune_event"] = autotune_state["last_event"]
-            chunk_info["autotune_reason"] = autotune_state["last_reason"]
-            chunk_info["completed_at"] = _now_iso()
-            chunk_info["updated_at"] = chunk_info["completed_at"]
-            print(
-                f"Completed chunk {active_index}/{total} chunk_id={chunk_id} status=done "
-                f"input_chars={chunk_char_count} estimated_input_tokens={estimated_input_tokens} "
-                f"planned_max_output_tokens={planned_max_output_tokens} latency_ms={llm_result['latency_ms']} "
-                f"attempts={llm_result['attempts']} streaming_used={llm_result['streaming_used']} "
-                f"output_chars={result_char_count} actual_output_tokens={actual_output_tokens} "
-                f"autotune_event={autotune_state['last_event']} next_autotune_target_tokens={autotune_state['current_target_tokens']}",
-                file=sys.stderr,
-            )
-            if autotune_state["last_event"]:
+                autotune_state["current_planned_max_output_tokens"] = planned_max_output_tokens
+                manifest["autotune"] = autotune_state
+                chunk_info["autotune_next_target_tokens"] = autotune_state["current_target_tokens"]
+                chunk_info["autotune_event"] = autotune_state["last_event"]
+                chunk_info["autotune_reason"] = autotune_state["last_reason"]
+                chunk_info["updated_at"] = _now_iso()
                 print(
-                    f"Autotune chunk_id={chunk_id} event={autotune_state['last_event']} "
-                    f"target_tokens={autotune_state['current_target_tokens']} reason={autotune_state['last_reason']}",
+                    f"Chunk {active_index}/{total} chunk_id={chunk_id} status=failed "
+                    f"input_chars={chunk_char_count} estimated_input_tokens={estimated_input_tokens} "
+                    f"planned_max_output_tokens={planned_max_output_tokens} latency_ms={chunk_info.get('latency_ms')} "
+                    f"attempts={getattr(error, 'attempts', 1)} streaming_used={chunk_info.get('streaming_used', False)} "
+                    f"error_type={error.error_type} url={error.request_url or request_url} error={error} "
+                    f"autotune_event={autotune_state['last_event']} next_autotune_target_tokens={autotune_state['current_target_tokens']}",
                     file=sys.stderr,
                 )
-            if had_timeout_retry or (autotune_state["last_event"] == "shrink" and active_index <= canary_limit):
-                runtime["replan_required"] = True
-                runtime["replan_reason"] = autotune_state["last_reason"] or "Observed unstable retries under the current plan"
-                runtime["status"] = "aborted"
-                aborted = True
-                aborted_reason = (
-                    "Current plan requires replanning before continuing. "
-                    f"{runtime['replan_reason']}"
-                )
-                print(f"Error: {aborted_reason}", file=sys.stderr)
-                break
-        except LLMRequestError as error:
-            attempt_logs = _collect_attempt_logs(error)
-            failed_count += 1
-            chunk_info["status"] = "failed"
-            chunk_info["attempts"] = chunk_info.get("attempts", 0) + max(len(attempt_logs), getattr(error, "attempts", 1))
-            chunk_info["attempt_logs"] = list(chunk_info.get("attempt_logs", [])) + attempt_logs
-            chunk_info["last_error"] = str(error)
-            chunk_info["last_error_type"] = error.error_type
-            chunk_info["error_type"] = error.error_type
-            chunk_info["request_url"] = error.request_url or request_url
-            autotune_state = _update_autotune_state(
-                autotune_state,
-                success=False,
-                timeout=_is_timeout_error(error),
-                error_type=error.error_type,
-                chunk_id=chunk_id,
-            )
-            autotune_state["current_planned_max_output_tokens"] = planned_max_output_tokens
-            manifest["autotune"] = autotune_state
-            chunk_info["autotune_next_target_tokens"] = autotune_state["current_target_tokens"]
-            chunk_info["autotune_event"] = autotune_state["last_event"]
-            chunk_info["autotune_reason"] = autotune_state["last_reason"]
-            chunk_info["updated_at"] = _now_iso()
-            print(
-                f"Chunk {active_index}/{total} chunk_id={chunk_id} status=failed "
-                f"input_chars={chunk_char_count} estimated_input_tokens={estimated_input_tokens} "
-                f"planned_max_output_tokens={planned_max_output_tokens} latency_ms={chunk_info.get('latency_ms')} "
-                f"attempts={getattr(error, 'attempts', 1)} streaming_used={chunk_info.get('streaming_used', False)} "
-                f"error_type={error.error_type} url={error.request_url or request_url} error={error} "
-                f"autotune_event={autotune_state['last_event']} next_autotune_target_tokens={autotune_state['current_target_tokens']}",
-                file=sys.stderr,
-            )
-            if autotune_state["last_event"]:
-                print(
-                    f"Autotune chunk_id={chunk_id} event={autotune_state['last_event']} "
-                    f"target_tokens={autotune_state['current_target_tokens']} reason={autotune_state['last_reason']}",
-                    file=sys.stderr,
-                )
+                if autotune_state["last_event"]:
+                    print(
+                        f"Autotune chunk_id={chunk_id} event={autotune_state['last_event']} "
+                        f"target_tokens={autotune_state['current_target_tokens']} reason={autotune_state['last_reason']}",
+                        file=sys.stderr,
+                    )
 
-            if _should_replan_after_error(error) or (autotune_state["last_event"] == "shrink" and active_index <= canary_limit):
-                runtime["replan_required"] = True
-                runtime["replan_reason"] = autotune_state["last_reason"] or str(error)
-                runtime["status"] = "aborted"
-                aborted = True
-                aborted_reason = (
-                    "Current plan requires replanning before continuing. "
-                    f"{runtime['replan_reason']}"
-                )
-                print(f"Error: {aborted_reason}", file=sys.stderr)
-                break
+                if _should_replan_after_error(error) or (autotune_state["last_event"] == "shrink" and active_index <= canary_limit):
+                    runtime["replan_required"] = True
+                    runtime["replan_reason"] = autotune_state["last_reason"] or str(error)
+                    runtime["status"] = "aborted"
+                    aborted = True
+                    aborted_reason = (
+                        "Current plan requires replanning before continuing. "
+                        f"{runtime['replan_reason']}"
+                    )
+                    print(f"Error: {aborted_reason}", file=sys.stderr)
+                    break
 
-            if _is_timeout_error(error):
-                consecutive_timeouts += 1
-            else:
-                consecutive_timeouts = 0
+                if _is_timeout_error(error):
+                    consecutive_timeouts += 1
+                else:
+                    consecutive_timeouts = 0
 
-            if stop_after_timeouts > 0 and consecutive_timeouts >= stop_after_timeouts:
-                aborted = True
-                aborted_reason = (
-                    f"Stopped after {consecutive_timeouts} consecutive timeout failures. "
-                    f"Check provider/gateway latency or reduce chunk size."
-                )
-                print(f"Error: {aborted_reason}", file=sys.stderr)
-                _write_manifest(manifest_path, manifest)
+                if stop_after_timeouts > 0 and consecutive_timeouts >= stop_after_timeouts:
+                    aborted = True
+                    aborted_reason = (
+                        f"Stopped after {consecutive_timeouts} consecutive timeout failures. "
+                        f"Check provider/gateway latency or reduce chunk size."
+                    )
+                    print(f"Error: {aborted_reason}", file=sys.stderr)
+                    _write_manifest(manifest_path, manifest)
+                    break
                 break
-        finally:
-            runtime["processed_count"] = processed_count
-            runtime["failed_count"] = failed_count
-            runtime["skipped_count"] = skipped_count
-            runtime["superseded_count"] = superseded_count
-            runtime["last_request_url"] = request_url
-            runtime["updated_at"] = _now_iso()
-            if not aborted:
-                runtime["status"] = "running"
-            _refresh_manifest_token_source_summary(manifest)
-            _sync_manifest_legacy_fields(manifest)
-            _write_manifest(manifest_path, manifest)
+        runtime["processed_count"] = processed_count
+        runtime["failed_count"] = failed_count
+        runtime["skipped_count"] = skipped_count
+        runtime["superseded_count"] = superseded_count
+        runtime["last_request_url"] = request_url
+        runtime["updated_at"] = _now_iso()
+        if not aborted:
+            runtime["status"] = "running"
+        _refresh_manifest_token_source_summary(manifest)
+        _sync_manifest_legacy_fields(manifest)
+        _write_manifest(manifest_path, manifest)
 
         if aborted:
             break
@@ -5029,6 +5170,16 @@ def load_config(config_path: str = None, allow_missing: bool = False) -> dict:
     llm_probe_timeout_sec = parse_int_field('llm_probe_timeout_sec', 20, minimum=1)
     llm_probe_max_tokens = parse_int_field('llm_probe_max_tokens', 16, minimum=1)
     llm_stop_after_consecutive_timeouts = parse_int_field('llm_stop_after_consecutive_timeouts', 2, minimum=1)
+    llm_chunk_recovery_attempts = parse_int_field(
+        'llm_chunk_recovery_attempts',
+        DEFAULT_LLM_CHUNK_RECOVERY_ATTEMPTS,
+        minimum=0,
+    )
+    llm_chunk_recovery_backoff_sec = parse_float_field(
+        'llm_chunk_recovery_backoff_sec',
+        DEFAULT_LLM_CHUNK_RECOVERY_BACKOFF_SEC,
+        minimum=0.0,
+    )
 
     parsed = dict(defaults)
     parsed.update({
@@ -5050,6 +5201,8 @@ def load_config(config_path: str = None, allow_missing: bool = False) -> dict:
         "llm_probe_timeout_sec": llm_probe_timeout_sec,
         "llm_probe_max_tokens": llm_probe_max_tokens,
         "llm_stop_after_consecutive_timeouts": llm_stop_after_consecutive_timeouts,
+        "llm_chunk_recovery_attempts": llm_chunk_recovery_attempts,
+        "llm_chunk_recovery_backoff_sec": llm_chunk_recovery_backoff_sec,
         "chunk_mode": _normalize_chunk_mode(config.get('chunk_mode', DEFAULT_CHUNK_MODE)),
         "chunk_size_override": parse_int_field('chunk_size_override', 0, minimum=0),
         "chunk_tokens_structure_only": parse_int_field('chunk_tokens_structure_only', TASK_CHUNK_TOKEN_DEFAULTS['structure_only'], minimum=1),
@@ -5105,6 +5258,15 @@ def main():
         help='Parse VTT subtitle file, output plain text'
     )
     vtt_parser.add_argument('vtt_path', help='VTT file path')
+
+    # parse-vtt-segments command
+    vtt_segments_parser = subparsers.add_parser(
+        'parse-vtt-segments',
+        help='Parse VTT subtitle file, output aligned segments JSON'
+    )
+    vtt_segments_parser.add_argument('vtt_path', help='VTT file path')
+    vtt_segments_parser.add_argument('--language', default='',
+                                     help='Optional language override for output metadata')
 
     # process-deepgram command
     dg_parser = subparsers.add_parser(

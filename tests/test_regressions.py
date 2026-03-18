@@ -1,9 +1,12 @@
+import http.client
 import io
 import json
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
+import urllib.error
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -350,6 +353,44 @@ class RegressionTests(unittest.TestCase):
             self.assertEqual(segments[1]["text"], "Second line Third line")
             self.assertEqual(segments[1]["start_time"], 4.0)
             self.assertEqual(segments[1]["end_time"], 6.5)
+
+    def test_cli_parse_vtt_segments_command_is_registered(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            vtt_path = Path(tmpdir) / "sub.vtt"
+            vtt_path.write_text(
+                "WEBVTT\n"
+                "Language: en\n"
+                "\n"
+                "00:00:00.000 --> 00:00:02.000\n"
+                "Hello world.\n"
+                "\n"
+                "00:00:02.000 --> 00:00:04.000\n"
+                "Hello world.\n",
+                encoding="utf-8",
+            )
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(PROJECT_ROOT / "yt_transcript_utils.py"),
+                    "parse-vtt-segments",
+                    str(vtt_path),
+                    "--language",
+                    "en",
+                ],
+                cwd=PROJECT_ROOT,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+            payload = json.loads(result.stdout)
+            self.assertEqual(payload["source"], "vtt")
+            self.assertEqual(payload["language"], "en")
+            self.assertEqual(payload["segment_count"], 1)
+            self.assertEqual(payload["segments"][0]["text"], "Hello world.")
+            self.assertEqual(payload["segments"][0]["start_time"], 0.0)
+            self.assertEqual(payload["segments"][0]["end_time"], 4.0)
 
     def test_chunk_segments_can_force_chapter_boundaries(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1765,6 +1806,23 @@ exit 1
             self.assertEqual(result["attempt_history"][1]["result"], "success")
             self.assertEqual(mocked_request.call_count, 2)
 
+    def test_execute_llm_request_marks_remote_disconnect_retryable(self):
+        remote_error = urllib.error.URLError(
+            http.client.RemoteDisconnected("Remote end closed connection without response")
+        )
+
+        with mock.patch("urllib.request.urlopen", side_effect=remote_error):
+            with self.assertRaises(utils.LLMRequestError) as ctx:
+                utils._execute_llm_request(
+                    api_key="key",
+                    base_url="https://api.example.com",
+                    model="demo",
+                    messages=[{"role": "user", "content": "hello"}],
+                )
+
+        self.assertEqual(ctx.exception.error_type, "remote_disconnect")
+        self.assertTrue(ctx.exception.retryable)
+
     def test_call_llm_api_fails_fast_on_http_400(self):
         with mock.patch.object(utils, "_execute_llm_request") as mocked_request, mock.patch("time.sleep"):
             mocked_request.side_effect = utils.LLMRequestError(
@@ -1989,10 +2047,10 @@ exit 1
 
             translate_prompts = []
             translated_outputs = iter([
-                "[EN1]\n\n[ZH1]",
-                "[EN2]\n\n[ZH2]",
-                "[EN3]\n\n[ZH3]",
-                "[EN4]\n\n[ZH4]",
+                "[EN1]\n\n" + ("这是第一块的中文翻译。\n" * 6),
+                "[EN2]\n\n" + ("这是第二块的中文翻译。\n" * 6),
+                "[EN3]\n\n" + ("这是第三块的中文翻译。\n" * 6),
+                "[EN4]\n\n" + ("这是第四块的中文翻译。\n" * 6),
             ])
             stderr = io.StringIO()
             with mock.patch.object(utils, "load_config", return_value=config), mock.patch.object(
@@ -2253,6 +2311,55 @@ exit 1
             self.assertEqual(first_chunk["attempt_logs"][0]["error_type"], "timeout")
             self.assertEqual(first_chunk["attempt_logs"][1]["result"], "success")
             self.assertTrue(manifest["runtime"]["replan_required"])
+
+    def test_process_chunks_auto_recovers_suspicious_short_output(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source = Path(tmpdir) / "raw.txt"
+            work_dir = Path(tmpdir) / "chunks"
+            source.write_text("第一句。" * 40, encoding="utf-8")
+            utils.chunk_text(str(source), str(work_dir), 1000, "structure_only")
+
+            config = utils._default_config_values()
+            config.update({
+                "llm_api_key": "key",
+                "llm_base_url": "https://api.example.com",
+                "llm_model": "demo",
+                "llm_api_format": "openai",
+                "llm_chunk_recovery_attempts": 1,
+                "llm_chunk_recovery_backoff_sec": 0.0,
+            })
+
+            with mock.patch.object(utils, "load_config", return_value=config), \
+                mock.patch.object(utils, "_call_llm_api", side_effect=[
+                    {
+                        "text": "处理。",
+                        "latency_ms": 10,
+                        "request_url": "https://api.example.com/v1/chat/completions",
+                        "streaming_used": False,
+                        "attempts": 1,
+                    },
+                    {
+                        "text": "## Done\n\n" + ("处理完成，保留原始信息。\n" * 12),
+                        "latency_ms": 12,
+                        "request_url": "https://api.example.com/v1/chat/completions",
+                        "streaming_used": False,
+                        "attempts": 1,
+                    },
+                ]) as mocked_call, mock.patch("time.sleep"):
+                result = utils.process_chunks(str(work_dir), "structure_only")
+
+            manifest = json.loads((work_dir / "manifest.json").read_text(encoding="utf-8"))
+            first_chunk = manifest["chunks"][0]
+            output_path = work_dir / first_chunk["processed_path"]
+
+            self.assertTrue(result["success"])
+            self.assertEqual(mocked_call.call_count, 2)
+            self.assertEqual(first_chunk["status"], "done")
+            self.assertEqual(first_chunk["recovery_attempts"], 1)
+            self.assertEqual(first_chunk["recovery_logs"][0]["action"], "retry")
+            self.assertEqual(first_chunk["recovery_logs"][0]["reasons"], ["short_output"])
+            self.assertEqual(first_chunk["attempts"], 2)
+            self.assertIn("## Done", output_path.read_text(encoding="utf-8"))
 
     def test_replan_remaining_supersedes_pending_chunks_and_appends_new_plan(self):
         with tempfile.TemporaryDirectory() as tmpdir:
