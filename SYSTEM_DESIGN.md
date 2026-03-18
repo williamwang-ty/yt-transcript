@@ -1,466 +1,267 @@
-# System Design (v4.0)
+# System Design (v5.0-stage0)
 
-[English](#english) | [中文](#中文)
+**Stage**: 0
 
----
+**Status**: accepted and implemented
 
-## English
+**Behavior change in this stage**: none
 
-> **Design Goal**: Enable highly reliable execution on **Weak Models** (e.g., 8B parameters) while maintaining advanced capabilities for SOTA models.
+**Source of truth**: This file is the canonical system design document for the repository from this stage forward.
 
-### Part 1: Design Philosophy
-
-#### 1.1 The "Weak Model" Challenge
-
-We identified three primary failure modes when running complex agentic skills on smaller models (Llama-3-8B, Gemini Flash, etc.):
-
-1.  **Context Overflow**: Loading a 800+ line `SKILL.md` plus conversation history dilutes attention.
-2.  **Instruction Interference**: When a prompt contains >3 distinct objectives (e.g., "Translate AND Format AND Fix Grammar"), weak models tend to ignore the secondary constraints.
-3.  **State Amnesia**: During multi-step workflows, weak models often lose track of variable state (`VIDEO_ID`, `LANGUAGE`) after context switching.
-
-#### 1.2 Core Design Patterns
-
-**1.2.1 Modular Context Loading (The "Swap" Pattern)**
-
-Instead of a monolithic instruction file, we split the skill into a lightweight router and specialized modules.
-
-*   **Router (`SKILL.md`)**: < 400 lines. Contains only high-level decision trees (Binary choices: Yes/No).
-*   **Modules (`workflows/*.md`)**: Loaded *on-demand*. The model never sees the "Subtitle Download" instructions while doing "Text Optimization".
-
-*Impact: Reduces active context by ~40-50%.*
-
-**1.2.1.b Script-First Decision Logic**
-
-High-risk decisions should live in scripts that emit JSON, not in prompt prose. Subtitle availability, subtitle source-language selection, Deepgram split/merge behavior, config-path discovery, state validation, optimization planning, and quality gates are handled by helper scripts so the workflow docs stay declarative.
-
-**1.2.2 Single-Task Prompts**
-
-We enforce a hard rule: **One Prompt = One Primary Objective**.
-
-*   `structure_only.md`: Only adds newlines and headers. Explicit instruction to NOT translate.
-*   `translate_only.md`: Only translates. Explicit instruction to preserve structure.
-*   `quick_cleanup.md`: Only adds punctuation.
-
-*Impact: Drastically reduces "hallucination" and instruction skipping.*
-
-**1.2.3 The "Context Sync" Handshake**
-
-Every workflow file begins with a **Context Sync Section** that forces the model to read the State File (`/tmp/${VIDEO_ID}_state.md`) and extract variable values. This replaces memory-based recall with reliable disk-based verification. In the stabilized flow, `validate-state` is the canonical checkpoint instead of prompt-side field checklists.
-
-**1.2.4 Workflow State Persistence**
-
-To survive context loss or session interruptions, we maintain a lightweight **State File** (`/tmp/${VIDEO_ID}_state.md`).
-
-*   **Mechanism**: The LLM reads this state at the start of every cognitive turn (~180 tokens overhead) and updates it only after irreversible actions (checkpoints).
-*   **Checkpointing**:
-    1.  **CREATE**: After fetching metadata.
-    2.  **READ**: Before every decision/action.
-    3.  **WRITE**: After key milestones (Download complete, Chunk processed, File saved).
-    4.  **DELETE**: Upon successful cleanup (handled by `cleanup.sh` by default).
-
-*Impact: Ensures the Agent never "forgets" where it is or what rules to follow, even if the chat context is cleared.*
-
-**1.2.5 Fail-Fast & "Safety Nets"**
-
-Weak models tend to loop indefinitely when errors occur.
-
-*   **Fail-Fast**: Irreversible failures still stop the workflow immediately, but transient LLM transport failures (for example timeouts, `429`, and `5xx`) are retried a small bounded number of times in the script layer before the chunk is marked failed.
-*   **Safety Net**: In `quick_cleanup.md`, we added a trigger: "If text has ZERO punctuation, ignore minimal-change rules and fully punctuate."
+**Temporary companion document**: `LONG_TEXT_TRANSFORMATION_KERNEL.md` is now a staging draft only. It may contain useful target-state thinking, but it is not authoritative. Stable content will be folded into this file stage by stage.
 
 ---
 
-### Part 2: Implementation Strategies
+## 1. Stage 0 Goal
 
-#### 2.1 Audio Splitting Strategy
+Stage 0 is a **documentation canonicalization stage**.
 
-To bypass API limits (25MB) and improve reliability, large audio files are split intelligently:
+Its purpose is to establish a durable rule for all later implementation stages:
 
-1. **Rough Split**: Calculate theoretical split points at 10MB intervals.
-2. **Silence Detection**: Use FFmpeg to find silence intervals near rough split points.
-3. **Smart Decision**: Choose the nearest silence point within 60s deviation.
-4. **Fallback**: If no silence is found, force split at the rough point.
+- each implementation stage updates `SYSTEM_DESIGN.md`
+- each stage leaves the code and design documentation in a mutually consistent state
+- `SYSTEM_DESIGN.md` describes the **current implemented system first**, not the eventual end state
+- future work is documented as staged roadmap items, not as already-true architecture
 
-#### 2.2 Long-Text Processing Strategy
-
-To handle arbitrarily long videos (e.g., >2 hours) without hitting LLM context limits, we use a **Map-Reduce inspired hybrid pipeline**:
-
-1.  **Structural Chunking (Script)**:
-    - The `chunk-text` command splits raw text into semantic chunks based on sentence boundaries.
-    - The default path is now token-aware and prompt-aware: rewrite / translation paths use smaller targets, while summarize-only paths use larger ones.
-    - Character-based chunking remains as a compatibility fallback, and an explicit `--chunk-size` without `--prompt` keeps the legacy character interpretation.
-    - Prompt names are validated during chunk planning so bad prompt identifiers fail fast.
-    - Uses an idempotent `manifest.json` to track processing status, allowing resumability.
-
-2.  **Budgeted Chunk Processing**:
-    - `process-chunks` uses prompt-specific `max_output_tokens` computed from the same request budget as chunk planning.
-    - It also injects a lightweight continuity block from the previous chunk (tail sentence + optional section title) so adjacent chunks stay coherent without enabling overlap, and the chunk budget reserves a small token allowance for that context.
-    - `manifest.json` now separates immutable `plan` metadata from mutable `runtime` state, and chunk entries also retain `attempt_logs` so retries are observable instead of being hidden behind final chunk status.
-    - The controller no longer mutates the current batch plan in place. When canary chunks or retry history indicate the plan is unhealthy, `process-chunks` stops with `replan_required=true`, and `replan-remaining` generates a new plan for unfinished raw chunks.
-    - Runtime completion is now explicit (`completed`, `completed_with_errors`, `aborted`), and raw-path replans also remap any existing `chapter_plan.json` chunk starts so downstream merges preserve chapter headers.
-    - This keeps request envelopes conservative without pretending that an already-materialized batch has been resized at runtime.
-
-3.  **Two-Stage Chapter Planning**:
-    - **Priority 1**: Use YouTube Chapters if available (via `get-chapters`).
-    - **Priority 2**: If no chapters, the LLM first generates summaries for each chunk, then plans a global chapter structure based on summaries.
-
-4.  **Stateless Translation**:
-    - Each chunk is translated independently by the LLM without needing global context.
-    - Script (`merge-content`) handles the re-assembly and injection of chapter headers.
-
-5.  **Structured Optimization Planning**:
-    - `plan-optimization` reads validated state and emits the canonical short/long path, required operations, per-operation execution contracts, and whether `--require-llm` preflight is needed.
-    - The short/long split is canonical at `< 1800s = short` and `>= 1800s = long`; the separate Quick Mode shortcut is a narrower `< 900s` fast path for subtitle-friendly videos.
-    - Workflow docs consume this JSON instead of re-deriving prompt branches in prose.
-
-#### 2.3 Serial Processing for Multiple Links
-
-When processing multiple YouTube links, this skill uses **serial processing** (one video at a time) instead of parallel:
-
-| Approach | Feasibility | Reason |
-|----------|-------------|--------|
-| Parallel with Subagents | Not supported | Current Claude/Gemini Code architecture does not support spawning independent subagents with isolated context for general tasks |
-| Parallel in single session | Not feasible | AI optimization step requires direct LLM involvement; cannot split into multiple parallel cognitive threads |
-| Serial processing | Adopted | Process one video completely, clear context, then proceed to next |
-
-#### 2.4 Context Isolation for Chunk Processing
-
-**Problem**: During long video processing, the Agent processes multiple chunks sequentially within a single conversation. After the summary generation phase (Step 3: chapter planning), the Agent enters a summarization cognitive mode. When it then switches to the structuring phase (Step 4), this cognitive inertia causes **Goal Drift** -- the Agent produces summaries instead of structured original text.
-
-Root causes:
-
-1.  **Recency Bias**: The Agent spent significant tokens generating summaries, so summarization has high attention weight.
-2.  **Context Accumulation**: In Agent IDE (Claude Code / Gemini Code), all intermediate outputs (summaries, tool call results) accumulate in a shared, non-clearable conversation context.
-3.  **Instruction Decay**: After many rounds of chunk processing, the original instruction (Do NOT summarize) gets diluted.
-
-**Solution**: Offload chunk processing to the Python script (`process-chunks` command), which makes **independent LLM API calls** per chunk.
-
-```
-Before (shared context, cognitive drift):
-  Agent conversation
-    +-- chunk_0: generate summary    <-- sets summarize mode
-    +-- chunk_1: generate summary    <-- reinforces mode
-    +-- chunk_0: structure text      <-- instruction conflict!
-    +-- chunk_1: structure text      <-- likely produces summary
-
-After (hard isolation, no drift):
-  Agent conversation
-    +-- run: process-chunks --prompt summarize --auto-replan        <-- one command
-    |     +-- Script: API call per chunk (isolated)
-    +-- run: process-chunks --prompt structure_only --auto-replan   <-- one command
-          +-- Script: API call per chunk (isolated)
-```
-
-Key design decisions:
-
-*   **Dual API format support**: `_call_llm_api()` supports both OpenAI (`/v1/chat/completions`) and Anthropic (`/v1/messages`) formats, controlled by `llm_api_format` in `config.yaml`. The URL builder accepts either a provider root URL or a `/v1` URL.
-*   **Bounded retry + streaming**: LLM calls now use configurable timeout / retry / backoff settings and prefer streaming when the provider supports it, reducing read-timeout risk for long outputs.
-*   **Output validation**: For non-summary tasks, the script checks that output character count >= 50% of input. If below, a warning is raised (possible accidental summarization).
-*   **Manifest-based progress tracking**: `manifest.json` now tracks chunk status, attempts, latency, and last error metadata. Completed chunks are skipped by default on re-runs, making resumability operational instead of theoretical.
-*   **Real LLM preflight**: `scripts/preflight.sh --require-llm` now performs a small live probe instead of checking config presence only.
-*   **No external dependencies**: Uses only `urllib.request` for HTTP calls.
-*   **Script-owned routing**: `plan-optimization` is the canonical source for text-optimization branching, chunk execution contracts, and `replan_required` handling; `transcribe-deepgram` is the only supported Deepgram transcription entry.
-
-#### 2.5 Deterministic File Assembly & Quality Verification
-
-**Problem**: For very long videos (> 1 hour), the final "Assembly" phase (merging chunks into a markdown file) and "Verification" phase (checking quality) can cause context explosion if done by the Agent.
-1.  **Assembly**: Reading a 50k+ char text file into context just to prepend a header is wasteful and risky.
-2.  **Verification**: Asking the Agent to "read this 100-page document and check for errors" hits context limits and "lost-in-the-middle" issues.
-
-**Solution**: Offload these tasks to deterministic Python scripts.
-
-1.  **Assembly (`assemble-final`)**:
-    - The Agent passes metadata (Title, URL, Date) and the path to the optimized text file to the script.
-    - The script handles file I/O, frontmatter generation, Markdown header escaping, safe link encoding, and concatenation.
-    - **Key Benefit**: The Agent *never* loads the full optimized text into its context.
-
-2.  **Two-Layer Quality Verification**:
-    - **Layer 1 (Chunk Level via LLM)**: `process-chunks` checks every chunk output for:
-        - Size ratio (detects accidental summarization)
-        - Section headers (detects structure failure)
-        - Language ratio (detects translation failure)
-    - **Layer 2 (Document Level via Script)**: `verify-quality` check structural integrity of the merged file:
-        - File existence/non-empty
-        - No abrupt truncation at the end
-        - Global bilingual balance
-        - Minimum paragraph/section structure
-        - Basic bilingual paragraph pairing
-    - **Stop/go semantics**:
-        - Non-empty `hard_failures` => STOP
-        - `warnings` only => review and decide
-    - **Key Benefit**: The Agent only reads a lightweight JSON report (`{"passed": true, "hard_failures": [], "warnings": [...]}`), keeping context usage constant regardless of video length.
-
-#### 2.6 Validation Lifecycle
-
-The stabilized execution order is intentionally small and reusable:
-
-1.  `scripts/preflight.sh`
-2.  `scripts/download.sh "$URL" metadata`
-3.  `scripts/download.sh "$URL" subtitle-info`
-4.  `validate-state --stage metadata|post-source|pre-assemble|final`
-5.  `plan-optimization`
-6.  `transcribe-deepgram` when subtitle fallback is needed
-7.  `verify-quality`
-
-This keeps terminology and flow aligned across `README.md`, `SKILL.md`, `SYSTEM_DESIGN.md`, and `workflows/*.md`.
+Stage 0 intentionally makes **no behavior changes** to the running system.
 
 ---
 
-### Part 3: Technical Reference
+## 2. Current System Identity
 
-#### 3.1 Directory Structure
+### 2.1 What This Repository Is Today
 
-```
-yt-transcript/
-├── SKILL.md                # The Brain (Router)
-├── workflows/              # The Limbs (Procedural Knowledge)
-│   ├── subtitle_download.md
-│   ├── deepgram_transcribe.md
-│   └── text_optimization.md
-├── prompts/                # The Voice (Generation Templates)
-│   ├── structure_only.md
-│   ├── translate_only.md
-│   └── quick_cleanup.md
-├── scripts/                # The Hands (Tool Execution)
-│   ├── preflight.sh
-│   ├── download.sh
-│   └── cleanup.sh
-└── yt_transcript_utils.py  # Python Utilities
-```
+At the current implementation stage, this repository is a **script-first long-text processing system centered on YouTube transcript workflows**.
 
-#### 3.2 Minimum Requirements
+Its current implemented use cases are:
 
-*   **Context**: 4k tokens active window
-*   **Reasoning**: Elementary (Binary classification)
-*   **Instruction Following**: Medium (Single-constraint following)
-*   **Target Model Tier**: Llama-3-8B (Instruct) / GPT-3.5 Turbo level.
+- transcript extraction from subtitles or Deepgram fallback
+- transcript cleanup and structure restoration
+- bilingual translation workflow
+- chunked processing for long inputs
+- deterministic merge and final markdown assembly
+- workflow validation and stop/go quality checks
 
----
+This is broader than a simple transcript downloader, but narrower than a fully generalized long-text transformation kernel.
 
-## 中文
+### 2.2 Primary Design Goal
 
-> **设计目标**: 使 Skill 能够在 **弱模型**（如 8B 参数）上高度可靠地运行，同时为 SOTA 模型保留高级能力。
+The current primary design goal is:
 
-### 第一部分：设计哲学
+> Enable reliable long-text transcript transformation under context limits, especially on weaker models, using script-owned state, chunking, and deterministic verification.
 
-#### 1.1 "弱模型"的挑战
+### 2.3 Current Non-Goals
 
-我们在较小模型（Llama-3-8B, Gemini Flash 等）上运行复杂的 Agent Skill 时，识别出三种主要故障模式：
+At Stage 0, the system is **not yet**:
 
-1.  **上下文溢出 (Context Overflow)**: 加载 800+ 行的 `SKILL.md` 加上对话历史会稀释模型的注意力。
-2.  **指令干扰 (Instruction Interference)**: 当一个 Prompt 包含 >3 个不同的目标（例如"翻译"且"格式化"且"修复语法"）时，弱模型倾向于忽略次要约束。
-3.  **状态失忆 (State Amnesia)**: 在多步骤工作流中，弱模型在切换上下文后经常丢失变量状态（如 `VIDEO_ID`, `LANGUAGE`）。
+- a generalized multi-source document transformation framework
+- a formalized reusable kernel package
+- a concurrent chunk execution runtime with a first-class state store
+- a fully specified repair/replan engine
+- a complete observability platform
 
-#### 1.2 核心设计模式
-
-**1.2.1 模块化上下文加载 ("Swap" Pattern)**
-
-我们将 Skill 拆分为一个轻量级的路由（Router）和专门的模块（Modules），而不是使用单体指令文件。
-
-*   **Router (`SKILL.md`)**: < 400 行。仅包含高级决策树（二元选择：是/否）。
-*   **Modules (`workflows/*.md`)**: *按需*加载。模型在执行"文本优化"时永远不会看到"字幕下载"的指令。
-
-*影响：减少约 40-50% 的活跃上下文。*
-
-**1.2.1.b 脚本优先的决策逻辑**
-
-高风险的分支判断应尽量下沉到输出 JSON 的脚本，而不是散落在 Prompt 文案中。字幕可用性、字幕源语言选择、Deepgram 分片合并、配置路径发现、state 校验、文本优化分支规划、质量门禁等逻辑统一由辅助脚本负责，workflow 文档只描述调用顺序。
-
-**1.2.2 单任务 Prompts**
-
-我们强制执行一条硬性规则：**一个 Prompt = 一个主要目标**。
-
-*   `structure_only.md`: 仅添加换行和标题。显式指令**不**翻译。
-*   `translate_only.md`: 仅翻译。显式指令保留结构。
-*   `quick_cleanup.md`: 仅添加标点。
-
-*影响：大幅减少"幻觉"和指令跳过。*
-
-**1.2.3 "Context Sync" 握手**
-
-每个 Workflow 文件都以 **Context Sync 部分** 开头，强制模型读取状态文件（`/tmp/${VIDEO_ID}_state.md`）并提取变量值。这用可靠的基于磁盘的验证取代了基于记忆的回想。在稳定版流程中，`validate-state` 是标准检查点，而不是依赖文档里的人工字段核对。
-
-**1.2.4 工作流状态持久化**
-
-为了在上下文丢失或会话中断后存活，我们维护一个轻量级的 **状态文件** (`/tmp/${VIDEO_ID}_state.md`)。
-
-*   **机制**: LLM 在每个认知回合开始时读取此状态（约 180 tokens 开销），并仅在不可逆操作（检查点）后更新它。
-*   **检查点设计**:
-    1.  **CREATE**: 获取 Metadata 后创建。
-    2.  **READ**: 每次决策/行动前读取。
-    3.  **WRITE**: 关键里程碑后写入（下载完成、分块处理完、文件保存）。
-    4.  **DELETE**: 清理完成后删除（默认由 `cleanup.sh` 执行）。
-
-*价值: 确保 Agent 即使在聊天上下文被清空的情况下，也永远不会"忘记"当前进度或应遵循的规则。*
-
-**1.2.5 Fail-Fast & "安全网"**
-
-弱模型在出错时倾向于无限循环。
-
-*   **Fail-Fast**: 不可恢复的失败仍然立即 STOP；但对 LLM 传输层的瞬时故障（例如 timeout、`429`、`5xx`），脚本层会做小次数、有上限的重试后再判定该 chunk 失败。
-*   **Safety Net**: 在 `quick_cleanup.md` 中，我们添加了一个触发器："如果文本包含零标点，忽略最小修改规则并完全添加标点。"
+These may become future stages, but they are not part of the current implemented contract.
 
 ---
 
-### 第二部分：实现策略
+## 3. Current Implemented Architecture
 
-#### 2.1 音频分割策略
+### 3.1 Current Execution Shape
 
-为规避 API 限制（25MB）并提高稳定性，对大音频文件进行智能分割：
+The current system behaves approximately like this:
 
-1. **粗略分割**：按 10MB 间隔计算理论分割点。
-2. **静音检测**：使用 FFmpeg 检测粗略点附近的静音区间。
-3. **智能决策**：选择 60秒偏差范围内最近的静音点作为实际分割位置。
-4. **兜底机制**：若范围内无静音，则在粗略点强制分割。
-
-#### 2.2 长文本处理策略
-
-为了在不突破 LLM 上下文限制的情况下处理超长视频（如 >2小时），我们采用了 **Map-Reduce 思想的混合流水线**：
-
-1.  **结构化分块（脚本）**：
-    - `chunk-text` 命令按句子边界将原始文本切分为语义块。
-    - 默认路径已经切到 token-aware + prompt-aware：rewrite / translation 路径更小，summarize-only 路径更大。
-    - 字符模式仍然保留为兼容 fallback；如果只传显式 `--chunk-size` 而不传 `--prompt`，会继续按 legacy 字符大小解释。
-    - 分块规划阶段会提前校验 prompt 名称，避免坏 prompt 标识静默通过。
-    - 使用幂等的 `manifest.json` 追踪状态，支持断点续传。
-
-2.  **预算化 Chunk 处理**：
-    - `process-chunks` 会使用与分块规划同一套请求预算，为不同 prompt 单独计算 `max_output_tokens`。
-    - 它还会注入上一块的轻量 continuity block（尾句 + 可选 section title），在不启用 overlap 的前提下提升相邻块的一致性；同时 chunk budget 也会为这段上下文预留一小段 token 成本。
-    - `manifest.json` 现在会把不可变 `plan` 元数据和可变 `runtime` 状态分开，chunk 条目也会保留 `attempt_logs`，这样 retry 历史不会再被最终状态吞掉。
-    - controller 不再在当前 batch 内改写 plan；当 canary chunk 或 retry 历史表明 plan 不健康时，`process-chunks` 会以 `replan_required=true` 停止，而 `replan-remaining` 会为未完成的原始 chunk 生成新计划。
-    - runtime 完成态现在会明确区分 `completed` / `completed_with_errors` / `aborted`；同时 raw replan 也会重映射已有 `chapter_plan.json` 的 chunk 起点，保证后续 merge 时章节标题不丢。
-    - `process-chunks --auto-replan` 则提供一个更高层的编排入口，在不破坏上述边界的前提下自动串起 `process -> replan-remaining -> resume`。
-
-3.  **两阶段章节规划**：
-    - **优先级 1**：如果有 YouTube 章节（通过 `get-chapters` 获取），直接使用。
-    - **优先级 2**：无章节时，LLM 先对每个块生成摘要，再基于摘要规划全局章节结构。
-
-4.  **无状态翻译**：
-    - 每个文本块由 LLM 独立翻译，不需要全局上下文。
-    - 最终由脚本（`merge-content`）负责按顺序组装并插入章节标题。
-
-5.  **结构化优化规划**：
-    - `plan-optimization` 读取已校验的 state，输出 canonical 的短视频/长视频路径、操作序列、每步 chunk 执行契约，以及是否需要 `--require-llm`。
-    - workflow 文档消费这份 JSON，而不是再次用 prose 推导分支。
-
-#### 2.3 多链接串行处理
-
-处理多个 YouTube 链接时，本工具采用**串行处理**（逐个处理）而非并行：
-
-| 方案 | 可行性 | 原因 |
-|------|--------|------|
-| 并行 + Subagent | 不支持 | 当前 Claude/Gemini Code 架构不支持为通用任务创建具有独立上下文的子智能体 |
-| 单会话内并行 | 不可行 | AI 优化步骤需要 LLM 直接参与，无法"分身"成多个并行认知线程 |
-| 串行处理 | 采用 | 完整处理一个视频后清理上下文，再处理下一个 |
-
-#### 2.4 Chunk 处理的上下文隔离
-
-**问题**：处理长视频时，Agent 在同一对话中顺序处理多个 chunk。完成"摘要生成"阶段（Step 3: 章节规划）后，Agent 进入"概括"认知模式。切换到"结构化"阶段（Step 4）时，这种认知惯性导致**目标漂移（Goal Drift）**——Agent 输出摘要而非结构化原文。
-
-根因分析：
-
-1.  **近因偏差（Recency Bias）**：Agent 花了大量 token 生成摘要，"概括"在注意力中的权重过高。
-2.  **上下文累积**：在 Agent IDE（Claude Code / Gemini Code）中，所有中间产物（摘要、工具调用结果）累积在共享的、不可清除的对话上下文中。
-3.  **指令衰减（Instruction Decay）**：多轮 chunk 处理后，原始指令（"不要摘要"）被稀释。
-
-**解决方案**：将 chunk 处理下沉到 Python 脚本（`process-chunks` 命令），每个 chunk 通过**独立的 LLM API 调用**处理。
-
-```
-改造前（共享上下文，认知漂移）：
-  Agent 对话
-    +-- chunk_0: 生成摘要    <-- 设定"概括"模式
-    +-- chunk_1: 生成摘要    <-- 强化模式
-    +-- chunk_0: 结构化文本  <-- 指令冲突！
-    +-- chunk_1: 结构化文本  <-- 很可能输出摘要
-
-改造后（硬隔离，无漂移）：
-  Agent 对话
-    +-- 执行: process-chunks --prompt summarize --auto-replan      <-- 一条命令
-    |     +-- 脚本: 每个 chunk 独立 API 调用（隔离）
-    +-- 执行: process-chunks --prompt structure_only --auto-replan  <-- 一条命令
-          +-- 脚本: 每个 chunk 独立 API 调用（隔离）
+```text
+source acquisition
+  -> source selection (subtitles vs Deepgram)
+  -> raw text extraction
+  -> optimization planning
+  -> chunking for long inputs
+  -> per-chunk prompt execution
+  -> deterministic merge
+  -> deterministic final assembly
+  -> quality verification
 ```
 
-关键设计决策：
+This flow is implemented through shell scripts, workflow documents, prompts, and the Python utility layer.
 
-*   **双 API 格式支持**：`_call_llm_api()` 同时支持 OpenAI（`/v1/chat/completions`）和 Anthropic（`/v1/messages`）格式，通过 `config.yaml` 中的 `llm_api_format` 切换，并兼容填写服务根地址或 `/v1` 地址两种配置方式。
-*   **有上限的重试 + 流式优先**：LLM 调用现在支持可配置的 timeout / retry / backoff，并在 provider 支持时优先使用 streaming，以降低长输出场景的 read-timeout 风险。
-*   **输出验证**：非摘要任务中，脚本检查输出字符数 >= 输入的 50%。低于阈值则发出警告（可能误做了摘要）。
-*   **Manifest 进度追踪**：`manifest.json` 现在会记录 chunk 的状态、attempts、latency 和 last error；重跑时默认跳过已完成 chunk，使断点续传从“设计意图”变成“实际行为”。
-*   **真实 LLM preflight**：`scripts/preflight.sh --require-llm` 现在会执行一次低成本实时探活，而不只是检查配置项是否存在。
-*   **零外部依赖**：仅使用 `urllib.request` 进行 HTTP 调用。
-*   **脚本拥有最终路由权**：`plan-optimization` 是文本优化分支、chunk 执行契约与 `replan_required` 处理策略的唯一口径，`transcribe-deepgram` 是唯一支持的 Deepgram 转录入口。
+### 3.2 Current Persisted Artifacts
 
-#### 2.5 确定性文件组装与质量验证
+The current implementation relies on the following persisted artifacts:
 
-**问题**：对于超长视频（> 1小时），最后的"组装"阶段（合并 chunk 为 markdown）和"验证"阶段（检查质量）如果由 Agent 执行，会导致上下文爆炸。
-1.  **组装**：仅仅为了加个标题就把 5万+ 字符的文本读入上下文，既浪费又危险。
-2.  **验证**：让 Agent "阅读这份 100 页的文档并检查错误" 会触碰到上下文限制和 "中间迷失 (lost-in-the-middle)" 问题。
+- `/tmp/${VIDEO_ID}_state.md`
+  - workflow-facing state file
+  - currently the main explicit state surface used by workflow docs and helpers
+- `manifest.json` in chunk work directories
+  - chunk plan + runtime execution metadata
+  - used for resumability and chunk-level processing state
+- `/tmp/${VIDEO_ID}_raw_text.txt`
+  - raw extracted text
+- `/tmp/${VIDEO_ID}_structured.txt`
+  - optional intermediate structured text
+- `/tmp/${VIDEO_ID}_optimized.txt`
+  - transformed output before final assembly
+- final markdown output under configured output directory
 
-**解决方案**：将这些任务卸载给确定性的 Python 脚本。
+### 3.3 Current Core Commands
 
-1.  **组装 (`assemble-final`)**：
-    - Agent 将元数据（标题、URL、日期）和优化后的文本路径传递给脚本。
-    - 脚本负责文件 I/O、Frontmatter 生成、Markdown 头部转义、链接安全编码与拼接。
-    - **核心收益**：Agent *永远不需要* 将完整的优化文本加载到其上下文中。
+The current Python utility surface includes important orchestration primitives such as:
 
-2.  **双层质量验证**：
-    - **第一层（Chunk 级 LLM 验证）**：`process-chunks` 检查每个 chunk 的输出：
-        - 大小比例（检测意外摘要）
-        - 章节标题（检测结构化失败）
-        - 语言比例（检测翻译失败）
-    - **第二层（文档级脚本验证）**：`verify-quality` 检查合并文件的结构完整性：
-        - 文件存在/非空
-        - 结尾无突兀截断
-        - 全局双语平衡
-        - 最低段落/章节结构要求
-        - 基本的双语段落配对
-    - **Stop/go 语义**：
-        - `hard_failures` 非空 => 必须 STOP
-        - 只有 `warnings` => 人工复核后决定是否继续
-    - **核心收益**：Agent 只读取轻量级的 JSON 报告（`{"passed": true, "hard_failures": [], "warnings": [...]}`），无论视频多长，上下文占用保持恒定。
+- `validate-state`
+- `plan-optimization`
+- `chunk-text`
+- `chunk-segments`
+- `process-chunks`
+- `merge-content`
+- `assemble-final`
+- `verify-quality`
 
-#### 2.6 验证生命周期
+These commands are already the architectural core of the system.
 
-稳定版执行顺序刻意保持为一组可复用的最小命令：
+### 3.4 Current Architectural Strengths
 
-1.  `scripts/preflight.sh`
-2.  `scripts/download.sh "$URL" metadata`
-3.  `scripts/download.sh "$URL" subtitle-info`
-4.  `validate-state --stage metadata|post-source|pre-assemble|final`
-5.  `plan-optimization`
-6.  需要字幕兜底时执行 `transcribe-deepgram`
-7.  `verify-quality`
+The system already has several strong design properties:
 
-这样可以把术语和流程固定下来，并降低 `README.md`、`SKILL.md`、`SYSTEM_DESIGN.md` 与 `workflows/*.md` 之间再次漂移的风险。
+- script-first routing for high-risk decisions
+- explicit state instead of relying only on chat memory
+- prompt specialization by task
+- chunked long-text execution
+- manifest-backed resumability for chunk runs
+- deterministic merge and final file assembly
+- explicit verification checkpoints before final output
 
 ---
 
-### 第三部分：技术参考
+## 4. Current Design Principles
 
-#### 3.1 目录结构
+These principles are already true in the implemented system and should remain true during later refactors.
 
-```
-yt-transcript/
-├── SKILL.md                # 大脑 (路由)
-├── workflows/              # 四肢 (过程知识)
-│   ├── subtitle_download.md
-│   ├── deepgram_transcribe.md
-│   └── text_optimization.md
-├── prompts/                # 声音 (生成模板)
-│   ├── structure_only.md
-│   ├── translate_only.md
-│   └── quick_cleanup.md
-├── scripts/                # 双手 (工具执行)
-│   ├── preflight.sh
-│   ├── download.sh
-│   └── cleanup.sh
-└── yt_transcript_utils.py  # Python 工具脚本
-```
+### 4.1 Script-First Decisions
 
-#### 3.2 最低要求
+Branching and validation logic should live in scripts, not in prompt prose, whenever reliability matters.
 
-*   **上下文**: 4k tokens 活跃窗口
-*   **推理**: 初级 (二元分类)
-*   **指令遵循**: 中等 (单一约束遵循)
-*   **目标模型层级**: Llama-3-8B (Instruct) / GPT-3.5 Turbo 级别。
+### 4.2 Narrow Prompt Responsibilities
+
+One prompt should have one primary job whenever possible.
+
+### 4.3 Explicit State over Conversational Recall
+
+The system should prefer persisted state files and structured artifacts over relying on model memory.
+
+### 4.4 Deterministic Steps Stay out of Prompts
+
+Tasks such as file assembly, state validation, and basic quality gating should remain deterministic.
+
+### 4.5 Weak-Model Compatibility Matters
+
+The system should keep working with smaller or weaker models by reducing prompt burden and maintaining explicit checkpoints.
+
+### 4.6 Debuggability Is a First-Class Requirement
+
+Contributors should be able to inspect intermediate artifacts, chunk state, and quality outputs without reverse-engineering hidden runtime behavior.
+
+---
+
+## 5. Current Known Gaps
+
+The current implementation is effective, but not yet fully formalized.
+
+The main gaps at Stage 0 are:
+
+1. the authoritative state model is still workflow-oriented rather than kernel-oriented
+2. current state and target state are not yet unified in one implemented contract
+3. global glossary / entity / style constraint handling is not yet first-class
+4. continuity handling exists, but is still lightweight and not fully formalized
+5. verification, repair, resume, and replan are not yet described in one canonical control model
+6. concurrency, testing, and telemetry are real concerns but not yet fully specified in the main system design
+
+These gaps define the next implementation stages.
+
+---
+
+## 6. Staged Implementation Roadmap
+
+The long-text transformation refactor will proceed in vertical stages.
+
+Each stage should be a separate commit and should satisfy all of the following:
+
+- code changes are coherent and runnable
+- `SYSTEM_DESIGN.md` is updated to describe the new current state
+- tests or validation steps are updated with the change
+- planned work remains clearly separated from implemented behavior
+
+### Stage 1 — Authoritative State Model and Compatibility Layer
+
+Planned scope:
+
+- introduce a more formal authoritative machine-readable state model
+- preserve compatibility with current workflow-facing state usage
+- clarify which state surface is authoritative
+
+### Stage 2 — Normalization and Source Adapter Layer
+
+Planned scope:
+
+- make input normalization more explicit
+- define a cleaner source adapter boundary
+- reduce task-specific assumptions in the core flow
+
+### Stage 3 — Chunking and Continuity Formalization
+
+Planned scope:
+
+- formalize chunk contracts
+- improve continuity metadata
+- tighten chunk boundaries and merge assumptions
+
+### Stage 4 — Transform Runner and Resume Semantics
+
+Planned scope:
+
+- harden resumability
+- improve chunk lifecycle semantics
+- prepare for safer concurrency or more explicit execution control
+
+### Stage 5 — Verification, Repair, and Replan Control Loops
+
+Planned scope:
+
+- formalize verification policy
+- separate repair from replan
+- add bounded control-loop behavior
+
+### Stage 6 — Interfaces, Testing, and Observability
+
+Planned scope:
+
+- formalize CLI and Python API layers
+- improve tests and fixtures
+- define telemetry and debugging expectations
+
+---
+
+## 7. Stage 0 Deliverables
+
+Completed in this stage:
+
+- `SYSTEM_DESIGN.md` is now the canonical system design document
+- the design doc now describes the current implemented system first
+- future architecture is represented as staged roadmap items instead of assumed truth
+- the repository now has a clear “one stage, one coherent design/code state” rule
+
+Not done in this stage:
+
+- no code behavior changes
+- no state-model changes
+- no API changes
+- no chunking or verification logic changes
+
+---
+
+## 8. Next Stage Entry Criteria
+
+Stage 1 should begin only when the following are agreed:
+
+1. what the authoritative state file format should be
+2. how compatibility with current workflow-facing state will be preserved
+3. which minimum tests or validation checks must land with that state-model change
+
