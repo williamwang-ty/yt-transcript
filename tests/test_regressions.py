@@ -645,6 +645,83 @@ class RegressionTests(unittest.TestCase):
 
             self.assertTrue(result["passed"], result)
 
+    def test_validate_state_materializes_machine_state_from_legacy_markdown(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state = Path(tmpdir) / "vid001_state.md"
+            state.write_text(
+                "# State\n"
+                "vid: vid001\n"
+                "url: https://example.com/watch?v=1\n"
+                "title: Sample\n"
+                "channel: Channel\n"
+                "upload_date: 20260308\n"
+                "duration: 120\n"
+                "output_dir: /tmp/out\n"
+                "mode: bilingual\n"
+                "src: youtube\n"
+                "source_language: en\n"
+                "subtitle_source: YouTube Subtitles\n",
+                encoding="utf-8",
+            )
+
+            result = utils.validate_state(str(state), stage="post-source")
+
+            self.assertTrue(result["passed"], result)
+            machine_state = Path(result["machine_state_path"])
+            self.assertTrue(machine_state.exists())
+            payload = json.loads(machine_state.read_text(encoding="utf-8"))
+            self.assertEqual(payload["document_id"], "vid001")
+            self.assertEqual(payload["compat_projection"]["fields"]["title"], "Sample")
+
+    def test_plan_optimization_accepts_machine_state_json_input(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state = Path(tmpdir) / "vid001_state.md"
+            state.write_text(
+                "# State\n"
+                "vid: vid001\n"
+                "url: https://example.com/watch?v=1\n"
+                "title: Sample\n"
+                "channel: Channel\n"
+                "upload_date: 20260308\n"
+                "duration: 3600\n"
+                "output_dir: /tmp/out\n"
+                "mode: chinese\n"
+                "src: deepgram\n"
+                "source_language: zh\n"
+                "subtitle_source: Deepgram Transcription\n"
+                "work_dir: /tmp/vid001_chunks\n",
+                encoding="utf-8",
+            )
+            sync_result = utils.sync_machine_state(str(state))
+
+            result = utils.plan_optimization(sync_result["machine_state_path"])
+
+            self.assertTrue(result["passed"], result)
+            self.assertEqual(result["video_path"], "long")
+            self.assertEqual(result["machine_state_path"], sync_result["machine_state_path"])
+
+    def test_sync_machine_state_can_write_legacy_projection_from_json(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state = Path(tmpdir) / "vid001_state.md"
+            state.write_text(
+                "# State\n"
+                "vid: vid001\n"
+                "url: https://example.com/watch?v=1\n"
+                "title: Sample\n"
+                "channel: Channel\n"
+                "upload_date: 20260308\n"
+                "duration: 120\n"
+                "output_dir: /tmp/out\n",
+                encoding="utf-8",
+            )
+            sync_result = utils.sync_machine_state(str(state))
+            state.unlink()
+
+            rewrite_result = utils.sync_machine_state(sync_result["machine_state_path"], write_legacy=True)
+
+            self.assertTrue(Path(rewrite_result["legacy_state_path"]).exists())
+            content = Path(rewrite_result["legacy_state_path"]).read_text(encoding="utf-8")
+            self.assertIn("vid: vid001", content)
     def test_plan_optimization_returns_short_bilingual_operations(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             state = Path(tmpdir) / "state.md"
@@ -738,8 +815,10 @@ class RegressionTests(unittest.TestCase):
     def test_cleanup_script_removes_state_by_default(self):
         video_id = "cleanup_state_test"
         state_file = Path(f"/tmp/{video_id}_state.md")
+        machine_state_file = Path(f"/tmp/{video_id}_machine_state.json")
         try:
             state_file.write_text("state", encoding="utf-8")
+            machine_state_file.write_text("{}", encoding="utf-8")
             subprocess.run(
                 ["bash", str(PROJECT_ROOT / "scripts/cleanup.sh"), video_id],
                 cwd=PROJECT_ROOT,
@@ -748,14 +827,18 @@ class RegressionTests(unittest.TestCase):
                 text=True,
             )
             self.assertFalse(state_file.exists())
+            self.assertFalse(machine_state_file.exists())
         finally:
             state_file.unlink(missing_ok=True)
+            machine_state_file.unlink(missing_ok=True)
 
     def test_cleanup_script_can_keep_state(self):
         video_id = "cleanup_keep_state_test"
         state_file = Path(f"/tmp/{video_id}_state.md")
+        machine_state_file = Path(f"/tmp/{video_id}_machine_state.json")
         try:
             state_file.write_text("state", encoding="utf-8")
+            machine_state_file.write_text("{}", encoding="utf-8")
             subprocess.run(
                 ["bash", str(PROJECT_ROOT / "scripts/cleanup.sh"), video_id, "--keep-state"],
                 cwd=PROJECT_ROOT,
@@ -764,8 +847,10 @@ class RegressionTests(unittest.TestCase):
                 text=True,
             )
             self.assertTrue(state_file.exists())
+            self.assertTrue(machine_state_file.exists())
         finally:
             state_file.unlink(missing_ok=True)
+            machine_state_file.unlink(missing_ok=True)
 
     def test_cleanup_script_rejects_unsafe_video_id(self):
         result = subprocess.run(

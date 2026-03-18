@@ -34,6 +34,20 @@ fi
 
 echo "🧹 Cleaning up temporary files for video: $VIDEO_ID"
 
+STATE_FILE="/tmp/${VIDEO_ID}_state.md"
+MACHINE_STATE_FILE="/tmp/${VIDEO_ID}_machine_state.json"
+KEEP_DIR=""
+
+if [ "$KEEP_STATE" = true ]; then
+    KEEP_DIR=$(mktemp -d)
+    if [ -f "$STATE_FILE" ]; then
+        mv "$STATE_FILE" "$KEEP_DIR/state.md"
+    fi
+    if [ -f "$MACHINE_STATE_FILE" ]; then
+        mv "$MACHINE_STATE_FILE" "$KEEP_DIR/machine_state.json"
+    fi
+fi
+
 # Remove all temp files related to this video
 rm -f /tmp/${VIDEO_ID}.*
 rm -f /tmp/${VIDEO_ID}_*.json
@@ -45,7 +59,17 @@ rm -f /tmp/${VIDEO_ID}_combined_transcript.txt
 rm -rf /tmp/${VIDEO_ID}_chunks/
 rm -rf /tmp/${VIDEO_ID}_downloads/
 if [ "$KEEP_STATE" != true ]; then
-    rm -f /tmp/${VIDEO_ID}_state.md
+    rm -f "$STATE_FILE"
+fi
+
+if [ "$KEEP_STATE" = true ]; then
+    if [ -f "$KEEP_DIR/state.md" ]; then
+        mv "$KEEP_DIR/state.md" "$STATE_FILE"
+    fi
+    if [ -f "$KEEP_DIR/machine_state.json" ]; then
+        mv "$KEEP_DIR/machine_state.json" "$MACHINE_STATE_FILE"
+    fi
+    rmdir "$KEEP_DIR" 2>/dev/null || true
 fi
 
 echo "✅ Cleanup complete"

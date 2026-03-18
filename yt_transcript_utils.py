@@ -30,12 +30,14 @@ Commands:
     replan-remaining <work_dir>    Re-plan unfinished raw chunks after canary/autotune aborts
     assemble-final <optimized_text> <output_file>  Assemble final markdown from optimized text + metadata
     verify-quality <optimized_text>  Verify quality of optimized text (structural checks)
+    sync-state <state_ref>         Sync legacy state.md and authoritative machine_state.json
     validate-state <state_path>    Validate workflow state fields for a given stage
     plan-optimization <state_path> Generate a structured optimization plan from workflow state
 """
 
 import argparse
 import bisect
+import hashlib
 import http.client
 import json
 import math
@@ -4829,22 +4831,33 @@ STATE_STAGE_FIELDS = {
               "mode", "src", "source_language", "subtitle_source", "output_file"],
 }
 
+MACHINE_STATE_SCHEMA_VERSION = 1
+MACHINE_STATE_FORMAT = "yt_transcript.machine_state/v1"
+LEGACY_STATE_MACHINE_SUFFIX = "_machine_state.json"
 
-def load_state(state_path: str) -> dict:
-    """
-    Load the workflow state markdown file as a simple flat key/value mapping.
-    """
+
+def _derive_machine_state_path(state_path: str | Path) -> Path:
     path = Path(state_path)
-    if not path.exists():
-        print(f"Error: State file not found: {state_path}", file=sys.stderr)
-        sys.exit(1)
+    if path.suffix.lower() == ".json":
+        return path
+    if path.name.endswith("_state.md"):
+        return path.with_name(path.name[:-len("_state.md")] + LEGACY_STATE_MACHINE_SUFFIX)
+    stem = path.stem
+    if stem.endswith("_state"):
+        stem = stem[:-len("_state")]
+    return path.with_name(f"{stem}{LEGACY_STATE_MACHINE_SUFFIX}")
 
-    try:
-        content = path.read_text(encoding="utf-8")
-    except Exception as e:
-        print(f"Error: Cannot read state file: {e}", file=sys.stderr)
-        sys.exit(2)
 
+def _derive_legacy_state_path(machine_state_path: str | Path) -> Path:
+    path = Path(machine_state_path)
+    if path.suffix.lower() == ".md":
+        return path
+    if path.name.endswith(LEGACY_STATE_MACHINE_SUFFIX):
+        return path.with_name(path.name[:-len(LEGACY_STATE_MACHINE_SUFFIX)] + "_state.md")
+    return path.with_suffix(".md")
+
+
+def _parse_legacy_state_content(content: str) -> dict:
     state = {}
     for raw_line in content.splitlines():
         line = raw_line.strip()
@@ -4857,15 +4870,171 @@ def load_state(state_path: str) -> dict:
     return state
 
 
+def _read_legacy_state_file(state_path: str | Path) -> tuple[dict, str]:
+    path = Path(state_path)
+    try:
+        content = path.read_text(encoding="utf-8")
+    except Exception as e:
+        print(f"Error: Cannot read state file: {e}", file=sys.stderr)
+        sys.exit(2)
+    return _parse_legacy_state_content(content), content
+
+
+def _compat_fields_to_machine_state(compat_fields: dict, legacy_state_path: Path, machine_state_path: Path) -> dict:
+    compat = {str(key).strip(): str(value).strip() for key, value in (compat_fields or {}).items() if str(key).strip()}
+    content = "\n".join(f"{key}: {value}" for key, value in sorted(compat.items()))
+    content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
+    source = {
+        "type": compat.get("src", ""),
+        "url": compat.get("url", ""),
+        "title": compat.get("title", ""),
+        "channel": compat.get("channel", ""),
+        "upload_date": compat.get("upload_date", ""),
+        "duration": compat.get("duration", ""),
+        "source_language": compat.get("source_language", ""),
+        "subtitle_source": compat.get("subtitle_source", ""),
+    }
+    artifacts = {
+        "output_dir": compat.get("output_dir", ""),
+        "work_dir": compat.get("work_dir", ""),
+        "output_file": compat.get("output_file", ""),
+        "raw_text": compat.get("raw_text", ""),
+        "structured_text": compat.get("structured_text", ""),
+        "optimized_text": compat.get("optimized_text", ""),
+    }
+    workflow = {
+        "mode": compat.get("mode", ""),
+        "step": compat.get("step", ""),
+        "last_action": compat.get("last_action", ""),
+        "chunk": compat.get("chunk", ""),
+        "total": compat.get("total", ""),
+    }
+    return {
+        "schema_version": MACHINE_STATE_SCHEMA_VERSION,
+        "format": MACHINE_STATE_FORMAT,
+        "updated_at": _now_iso(),
+        "document_id": compat.get("vid", ""),
+        "legacy_state_path": str(legacy_state_path),
+        "machine_state_path": str(machine_state_path),
+        "compat_projection": {
+            "fields": compat,
+            "source_hash": content_hash,
+        },
+        "source": source,
+        "artifacts": artifacts,
+        "workflow": workflow,
+    }
+
+
+def _read_machine_state(machine_state_path: str | Path) -> dict:
+    path = Path(machine_state_path)
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as e:
+        print(f"Error: Cannot read machine state: {e}", file=sys.stderr)
+        sys.exit(2)
+    if not isinstance(payload, dict):
+        print("Error: Machine state must be a JSON object", file=sys.stderr)
+        sys.exit(2)
+    return payload
+
+
+def _write_machine_state(machine_state_path: str | Path, payload: dict) -> None:
+    path = Path(machine_state_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _atomic_write_text(path, json.dumps(payload, ensure_ascii=False, indent=2))
+
+
+def _machine_state_to_compat_fields(payload: dict) -> dict:
+    compat = payload.get("compat_projection", {}).get("fields", {}) if isinstance(payload, dict) else {}
+    if not isinstance(compat, dict):
+        return {}
+    return {str(key).strip(): str(value).strip() for key, value in compat.items() if str(key).strip()}
+
+
+def sync_machine_state(state_ref: str, write_legacy: bool = False) -> dict:
+    path = Path(state_ref)
+    if path.suffix.lower() == ".json":
+        if not path.exists():
+            print(f"Error: Machine state file not found: {state_ref}", file=sys.stderr)
+            sys.exit(1)
+        machine_state = _read_machine_state(path)
+        legacy_state_path = _derive_legacy_state_path(path)
+        compat_fields = _machine_state_to_compat_fields(machine_state)
+        if write_legacy:
+            lines = ["# State"]
+            for key, value in compat_fields.items():
+                lines.append(f"{key}: {value}")
+            _atomic_write_text(legacy_state_path, "\n".join(lines) + "\n")
+        return {
+            "machine_state_path": str(path),
+            "legacy_state_path": str(legacy_state_path),
+            "compat_fields": compat_fields,
+            "updated_machine_state": False,
+            "updated_legacy_state": write_legacy,
+        }
+
+    if not path.exists():
+        machine_state_path = _derive_machine_state_path(path)
+        if machine_state_path.exists():
+            machine_state = _read_machine_state(machine_state_path)
+            return {
+                "machine_state_path": str(machine_state_path),
+                "legacy_state_path": str(path),
+                "compat_fields": _machine_state_to_compat_fields(machine_state),
+                "updated_machine_state": False,
+                "updated_legacy_state": False,
+            }
+        print(f"Error: State file not found: {state_ref}", file=sys.stderr)
+        sys.exit(1)
+
+    compat_fields, content = _read_legacy_state_file(path)
+    machine_state_path = _derive_machine_state_path(path)
+    content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
+    existing = _read_machine_state(machine_state_path) if machine_state_path.exists() else None
+    existing_hash = ""
+    if isinstance(existing, dict):
+        existing_hash = str(existing.get("compat_projection", {}).get("source_hash", "")).strip()
+    updated_machine_state = not existing or existing_hash != content_hash
+    if updated_machine_state:
+        machine_state = _compat_fields_to_machine_state(compat_fields, path, machine_state_path)
+        _write_machine_state(machine_state_path, machine_state)
+    else:
+        machine_state = existing
+    return {
+        "machine_state_path": str(machine_state_path),
+        "legacy_state_path": str(path),
+        "compat_fields": _machine_state_to_compat_fields(machine_state),
+        "updated_machine_state": updated_machine_state,
+        "updated_legacy_state": False,
+    }
+
+
+def load_state(state_path: str) -> dict:
+    """
+    Load workflow state through the authoritative machine-state bridge.
+
+    Compatibility behavior:
+    - legacy markdown state files remain accepted inputs
+    - if a legacy state file is provided, a sibling machine_state.json is
+      created or refreshed automatically
+    - direct machine_state.json inputs are also supported
+    """
+    sync_result = sync_machine_state(state_path)
+    return sync_result["compat_fields"]
+
+
 def validate_state(state_path: str, stage: str = "", require: list[str] | None = None) -> dict:
     """
-    Validate the state file for a workflow stage or explicit required fields.
+    Validate workflow state fields for a stage or explicit required fields.
 
-    This is the canonical workflow checkpoint validator. Stages intentionally
-    model the real execution order instead of enforcing one global required
-    field set.
+    Compatibility behavior:
+    - legacy state.md inputs are accepted
+    - machine_state.json is materialized and refreshed automatically when the
+      legacy projection changes
     """
-    state = load_state(state_path)
+    sync_result = sync_machine_state(state_path)
+    state = sync_result["compat_fields"]
     warnings = []
     hard_failures = []
 
@@ -4911,6 +5080,9 @@ def validate_state(state_path: str, stage: str = "", require: list[str] | None =
         "checks": checks,
         "warnings": warnings,
         "hard_failures": hard_failures,
+        "machine_state_path": sync_result["machine_state_path"],
+        "legacy_state_path": sync_result["legacy_state_path"],
+        "updated_machine_state": sync_result["updated_machine_state"],
     }
 
 
@@ -4929,6 +5101,8 @@ def plan_optimization(state_path: str) -> dict:
             "checks": validation["checks"],
             "warnings": validation["warnings"],
             "hard_failures": validation["hard_failures"],
+            "machine_state_path": validation.get("machine_state_path", ""),
+            "legacy_state_path": validation.get("legacy_state_path", ""),
         }
 
     state = load_state(state_path)
@@ -5036,6 +5210,8 @@ def plan_optimization(state_path: str) -> dict:
 
     return {
         "passed": True,
+        "machine_state_path": validation.get("machine_state_path", ""),
+        "legacy_state_path": validation.get("legacy_state_path", ""),
         "checks": {
             "state_stage": "post-source",
             "duration": duration,
@@ -5469,6 +5645,15 @@ def main():
     config_parser.add_argument('--config-path', default=None,
                                help='Optional path to config file')
 
+    # sync-state command
+    sync_state_parser = subparsers.add_parser(
+        'sync-state',
+        help='Sync legacy state.md with authoritative machine_state.json'
+    )
+    sync_state_parser.add_argument('state_ref', help='Path to legacy state.md or machine_state.json')
+    sync_state_parser.add_argument('--write-legacy', action='store_true',
+                                   help='When given a machine_state.json, write the legacy state.md projection')
+
     # validate-state command
     state_parser = subparsers.add_parser(
         'validate-state',
@@ -5637,6 +5822,10 @@ def main():
 
     elif args.command == 'load-config':
         result = load_config(args.config_path)
+        print(json.dumps(result, ensure_ascii=False))
+
+    elif args.command == 'sync-state':
+        result = sync_machine_state(args.state_ref, write_legacy=args.write_legacy)
         print(json.dumps(result, ensure_ascii=False))
 
     elif args.command == 'validate-state':

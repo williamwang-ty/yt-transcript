@@ -1,29 +1,29 @@
-# System Design (v5.0-stage0)
+# System Design (v5.1-stage1)
 
-**Stage**: 0
+**Stage**: 1
 
 **Status**: accepted and implemented
 
-**Behavior change in this stage**: none
+**Behavior change in this stage**: introduced an authoritative machine-readable state model with backward-compatible legacy state projection support
 
-**Source of truth**: This file is the canonical system design document for the repository from this stage forward.
+**Source of truth**: This file is the canonical system design document for the repository.
 
-**Temporary companion document**: `LONG_TEXT_TRANSFORMATION_KERNEL.md` is now a staging draft only. It may contain useful target-state thinking, but it is not authoritative. Stable content will be folded into this file stage by stage.
+**Temporary companion document**: `LONG_TEXT_TRANSFORMATION_KERNEL.md` remains a non-authoritative staging draft. Stable content is folded into this file only when implemented or accepted for the next stage.
 
 ---
 
-## 1. Stage 0 Goal
+## 1. Stage 1 Goal
 
-Stage 0 is a **documentation canonicalization stage**.
+Stage 1 establishes the first formal kernel-oriented substrate without breaking the current workflow surface.
 
-Its purpose is to establish a durable rule for all later implementation stages:
+Its goals are:
 
-- each implementation stage updates `SYSTEM_DESIGN.md`
-- each stage leaves the code and design documentation in a mutually consistent state
-- `SYSTEM_DESIGN.md` describes the **current implemented system first**, not the eventual end state
-- future work is documented as staged roadmap items, not as already-true architecture
+- introduce an authoritative machine-readable state model
+- preserve compatibility with the existing workflow-facing `state.md` file
+- make current orchestration commands work with either state surface
+- keep the rest of the system behavior unchanged
 
-Stage 0 intentionally makes **no behavior changes** to the running system.
+Stage 1 is intentionally narrow. It does **not** attempt to generalize the full kernel yet. It only formalizes the state boundary so later stages have a stable base.
 
 ---
 
@@ -31,7 +31,7 @@ Stage 0 intentionally makes **no behavior changes** to the running system.
 
 ### 2.1 What This Repository Is Today
 
-At the current implementation stage, this repository is a **script-first long-text processing system centered on YouTube transcript workflows**.
+At the current implementation stage, this repository is a **script-first long-text processing system centered on YouTube transcript workflows**, with an emerging kernel-style core.
 
 Its current implemented use cases are:
 
@@ -42,7 +42,7 @@ Its current implemented use cases are:
 - deterministic merge and final markdown assembly
 - workflow validation and stop/go quality checks
 
-This is broader than a simple transcript downloader, but narrower than a fully generalized long-text transformation kernel.
+This is broader than a simple transcript downloader, but still narrower than a fully generalized long-text transformation framework.
 
 ### 2.2 Primary Design Goal
 
@@ -52,15 +52,15 @@ The current primary design goal is:
 
 ### 2.3 Current Non-Goals
 
-At Stage 0, the system is **not yet**:
+At Stage 1, the system is **not yet**:
 
 - a generalized multi-source document transformation framework
-- a formalized reusable kernel package
-- a concurrent chunk execution runtime with a first-class state store
+- a formalized reusable kernel package layout
+- a concurrent chunk execution runtime with per-chunk authoritative state stores
 - a fully specified repair/replan engine
 - a complete observability platform
 
-These may become future stages, but they are not part of the current implemented contract.
+These remain future stages, not current contract.
 
 ---
 
@@ -74,6 +74,7 @@ The current system behaves approximately like this:
 source acquisition
   -> source selection (subtitles vs Deepgram)
   -> raw text extraction
+  -> state synchronization
   -> optimization planning
   -> chunking for long inputs
   -> per-chunk prompt execution
@@ -86,11 +87,14 @@ This flow is implemented through shell scripts, workflow documents, prompts, and
 
 ### 3.2 Current Persisted Artifacts
 
-The current implementation relies on the following persisted artifacts:
+The current implementation relies on these persisted artifacts:
 
+- `/tmp/${VIDEO_ID}_machine_state.json`
+  - authoritative machine-readable state surface introduced in Stage 1
+  - materialized automatically from legacy state when needed
 - `/tmp/${VIDEO_ID}_state.md`
-  - workflow-facing state file
-  - currently the main explicit state surface used by workflow docs and helpers
+  - workflow-facing compatibility projection
+  - still accepted by current workflow docs and current operator habits
 - `manifest.json` in chunk work directories
   - chunk plan + runtime execution metadata
   - used for resumability and chunk-level processing state
@@ -102,10 +106,38 @@ The current implementation relies on the following persisted artifacts:
   - transformed output before final assembly
 - final markdown output under configured output directory
 
-### 3.3 Current Core Commands
+### 3.3 Current State Model
 
-The current Python utility surface includes important orchestration primitives such as:
+Stage 1 introduces a two-surface state model:
 
+#### Authoritative surface
+
+- `machine_state.json` is the authoritative state surface for helper commands
+- it stores a structured machine-readable payload plus a compatibility projection
+- it is intended as the base for later kernel extraction work
+
+#### Compatibility surface
+
+- `state.md` remains the workflow-facing compatibility surface
+- current workflow docs can continue reading and writing it
+- helper commands automatically import it into `machine_state.json`
+- helper commands also accept direct `machine_state.json` input
+
+#### Current authority rule
+
+At Stage 1, authority is implemented as follows:
+
+- if a legacy `state.md` is passed to a helper command, the command syncs or refreshes `machine_state.json`
+- if a `machine_state.json` path is passed directly, the helper uses it as authoritative input
+- `sync-state` exists for explicit manual synchronization and recovery tasks
+
+This design keeps the current workflow surface stable while introducing a stronger internal contract.
+
+### 3.4 Current Core Commands
+
+The current Python utility surface includes the following architectural primitives:
+
+- `sync-state`
 - `validate-state`
 - `plan-optimization`
 - `chunk-text`
@@ -115,9 +147,9 @@ The current Python utility surface includes important orchestration primitives s
 - `assemble-final`
 - `verify-quality`
 
-These commands are already the architectural core of the system.
+These commands remain the system’s current orchestration center.
 
-### 3.4 Current Architectural Strengths
+### 3.5 Current Architectural Strengths
 
 The system already has several strong design properties:
 
@@ -128,6 +160,7 @@ The system already has several strong design properties:
 - manifest-backed resumability for chunk runs
 - deterministic merge and final file assembly
 - explicit verification checkpoints before final output
+- backward-compatible state evolution without breaking current workflows
 
 ---
 
@@ -159,43 +192,65 @@ The system should keep working with smaller or weaker models by reducing prompt 
 
 Contributors should be able to inspect intermediate artifacts, chunk state, and quality outputs without reverse-engineering hidden runtime behavior.
 
+### 4.7 Compatibility Is Allowed When It Preserves Forward Motion
+
+State evolution is allowed to proceed behind a compatibility layer, as long as:
+
+- existing workflows continue to operate
+- the new authoritative surface is explicit
+- the migration path remains inspectable and reversible
+
 ---
 
-## 5. Current Known Gaps
+## 5. Stage 1 Deliverables
 
-The current implementation is effective, but not yet fully formalized.
+Completed in this stage:
 
-The main gaps at Stage 0 are:
+- introduced `machine_state.json` as an authoritative machine-readable state surface
+- preserved `state.md` as a workflow-facing compatibility surface
+- made `validate-state` work through the state bridge
+- made `plan-optimization` accept both legacy markdown state and machine JSON state
+- added explicit `sync-state` command for manual synchronization and recovery workflows
+- updated cleanup behavior so `--keep-state` preserves both state surfaces
+- added regression coverage for state materialization, direct JSON input, legacy projection rewrite, and cleanup behavior
 
-1. the authoritative state model is still workflow-oriented rather than kernel-oriented
-2. current state and target state are not yet unified in one implemented contract
+Not done in this stage:
+
+- no broader normalization layer yet
+- no canonical multi-source document model yet
+- no per-chunk authoritative state files yet
+- no formal repair/replan contract yet
+- no telemetry module yet
+
+---
+
+## 6. Current Known Gaps
+
+The current implementation is stronger than Stage 0, but still not fully kernelized.
+
+The main remaining gaps are:
+
+1. input normalization is still implicit rather than a formal layer
+2. source adapters are still task-shaped rather than canonicalized
 3. global glossary / entity / style constraint handling is not yet first-class
 4. continuity handling exists, but is still lightweight and not fully formalized
-5. verification, repair, resume, and replan are not yet described in one canonical control model
-6. concurrency, testing, and telemetry are real concerns but not yet fully specified in the main system design
+5. verification, repair, resume, and replan are not yet unified in one canonical control model
+6. concurrency, testing structure, and telemetry are not yet fully specified as system-level modules
 
 These gaps define the next implementation stages.
 
 ---
 
-## 6. Staged Implementation Roadmap
+## 7. Staged Implementation Roadmap
 
-The long-text transformation refactor will proceed in vertical stages.
+The long-text transformation refactor proceeds in vertical stages.
 
-Each stage should be a separate commit and should satisfy all of the following:
+Each stage should satisfy all of the following:
 
 - code changes are coherent and runnable
 - `SYSTEM_DESIGN.md` is updated to describe the new current state
 - tests or validation steps are updated with the change
 - planned work remains clearly separated from implemented behavior
-
-### Stage 1 — Authoritative State Model and Compatibility Layer
-
-Planned scope:
-
-- introduce a more formal authoritative machine-readable state model
-- preserve compatibility with current workflow-facing state usage
-- clarify which state surface is authoritative
 
 ### Stage 2 — Normalization and Source Adapter Layer
 
@@ -239,29 +294,29 @@ Planned scope:
 
 ---
 
-## 7. Stage 0 Deliverables
+## 8. Stage 1 Validation
 
-Completed in this stage:
+The Stage 1 implementation is considered valid because:
 
-- `SYSTEM_DESIGN.md` is now the canonical system design document
-- the design doc now describes the current implemented system first
-- future architecture is represented as staged roadmap items instead of assumed truth
-- the repository now has a clear “one stage, one coherent design/code state” rule
+- existing state-based workflows continue to work with legacy markdown input
+- helper commands can now materialize and read an authoritative machine state
+- cleanup semantics remain explicit and debuggable
+- regression coverage now exercises both state surfaces
 
-Not done in this stage:
+Representative validated behaviors in this stage include:
 
-- no code behavior changes
-- no state-model changes
-- no API changes
-- no chunking or verification logic changes
+- validating legacy state and auto-materializing machine state
+- planning directly from machine JSON state
+- rewriting a legacy projection from machine state
+- preserving both state surfaces under `cleanup.sh --keep-state`
 
 ---
 
-## 8. Next Stage Entry Criteria
+## 9. Next Stage Entry Criteria
 
-Stage 1 should begin only when the following are agreed:
+Stage 2 should begin only when the following are agreed:
 
-1. what the authoritative state file format should be
-2. how compatibility with current workflow-facing state will be preserved
-3. which minimum tests or validation checks must land with that state-model change
+1. what the minimal canonical normalized document shape should be
+2. which current source-specific assumptions should remain in adapters versus move into normalization
+3. which current commands should continue operating on state only versus begin consuming normalized document artifacts
 
