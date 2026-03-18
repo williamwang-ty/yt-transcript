@@ -530,6 +530,21 @@ class RegressionTests(unittest.TestCase):
             manifest = json.loads((work_dir / "manifest.json").read_text(encoding="utf-8"))
             self.assertEqual(manifest["plan"]["chunk_contract"]["source_kind"], "text")
             self.assertNotIn("start_time", manifest["chunks"][0])
+
+    def test_chunk_text_manifest_initializes_control_state(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source = Path(tmpdir) / "raw.txt"
+            work_dir = Path(tmpdir) / "chunks"
+            source.write_text("第一句。第二句。第三句。第四句。", encoding="utf-8")
+
+            utils.chunk_text(str(source), str(work_dir), 4, "structure_only")
+
+            manifest = json.loads((work_dir / "manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest["schema_version"], 5)
+            self.assertEqual(manifest["runtime"]["control"]["repair_attempted_count"], 0)
+            self.assertEqual(manifest["runtime"]["operation_control"], {})
+            self.assertEqual(manifest["chunks"][0]["control"]["verification_status"], "pending")
+            self.assertFalse(manifest["chunks"][0]["control"]["repair_exhausted"])
     def test_build_chapter_plan_maps_chapters_to_timed_chunks(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             segments_path = Path(tmpdir) / "segments.json"
@@ -990,6 +1005,9 @@ work_dir: /tmp/vid001_chunks
             self.assertEqual(result["operations"][0]["execution"]["recommended_cli_flags"], ["--auto-replan"])
             self.assertEqual(result["operations"][0]["execution"]["on_replan_required"], "auto_replan_remaining")
             self.assertTrue(result["replan_contract"]["raw_path"]["supports_auto_replan"])
+            self.assertEqual(result["operations"][0]["control"]["repair"]["mode"], "bounded_retry")
+            self.assertEqual(result["operations"][0]["control"]["replan"]["on_replan_required"], "auto_replan_remaining")
+            self.assertEqual(result["quality_contract"]["stop_rule"], "hard_failures_stop")
 
     def test_plan_optimization_marks_processed_path_chunk_stage_for_manual_review(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1019,6 +1037,8 @@ work_dir: /tmp/vid001_chunks
             self.assertFalse(result["operations"][1]["execution"]["supports_auto_replan"])
             self.assertEqual(result["operations"][1]["execution"]["on_replan_required"], "stop_and_review")
             self.assertEqual(result["replan_contract"]["processed_path"]["on_replan_required"], "stop_and_review")
+            self.assertFalse(result["operations"][1]["control"]["replan"]["supports_auto_replan"])
+            self.assertEqual(result["operations"][1]["control"]["quality_gate"]["hard_failure_checks"][-1]["id"], "bilingual_pairs")
 
     def test_cleanup_script_removes_state_by_default(self):
         video_id = "cleanup_state_test"
@@ -2767,6 +2787,9 @@ chunk_context_summary_tokens: 20
             self.assertEqual(first_chunk["attempt_logs"][0]["error_type"], "timeout")
             self.assertEqual(first_chunk["attempt_logs"][1]["result"], "success")
             self.assertTrue(manifest["runtime"]["replan_required"])
+            self.assertEqual(result["control"]["replan"]["trigger"], "timeout_retry_instability")
+            self.assertEqual(result["control"]["replan"]["action"], "auto_replan_remaining")
+            self.assertEqual(manifest["runtime"]["control"]["last_replan_chunk_id"], first_chunk["id"])
 
     def test_process_chunks_auto_recovers_suspicious_short_output(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -2815,7 +2838,49 @@ chunk_context_summary_tokens: 20
             self.assertEqual(first_chunk["recovery_logs"][0]["action"], "retry")
             self.assertEqual(first_chunk["recovery_logs"][0]["reasons"], ["short_output"])
             self.assertEqual(first_chunk["attempts"], 2)
+            self.assertEqual(result["control"]["repair"]["attempted_count"], 1)
+            self.assertEqual(result["control"]["repair"]["exhausted_count"], 0)
+            self.assertEqual(manifest["runtime"]["control"]["repair_attempted_count"], 1)
+            self.assertEqual(first_chunk["control"]["verification_status"], "passed")
             self.assertIn("## Done", output_path.read_text(encoding="utf-8"))
+
+    def test_process_chunks_marks_repair_exhausted_when_retries_disabled(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source = Path(tmpdir) / "raw.txt"
+            work_dir = Path(tmpdir) / "chunks"
+            source.write_text("第一句。" * 40, encoding="utf-8")
+            utils.chunk_text(str(source), str(work_dir), 1000, "structure_only")
+
+            config = utils._default_config_values()
+            config.update({
+                "llm_api_key": "key",
+                "llm_base_url": "https://api.example.com",
+                "llm_model": "demo",
+                "llm_api_format": "openai",
+                "llm_chunk_recovery_attempts": 0,
+            })
+
+            with mock.patch.object(utils, "load_config", return_value=config), mock.patch.object(
+                utils,
+                "_call_llm_api",
+                return_value={
+                    "text": "处理。",
+                    "latency_ms": 10,
+                    "request_url": "https://api.example.com/v1/chat/completions",
+                    "streaming_used": False,
+                    "attempts": 1,
+                },
+            ):
+                result = utils.process_chunks(str(work_dir), "structure_only")
+
+            manifest = json.loads((work_dir / "manifest.json").read_text(encoding="utf-8"))
+            first_chunk = manifest["chunks"][0]
+            self.assertTrue(result["success"])
+            self.assertEqual(result["control"]["repair"]["attempted_count"], 0)
+            self.assertEqual(result["control"]["repair"]["exhausted_count"], 1)
+            self.assertEqual(first_chunk["control"]["verification_status"], "warning")
+            self.assertTrue(first_chunk["control"]["repair_exhausted"])
+            self.assertEqual(first_chunk["control"]["retry_reasons"], ["short_output"])
 
     def test_replan_remaining_supersedes_pending_chunks_and_appends_new_plan(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -2992,6 +3057,8 @@ chunk_context_summary_tokens: 20
             self.assertFalse(manifest["runtime"]["replan_required"])
             self.assertEqual(manifest["runtime"]["status"], "completed")
             self.assertTrue(any(chunk["status"] == utils.SUPERSEDED_CHUNK_STATUS for chunk in manifest["chunks"]))
+            self.assertEqual(result["control"]["replan"]["auto_replan_count"], 1)
+            self.assertEqual(result["control"]["replan"]["max_auto_replans"], 1)
 
     def test_process_chunks_with_replans_stops_when_replan_step_fails(self):
         with mock.patch.object(utils, "process_chunks", side_effect=[

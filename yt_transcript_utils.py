@@ -280,8 +280,9 @@ DEFAULT_AUTOTUNE_MIN_TARGET_RATIO = 0.5
 DEFAULT_AUTOTUNE_CANARY_CHUNKS = 3
 DEFAULT_LLM_CHUNK_RECOVERY_ATTEMPTS = 1
 DEFAULT_LLM_CHUNK_RECOVERY_BACKOFF_SEC = 1.0
-MANIFEST_SCHEMA_VERSION = 4
+MANIFEST_SCHEMA_VERSION = 5
 CHUNK_CONTRACT_SCHEMA_VERSION = 1
+CONTROL_CONTRACT_SCHEMA_VERSION = 1
 DEFAULT_UNKNOWN_CHUNK_TOKENS = 900
 CHUNK_SEPARATOR = "\n\n"
 DEFAULT_UNKNOWN_OUTPUT_RATIO = 1.0
@@ -850,6 +851,329 @@ def _build_manifest_plan(prompt_name: str, chunk_mode: str, recommended_chunk_si
     }
 
 
+def _normalize_operation_input_key(input_key: str = "") -> str:
+    normalized = str(input_key or "").strip()
+    return normalized or "raw_path"
+
+
+def _resolve_replan_action(input_key: str = "") -> str:
+    return "auto_replan_remaining" if _normalize_operation_input_key(input_key) == "raw_path" else "stop_and_review"
+
+
+def _build_quality_gate_contract(*, bilingual: bool = False) -> dict:
+    hard_failure_checks = [
+        {"id": "file_exists", "severity": "hard_failure"},
+        {"id": "file_readable", "severity": "hard_failure"},
+        {"id": "non_empty", "severity": "hard_failure"},
+        {
+            "id": "section_headers_for_long_text",
+            "severity": "hard_failure",
+            "min_chars": 1200,
+            "required_header_prefix": "## ",
+        },
+    ]
+    warning_checks = [
+        {
+            "id": "body_paragraph_count",
+            "severity": "warning",
+            "min_paragraphs": 2,
+            "min_chars": 400,
+        },
+        {"id": "no_truncation", "severity": "warning"},
+        {
+            "id": "size_ratio_vs_raw",
+            "severity": "warning",
+            "expected_range": [1.2, 4.0] if bilingual else [0.7, 2.0],
+        },
+    ]
+    if bilingual:
+        hard_failure_checks.append({
+            "id": "bilingual_pairs",
+            "severity": "hard_failure",
+            "required_pair_order": ["english", "chinese"],
+        })
+        warning_checks.append({
+            "id": "bilingual_balance",
+            "severity": "warning",
+            "min_cn_ratio": 0.1,
+            "min_en_ratio": 0.05,
+        })
+    return {
+        "version": CONTROL_CONTRACT_SCHEMA_VERSION,
+        "scope": "final_output",
+        "stop_rule": "hard_failures_stop",
+        "warning_rule": "warnings_require_review",
+        "hard_failure_checks": hard_failure_checks,
+        "warning_checks": warning_checks,
+    }
+
+
+def _build_chunk_verification_contract(prompt_name: str, *, applicable: bool = True) -> dict:
+    if not applicable:
+        return {
+            "version": CONTROL_CONTRACT_SCHEMA_VERSION,
+            "scope": "single_pass_output",
+            "retryable_checks": [],
+            "warning_rule": "warnings_are_recorded",
+        }
+
+    retryable_checks = []
+    if prompt_name != "summarize":
+        retryable_checks.append({
+            "id": "short_output",
+            "severity": "repairable_warning",
+            "retry_action": "retry_same_chunk_same_plan",
+            "min_output_input_ratio": SHORT_OUTPUT_WARNING_RATIO,
+        })
+    if prompt_name in ("structure_only", "quick_cleanup"):
+        retryable_checks.append({
+            "id": "missing_headers",
+            "severity": "repairable_warning",
+            "retry_action": "retry_same_chunk_same_plan",
+            "required_header_prefix": "## ",
+            "min_input_chars": STRUCTURE_HEADER_WARNING_MIN_CHARS,
+        })
+    if prompt_name == "translate_only":
+        retryable_checks.append({
+            "id": "translation_skipped",
+            "severity": "repairable_warning",
+            "retry_action": "retry_same_chunk_same_plan",
+            "min_cn_char_ratio": TRANSLATION_WARNING_CN_RATIO,
+        })
+    return {
+        "version": CONTROL_CONTRACT_SCHEMA_VERSION,
+        "scope": "chunk_output",
+        "retryable_checks": retryable_checks,
+        "warning_rule": "warnings_are_recorded",
+    }
+
+
+def _build_repair_contract(prompt_name: str, config: dict | None = None, *, applicable: bool = True) -> dict:
+    config = config or {}
+    if not applicable:
+        return {
+            "version": CONTROL_CONTRACT_SCHEMA_VERSION,
+            "mode": "not_applicable",
+            "max_retries_per_chunk": 0,
+            "backoff_sec": 0.0,
+            "retry_on_checks": [],
+            "after_max_retries": "not_applicable",
+        }
+
+    retry_on_checks = [check["id"] for check in _build_chunk_verification_contract(prompt_name)["retryable_checks"]]
+    return {
+        "version": CONTROL_CONTRACT_SCHEMA_VERSION,
+        "mode": "bounded_retry",
+        "max_retries_per_chunk": _parse_int_min(
+            config.get("llm_chunk_recovery_attempts"),
+            DEFAULT_LLM_CHUNK_RECOVERY_ATTEMPTS,
+            0,
+        ),
+        "backoff_sec": round(_parse_float_min(
+            config.get("llm_chunk_recovery_backoff_sec"),
+            DEFAULT_LLM_CHUNK_RECOVERY_BACKOFF_SEC,
+            0.0,
+        ), 2),
+        "retry_on_checks": retry_on_checks,
+        "retry_action": "retry_same_chunk_same_plan",
+        "after_max_retries": "accept_with_warnings",
+    }
+
+
+def _build_replan_contract(input_key: str = "raw_path", *, applicable: bool = True,
+                           canary_chunks: int = DEFAULT_AUTOTUNE_CANARY_CHUNKS,
+                           max_auto_replans: int | None = None) -> dict:
+    if not applicable:
+        return {
+            "version": CONTROL_CONTRACT_SCHEMA_VERSION,
+            "mode": "not_applicable",
+            "supports_auto_replan": False,
+            "recommended_cli_flags": [],
+            "on_replan_required": "not_applicable",
+            "trigger_conditions": [],
+        }
+
+    action = _resolve_replan_action(input_key)
+    supports_auto_replan = action == "auto_replan_remaining"
+    contract = {
+        "version": CONTROL_CONTRACT_SCHEMA_VERSION,
+        "mode": "document_abort_and_replan",
+        "supports_auto_replan": supports_auto_replan,
+        "recommended_cli_flags": ["--auto-replan"] if supports_auto_replan else [],
+        "on_replan_required": action,
+        "auto_replan_eligible_input_keys": ["raw_path"],
+        "trigger_conditions": [
+            {
+                "id": "timeout_retry_instability",
+                "effect": "abort_current_run_and_replan_remaining",
+            },
+            {
+                "id": "context_or_budget_error",
+                "effect": "abort_current_run_and_replan_remaining",
+            },
+            {
+                "id": "bad_response_requires_replan",
+                "effect": "abort_current_run_and_replan_remaining",
+            },
+            {
+                "id": "canary_autotune_shrink",
+                "effect": "abort_current_run_and_replan_remaining",
+                "canary_chunk_limit": max(1, _parse_int_min(canary_chunks, DEFAULT_AUTOTUNE_CANARY_CHUNKS, 1)),
+            },
+        ],
+    }
+    if max_auto_replans is not None:
+        contract["max_auto_replans"] = max(0, _parse_int(max_auto_replans, 0))
+    return contract
+
+
+def _build_operation_control_contract(kind: str, prompt_name: str, *,
+                                      input_key: str = "raw_path",
+                                      config: dict | None = None,
+                                      bilingual: bool = False,
+                                      max_auto_replans: int | None = None) -> dict:
+    config = config or {}
+    is_chunk = kind == "chunk"
+    return {
+        "version": CONTROL_CONTRACT_SCHEMA_VERSION,
+        "kind": "chunk" if is_chunk else "single_pass",
+        "prompt_name": str(prompt_name or "").strip(),
+        "input_key": _normalize_operation_input_key(input_key) if is_chunk else "",
+        "verification": _build_chunk_verification_contract(prompt_name, applicable=is_chunk),
+        "repair": _build_repair_contract(prompt_name, config, applicable=is_chunk),
+        "replan": _build_replan_contract(
+            input_key,
+            applicable=is_chunk,
+            canary_chunks=_parse_int_min(
+                config.get("autotune_canary_chunks"),
+                DEFAULT_AUTOTUNE_CANARY_CHUNKS,
+                1,
+            ),
+            max_auto_replans=max_auto_replans,
+        ),
+        "quality_gate": _build_quality_gate_contract(bilingual=bilingual),
+    }
+
+
+def _build_runtime_control_state() -> dict:
+    return {
+        "verification_warning_count": 0,
+        "repair_attempted_count": 0,
+        "repair_exhausted_count": 0,
+        "last_replan_trigger": "",
+        "last_replan_action": "",
+        "last_replan_chunk_id": None,
+    }
+
+
+def _ensure_runtime_control_state(runtime: dict) -> dict:
+    control = runtime.get("control")
+    if not isinstance(control, dict):
+        control = _build_runtime_control_state()
+        runtime["control"] = control
+    control.setdefault("verification_warning_count", 0)
+    control.setdefault("repair_attempted_count", 0)
+    control.setdefault("repair_exhausted_count", 0)
+    control.setdefault("last_replan_trigger", "")
+    control.setdefault("last_replan_action", "")
+    control.setdefault("last_replan_chunk_id", None)
+    return control
+
+
+def _build_chunk_control_state() -> dict:
+    return {
+        "verification_status": "pending",
+        "warning_count": 0,
+        "warnings": [],
+        "retry_reasons": [],
+        "repair_exhausted": False,
+        "last_verified_at": "",
+    }
+
+
+def _ensure_chunk_control_state(chunk_info: dict) -> dict:
+    control = chunk_info.get("control")
+    if not isinstance(control, dict):
+        control = _build_chunk_control_state()
+        chunk_info["control"] = control
+    control.setdefault("verification_status", "pending")
+    control.setdefault("warning_count", 0)
+    control.setdefault("warnings", [])
+    control.setdefault("retry_reasons", [])
+    control.setdefault("repair_exhausted", False)
+    control.setdefault("last_verified_at", "")
+    return control
+
+
+def _record_chunk_verification(chunk_info: dict, *, status: str, warnings: list[str],
+                               retry_reasons: list[str], repair_exhausted: bool = False) -> None:
+    control = _ensure_chunk_control_state(chunk_info)
+    control["verification_status"] = str(status or "pending")
+    control["warning_count"] = len([warning for warning in (warnings or []) if str(warning).strip()])
+    control["warnings"] = [str(warning) for warning in (warnings or []) if str(warning).strip()]
+    control["retry_reasons"] = [str(reason) for reason in (retry_reasons or []) if str(reason).strip()]
+    control["repair_exhausted"] = bool(repair_exhausted)
+    control["last_verified_at"] = _now_iso()
+
+
+def _classify_replan_trigger(error: Exception | None = None, *,
+                             had_timeout_retry: bool = False,
+                             autotune_last_event: str = "") -> str:
+    if had_timeout_retry:
+        return "timeout_retry_instability"
+    if autotune_last_event == "shrink":
+        return "canary_autotune_shrink"
+    if error is not None:
+        if _is_timeout_error(error):
+            return "timeout_retry_instability"
+        status_code = getattr(error, "status_code", None)
+        response_hint = str(getattr(error, "response_body", "") or "").lower()
+        if status_code in {413, 422}:
+            return "context_or_budget_error"
+        if status_code == 400 and any(token in response_hint for token in ("context", "prompt", "max token", "too long", "token limit")):
+            return "context_or_budget_error"
+        if str(getattr(error, "error_type", "") or "") == "bad_response":
+            return "bad_response_requires_replan"
+    return "manual_review"
+
+
+def _mark_runtime_replan(runtime: dict, *, reason: str, trigger: str,
+                         input_key: str, chunk_id: int | None = None) -> None:
+    runtime["replan_required"] = True
+    runtime["replan_reason"] = str(reason or "").strip()
+    control = _ensure_runtime_control_state(runtime)
+    control["last_replan_trigger"] = str(trigger or "manual_review")
+    control["last_replan_action"] = _resolve_replan_action(input_key)
+    control["last_replan_chunk_id"] = chunk_id
+
+
+def _build_process_control_summary(runtime: dict, operation_control: dict) -> dict:
+    runtime_control = _ensure_runtime_control_state(runtime)
+    replan_contract = operation_control.get("replan", {}) if isinstance(operation_control.get("replan", {}), dict) else {}
+    repair_contract = operation_control.get("repair", {}) if isinstance(operation_control.get("repair", {}), dict) else {}
+    return {
+        "operation": operation_control,
+        "verification": {
+            "warning_count": runtime_control.get("verification_warning_count", 0),
+        },
+        "repair": {
+            "attempted_count": runtime_control.get("repair_attempted_count", 0),
+            "exhausted_count": runtime_control.get("repair_exhausted_count", 0),
+            "max_retries_per_chunk": repair_contract.get("max_retries_per_chunk", 0),
+            "backoff_sec": repair_contract.get("backoff_sec", 0.0),
+            "after_max_retries": repair_contract.get("after_max_retries", "not_applicable"),
+        },
+        "replan": {
+            "required": bool(runtime.get("replan_required", False)),
+            "reason": str(runtime.get("replan_reason", "") or ""),
+            "trigger": str(runtime_control.get("last_replan_trigger", "") or ""),
+            "action": str(runtime_control.get("last_replan_action", replan_contract.get("on_replan_required", "not_applicable")) or ""),
+            "supports_auto_replan": bool(replan_contract.get("supports_auto_replan", False)),
+            "last_replan_chunk_id": runtime_control.get("last_replan_chunk_id"),
+        },
+    }
+
+
 def _build_manifest_runtime(plan_id: str, request_url: str = "") -> dict:
     return {
         "status": "pending",
@@ -867,6 +1191,10 @@ def _build_manifest_runtime(plan_id: str, request_url: str = "") -> dict:
         "last_resume_check_at": "",
         "last_resume_repair_at": "",
         "resume_repair_count": 0,
+        "operation_prompt_name": "",
+        "operation_input_key": "raw_path",
+        "operation_control": {},
+        "control": _build_runtime_control_state(),
         "updated_at": _now_iso(),
     }
 
@@ -930,6 +1258,7 @@ def _new_chunk_manifest_entry(chunk_id: int, chunk_content: str, budget: dict,
         "updated_at": "",
         "started_at": "",
         "completed_at": "",
+        "control": _build_chunk_control_state(),
     }
 
 
@@ -988,6 +1317,7 @@ def _ensure_chunk_runtime_defaults(manifest: dict, runtime: dict, plan: dict,
         chunk_info.setdefault("updated_at", "")
         chunk_info.setdefault("started_at", "")
         chunk_info.setdefault("completed_at", "")
+        _ensure_chunk_control_state(chunk_info)
 
 
 def _infer_resume_runtime_status(runtime: dict, chunks: list[dict]) -> str:
@@ -1318,7 +1648,11 @@ def _ensure_manifest_structure(manifest: dict, *, prompt_name: str = "", prompt_
     runtime.setdefault("last_resume_check_at", "")
     runtime.setdefault("last_resume_repair_at", "")
     runtime.setdefault("resume_repair_count", 0)
+    runtime.setdefault("operation_prompt_name", "")
+    runtime.setdefault("operation_input_key", "raw_path")
+    runtime.setdefault("operation_control", {})
     runtime.setdefault("updated_at", _now_iso())
+    _ensure_runtime_control_state(runtime)
     manifest.setdefault("plan_history", [])
     _sync_manifest_legacy_fields(manifest)
     return manifest
@@ -4104,6 +4438,13 @@ def process_chunks(work_dir: str, prompt_name: str, extra_instruction: str = "",
         DEFAULT_LLM_CHUNK_RECOVERY_BACKOFF_SEC,
         0.0,
     )
+    operation_control = _build_operation_control_contract(
+        "chunk",
+        prompt_name,
+        input_key=input_key,
+        config=config,
+        bilingual=prompt_name == "translate_only",
+    )
 
     request_url = _build_api_url(base_url, api_format) if base_url else ""
     if not dry_run and (not api_key or not base_url or not model):
@@ -4178,6 +4519,16 @@ def process_chunks(work_dir: str, prompt_name: str, extra_instruction: str = "",
 
     runtime["active_plan_id"] = plan.get("plan_id", runtime.get("active_plan_id", _new_plan_id()))
     runtime["last_request_url"] = request_url
+    runtime["operation_prompt_name"] = prompt_name
+    runtime["operation_input_key"] = _normalize_operation_input_key(input_key)
+    runtime["operation_control"] = operation_control
+    runtime_control = _ensure_runtime_control_state(runtime)
+    runtime_control["verification_warning_count"] = 0
+    runtime_control["repair_attempted_count"] = 0
+    runtime_control["repair_exhausted_count"] = 0
+    runtime_control["last_replan_trigger"] = ""
+    runtime_control["last_replan_action"] = operation_control.get("replan", {}).get("on_replan_required", "not_applicable")
+    runtime_control["last_replan_chunk_id"] = None
     runtime["updated_at"] = _now_iso()
     plan["prompt_name"] = plan.get("prompt_name", prompt_name) or prompt_name
     plan["recommended_chunk_size"] = recommended_chunk_size
@@ -4222,6 +4573,7 @@ def process_chunks(work_dir: str, prompt_name: str, extra_instruction: str = "",
             "autotune": manifest.get("autotune", {}),
             "plan": manifest.get("plan", {}),
             "resume": resume_report,
+            "control": _build_process_control_summary(runtime, operation_control),
             "warnings": setup_warnings,
             "message": "Dry run: all validations passed"
         }
@@ -4391,6 +4743,14 @@ def process_chunks(work_dir: str, prompt_name: str, extra_instruction: str = "",
                         latency_ms=llm_result.get("latency_ms"),
                         sleep_sec=chunk_recovery_backoff_sec,
                     )
+                    runtime_control["repair_attempted_count"] = runtime_control.get("repair_attempted_count", 0) + 1
+                    _record_chunk_verification(
+                        chunk_info,
+                        status="repairable_failure",
+                        warnings=output_health["warnings"],
+                        retry_reasons=output_health["retry_reasons"],
+                        repair_exhausted=False,
+                    )
                     chunk_info["status"] = "pending"
                     chunk_info["last_error"] = " | ".join(output_health["warnings"])
                     chunk_info["last_error_type"] = "quality_retry"
@@ -4412,6 +4772,18 @@ def process_chunks(work_dir: str, prompt_name: str, extra_instruction: str = "",
                         time.sleep(chunk_recovery_backoff_sec)
                     continue
 
+                repair_exhausted = bool(output_health["retry_reasons"]) and chunk_info.get("recovery_attempts", 0) >= chunk_recovery_attempt_limit
+                if output_health["warnings"]:
+                    runtime_control["verification_warning_count"] = runtime_control.get("verification_warning_count", 0) + len(output_health["warnings"])
+                if repair_exhausted:
+                    runtime_control["repair_exhausted_count"] = runtime_control.get("repair_exhausted_count", 0) + 1
+                _record_chunk_verification(
+                    chunk_info,
+                    status="warning" if output_health["warnings"] else "passed",
+                    warnings=output_health["warnings"],
+                    retry_reasons=output_health["retry_reasons"],
+                    repair_exhausted=repair_exhausted,
+                )
                 for warning in output_health["warnings"]:
                     warnings.append(warning)
                     print(warning, file=sys.stderr)
@@ -4483,8 +4855,16 @@ def process_chunks(work_dir: str, prompt_name: str, extra_instruction: str = "",
                         file=sys.stderr,
                     )
                 if had_timeout_retry or (autotune_state["last_event"] == "shrink" and active_index <= canary_limit):
-                    runtime["replan_required"] = True
-                    runtime["replan_reason"] = autotune_state["last_reason"] or "Observed unstable retries under the current plan"
+                    _mark_runtime_replan(
+                        runtime,
+                        reason=autotune_state["last_reason"] or "Observed unstable retries under the current plan",
+                        trigger=_classify_replan_trigger(
+                            had_timeout_retry=had_timeout_retry,
+                            autotune_last_event=autotune_state["last_event"],
+                        ),
+                        input_key=input_key,
+                        chunk_id=chunk_id,
+                    )
                     runtime["status"] = "aborted"
                     aborted = True
                     aborted_reason = (
@@ -4535,8 +4915,13 @@ def process_chunks(work_dir: str, prompt_name: str, extra_instruction: str = "",
                     )
 
                 if _should_replan_after_error(error) or (autotune_state["last_event"] == "shrink" and active_index <= canary_limit):
-                    runtime["replan_required"] = True
-                    runtime["replan_reason"] = autotune_state["last_reason"] or str(error)
+                    _mark_runtime_replan(
+                        runtime,
+                        reason=autotune_state["last_reason"] or str(error),
+                        trigger=_classify_replan_trigger(error, autotune_last_event=autotune_state["last_event"]),
+                        input_key=input_key,
+                        chunk_id=chunk_id,
+                    )
                     runtime["status"] = "aborted"
                     aborted = True
                     aborted_reason = (
@@ -4607,6 +4992,7 @@ def process_chunks(work_dir: str, prompt_name: str, extra_instruction: str = "",
         "replan_reason": runtime.get("replan_reason", ""),
         "resume": resume_report,
         "plan": manifest.get("plan", {}),
+        "control": _build_process_control_summary(runtime, operation_control),
         "request_url": request_url,
     }
 
@@ -4902,6 +5288,7 @@ def process_chunks_with_replans(work_dir: str, prompt_name: str, extra_instructi
         "aborted": False,
         "aborted_reason": "",
         "success": False,
+        "control": {},
     }
 
     next_force = force
@@ -4922,6 +5309,7 @@ def process_chunks_with_replans(work_dir: str, prompt_name: str, extra_instructi
         aggregate["warnings"].extend(last_result.get("warnings", []))
         aggregate["output_files"].extend(last_result.get("output_files", []))
         aggregate["request_url"] = last_result.get("request_url", aggregate["request_url"])
+        aggregate["control"] = last_result.get("control", aggregate.get("control", {}))
         aggregate["superseded_count"] = current_superseded_count()
 
         if not last_result.get("replan_required", False):
@@ -4933,6 +5321,9 @@ def process_chunks_with_replans(work_dir: str, prompt_name: str, extra_instructi
                 "replan_reason": "",
                 "plan": last_result.get("plan", {}),
             })
+            if isinstance(aggregate.get("control"), dict) and isinstance(aggregate["control"].get("replan"), dict):
+                aggregate["control"]["replan"]["auto_replan_count"] = aggregate["replan_count"]
+                aggregate["control"]["replan"]["max_auto_replans"] = max(0, max_replans)
             aggregate["warning_count"] = len(aggregate["warnings"])
             aggregate["superseded_count"] = current_superseded_count()
             return aggregate
@@ -4946,6 +5337,9 @@ def process_chunks_with_replans(work_dir: str, prompt_name: str, extra_instructi
                 "replan_reason": last_result.get("replan_reason", ""),
                 "plan": last_result.get("plan", {}),
             })
+            if isinstance(aggregate.get("control"), dict) and isinstance(aggregate["control"].get("replan"), dict):
+                aggregate["control"]["replan"]["auto_replan_count"] = aggregate["replan_count"]
+                aggregate["control"]["replan"]["max_auto_replans"] = max(0, max_replans)
             aggregate["warning_count"] = len(aggregate["warnings"])
             aggregate["superseded_count"] = current_superseded_count()
             return aggregate
@@ -4969,6 +5363,9 @@ def process_chunks_with_replans(work_dir: str, prompt_name: str, extra_instructi
                 "replan_reason": last_result.get("replan_reason", "") or replan_error,
                 "plan": last_result.get("plan", {}),
             })
+            if isinstance(aggregate.get("control"), dict) and isinstance(aggregate["control"].get("replan"), dict):
+                aggregate["control"]["replan"]["auto_replan_count"] = aggregate["replan_count"]
+                aggregate["control"]["replan"]["max_auto_replans"] = max(0, max_replans)
             aggregate["warning_count"] = len(aggregate["warnings"])
             return aggregate
         next_force = False
@@ -4981,6 +5378,9 @@ def process_chunks_with_replans(work_dir: str, prompt_name: str, extra_instructi
         "replan_reason": last_result.get("replan_reason", ""),
         "plan": last_result.get("plan", {}),
     })
+    if isinstance(aggregate.get("control"), dict) and isinstance(aggregate["control"].get("replan"), dict):
+        aggregate["control"]["replan"]["auto_replan_count"] = aggregate["replan_count"]
+        aggregate["control"]["replan"]["max_auto_replans"] = max(0, max_replans)
     aggregate["warning_count"] = len(aggregate["warnings"])
     aggregate["superseded_count"] = current_superseded_count()
     return aggregate
@@ -5971,6 +6371,8 @@ def plan_optimization(state_path: str) -> dict:
     source = state.get("src", "")
     work_dir = state.get("work_dir", "/tmp/unknown_chunks")
     video_id = state.get("vid", "")
+    planner_config = load_config(None, allow_missing=True)
+    bilingual_quality_gate = mode == "bilingual"
 
     video_path = "long" if duration >= 1800 else "short"
     outputs = {
@@ -6006,6 +6408,15 @@ def plan_optimization(state_path: str) -> dict:
             "on_replan_required": "stop_and_review",
         }
 
+    def build_control_contract(kind: str, prompt: str, input_key: str = "", *, bilingual_output: bool = False) -> dict:
+        return _build_operation_control_contract(
+            kind,
+            prompt,
+            input_key=input_key,
+            config=planner_config,
+            bilingual=bilingual_output,
+        )
+
     if video_path == "short":
         if mode == "bilingual":
             operations = [
@@ -6016,6 +6427,7 @@ def plan_optimization(state_path: str) -> dict:
                     "output": outputs["structured_text"],
                     "extra_instruction": "",
                     "execution": build_execution_contract("prompt"),
+                    "control": build_control_contract("prompt", "structure_only", bilingual_output=False),
                 },
                 {
                     "kind": "prompt",
@@ -6024,6 +6436,7 @@ def plan_optimization(state_path: str) -> dict:
                     "output": outputs["optimized_text"],
                     "extra_instruction": "",
                     "execution": build_execution_contract("prompt"),
+                    "control": build_control_contract("prompt", "translate_only", bilingual_output=True),
                 },
             ]
         else:
@@ -6038,6 +6451,7 @@ def plan_optimization(state_path: str) -> dict:
                     "output": outputs["optimized_text"],
                     "extra_instruction": extra_instruction,
                     "execution": build_execution_contract("prompt"),
+                    "control": build_control_contract("prompt", "structure_only", bilingual_output=False),
                 }
             ]
     else:
@@ -6052,6 +6466,7 @@ def plan_optimization(state_path: str) -> dict:
                 "input_key": "raw_path",
                 "extra_instruction": extra_instruction,
                 "execution": build_execution_contract("chunk", "raw_path"),
+                "control": build_control_contract("chunk", "structure_only", "raw_path", bilingual_output=False),
             }
         ]
         if mode == "bilingual":
@@ -6062,6 +6477,7 @@ def plan_optimization(state_path: str) -> dict:
                     "input_key": "processed_path",
                     "extra_instruction": "",
                     "execution": build_execution_contract("chunk", "processed_path"),
+                    "control": build_control_contract("chunk", "translate_only", "processed_path", bilingual_output=True),
                 }
             )
 
@@ -6099,17 +6515,10 @@ def plan_optimization(state_path: str) -> dict:
         "chunking": chunking,
         "requires_llm_preflight": video_path == "long",
         "requires_quality_check": True,
+        "quality_contract": _build_quality_gate_contract(bilingual=bilingual_quality_gate),
         "replan_contract": {
-            "raw_path": {
-                "supports_auto_replan": True,
-                "recommended_cli_flags": ["--auto-replan"],
-                "on_replan_required": "auto_replan_remaining",
-            },
-            "processed_path": {
-                "supports_auto_replan": False,
-                "recommended_cli_flags": [],
-                "on_replan_required": "stop_and_review",
-            },
+            "raw_path": _build_replan_contract("raw_path", applicable=True, canary_chunks=planner_config.get("autotune_canary_chunks", DEFAULT_AUTOTUNE_CANARY_CHUNKS)),
+            "processed_path": _build_replan_contract("processed_path", applicable=True, canary_chunks=planner_config.get("autotune_canary_chunks", DEFAULT_AUTOTUNE_CANARY_CHUNKS)),
         },
         "operations": operations,
         "outputs": outputs,

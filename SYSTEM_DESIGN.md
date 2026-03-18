@@ -1,10 +1,10 @@
-# System Design (v5.4-stage4)
+# System Design (v5.5-stage5)
 
-**Stage**: 4
+**Stage**: 5
 
 **Status**: accepted and implemented
 
-**Behavior change in this stage**: formalized transform-runner lifecycle and resume semantics, added `prepare-resume`, and made `process-chunks` auto-repair stale chunk/runtime state before resuming execution
+**Behavior change in this stage**: formalized explicit verification / repair / replan control contracts, persisted per-run control state in `manifest.json`, and made `process-chunks` / `plan-optimization` emit inspectable control metadata
 
 **Source of truth**: This file is the canonical system design document for the repository.
 
@@ -12,18 +12,18 @@
 
 ---
 
-## 1. Stage 4 Goal
+## 1. Stage 5 Goal
 
-Stage 4 hardens the execution side of the long-text kernel.
+Stage 5 hardens the control side of the long-text kernel.
 
 Its goals are:
 
-- make chunk lifecycle states explicit enough to support safe resume
-- define concrete checkpoint rules for chunk outputs versus manifest state
-- add a manual recovery command for stale manifests
-- make normal chunk execution automatically recover resumable state before work continues
+- make verification policy explicit and inspectable
+- separate chunk-local repair from document-level replan
+- bound both chunk repair loops and document auto-replan loops
+- persist control outcomes in manifest state and CLI JSON results
 
-Stage 4 remains intentionally bounded. It does **not** yet formalize verification / repair / replan as one unified control system.
+Stage 5 remains intentionally bounded. It does **not** add semantic LLM-as-judge verification, global glossary propagation, or concurrency-safe task ownership.
 
 ---
 
@@ -41,21 +41,22 @@ Its current implemented use cases are:
 - explicit normalization from raw text or timed segments
 - canonical chunking from normalized documents
 - resumable chunk execution with manifest repair
+- explicit chunk verification, bounded repair, and bounded replan control loops
 - deterministic merge and final markdown assembly
 - workflow validation and stop/go quality checks
 
 ### 2.2 Current Primary Design Goal
 
-> Enable reliable long-text transcript transformation under context limits, especially on weaker models, using script-owned state, explicit normalization, explicit chunk contracts, bounded continuity, explicit lifecycle semantics, and deterministic verification.
+> Enable reliable long-text transcript transformation under context limits, especially on weaker models, using script-owned state, explicit normalization, explicit chunk contracts, bounded continuity, explicit lifecycle semantics, explicit control contracts, and deterministic verification.
 
 ### 2.3 Current Non-Goals
 
-At Stage 4, the system is **not yet**:
+At Stage 5, the system is **not yet**:
 
 - a generalized multi-source document transformation framework
 - a reusable extracted kernel package
 - a global glossary / terminology propagation system
-- a formal verification / repair / replan policy engine
+- an LLM-judge semantic verification system
 - a concurrency-safe persistent state store
 - a telemetry-first production runtime
 
@@ -75,9 +76,12 @@ source acquisition
   -> normalization
   -> planning
   -> canonical chunk contract selection
+  -> operation control contract emission
   -> chunking
   -> resume preflight / manifest repair
   -> per-chunk prompt execution
+  -> chunk output verification
+  -> bounded same-plan repair or document replan decision
   -> deterministic merge
   -> deterministic final assembly
   -> quality verification
@@ -94,8 +98,8 @@ The current implementation relies on these persisted artifacts:
 - `/tmp/${VIDEO_ID}_normalized_document.json`
   - normalized source artifact
 - `manifest.json` in chunk work directories
-  - chunk plan, chunk contract, continuity policy, runtime state, and resume / autotune / replan metadata
-  - Stage 4 manifest schema is now `v4`
+  - chunk plan, chunk contract, continuity policy, runtime state, resume / autotune / replan metadata, and explicit operation-control state
+  - Stage 5 manifest schema is now `v5`
 - `/tmp/${VIDEO_ID}_raw_text.txt`
   - raw extracted transcript-like text
 - `/tmp/${VIDEO_ID}_segments.json`
@@ -242,13 +246,15 @@ Its current role is:
 
 `process-chunks` now calls the same repair logic automatically before execution starts and returns the resume report in its JSON result.
 
-### 3.11 Current Planning Behavior
+### 3.11 Current Planning and Control Surfaces
 
-`plan-optimization` still:
+`plan-optimization` now:
 
 - validates workflow state
 - auto-materializes normalization when source artifacts exist
 - emits an explicit `chunking` block
+- emits per-operation `control` contracts
+- emits top-level `quality_contract` and `replan_contract` surfaces
 
 The current `chunking` block reports:
 
@@ -257,6 +263,28 @@ The current `chunking` block reports:
 - boundary mode
 - continuity mode
 - merge strategy
+
+The current per-operation `control` contract reports:
+
+- chunk-output verification rules
+- bounded repair rules for suspicious chunk outputs
+- replan triggers and the required action (`auto_replan_remaining` or `stop_and_review`)
+- final quality-gate expectations for the operation output
+
+`process-chunks` now persists the active operation surface into `manifest.json` via:
+
+- `runtime.operation_prompt_name`
+- `runtime.operation_input_key`
+- `runtime.operation_control`
+- `runtime.control` counters and last replan trigger/action
+- per-chunk `control` status (`verification_status`, warnings, retry reasons, repair exhaustion)
+
+Current control semantics are:
+
+- verification = inspect produced text and classify warnings versus hard stop/go failures
+- repair = rerun the same chunk under the same active plan
+- replan = abort the current run because the active plan is no longer trusted
+- `process-chunks-with-replans` = bounded wrapper that auto-replans raw-path plans up to `max_replans`
 
 ### 3.12 Current Core Commands
 
@@ -289,6 +317,9 @@ The system now has the following concrete strengths:
 - canonical normalized-document chunking
 - explicit lifecycle and checkpoint semantics for chunk runs
 - automatic manifest repair before resume
+- explicit operation control contracts from planner to runner
+- explicit separation between repair and replan
+- bounded same-plan recovery and bounded auto-replan behavior
 - deterministic merge and final file assembly
 - explicit verification checkpoints before final output
 
@@ -322,7 +353,7 @@ Resuming long-running work should reconcile manifest state against durable outpu
 
 ### 4.7 Deterministic Steps Stay out of Prompts
 
-State validation, normalization, lifecycle repair, and final assembly should stay deterministic.
+State validation, normalization, lifecycle repair, control gating, and final assembly should stay deterministic whenever possible.
 
 ### 4.8 Weak-Model Compatibility Matters
 
@@ -334,40 +365,42 @@ Intermediate artifacts, manifest plans, lifecycle state, and resume repairs shou
 
 ---
 
-## 5. Stage 4 Deliverables
+## 5. Stage 5 Deliverables
 
 Completed in this stage:
 
-- formalized chunk lifecycle states enough for safe resume behavior
-- formalized current checkpoint rules around chunk outputs and manifest state
-- introduced `prepare-resume` for explicit manifest repair
-- made `process-chunks` auto-repair stale chunk/runtime state before execution
-- extended manifest runtime metadata with resume-oriented fields
-- preserved Stage 3 chunking / continuity behavior
-- added regression coverage for interrupted, promoted, and demoted checkpoint recovery flows
+- formalized explicit control contracts for verification, repair, and replan
+- exposed those control contracts from `plan-optimization`
+- persisted active operation control state into `manifest.json`
+- recorded per-chunk verification state and repair exhaustion metadata
+- separated suspicious-output repair from plan-invalid replan behavior in `process-chunks`
+- made document auto-replan bounds explicit in `process-chunks-with-replans`
+- preserved Stage 4 resume and checkpoint semantics
+- added regression coverage for control-contract emission, repair accounting, repair exhaustion, and bounded auto-replan reporting
 
 Not done in this stage:
 
+- no semantic LLM-judge verification layer yet
+- no global glossary extraction pass yet
 - no concurrency-safe shared state store yet
 - no cancellation / pause API yet
-- no formal verification / repair / replan policy engine yet
-- no global glossary extraction pass yet
 - no dedicated telemetry module yet
 
 ---
 
 ## 6. Current Known Gaps
 
-The implementation is meaningfully stronger after Stage 4, but still not fully kernelized.
+The implementation is meaningfully stronger after Stage 5, but still not fully kernelized.
 
 The main remaining gaps are:
 
-1. verification, repair, and replan are still not unified as one explicit control model
-2. global terminology / entity consistency is still not first-class
-3. runtime control is resumable, but not yet concurrency-safe
-4. cancellation, pause, and long-lived task ownership are not formalized
-5. telemetry and testing structure are stronger, but not yet extracted into dedicated subsystems
-6. module boundaries are still logical inside one script, not yet split into a kernel package layout
+1. control contracts are now explicit, but they still live inside one script instead of dedicated modules
+2. verification remains deterministic / heuristic only and does not yet include semantic judge layers
+3. global terminology / entity consistency is still not first-class
+4. runtime control is resumable, but not yet concurrency-safe
+5. cancellation, pause, and long-lived task ownership are not formalized
+6. telemetry and test layout are stronger, but not yet extracted into dedicated subsystems
+7. module boundaries are still logical inside one script, not yet split into a kernel package layout
 
 ---
 
@@ -382,11 +415,11 @@ Each stage should satisfy all of the following:
 
 ### Stage 5 — Verification, Repair, and Replan Control Loops
 
-Planned scope:
+Implemented scope:
 
-- formalize verification policy
-- separate repair from replan more explicitly
-- add bounded control-loop behavior and failure contracts
+- formalized verification policy surfaces
+- separated repair from replan explicitly in runtime contracts
+- added bounded chunk-repair and document auto-replan behavior
 
 ### Stage 6 — Interfaces, Testing, and Observability
 
@@ -398,29 +431,32 @@ Planned scope:
 
 ---
 
-## 8. Stage 4 Validation
+## 8. Stage 5 Validation
 
-The Stage 4 implementation is considered valid because:
+The Stage 5 implementation is considered valid because:
 
-- stale runner state is now reconciled against on-disk checkpoints before execution resumes
-- chunk lifecycle semantics are explicit enough to support interrupted resumptions safely
-- `prepare-resume` provides a manual inspection / repair entrypoint
-- `process-chunks` automatically repairs resumable state before continuing work
-- Stage 3 chunking and continuity guarantees remain preserved
+- planner output now exposes explicit control contracts instead of leaving repair / replan behavior implicit
+- manifest runtime now records active operation control state in an inspectable way
+- suspicious chunk outputs are treated as bounded repair within the same plan
+- plan-invalid conditions are treated as replan triggers instead of more silent retries
+- bounded auto-replan reporting now survives all the way to the wrapper result surface
+- Stage 4 resume and checkpoint guarantees remain preserved
 
 Representative validated behaviors in this stage include:
 
-- marking stale `running` chunks as `interrupted` when no output checkpoint exists
-- promoting stale `running` chunks to `done` when an output checkpoint already exists
-- demoting inconsistent `done` chunks back to `interrupted` when outputs are missing
-- auto-repairing resume state at `process-chunks` startup and skipping already recovered completed chunks
+- emitting per-operation `control` contracts from `plan-optimization`
+- initializing manifest runtime and chunk-level control state during chunking
+- incrementing repair counters when suspicious output triggers a same-plan retry
+- marking repair exhaustion when suspicious output is accepted after the repair budget is exhausted
+- recording explicit replan trigger/action metadata when timeout instability or canary shrink aborts the run
+- reporting `auto_replan_count` and `max_auto_replans` from `process-chunks-with-replans`
 
 ---
 
 ## 9. Next Stage Entry Criteria
 
-Stage 5 should begin only when the following are agreed:
+Stage 6 should begin only when the following are agreed:
 
-1. which verification checks are deterministic hard gates versus heuristic advisory checks
-2. what bounded repair loop policy should exist per chunk and per document
-3. how replan triggers should differ from repair triggers in the canonical contract
+1. which CLI and Python-return fields now count as stable public interfaces
+2. how regression fixtures and test layering should split by module responsibility
+3. which telemetry and debugging fields are required before extracting dedicated runtime modules
