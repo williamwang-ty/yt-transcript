@@ -778,6 +778,106 @@ class RegressionTests(unittest.TestCase):
             output = (work_dir / manifest["chunks"][0]["processed_path"]).read_text(encoding="utf-8")
             self.assertIn("OpenAI API", output)
 
+    def test_process_chunks_injects_semantic_anchor_guardrails(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source = Path(tmpdir) / "raw.txt"
+            work_dir = Path(tmpdir) / "chunks"
+            source.write_text("访问 https://example.com 于 2026-03-08 完成 32% 进度。", encoding="utf-8")
+            utils.chunk_text(str(source), str(work_dir), 120, "structure_only")
+
+            config = utils._default_config_values()
+            config.update({
+                "llm_api_key": "key",
+                "llm_base_url": "https://api.example.com",
+                "llm_model": "demo",
+                "llm_api_format": "openai",
+            })
+
+            captured = {}
+
+            def fake_llm(*args, **kwargs):
+                captured["prompt"] = kwargs["messages"][0]["content"]
+                return {
+                    "text": "## 结果\n\n访问 https://example.com 于 2026-03-08 完成 32% 进度。",
+                    "latency_ms": 12,
+                    "request_url": "https://api.example.com/v1/chat/completions",
+                    "streaming_used": False,
+                    "attempts": 1,
+                }
+
+            with mock.patch.object(utils, "load_config", return_value=config), mock.patch.object(
+                utils,
+                "_call_llm_api",
+                side_effect=fake_llm,
+            ):
+                result = utils.process_chunks(str(work_dir), "structure_only")
+
+            self.assertTrue(result["success"])
+            self.assertIn("Semantic Anchors", captured["prompt"])
+            self.assertIn("https://example.com", captured["prompt"])
+            self.assertIn("2026-03-08", captured["prompt"])
+            self.assertIn("32%", captured["prompt"])
+            self.assertEqual(result["semantic_verification"]["mode"], "anchor_checks")
+
+    def test_process_chunks_retries_when_semantic_anchor_missing(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source = Path(tmpdir) / "raw.txt"
+            work_dir = Path(tmpdir) / "chunks"
+            source.write_text("本季度增长 32%。", encoding="utf-8")
+            utils.chunk_text(str(source), str(work_dir), 120, "structure_only")
+
+            config = utils._default_config_values()
+            config.update({
+                "llm_api_key": "key",
+                "llm_base_url": "https://api.example.com",
+                "llm_model": "demo",
+                "llm_api_format": "openai",
+                "llm_chunk_recovery_attempts": 1,
+            })
+
+            responses = [
+                {
+                    "text": "## 结果\n\n本季度增长显著。",
+                    "latency_ms": 10,
+                    "request_url": "https://api.example.com/v1/chat/completions",
+                    "streaming_used": False,
+                    "attempts": 1,
+                },
+                {
+                    "text": "## 结果\n\n本季度增长 32%。",
+                    "latency_ms": 12,
+                    "request_url": "https://api.example.com/v1/chat/completions",
+                    "streaming_used": False,
+                    "attempts": 1,
+                },
+            ]
+
+            with mock.patch.object(utils, "load_config", return_value=config), mock.patch.object(
+                utils,
+                "_call_llm_api",
+                side_effect=responses,
+            ) as mocked_call:
+                result = utils.process_chunks(str(work_dir), "structure_only")
+
+            manifest = json.loads((work_dir / "manifest.json").read_text(encoding="utf-8"))
+            self.assertTrue(result["success"])
+            self.assertEqual(mocked_call.call_count, 2)
+            self.assertEqual(manifest["chunks"][0]["recovery_attempts"], 1)
+            self.assertIn("32%", (work_dir / manifest["chunks"][0]["processed_path"]).read_text(encoding="utf-8"))
+
+    def test_verify_quality_reports_missing_semantic_anchors(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            raw = Path(tmpdir) / "raw.txt"
+            optimized = Path(tmpdir) / "optimized.txt"
+            raw.write_text("访问 https://example.com 于 2026-03-08 完成 32% 进度。", encoding="utf-8")
+            optimized.write_text("## 结果\n\n已完成进度。", encoding="utf-8")
+
+            result = utils.verify_quality(str(optimized), raw_text_path=str(raw), bilingual=False)
+
+            self.assertFalse(result["checks"]["semantic_anchor_coverage_ok"])
+            self.assertGreater(result["checks"]["semantic_missing_count"], 0)
+            self.assertTrue(any("Semantic anchors" in warning for warning in result["warnings"]))
+
     def test_build_chapter_plan_maps_chapters_to_timed_chunks(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             segments_path = Path(tmpdir) / "segments.json"

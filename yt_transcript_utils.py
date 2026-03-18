@@ -69,6 +69,7 @@ import kernel_state
 import kernel_controller
 import kernel_telemetry
 import kernel_glossary
+import kernel_semantic
 
 
 def _skill_root() -> Path:
@@ -364,6 +365,7 @@ def _default_config_values(config_path: str = "") -> dict:
         "chunk_context_tail_sentences": DEFAULT_CHUNK_CONTEXT_TAIL_SENTENCES,
         "chunk_context_summary_tokens": DEFAULT_CHUNK_CONTEXT_SUMMARY_TOKENS,
         "chunk_glossary_max_prompt_terms": 8,
+        "chunk_semantic_max_anchors": 8,
         "output_ratio_structure_only": TASK_OUTPUT_RATIO_DEFAULTS["structure_only"],
         "output_ratio_quick_cleanup": TASK_OUTPUT_RATIO_DEFAULTS["quick_cleanup"],
         "output_ratio_translate_only": TASK_OUTPUT_RATIO_DEFAULTS["translate_only"],
@@ -700,9 +702,15 @@ def _inject_glossary_context(prompt_template: str, glossary_text: str) -> str:
     return _inject_context_block(prompt_template, glossary_text)
 
 
+def _inject_semantic_context(prompt_template: str, semantic_text: str) -> str:
+    return _inject_context_block(prompt_template, semantic_text)
+
+
 def _build_chunk_prompt(prompt_template: str, chunk_body: str,
-                        continuity_text: str = "", glossary_text: str = "") -> str:
-    template = _inject_glossary_context(prompt_template, glossary_text)
+                        continuity_text: str = "", glossary_text: str = "",
+                        semantic_text: str = "") -> str:
+    template = _inject_semantic_context(prompt_template, semantic_text)
+    template = _inject_glossary_context(template, glossary_text)
     template = _inject_continuity_context(template, continuity_text)
     if "{RAW_TEXT}" in template:
         return template.replace("{RAW_TEXT}", chunk_body)
@@ -1292,6 +1300,9 @@ def _new_chunk_manifest_entry(chunk_id: int, chunk_content: str, budget: dict,
         "glossary_terms": [],
         "glossary_term_count": 0,
         "glossary_context_tokens": 0,
+        "semantic_anchors": [],
+        "semantic_anchor_count": 0,
+        "semantic_context_tokens": 0,
         "last_section_title": "",
         "output_chars": 0,
         "actual_output_tokens": 0,
@@ -1362,6 +1373,9 @@ def _ensure_chunk_runtime_defaults(manifest: dict, runtime: dict, plan: dict,
         chunk_info.setdefault("glossary_terms", [])
         chunk_info.setdefault("glossary_term_count", 0)
         chunk_info.setdefault("glossary_context_tokens", 0)
+        chunk_info.setdefault("semantic_anchors", [])
+        chunk_info.setdefault("semantic_anchor_count", 0)
+        chunk_info.setdefault("semantic_context_tokens", 0)
         chunk_info.setdefault("last_section_title", "")
         chunk_info.setdefault("output_chars", 0)
         chunk_info.setdefault("actual_output_tokens", 0)
@@ -2170,6 +2184,14 @@ def _evaluate_chunk_output_health(prompt_name: str, chunk_id: int, chunk_char_co
     warnings.extend(glossary_evaluation["warnings"])
     retry_reasons.extend(glossary_evaluation["retry_reasons"])
 
+    semantic_evaluation = kernel_semantic.evaluate_semantic_anchors(
+        source_text,
+        result_text,
+        max_items=glossary_max_terms,
+    )
+    warnings.extend(semantic_evaluation["warnings"])
+    retry_reasons.extend(semantic_evaluation["retry_reasons"])
+
     return {
         "warnings": warnings,
         "retry_reasons": list(dict.fromkeys(retry_reasons)),
@@ -2177,6 +2199,8 @@ def _evaluate_chunk_output_health(prompt_name: str, chunk_id: int, chunk_char_co
         "result_chars": result_char_count,
         "glossary_terms": glossary_evaluation["matched_terms"],
         "missing_glossary_terms": glossary_evaluation["missing_terms"],
+        "semantic_anchors": semantic_evaluation["anchors"]["ordered"],
+        "missing_semantic_anchors": semantic_evaluation["missing_anchors"],
     }
 
 
@@ -4890,6 +4914,11 @@ def _process_chunks_impl(work_dir: str, prompt_name: str, extra_instruction: str
         "term_count": glossary_term_count,
         "max_prompt_terms": max(0, _parse_int_min(config.get("chunk_glossary_max_prompt_terms"), 8, 0)),
     }
+    plan["semantic_verification"] = {
+        "mode": "anchor_checks",
+        "max_anchors": max(0, _parse_int_min(config.get("chunk_semantic_max_anchors"), 8, 0)),
+        "judge_free": True,
+    }
     plan_continuity = plan.get("continuity", {}) if isinstance(plan.get("continuity", {}), dict) else _build_manifest_continuity_policy(config)
     plan_chunk_contract = plan.get("chunk_contract", {}) if isinstance(plan.get("chunk_contract", {}), dict) else _build_manifest_chunk_contract()
     manifest_chunk_size = max(0, _parse_int(plan.get("chunk_size"), manifest.get("chunk_size", 0)))
@@ -4999,6 +5028,7 @@ def _process_chunks_impl(work_dir: str, prompt_name: str, extra_instruction: str
             "autotune": manifest.get("autotune", {}),
             "plan": manifest.get("plan", {}),
             "glossary": plan.get("glossary", {}),
+            "semantic_verification": plan.get("semantic_verification", {}),
             "resume": resume_report,
             "control": _build_process_control_summary(runtime, operation_control),
             "warnings": setup_warnings,
@@ -5113,6 +5143,7 @@ def _process_chunks_impl(work_dir: str, prompt_name: str, extra_instruction: str
             "resume": resume_report,
             "plan": manifest.get("plan", {}),
             "glossary": plan.get("glossary", {}),
+            "semantic_verification": plan.get("semantic_verification", {}),
             "control": _build_process_control_summary(runtime, operation_control),
             "request_url": request_url,
             "cancellation": cancellation,
@@ -5143,6 +5174,7 @@ def _process_chunks_impl(work_dir: str, prompt_name: str, extra_instruction: str
             "resume": resume_report,
             "plan": manifest.get("plan", {}),
             "glossary": plan.get("glossary", {}),
+            "semantic_verification": plan.get("semantic_verification", {}),
             "control": _build_process_control_summary(runtime, operation_control),
             "request_url": request_url,
             "cancellation": cancellation,
@@ -5224,16 +5256,22 @@ def _process_chunks_impl(work_dir: str, prompt_name: str, extra_instruction: str
             chunk_text,
             max_terms=max(0, _parse_int_min(config.get("chunk_glossary_max_prompt_terms"), 8, 0)),
         )
+        semantic_context = kernel_semantic.build_anchor_prompt_context(
+            chunk_text,
+            max_items=max(0, _parse_int_min(config.get("chunk_semantic_max_anchors"), 8, 0)),
+        )
         prompt = _build_chunk_prompt(
             prompt_template,
             chunk_text,
             continuity_context["text"],
             glossary_context["text"],
+            semantic_context["text"],
         )
         actual_prompt_tokens = (
             prompt_budget["prompt_template_tokens"]
             + continuity_context["token_count"]
             + _estimate_tokens(glossary_context["text"], "tokens", config)
+            + _estimate_tokens(semantic_context["text"], "tokens", config)
         )
 
         chunk_info["input_chars"] = chunk_char_count
@@ -5249,6 +5287,9 @@ def _process_chunks_impl(work_dir: str, prompt_name: str, extra_instruction: str
         chunk_info["glossary_terms"] = [str(entry.get("term", "")).strip() for entry in glossary_context.get("terms", []) if str(entry.get("term", "")).strip()]
         chunk_info["glossary_term_count"] = len(chunk_info["glossary_terms"])
         chunk_info["glossary_context_tokens"] = _estimate_tokens(glossary_context["text"], "tokens", config) if glossary_context.get("text") else 0
+        chunk_info["semantic_anchors"] = list(semantic_context.get("anchors", {}).get("ordered", []))
+        chunk_info["semantic_anchor_count"] = len(chunk_info["semantic_anchors"])
+        chunk_info["semantic_context_tokens"] = _estimate_tokens(semantic_context["text"], "tokens", config) if semantic_context.get("text") else 0
         chunk_info["autotune_target_tokens"] = autotune_state["current_target_tokens"]
         chunk_info["autotune_next_target_tokens"] = autotune_state["current_target_tokens"]
         chunk_info["autotune_event"] = ""
@@ -5572,6 +5613,7 @@ def _process_chunks_impl(work_dir: str, prompt_name: str, extra_instruction: str
         "resume": resume_report,
         "plan": manifest.get("plan", {}),
         "glossary": plan.get("glossary", {}),
+        "semantic_verification": plan.get("semantic_verification", {}),
         "control": _build_process_control_summary(runtime, operation_control),
         "request_url": request_url,
         "cancellation": cancellation,
@@ -6326,6 +6368,13 @@ def verify_quality(optimized_text_path: str, raw_text_path: str = None,
                         checks["size_ratio_ok"] = 0.7 <= size_ratio <= 2.0
                         if not checks["size_ratio_ok"]:
                             warnings.append(f"Size ratio {size_ratio:.2f}x vs raw text is outside expected range (0.7-2.0x for monolingual)")
+
+                    semantic_evaluation = kernel_semantic.evaluate_semantic_anchors(raw_text, text, max_items=12)
+                    checks["semantic_anchor_count"] = len(semantic_evaluation["anchors"].get("ordered", []))
+                    checks["semantic_missing_count"] = len(semantic_evaluation["missing_anchors"])
+                    checks["semantic_anchor_coverage_ok"] = len(semantic_evaluation["missing_anchors"]) == 0
+                    if semantic_evaluation["missing_anchors"]:
+                        warnings.extend(semantic_evaluation["warnings"])
             except Exception:
                 pass  # Non-critical, skip if raw text unreadable
     

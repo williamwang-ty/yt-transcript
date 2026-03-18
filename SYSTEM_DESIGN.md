@@ -1,10 +1,10 @@
-# System Design (v5.12-stage12)
+# System Design (v5.13-stage13)
 
-**Stage**: 12
+**Stage**: 13
 
 **Status**: accepted and implemented
 
-**Behavior change in this stage**: added a local `glossary.json` artifact via `kernel_glossary.py`, injected glossary guardrails into chunk prompts, and made chunk-level verification detect missing terminology before accepting output
+**Behavior change in this stage**: added deterministic semantic anchor checks via `kernel_semantic.py`, injected high-signal anchors into chunk prompts, and made both chunk-level and final quality verification detect dropped numbers, dates, URLs, and similar anchors
 
 **Source of truth**: This file is the canonical system design document for the repository.
 
@@ -12,18 +12,18 @@
 
 ---
 
-## 1. Stage 12 Goal
+## 1. Stage 13 Goal
 
-Stage 12 makes terminology consistency a first-class local runtime concern.
+Stage 13 strengthens local verification beyond terminology-only checks by tracking semantic anchors deterministically.
 
 Its goals are:
 
-- add a local `glossary.json` artifact for document-level terminology consistency
-- expose a public `build-glossary` command that derives deterministic glossary candidates from source chunks
-- inject relevant glossary terms into chunk prompts without changing chunk boundaries or merge contracts
-- make chunk-level verification detect missing glossary terms before accepting output
+- add a judge-free semantic anchor subsystem in `kernel_semantic.py`
+- inject high-signal anchors such as URLs, dates, percentages, and important numbers into chunk prompts
+- make chunk-level verification retry outputs that silently drop required anchors
+- expose anchor coverage signals in final `verify-quality` checks when raw text is available
 
-Stage 12 remains intentionally bounded. It does **not** introduce LLM-judge terminology arbitration or a cross-document knowledge base.
+Stage 13 remains intentionally bounded. It does **not** introduce LLM-as-judge verification loops or model-based semantic comparison.
 
 ---
 
@@ -46,6 +46,7 @@ Its current implemented use cases are:
 - local telemetry journals for kernel command runs
 - local telemetry summaries and filtered event queries for kernel command runs
 - local glossary extraction and terminology guardrails for chunk execution
+- local semantic anchor verification for chunk execution and final quality checks
 - local runtime ownership for manifest-mutating commands
 - local runtime status inspection for work directories
 - public local cancellation for active chunk-processing runs
@@ -59,7 +60,7 @@ Its current implemented use cases are:
 
 ### 2.3 Current Non-Goals
 
-At Stage 12, the system is **not yet**:
+At Stage 13, the system is **not yet**:
 
 - a generalized multi-source document transformation framework
 - a reusable extracted kernel package
@@ -90,8 +91,8 @@ source acquisition
   -> runtime ownership acquisition for manifest-mutating commands
   -> chunking
   -> resume preflight / manifest repair
-  -> per-chunk prompt execution with glossary guardrails when available
-  -> chunk output verification, including terminology checks when glossary terms are matched
+  -> per-chunk prompt execution with glossary and semantic anchor guardrails when available
+  -> chunk output verification, including terminology and semantic anchor checks when matched
   -> bounded same-plan repair or document replan decision
   -> deterministic merge
   -> deterministic final assembly
@@ -128,8 +129,8 @@ The current implementation relies on these persisted artifacts:
 - `/tmp/${VIDEO_ID}_normalized_document.json`
   - normalized source artifact
 - `manifest.json` in chunk work directories
-  - chunk plan, chunk contract, continuity policy, runtime state, resume / autotune / replan metadata, glossary metadata, and explicit operation-control state
-  - manifest schema remains `v5` in Stage 12, now with explicit pause / resume runtime fields and glossary plan metadata
+  - chunk plan, chunk contract, continuity policy, runtime state, resume / autotune / replan metadata, glossary metadata, semantic verification metadata, and explicit operation-control state
+  - manifest schema remains `v5` in Stage 13, now with explicit pause / resume runtime fields plus glossary and semantic verification plan metadata
 - `/tmp/${VIDEO_ID}_raw_text.txt`
   - raw extracted transcript-like text
 - `/tmp/${VIDEO_ID}_segments.json`
@@ -499,16 +500,16 @@ New public interfaces should prefer additive envelope layers over breaking chang
 
 ---
 
-## 5. Stage 12 Deliverables
+## 5. Stage 13 Deliverables
 
 Completed in this stage:
 
-- added `kernel_glossary.py` with deterministic glossary extraction and local glossary persistence
-- added public `build-glossary` command on the stable kernel interface
-- made `process-chunks` load glossary metadata, inject matching terminology guidance into prompts, and record glossary context per chunk
-- added deterministic chunk-level terminology checks that can trigger bounded same-plan repair when glossary terms disappear
-- preserved Stage 11 telemetry queries, Stage 10 pause / resume behavior, and existing chunk merge contracts
-- added regression coverage for glossary extraction, prompt injection, and glossary-triggered retry behavior
+- added `kernel_semantic.py` with judge-free semantic anchor extraction, prompt-context generation, and anchor verification
+- made `process-chunks` inject semantic anchors into prompts and record matched anchors per chunk
+- added deterministic chunk-level anchor checks that can trigger bounded same-plan repair when anchors disappear
+- extended `verify-quality` to report semantic anchor coverage when raw text is available
+- preserved Stage 12 glossary behavior, Stage 11 telemetry queries, and existing merge/runtime contracts
+- added regression coverage for semantic prompt injection, anchor-triggered retry behavior, and final quality anchor warnings
 
 Not done in this stage:
 
@@ -516,19 +517,19 @@ Not done in this stage:
 - no fully concurrency-safe persistent state store yet
 - no subsystem test-package split yet
 - no broad extraction of the chunk-execution algorithm itself yet
-- no semantic drift verification subsystem yet
+- no package-level test suite reorganization yet
 
 ---
 
 ## 6. Current Known Gaps
 
-The implementation is meaningfully stronger after Stage 12, but still not fully kernelized.
+The implementation is meaningfully stronger after Stage 13, but still not fully kernelized.
 
 The main remaining gaps are:
 
 1. runtime, state-store, and controller boundaries are extracted, but much of the chunk-execution algorithm still lives in one large script
 2. telemetry now has local query surfaces, but it is still a lightweight file-based subsystem rather than a richer observability stack
-3. verification remains deterministic / heuristic only and does not yet include semantic judge layers
+3. verification now includes deterministic semantic anchor checks, but still does not include richer semantic judge layers or embedding-based drift models
 4. terminology consistency now has a local glossary path, but deeper semantic or human-curated terminology workflows are still not first-class
 5. ownership is local single-writer gating, not a general concurrent state-store protocol
 6. cancellation and pause / resume are public and local, but long-lived job scheduling is not formalized
@@ -611,37 +612,45 @@ Implemented scope:
 
 ### Stage 13 — Semantic Verification and Anchor Checks
 
+Implemented scope:
+
+- added deterministic semantic anchor verification beyond terminology-only checks
+- tracked numbers, URLs, and other high-signal anchors through chunk transformations
+- kept semantic checks judge-free by default to avoid adding LLM-verifier loops
+
+### Stage 14 — Test Suite Reorganization
+
 Planned scope:
 
-- add deterministic semantic anchor verification beyond terminology-only checks
-- track numbers, URLs, and other high-signal anchors through chunk transformations
-- keep semantic checks judge-free by default to avoid adding LLM-verifier loops
+- split the monolithic regression file into smaller subsystem-oriented test modules
+- keep test coverage equivalent while making stage-specific changes easier to reason about
+- preserve the existing `python3 -m unittest` workflow while improving suite structure
 
 ---
 
-## 8. Stage 12 Validation
+## 8. Stage 13 Validation
 
-The Stage 12 implementation is considered valid because:
+The Stage 13 implementation is considered valid because:
 
-- `kernel_glossary.py` now owns glossary extraction, prompt-context selection, and terminology verification behavior
-- `build-glossary` exposes a public local glossary-building contract without changing chunking or merge behavior
-- `process-chunks` now injects matched glossary terms into prompts and can retry outputs that drop required terms
-- terminology checks remain deterministic and local, avoiding new verifier-model loops
-- Stage 11 telemetry queries and Stage 10 runtime-control behavior remain intact while terminology consistency becomes materially stronger
+- `kernel_semantic.py` now owns judge-free semantic anchor extraction, prompt-context generation, and anchor verification behavior
+- `process-chunks` now injects high-signal anchors into prompts and can retry outputs that silently drop them
+- `verify-quality` now reports semantic anchor coverage when raw text is available, without adding model-based verifier loops
+- Stage 12 glossary behavior, Stage 11 telemetry queries, and Stage 10 runtime-control behavior remain intact while semantic verification becomes materially stronger
+- semantic anchor checks stay deterministic and inspectable, preserving the repository's local-first design
 
 Representative validated behaviors in this stage include:
 
-- extracting glossary candidates such as technical product terms from source chunks
-- injecting glossary guardrails into per-chunk prompts when relevant terms are matched
-- retrying a chunk when required glossary terms disappear from output
-- persisting `glossary.json` as a local inspectable artifact
+- injecting URLs, dates, and percentages into per-chunk semantic anchor guardrails
+- retrying a chunk when required numeric anchors disappear from output
+- reporting missing semantic anchors as final quality warnings when comparing against raw text
+- recording semantic verification metadata in manifest plan and chunk state
 
 ---
 
 ## 9. Next Stage Entry Criteria
 
-Stage 13 should begin only when the following are agreed:
+Stage 14 should begin only when the following are agreed:
 
-1. which semantic anchors are stable enough to check deterministically across prompts
-2. how strict semantic anchor checks should be before triggering bounded repair
-3. which anchor classes belong in chunk-level verification versus final quality verification
+1. which subsystem split best reflects the current architecture boundaries in tests
+2. how much fixture extraction is worth doing without destabilizing the existing regression workflow
+3. what compatibility shim, if any, should remain after splitting `tests/test_regressions.py`
