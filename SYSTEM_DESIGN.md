@@ -1,10 +1,10 @@
-# System Design (v5.11-stage11)
+# System Design (v5.12-stage12)
 
-**Stage**: 11
+**Stage**: 12
 
 **Status**: accepted and implemented
 
-**Behavior change in this stage**: extracted local telemetry reading into `kernel_telemetry.py`, added public `telemetry-summary` / `telemetry-events` commands, and made append-only telemetry journals queryable without changing the existing envelope or event formats
+**Behavior change in this stage**: added a local `glossary.json` artifact via `kernel_glossary.py`, injected glossary guardrails into chunk prompts, and made chunk-level verification detect missing terminology before accepting output
 
 **Source of truth**: This file is the canonical system design document for the repository.
 
@@ -12,18 +12,18 @@
 
 ---
 
-## 1. Stage 11 Goal
+## 1. Stage 12 Goal
 
-Stage 11 makes local telemetry a first-class inspectable subsystem rather than a write-only journal.
+Stage 12 makes terminology consistency a first-class local runtime concern.
 
 Its goals are:
 
-- extract telemetry file reading and summarization into a dedicated `kernel_telemetry.py` module
-- expose stable public read-only query commands for local telemetry journals
-- preserve the existing append-only telemetry event format and command envelopes while improving debuggability
-- keep telemetry local-first and inspectable on disk without introducing remote backends
+- add a local `glossary.json` artifact for document-level terminology consistency
+- expose a public `build-glossary` command that derives deterministic glossary candidates from source chunks
+- inject relevant glossary terms into chunk prompts without changing chunk boundaries or merge contracts
+- make chunk-level verification detect missing glossary terms before accepting output
 
-Stage 11 remains intentionally bounded. It does **not** introduce distributed tracing, remote aggregation, or a telemetry schema rewrite.
+Stage 12 remains intentionally bounded. It does **not** introduce LLM-judge terminology arbitration or a cross-document knowledge base.
 
 ---
 
@@ -45,6 +45,7 @@ Its current implemented use cases are:
 - stable kernel command envelopes for Python and CLI consumers
 - local telemetry journals for kernel command runs
 - local telemetry summaries and filtered event queries for kernel command runs
+- local glossary extraction and terminology guardrails for chunk execution
 - local runtime ownership for manifest-mutating commands
 - local runtime status inspection for work directories
 - public local cancellation for active chunk-processing runs
@@ -58,11 +59,11 @@ Its current implemented use cases are:
 
 ### 2.3 Current Non-Goals
 
-At Stage 11, the system is **not yet**:
+At Stage 12, the system is **not yet**:
 
 - a generalized multi-source document transformation framework
 - a reusable extracted kernel package
-- a global glossary / terminology propagation system
+- a richer human-curated or cross-document terminology knowledge base
 - an LLM-judge semantic verification system
 - a fully concurrency-safe persistent state store beyond local single-owner work-dir mutation
 - a telemetry-first production runtime with remote aggregation or tracing backends
@@ -82,14 +83,15 @@ source acquisition
   -> state synchronization
   -> normalization
   -> planning
+  -> optional glossary build / load
   -> canonical chunk contract selection
   -> operation control contract emission
   -> stable command envelope / trace allocation
   -> runtime ownership acquisition for manifest-mutating commands
   -> chunking
   -> resume preflight / manifest repair
-  -> per-chunk prompt execution
-  -> chunk output verification
+  -> per-chunk prompt execution with glossary guardrails when available
+  -> chunk output verification, including terminology checks when glossary terms are matched
   -> bounded same-plan repair or document replan decision
   -> deterministic merge
   -> deterministic final assembly
@@ -126,8 +128,8 @@ The current implementation relies on these persisted artifacts:
 - `/tmp/${VIDEO_ID}_normalized_document.json`
   - normalized source artifact
 - `manifest.json` in chunk work directories
-  - chunk plan, chunk contract, continuity policy, runtime state, resume / autotune / replan metadata, and explicit operation-control state
-  - manifest schema remains `v5` in Stage 10, now with explicit pause / resume runtime fields
+  - chunk plan, chunk contract, continuity policy, runtime state, resume / autotune / replan metadata, glossary metadata, and explicit operation-control state
+  - manifest schema remains `v5` in Stage 12, now with explicit pause / resume runtime fields and glossary plan metadata
 - `/tmp/${VIDEO_ID}_raw_text.txt`
   - raw extracted transcript-like text
 - `/tmp/${VIDEO_ID}_segments.json`
@@ -136,6 +138,8 @@ The current implementation relies on these persisted artifacts:
   - optional intermediate structured text
 - `/tmp/${VIDEO_ID}_optimized.txt`
   - transformed output before final assembly
+- `glossary.json` in chunk work directories when glossary building is used
+  - local document-level terminology candidates and optional preferred renderings
 - final markdown output under configured output directory
 - `telemetry.jsonl` beside inferred kernel work artifacts when a stable local sink can be resolved
   - append-only local command journal for envelope-producing kernel commands
@@ -495,16 +499,16 @@ New public interfaces should prefer additive envelope layers over breaking chang
 
 ---
 
-## 5. Stage 11 Deliverables
+## 5. Stage 12 Deliverables
 
 Completed in this stage:
 
-- extracted local telemetry reading and aggregation into `kernel_telemetry.py`
-- added public `telemetry-summary` and `telemetry-events` commands on the stable kernel interface
-- kept `telemetry.jsonl` append-only while adding filterable event reads by command, trace, document, and success state
-- added local summary metrics such as counts, durations, warning totals, and recent event windows
-- preserved Stage 10 pause / resume behavior and Stage 6 envelope compatibility while expanding local observability
-- added regression coverage for telemetry summary reads, event filtering, and CLI envelope behavior for telemetry queries
+- added `kernel_glossary.py` with deterministic glossary extraction and local glossary persistence
+- added public `build-glossary` command on the stable kernel interface
+- made `process-chunks` load glossary metadata, inject matching terminology guidance into prompts, and record glossary context per chunk
+- added deterministic chunk-level terminology checks that can trigger bounded same-plan repair when glossary terms disappear
+- preserved Stage 11 telemetry queries, Stage 10 pause / resume behavior, and existing chunk merge contracts
+- added regression coverage for glossary extraction, prompt injection, and glossary-triggered retry behavior
 
 Not done in this stage:
 
@@ -512,20 +516,20 @@ Not done in this stage:
 - no fully concurrency-safe persistent state store yet
 - no subsystem test-package split yet
 - no broad extraction of the chunk-execution algorithm itself yet
-- no glossary / terminology propagation subsystem yet
+- no semantic drift verification subsystem yet
 
 ---
 
 ## 6. Current Known Gaps
 
-The implementation is meaningfully stronger after Stage 11, but still not fully kernelized.
+The implementation is meaningfully stronger after Stage 12, but still not fully kernelized.
 
 The main remaining gaps are:
 
 1. runtime, state-store, and controller boundaries are extracted, but much of the chunk-execution algorithm still lives in one large script
 2. telemetry now has local query surfaces, but it is still a lightweight file-based subsystem rather than a richer observability stack
 3. verification remains deterministic / heuristic only and does not yet include semantic judge layers
-4. global terminology / entity consistency is still not first-class
+4. terminology consistency now has a local glossary path, but deeper semantic or human-curated terminology workflows are still not first-class
 5. ownership is local single-writer gating, not a general concurrent state-store protocol
 6. cancellation and pause / resume are public and local, but long-lived job scheduling is not formalized
 7. test coverage is stronger around runtime control, but fixtures are not yet split into dedicated suites by subsystem
@@ -599,37 +603,45 @@ Implemented scope:
 
 ### Stage 12 — Glossary and Terminology Consistency
 
+Implemented scope:
+
+- added a local glossary artifact for document-level terminology consistency
+- injected glossary guidance into chunk execution prompts without changing chunk boundaries
+- added deterministic terminology checks to local verification
+
+### Stage 13 — Semantic Verification and Anchor Checks
+
 Planned scope:
 
-- add a local glossary artifact for document-level terminology consistency
-- inject glossary guidance into chunk execution prompts without changing chunk boundaries
-- add deterministic terminology checks to local verification
+- add deterministic semantic anchor verification beyond terminology-only checks
+- track numbers, URLs, and other high-signal anchors through chunk transformations
+- keep semantic checks judge-free by default to avoid adding LLM-verifier loops
 
 ---
 
-## 8. Stage 11 Validation
+## 8. Stage 12 Validation
 
-The Stage 11 implementation is considered valid because:
+The Stage 12 implementation is considered valid because:
 
-- `kernel_telemetry.py` now owns local telemetry reading, filtering, and summarization behavior
-- `telemetry-summary` and `telemetry-events` expose public read-only query contracts without changing the existing telemetry event schema
-- telemetry queries remain local-first, operating directly on `telemetry.jsonl` without mutating journal contents
-- Stage 6 envelope behavior remains compatible for the new telemetry query commands
-- Stage 10 runtime-control behavior remains intact while telemetry becomes materially more useful for debugging
+- `kernel_glossary.py` now owns glossary extraction, prompt-context selection, and terminology verification behavior
+- `build-glossary` exposes a public local glossary-building contract without changing chunking or merge behavior
+- `process-chunks` now injects matched glossary terms into prompts and can retry outputs that drop required terms
+- terminology checks remain deterministic and local, avoiding new verifier-model loops
+- Stage 11 telemetry queries and Stage 10 runtime-control behavior remain intact while terminology consistency becomes materially stronger
 
 Representative validated behaviors in this stage include:
 
-- summarizing command counts and duration totals from a local telemetry journal
-- filtering events by command and limit from a direct `telemetry.jsonl` path
-- emitting `yt_transcript.command_result/v1` envelopes for `telemetry-summary`
-- preserving append-only `telemetry.jsonl` compatibility while adding query helpers
+- extracting glossary candidates such as technical product terms from source chunks
+- injecting glossary guardrails into per-chunk prompts when relevant terms are matched
+- retrying a chunk when required glossary terms disappear from output
+- persisting `glossary.json` as a local inspectable artifact
 
 ---
 
 ## 9. Next Stage Entry Criteria
 
-Stage 12 should begin only when the following are agreed:
+Stage 13 should begin only when the following are agreed:
 
-1. which glossary artifact shape is stable enough to persist in work directories
-2. how glossary hints should be injected into prompts without over-inflating chunk prompts
-3. which terminology checks are deterministic enough to enable by default
+1. which semantic anchors are stable enough to check deterministically across prompts
+2. how strict semantic anchor checks should be before triggering bounded repair
+3. which anchor classes belong in chunk-level verification versus final quality verification

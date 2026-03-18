@@ -36,6 +36,7 @@ Commands:
     resume-run <work_dir>          Clear a local pause request and restore resumable runtime state
     telemetry-summary <ref>        Summarize local telemetry journal from a work_dir or telemetry.jsonl path
     telemetry-events <ref>         Query local telemetry journal events from a work_dir or telemetry.jsonl path
+    build-glossary <work_dir>      Build a local glossary artifact for terminology consistency
     assemble-final <optimized_text> <output_file>  Assemble final markdown from optimized text + metadata
     verify-quality <optimized_text>  Verify quality of optimized text (structural checks)
     sync-state <state_ref>         Sync legacy state.md and authoritative machine_state.json
@@ -67,6 +68,7 @@ import kernel_runtime
 import kernel_state
 import kernel_controller
 import kernel_telemetry
+import kernel_glossary
 
 
 def _skill_root() -> Path:
@@ -361,6 +363,7 @@ def _default_config_values(config_path: str = "") -> dict:
         "chunk_overlap_sentences": DEFAULT_CHUNK_OVERLAP_SENTENCES,
         "chunk_context_tail_sentences": DEFAULT_CHUNK_CONTEXT_TAIL_SENTENCES,
         "chunk_context_summary_tokens": DEFAULT_CHUNK_CONTEXT_SUMMARY_TOKENS,
+        "chunk_glossary_max_prompt_terms": 8,
         "output_ratio_structure_only": TASK_OUTPUT_RATIO_DEFAULTS["structure_only"],
         "output_ratio_quick_cleanup": TASK_OUTPUT_RATIO_DEFAULTS["quick_cleanup"],
         "output_ratio_translate_only": TASK_OUTPUT_RATIO_DEFAULTS["translate_only"],
@@ -679,19 +682,28 @@ def _build_continuity_context(previous_chunk: dict | None, work_path: Path,
     }
 
 
-def _inject_continuity_context(prompt_template: str, continuity_text: str) -> str:
-    if not continuity_text:
+def _inject_context_block(prompt_template: str, context_text: str) -> str:
+    if not context_text:
         return prompt_template
 
     input_anchor = "\n## Input Text\n"
     if input_anchor in prompt_template:
-        return prompt_template.replace(input_anchor, f"\n{continuity_text}\n\n## Input Text\n", 1)
-    return prompt_template.rstrip() + "\n\n" + continuity_text + "\n"
+        return prompt_template.replace(input_anchor, f"\n{context_text}\n\n## Input Text\n", 1)
+    return prompt_template.rstrip() + "\n\n" + context_text + "\n"
+
+
+def _inject_continuity_context(prompt_template: str, continuity_text: str) -> str:
+    return _inject_context_block(prompt_template, continuity_text)
+
+
+def _inject_glossary_context(prompt_template: str, glossary_text: str) -> str:
+    return _inject_context_block(prompt_template, glossary_text)
 
 
 def _build_chunk_prompt(prompt_template: str, chunk_body: str,
-                        continuity_text: str = "") -> str:
-    template = _inject_continuity_context(prompt_template, continuity_text)
+                        continuity_text: str = "", glossary_text: str = "") -> str:
+    template = _inject_glossary_context(prompt_template, glossary_text)
+    template = _inject_continuity_context(template, continuity_text)
     if "{RAW_TEXT}" in template:
         return template.replace("{RAW_TEXT}", chunk_body)
     if "{STRUCTURED_TEXT}" in template:
@@ -1277,6 +1289,9 @@ def _new_chunk_manifest_entry(chunk_id: int, chunk_content: str, budget: dict,
         "continuity_context_chars": 0,
         "continuity_context_tokens": 0,
         "continuity_section_title": "",
+        "glossary_terms": [],
+        "glossary_term_count": 0,
+        "glossary_context_tokens": 0,
         "last_section_title": "",
         "output_chars": 0,
         "actual_output_tokens": 0,
@@ -1344,6 +1359,9 @@ def _ensure_chunk_runtime_defaults(manifest: dict, runtime: dict, plan: dict,
         chunk_info.setdefault("continuity_context_chars", 0)
         chunk_info.setdefault("continuity_context_tokens", 0)
         chunk_info.setdefault("continuity_section_title", "")
+        chunk_info.setdefault("glossary_terms", [])
+        chunk_info.setdefault("glossary_term_count", 0)
+        chunk_info.setdefault("glossary_context_tokens", 0)
         chunk_info.setdefault("last_section_title", "")
         chunk_info.setdefault("output_chars", 0)
         chunk_info.setdefault("actual_output_tokens", 0)
@@ -2107,7 +2125,9 @@ def _find_previous_active_chunk(chunks: list[dict], current_index: int) -> dict 
 
 
 def _evaluate_chunk_output_health(prompt_name: str, chunk_id: int, chunk_char_count: int,
-                                  result_text: str) -> dict:
+                                  result_text: str, *, source_text: str = "",
+                                  glossary_payload: dict | None = None,
+                                  glossary_max_terms: int = 8) -> dict:
     result_char_count = len(result_text)
     ratio = result_char_count / chunk_char_count if chunk_char_count > 0 else 0
     warnings = []
@@ -2141,11 +2161,22 @@ def _evaluate_chunk_output_health(prompt_name: str, chunk_id: int, chunk_char_co
             )
             retry_reasons.append("translation_skipped")
 
+    glossary_evaluation = kernel_glossary.evaluate_glossary_terms(
+        glossary_payload or {},
+        source_text,
+        result_text,
+        max_terms=glossary_max_terms,
+    )
+    warnings.extend(glossary_evaluation["warnings"])
+    retry_reasons.extend(glossary_evaluation["retry_reasons"])
+
     return {
         "warnings": warnings,
         "retry_reasons": list(dict.fromkeys(retry_reasons)),
         "ratio": ratio,
         "result_chars": result_char_count,
+        "glossary_terms": glossary_evaluation["matched_terms"],
+        "missing_glossary_terms": glossary_evaluation["missing_terms"],
     }
 
 
@@ -3350,6 +3381,15 @@ def telemetry_events(telemetry_ref: str = "", *, telemetry_path: str = "", work_
     )
 
 
+def build_glossary(work_dir: str, max_terms: int = 50,
+                  min_occurrences: int = 1) -> dict:
+    return kernel_glossary.build_glossary(
+        work_dir,
+        max_terms=max_terms,
+        min_occurrences=min_occurrences,
+    )
+
+
 def _kernel_command_registry() -> dict[str, object]:
     return {
         "validate-state": validate_state,
@@ -3366,6 +3406,7 @@ def _kernel_command_registry() -> dict[str, object]:
         "resume-run": resume_run,
         "telemetry-summary": telemetry_summary,
         "telemetry-events": telemetry_events,
+        "build-glossary": build_glossary,
         "merge-content": lambda *, work_dir, output_file, header="": merge_content(work_dir, output_file, header_content=header),
         "assemble-final": assemble_final,
         "verify-quality": verify_quality,
@@ -4841,6 +4882,14 @@ def _process_chunks_impl(work_dir: str, prompt_name: str, extra_instruction: str
     )
     plan = manifest["plan"]
     runtime = manifest["runtime"]
+    glossary_payload = kernel_glossary.load_glossary(work_dir)
+    glossary_term_count = len(glossary_payload.get("terms", [])) if isinstance(glossary_payload.get("terms", []), list) else 0
+    plan["glossary"] = {
+        "mode": "local_file" if glossary_term_count > 0 else "disabled",
+        "glossary_path": str(kernel_glossary.glossary_path_for(work_dir)) if glossary_term_count > 0 else "",
+        "term_count": glossary_term_count,
+        "max_prompt_terms": max(0, _parse_int_min(config.get("chunk_glossary_max_prompt_terms"), 8, 0)),
+    }
     plan_continuity = plan.get("continuity", {}) if isinstance(plan.get("continuity", {}), dict) else _build_manifest_continuity_policy(config)
     plan_chunk_contract = plan.get("chunk_contract", {}) if isinstance(plan.get("chunk_contract", {}), dict) else _build_manifest_chunk_contract()
     manifest_chunk_size = max(0, _parse_int(plan.get("chunk_size"), manifest.get("chunk_size", 0)))
@@ -4949,6 +4998,7 @@ def _process_chunks_impl(work_dir: str, prompt_name: str, extra_instruction: str
             "token_count_source": manifest.get("token_count_source", ""),
             "autotune": manifest.get("autotune", {}),
             "plan": manifest.get("plan", {}),
+            "glossary": plan.get("glossary", {}),
             "resume": resume_report,
             "control": _build_process_control_summary(runtime, operation_control),
             "warnings": setup_warnings,
@@ -5062,6 +5112,7 @@ def _process_chunks_impl(work_dir: str, prompt_name: str, extra_instruction: str
             "replan_reason": "",
             "resume": resume_report,
             "plan": manifest.get("plan", {}),
+            "glossary": plan.get("glossary", {}),
             "control": _build_process_control_summary(runtime, operation_control),
             "request_url": request_url,
             "cancellation": cancellation,
@@ -5091,6 +5142,7 @@ def _process_chunks_impl(work_dir: str, prompt_name: str, extra_instruction: str
             "replan_reason": "",
             "resume": resume_report,
             "plan": manifest.get("plan", {}),
+            "glossary": plan.get("glossary", {}),
             "control": _build_process_control_summary(runtime, operation_control),
             "request_url": request_url,
             "cancellation": cancellation,
@@ -5167,9 +5219,21 @@ def _process_chunks_impl(work_dir: str, prompt_name: str, extra_instruction: str
             input_key=input_key,
             continuity_policy=plan_continuity,
         )
-        prompt = _build_chunk_prompt(prompt_template, chunk_text, continuity_context["text"])
+        glossary_context = kernel_glossary.build_glossary_prompt_context(
+            glossary_payload,
+            chunk_text,
+            max_terms=max(0, _parse_int_min(config.get("chunk_glossary_max_prompt_terms"), 8, 0)),
+        )
+        prompt = _build_chunk_prompt(
+            prompt_template,
+            chunk_text,
+            continuity_context["text"],
+            glossary_context["text"],
+        )
         actual_prompt_tokens = (
-            prompt_budget["prompt_template_tokens"] + continuity_context["token_count"]
+            prompt_budget["prompt_template_tokens"]
+            + continuity_context["token_count"]
+            + _estimate_tokens(glossary_context["text"], "tokens", config)
         )
 
         chunk_info["input_chars"] = chunk_char_count
@@ -5182,6 +5246,9 @@ def _process_chunks_impl(work_dir: str, prompt_name: str, extra_instruction: str
         chunk_info["continuity_context_chars"] = len(continuity_context["text"])
         chunk_info["continuity_context_tokens"] = continuity_context["token_count"]
         chunk_info["continuity_section_title"] = continuity_context["section_title"]
+        chunk_info["glossary_terms"] = [str(entry.get("term", "")).strip() for entry in glossary_context.get("terms", []) if str(entry.get("term", "")).strip()]
+        chunk_info["glossary_term_count"] = len(chunk_info["glossary_terms"])
+        chunk_info["glossary_context_tokens"] = _estimate_tokens(glossary_context["text"], "tokens", config) if glossary_context.get("text") else 0
         chunk_info["autotune_target_tokens"] = autotune_state["current_target_tokens"]
         chunk_info["autotune_next_target_tokens"] = autotune_state["current_target_tokens"]
         chunk_info["autotune_event"] = ""
@@ -5229,7 +5296,15 @@ def _process_chunks_impl(work_dir: str, prompt_name: str, extra_instruction: str
 
                 result_text = llm_result["text"]
                 actual_output_tokens = _estimate_tokens(result_text, "tokens", config)
-                output_health = _evaluate_chunk_output_health(prompt_name, chunk_id, chunk_char_count, result_text)
+                output_health = _evaluate_chunk_output_health(
+                    prompt_name,
+                    chunk_id,
+                    chunk_char_count,
+                    result_text,
+                    source_text=chunk_text,
+                    glossary_payload=glossary_payload,
+                    glossary_max_terms=max(0, _parse_int_min(config.get("chunk_glossary_max_prompt_terms"), 8, 0)),
+                )
                 consecutive_timeouts = 0
 
                 if output_health["retry_reasons"] and chunk_info.get("recovery_attempts", 0) < chunk_recovery_attempt_limit:
@@ -5496,6 +5571,7 @@ def _process_chunks_impl(work_dir: str, prompt_name: str, extra_instruction: str
         "replan_reason": runtime.get("replan_reason", ""),
         "resume": resume_report,
         "plan": manifest.get("plan", {}),
+        "glossary": plan.get("glossary", {}),
         "control": _build_process_control_summary(runtime, operation_control),
         "request_url": request_url,
         "cancellation": cancellation,
@@ -7430,6 +7506,15 @@ def main():
     telemetry_events_parser.add_argument('--document-id', default='', help='Optional document_id filter')
     telemetry_events_parser.add_argument('--success', choices=['all', 'true', 'false'], default='all', help='Filter by success state')
 
+    # build-glossary command
+    glossary_parser = subparsers.add_parser(
+        'build-glossary',
+        help='Build a local glossary artifact for terminology consistency'
+    )
+    glossary_parser.add_argument('work_dir', help='Working directory with manifest.json and raw chunks')
+    glossary_parser.add_argument('--max-terms', type=int, default=50, help='Maximum number of glossary terms to keep')
+    glossary_parser.add_argument('--min-occurrences', type=int, default=1, help='Minimum source occurrences required for a term')
+
     # assemble-final command
     af_parser = subparsers.add_parser(
         'assemble-final',
@@ -7737,6 +7822,18 @@ def main():
             trace_id=args.trace_id,
             document_id=args.document_id,
             success=args.success,
+        )
+        result = envelope['result']
+        print(json.dumps(envelope if args.api_envelope else result, ensure_ascii=False))
+        if not result.get('success', False):
+            sys.exit(1)
+
+    elif args.command == 'build-glossary':
+        envelope = run_kernel_command(
+            'build-glossary',
+            work_dir=args.work_dir,
+            max_terms=args.max_terms,
+            min_occurrences=args.min_occurrences,
         )
         result = envelope['result']
         print(json.dumps(envelope if args.api_envelope else result, ensure_ascii=False))

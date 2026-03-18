@@ -672,6 +672,112 @@ class RegressionTests(unittest.TestCase):
             self.assertTrue(payload["result"]["success"])
             self.assertGreaterEqual(payload["result"]["summary"]["matching_event_count"], 1)
 
+    def test_build_glossary_extracts_terms_from_work_dir(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source = Path(tmpdir) / "raw.txt"
+            work_dir = Path(tmpdir) / "chunks"
+            source.write_text("OpenAI API 与 Deepgram SDK 在 YouTube 工作流里一起使用。", encoding="utf-8")
+            utils.chunk_text(str(source), str(work_dir), 80, "structure_only")
+
+            result = utils.build_glossary(str(work_dir), max_terms=10, min_occurrences=1)
+
+            self.assertTrue(result["success"])
+            glossary_path = Path(result["glossary_path"])
+            self.assertTrue(glossary_path.exists())
+            terms = [entry["term"] for entry in result["terms"]]
+            self.assertIn("OpenAI", terms)
+            self.assertIn("API", terms)
+            self.assertIn("Deepgram", terms)
+
+    def test_process_chunks_injects_glossary_terms_into_prompt(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source = Path(tmpdir) / "raw.txt"
+            work_dir = Path(tmpdir) / "chunks"
+            source.write_text("OpenAI API 设计。", encoding="utf-8")
+            utils.chunk_text(str(source), str(work_dir), 80, "structure_only")
+            utils.build_glossary(str(work_dir), max_terms=10, min_occurrences=1)
+
+            config = utils._default_config_values()
+            config.update({
+                "llm_api_key": "key",
+                "llm_base_url": "https://api.example.com",
+                "llm_model": "demo",
+                "llm_api_format": "openai",
+            })
+
+            captured = {}
+
+            def fake_llm(*args, **kwargs):
+                captured["prompt"] = kwargs["messages"][0]["content"]
+                return {
+                    "text": "## 结果\n\nOpenAI API 设计。",
+                    "latency_ms": 12,
+                    "request_url": "https://api.example.com/v1/chat/completions",
+                    "streaming_used": False,
+                    "attempts": 1,
+                }
+
+            with mock.patch.object(utils, "load_config", return_value=config), mock.patch.object(
+                utils,
+                "_call_llm_api",
+                side_effect=fake_llm,
+            ):
+                result = utils.process_chunks(str(work_dir), "structure_only")
+
+            self.assertTrue(result["success"])
+            self.assertIn("Terminology Guardrails", captured["prompt"])
+            self.assertIn("OpenAI", captured["prompt"])
+            self.assertIn("API", captured["prompt"])
+            self.assertEqual(result["glossary"]["mode"], "local_file")
+
+    def test_process_chunks_retries_when_glossary_terms_are_missing(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source = Path(tmpdir) / "raw.txt"
+            work_dir = Path(tmpdir) / "chunks"
+            source.write_text("OpenAI API 发布。", encoding="utf-8")
+            utils.chunk_text(str(source), str(work_dir), 80, "structure_only")
+            utils.build_glossary(str(work_dir), max_terms=10, min_occurrences=1)
+
+            config = utils._default_config_values()
+            config.update({
+                "llm_api_key": "key",
+                "llm_base_url": "https://api.example.com",
+                "llm_model": "demo",
+                "llm_api_format": "openai",
+                "llm_chunk_recovery_attempts": 1,
+            })
+
+            responses = [
+                {
+                    "text": "## 结果\n\n发布。",
+                    "latency_ms": 10,
+                    "request_url": "https://api.example.com/v1/chat/completions",
+                    "streaming_used": False,
+                    "attempts": 1,
+                },
+                {
+                    "text": "## 结果\n\nOpenAI API 发布。",
+                    "latency_ms": 12,
+                    "request_url": "https://api.example.com/v1/chat/completions",
+                    "streaming_used": False,
+                    "attempts": 1,
+                },
+            ]
+
+            with mock.patch.object(utils, "load_config", return_value=config), mock.patch.object(
+                utils,
+                "_call_llm_api",
+                side_effect=responses,
+            ) as mocked_call:
+                result = utils.process_chunks(str(work_dir), "structure_only")
+
+            manifest = json.loads((work_dir / "manifest.json").read_text(encoding="utf-8"))
+            self.assertTrue(result["success"])
+            self.assertEqual(mocked_call.call_count, 2)
+            self.assertEqual(manifest["chunks"][0]["recovery_attempts"], 1)
+            output = (work_dir / manifest["chunks"][0]["processed_path"]).read_text(encoding="utf-8")
+            self.assertIn("OpenAI API", output)
+
     def test_build_chapter_plan_maps_chapters_to_timed_chunks(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             segments_path = Path(tmpdir) / "segments.json"
