@@ -32,6 +32,8 @@ Commands:
     replan-remaining <work_dir>    Re-plan unfinished raw chunks after canary/autotune aborts
     runtime-status <work_dir>      Inspect manifest runtime, ownership, and local runtime-control status
     cancel-run <work_dir>          Request local cancellation for an active chunk-processing run
+    pause-run <work_dir>           Request a safe-boundary pause for an active chunk-processing run
+    resume-run <work_dir>          Clear a local pause request and restore resumable runtime state
     assemble-final <optimized_text> <output_file>  Assemble final markdown from optimized text + metadata
     verify-quality <optimized_text>  Verify quality of optimized text (structural checks)
     sync-state <state_ref>         Sync legacy state.md and authoritative machine_state.json
@@ -307,6 +309,7 @@ DEFAULT_UNKNOWN_REQUEST_CAP = 2600
 DEFAULT_UNKNOWN_LEGACY_CHARS = 8000
 SUPERSEDED_CHUNK_STATUS = "superseded"
 INTERRUPTED_CHUNK_STATUS = "interrupted"
+PAUSED_RUNTIME_STATUS = "paused"
 RESUMABLE_RUNTIME_STATUS = "resumable"
 SHORT_OUTPUT_WARNING_RATIO = 0.5
 TRANSLATION_WARNING_CN_RATIO = 0.1
@@ -1079,6 +1082,10 @@ def _build_runtime_control_state() -> dict:
         "last_replan_trigger": "",
         "last_replan_action": "",
         "last_replan_chunk_id": None,
+        "pause_requested": False,
+        "pause_reason": "",
+        "paused_at": "",
+        "resumed_at": "",
     }
 
 
@@ -1093,6 +1100,10 @@ def _ensure_runtime_control_state(runtime: dict) -> dict:
     control.setdefault("last_replan_trigger", "")
     control.setdefault("last_replan_action", "")
     control.setdefault("last_replan_chunk_id", None)
+    control.setdefault("pause_requested", False)
+    control.setdefault("pause_reason", "")
+    control.setdefault("paused_at", "")
+    control.setdefault("resumed_at", "")
     return control
 
 
@@ -1187,6 +1198,12 @@ def _build_process_control_summary(runtime: dict, operation_control: dict) -> di
             "supports_auto_replan": bool(replan_contract.get("supports_auto_replan", False)),
             "last_replan_chunk_id": runtime_control.get("last_replan_chunk_id"),
         },
+        "pause": {
+            "requested": bool(runtime_control.get("pause_requested", False)),
+            "reason": str(runtime_control.get("pause_reason", "") or ""),
+            "paused_at": str(runtime_control.get("paused_at", "") or ""),
+            "resumed_at": str(runtime_control.get("resumed_at", "") or ""),
+        },
     }
 
 
@@ -1207,6 +1224,12 @@ def _build_manifest_runtime(plan_id: str, request_url: str = "") -> dict:
         "last_resume_check_at": "",
         "last_resume_repair_at": "",
         "resume_repair_count": 0,
+        "last_paused_at": "",
+        "last_pause_reason": "",
+        "pause_count": 0,
+        "last_resumed_at": "",
+        "last_resume_reason": "",
+        "run_id": "",
         "operation_prompt_name": "",
         "operation_input_key": "raw_path",
         "operation_control": {},
@@ -1349,14 +1372,14 @@ def _infer_resume_runtime_status(runtime: dict, chunks: list[dict]) -> str:
         return RESUMABLE_RUNTIME_STATUS
     if active_statuses and active_statuses.issubset({"done", "failed"}) and "failed" in active_statuses:
         return "completed_with_errors"
-    if previous_status == "running":
+    if previous_status in {"running", PAUSED_RUNTIME_STATUS}:
         return RESUMABLE_RUNTIME_STATUS
     if "pending" in active_statuses:
-        if previous_status in {RESUMABLE_RUNTIME_STATUS, "aborted", "completed", "completed_with_errors"}:
+        if previous_status in {RESUMABLE_RUNTIME_STATUS, PAUSED_RUNTIME_STATUS, "aborted", "completed", "completed_with_errors"}:
             return RESUMABLE_RUNTIME_STATUS
         return "pending"
     if "failed" in active_statuses:
-        if previous_status in {RESUMABLE_RUNTIME_STATUS, "aborted"}:
+        if previous_status in {RESUMABLE_RUNTIME_STATUS, PAUSED_RUNTIME_STATUS, "aborted"}:
             return RESUMABLE_RUNTIME_STATUS
         return "completed_with_errors"
     return previous_status
@@ -1763,6 +1786,12 @@ def _ensure_manifest_structure(manifest: dict, *, prompt_name: str = "", prompt_
     runtime.setdefault("last_resume_check_at", "")
     runtime.setdefault("last_resume_repair_at", "")
     runtime.setdefault("resume_repair_count", 0)
+    runtime.setdefault("last_paused_at", "")
+    runtime.setdefault("last_pause_reason", "")
+    runtime.setdefault("pause_count", 0)
+    runtime.setdefault("last_resumed_at", "")
+    runtime.setdefault("last_resume_reason", "")
+    runtime.setdefault("run_id", "")
     runtime.setdefault("operation_prompt_name", "")
     runtime.setdefault("operation_input_key", "raw_path")
     runtime.setdefault("operation_control", {})
@@ -3174,6 +3203,80 @@ def cancel_run(work_dir: str, reason: str = "") -> dict:
     return kernel_state.request_runtime_cancel(work_dir, reason=reason)
 
 
+def pause_run(work_dir: str, reason: str = "") -> dict:
+    return kernel_state.request_runtime_pause(work_dir, reason=reason)
+
+
+def _build_resume_run_ownership_conflict_result(ownership: dict) -> dict:
+    error, message = _runtime_ownership_error_parts(ownership)
+    return _finalize_mutation_result({
+        "success": False,
+        "resumed": False,
+        "pause": {},
+        "runtime": {},
+        "error": error,
+        "message": message,
+    }, ownership)
+
+
+def resume_run(work_dir: str, reason: str = "", runtime_ownership: dict | None = None) -> dict:
+    manifest_path = Path(work_dir) / "manifest.json"
+    if not manifest_path.exists():
+        print(f"Error: manifest.json not found in {work_dir}", file=sys.stderr)
+        sys.exit(1)
+
+    return kernel_controller.run_owned_mutation(
+        work_dir,
+        "resume-run",
+        runtime_ownership=runtime_ownership,
+        conflict_result_builder=_build_resume_run_ownership_conflict_result,
+        mutation_fn=lambda ownership: _resume_run_impl(work_dir, reason=reason),
+    )
+
+
+def _resume_run_impl(work_dir: str, reason: str = "") -> dict:
+    work_path = Path(work_dir)
+    manifest_path = work_path / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest = _ensure_manifest_structure(manifest)
+    runtime = manifest.get("runtime", {})
+    runtime_control = _ensure_runtime_control_state(runtime)
+
+    pause_before = kernel_state.summarize_runtime_pause_request(work_dir)
+    pause_after = kernel_state.clear_runtime_pause(work_dir)
+
+    runtime_status_before = str(runtime.get("status", "pending")).strip() or "pending"
+    runtime_status_after = _infer_resume_runtime_status(runtime, manifest.get("chunks", []))
+    if runtime_status_before == PAUSED_RUNTIME_STATUS and runtime_status_after == PAUSED_RUNTIME_STATUS:
+        runtime_status_after = RESUMABLE_RUNTIME_STATUS
+
+    now = _now_iso()
+    runtime["status"] = runtime_status_after
+    runtime["last_resumed_at"] = now
+    runtime["last_resume_reason"] = str(reason or "").strip() or str(pause_before.get("reason", "") or "").strip()
+    runtime["updated_at"] = now
+    runtime_control["pause_requested"] = False
+    runtime_control["pause_reason"] = ""
+    runtime_control["resumed_at"] = now
+    if not runtime_control.get("paused_at"):
+        runtime_control["paused_at"] = str(runtime.get("last_paused_at", "") or "")
+    _sync_manifest_legacy_fields(manifest)
+    _refresh_manifest_token_source_summary(manifest)
+    _write_manifest(manifest_path, manifest)
+    return {
+        "success": True,
+        "resumed": True,
+        "pause": {
+            "before": pause_before,
+            "after": kernel_state.summarize_runtime_pause_request(work_dir),
+        },
+        "runtime": runtime,
+        "runtime_status_before": runtime_status_before,
+        "runtime_status_after": runtime_status_after,
+        "message": "Runtime pause cleared; run may now be resumed.",
+    }
+
+
 def _kernel_command_registry() -> dict[str, object]:
     return {
         "validate-state": validate_state,
@@ -3186,6 +3289,8 @@ def _kernel_command_registry() -> dict[str, object]:
         "replan-remaining": replan_remaining,
         "runtime-status": runtime_status,
         "cancel-run": cancel_run,
+        "pause-run": pause_run,
+        "resume-run": resume_run,
         "merge-content": lambda *, work_dir, output_file, header="": merge_content(work_dir, output_file, header_content=header),
         "assemble-final": assemble_final,
         "verify-quality": verify_quality,
@@ -4773,13 +4878,17 @@ def _process_chunks_impl(work_dir: str, prompt_name: str, extra_instruction: str
             "control": _build_process_control_summary(runtime, operation_control),
             "warnings": setup_warnings,
             "cancellation": kernel_state.summarize_runtime_cancel_request(work_dir),
+            "pause": kernel_state.summarize_runtime_pause_request(work_dir),
             "message": "Dry run: all validations passed"
         }
 
     runtime["status"] = "running"
+    runtime["run_id"] = kernel_runtime.new_trace_id("process-chunks")
     runtime["replan_required"] = False
     runtime["replan_reason"] = ""
     runtime["updated_at"] = _now_iso()
+    runtime_control["pause_requested"] = False
+    runtime_control["pause_reason"] = ""
     _write_manifest(manifest_path, manifest)
 
     processed_count = 0
@@ -4789,8 +4898,11 @@ def _process_chunks_impl(work_dir: str, prompt_name: str, extra_instruction: str
     warnings = list(setup_warnings)
     output_files = []
     aborted = False
+    paused = False
     aborted_reason = ""
+    pause_reason = ""
     cancellation = kernel_state.summarize_runtime_cancel_request(work_dir)
+    pause = kernel_state.summarize_runtime_pause_request(work_dir)
     consecutive_timeouts = 0
     active_total = sum(1 for chunk in manifest["chunks"] if chunk.get("status") != SUPERSEDED_CHUNK_STATUS)
     total = active_total
@@ -4824,6 +4936,34 @@ def _process_chunks_impl(work_dir: str, prompt_name: str, extra_instruction: str
         print(f"Error: {aborted_reason}", file=sys.stderr)
         return True
 
+    def maybe_pause_for_request() -> bool:
+        nonlocal paused, pause_reason, pause
+        pause_snapshot = kernel_state.summarize_runtime_pause_request(work_dir)
+        if not pause_snapshot.get("requested", False):
+            return False
+        pause = pause_snapshot
+        pause_reason = str(pause.get("reason", "")).strip()
+        paused = True
+        now = _now_iso()
+        runtime["status"] = PAUSED_RUNTIME_STATUS
+        runtime["replan_required"] = False
+        runtime["replan_reason"] = ""
+        runtime["updated_at"] = now
+        runtime["last_paused_at"] = now
+        runtime["last_pause_reason"] = pause_reason
+        runtime["pause_count"] = max(0, _parse_int(runtime.get("pause_count"), 0)) + 1
+        runtime_control["pause_requested"] = True
+        runtime_control["pause_reason"] = pause_reason
+        runtime_control["paused_at"] = now
+        _refresh_manifest_token_source_summary(manifest)
+        _sync_manifest_legacy_fields(manifest)
+        _write_manifest(manifest_path, manifest)
+        message = "Pause requested"
+        if pause_reason:
+            message += f": {pause_reason}"
+        print(f"ℹ️ {message}", file=sys.stderr)
+        return True
+
     if maybe_abort_for_cancellation():
         runtime["processed_count"] = processed_count
         runtime["failed_count"] = failed_count
@@ -4841,6 +4981,8 @@ def _process_chunks_impl(work_dir: str, prompt_name: str, extra_instruction: str
             "output_files": output_files,
             "aborted": True,
             "aborted_reason": aborted_reason,
+            "paused": False,
+            "pause_reason": "",
             "replan_required": False,
             "replan_reason": "",
             "resume": resume_report,
@@ -4848,6 +4990,36 @@ def _process_chunks_impl(work_dir: str, prompt_name: str, extra_instruction: str
             "control": _build_process_control_summary(runtime, operation_control),
             "request_url": request_url,
             "cancellation": cancellation,
+            "pause": pause,
+        }
+
+    if maybe_pause_for_request():
+        runtime["processed_count"] = processed_count
+        runtime["failed_count"] = failed_count
+        runtime["skipped_count"] = skipped_count
+        runtime["superseded_count"] = superseded_count
+        return {
+            "success": False,
+            "processed_count": processed_count,
+            "failed_count": failed_count,
+            "skipped_count": skipped_count,
+            "superseded_count": superseded_count,
+            "total_chunks": total,
+            "warnings": warnings,
+            "warning_count": len(warnings),
+            "output_files": output_files,
+            "aborted": False,
+            "aborted_reason": "",
+            "paused": True,
+            "pause_reason": pause_reason,
+            "replan_required": False,
+            "replan_reason": "",
+            "resume": resume_report,
+            "plan": manifest.get("plan", {}),
+            "control": _build_process_control_summary(runtime, operation_control),
+            "request_url": request_url,
+            "cancellation": cancellation,
+            "pause": pause,
         }
 
     for chunk_index, chunk_info in enumerate(manifest["chunks"]):
@@ -4856,6 +5028,8 @@ def _process_chunks_impl(work_dir: str, prompt_name: str, extra_instruction: str
             superseded_count += 1
             continue
         if maybe_abort_for_cancellation():
+            break
+        if maybe_pause_for_request():
             break
         active_index += 1
         runtime["current_chunk_index"] = chunk_index
@@ -5203,7 +5377,7 @@ def _process_chunks_impl(work_dir: str, prompt_name: str, extra_instruction: str
         runtime["superseded_count"] = superseded_count
         runtime["last_request_url"] = request_url
         runtime["updated_at"] = _now_iso()
-        if not aborted:
+        if not aborted and not paused:
             runtime["status"] = "running"
         _refresh_manifest_token_source_summary(manifest)
         _sync_manifest_legacy_fields(manifest)
@@ -5219,6 +5393,8 @@ def _process_chunks_impl(work_dir: str, prompt_name: str, extra_instruction: str
     runtime["updated_at"] = _now_iso()
     if aborted:
         runtime["status"] = "aborted"
+    elif paused:
+        runtime["status"] = PAUSED_RUNTIME_STATUS
     elif failed_count > 0:
         runtime["status"] = "completed_with_errors"
     else:
@@ -5228,7 +5404,7 @@ def _process_chunks_impl(work_dir: str, prompt_name: str, extra_instruction: str
     _write_manifest(manifest_path, manifest)
 
     return {
-        "success": failed_count == 0 and not aborted,
+        "success": failed_count == 0 and not aborted and not paused,
         "processed_count": processed_count,
         "failed_count": failed_count,
         "skipped_count": skipped_count,
@@ -5239,6 +5415,8 @@ def _process_chunks_impl(work_dir: str, prompt_name: str, extra_instruction: str
         "output_files": output_files,
         "aborted": aborted,
         "aborted_reason": aborted_reason,
+        "paused": paused,
+        "pause_reason": pause_reason,
         "replan_required": runtime.get("replan_required", False),
         "replan_reason": runtime.get("replan_reason", ""),
         "resume": resume_report,
@@ -5246,6 +5424,7 @@ def _process_chunks_impl(work_dir: str, prompt_name: str, extra_instruction: str
         "control": _build_process_control_summary(runtime, operation_control),
         "request_url": request_url,
         "cancellation": cancellation,
+        "pause": kernel_state.summarize_runtime_pause_request(work_dir),
     }
 
 
@@ -7137,6 +7316,22 @@ def main():
     cancel_parser.add_argument('work_dir', help='Working directory to cancel')
     cancel_parser.add_argument('--reason', default='', help='Optional cancellation reason')
 
+    # pause-run command
+    pause_parser = subparsers.add_parser(
+        'pause-run',
+        help='Request a safe-boundary pause for an active chunk-processing run'
+    )
+    pause_parser.add_argument('work_dir', help='Working directory to pause')
+    pause_parser.add_argument('--reason', default='', help='Optional pause reason')
+
+    # resume-run command
+    resume_run_parser = subparsers.add_parser(
+        'resume-run',
+        help='Clear a local pause request and restore resumable runtime state'
+    )
+    resume_run_parser.add_argument('work_dir', help='Working directory to resume')
+    resume_run_parser.add_argument('--reason', default='', help='Optional resume reason')
+
     # assemble-final command
     af_parser = subparsers.add_parser(
         'assemble-final',
@@ -7391,6 +7586,28 @@ def main():
     elif args.command == 'cancel-run':
         envelope = run_kernel_command(
             'cancel-run',
+            work_dir=args.work_dir,
+            reason=args.reason,
+        )
+        result = envelope['result']
+        print(json.dumps(envelope if args.api_envelope else result, ensure_ascii=False))
+        if not result.get('success', False):
+            sys.exit(1)
+
+    elif args.command == 'pause-run':
+        envelope = run_kernel_command(
+            'pause-run',
+            work_dir=args.work_dir,
+            reason=args.reason,
+        )
+        result = envelope['result']
+        print(json.dumps(envelope if args.api_envelope else result, ensure_ascii=False))
+        if not result.get('success', False):
+            sys.exit(1)
+
+    elif args.command == 'resume-run':
+        envelope = run_kernel_command(
+            'resume-run',
             work_dir=args.work_dir,
             reason=args.reason,
         )

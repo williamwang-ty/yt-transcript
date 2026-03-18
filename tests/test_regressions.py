@@ -1385,6 +1385,154 @@ exit 1
             self.assertEqual(manifest["runtime"]["status"], "aborted")
             self.assertEqual(manifest["runtime"]["last_cancel_reason"], "operator stop")
 
+    def test_pause_run_marks_runtime_pause_request(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source = Path(tmpdir) / "raw.txt"
+            work_dir = Path(tmpdir) / "chunks"
+            source.write_text("第一句。第二句。第三句。第四句。", encoding="utf-8")
+            utils.chunk_text(str(source), str(work_dir), 4, "structure_only")
+
+            result = utils.pause_run(str(work_dir), reason="operator requested pause")
+            status = utils.runtime_status(str(work_dir))
+
+            self.assertTrue(result["success"])
+            self.assertTrue(result["requested"])
+            self.assertEqual(result["reason"], "operator requested pause")
+            self.assertTrue(status["pause"]["requested"])
+            self.assertEqual(status["pause"]["reason"], "operator requested pause")
+
+    def test_process_chunks_pauses_when_pause_requested(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source = Path(tmpdir) / "raw.txt"
+            work_dir = Path(tmpdir) / "chunks"
+            source.write_text("第一句。第二句。第三句。第四句。", encoding="utf-8")
+            utils.chunk_text(str(source), str(work_dir), 4, "structure_only")
+            utils.pause_run(str(work_dir), reason="operator pause")
+
+            config = utils._default_config_values()
+            config.update({
+                "llm_api_key": "key",
+                "llm_base_url": "https://api.example.com",
+                "llm_model": "demo",
+                "llm_api_format": "openai",
+            })
+
+            with mock.patch.object(utils, "load_config", return_value=config), mock.patch.object(
+                utils,
+                "_call_llm_api",
+                side_effect=AssertionError("paused run should not call LLM"),
+            ):
+                result = utils.process_chunks(str(work_dir), "structure_only")
+
+            manifest = json.loads((work_dir / "manifest.json").read_text(encoding="utf-8"))
+            self.assertFalse(result["success"])
+            self.assertTrue(result["paused"])
+            self.assertFalse(result["aborted"])
+            self.assertEqual(result["pause_reason"], "operator pause")
+            self.assertTrue(result["pause"]["requested"])
+            self.assertTrue((work_dir / utils.kernel_state.RUNTIME_PAUSE_FILENAME).exists())
+            self.assertEqual(manifest["runtime"]["status"], utils.PAUSED_RUNTIME_STATUS)
+            self.assertEqual(manifest["runtime"]["last_pause_reason"], "operator pause")
+
+    def test_process_chunks_pauses_at_safe_boundary_between_chunks(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source = Path(tmpdir) / "raw.txt"
+            work_dir = Path(tmpdir) / "chunks"
+            source.write_text("第一句。第二句。第三句。第四句。第五句。第六句。", encoding="utf-8")
+            utils.chunk_text(str(source), str(work_dir), 6, "structure_only")
+
+            config = utils._default_config_values()
+            config.update({
+                "llm_api_key": "key",
+                "llm_base_url": "https://api.example.com",
+                "llm_model": "demo",
+                "llm_api_format": "openai",
+            })
+
+            seen_calls = 0
+
+            def fake_llm(*args, **kwargs):
+                nonlocal seen_calls
+                seen_calls += 1
+                if seen_calls == 1:
+                    utils.pause_run(str(work_dir), reason="pause after first chunk")
+                return {
+                    "text": "## 结果\n\n处理完成。",
+                    "latency_ms": 12,
+                    "request_url": "https://api.example.com/v1/chat/completions",
+                    "streaming_used": False,
+                    "attempts": 1,
+                }
+
+            with mock.patch.object(utils, "load_config", return_value=config), mock.patch.object(
+                utils,
+                "_call_llm_api",
+                side_effect=fake_llm,
+            ):
+                result = utils.process_chunks(str(work_dir), "structure_only")
+
+            manifest = json.loads((work_dir / "manifest.json").read_text(encoding="utf-8"))
+            self.assertFalse(result["success"])
+            self.assertTrue(result["paused"])
+            self.assertEqual(result["processed_count"], 1)
+            self.assertEqual(seen_calls, 1)
+            self.assertEqual(manifest["runtime"]["status"], utils.PAUSED_RUNTIME_STATUS)
+            self.assertEqual(manifest["chunks"][0]["status"], "done")
+            self.assertTrue(any(chunk["status"] == "pending" for chunk in manifest["chunks"][1:]))
+
+    def test_resume_run_clears_pause_and_marks_runtime_resumable(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source = Path(tmpdir) / "raw.txt"
+            work_dir = Path(tmpdir) / "chunks"
+            source.write_text("第一句。第二句。第三句。第四句。", encoding="utf-8")
+            utils.chunk_text(str(source), str(work_dir), 4, "structure_only")
+            utils.pause_run(str(work_dir), reason="operator pause")
+
+            manifest_path = work_dir / "manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["runtime"]["status"] = utils.PAUSED_RUNTIME_STATUS
+            manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+
+            result = utils.resume_run(str(work_dir), reason="continue")
+
+            manifest_after = json.loads(manifest_path.read_text(encoding="utf-8"))
+            self.assertTrue(result["success"])
+            self.assertTrue(result["resumed"])
+            self.assertEqual(result["runtime_status_before"], utils.PAUSED_RUNTIME_STATUS)
+            self.assertEqual(result["runtime_status_after"], utils.RESUMABLE_RUNTIME_STATUS)
+            self.assertFalse((work_dir / utils.kernel_state.RUNTIME_PAUSE_FILENAME).exists())
+            self.assertEqual(manifest_after["runtime"]["status"], utils.RESUMABLE_RUNTIME_STATUS)
+            self.assertEqual(manifest_after["runtime"]["last_resume_reason"], "continue")
+
+    def test_cli_api_envelope_wraps_pause_and_resume_run(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source = Path(tmpdir) / "raw.txt"
+            work_dir = Path(tmpdir) / "chunks"
+            source.write_text("第一句。第二句。第三句。第四句。", encoding="utf-8")
+            utils.chunk_text(str(source), str(work_dir), 4, "structure_only")
+
+            pause_envelope = utils.run_kernel_command(
+                "pause-run",
+                work_dir=str(work_dir),
+                reason="api pause",
+            )
+            self.assertEqual(pause_envelope["command"], "pause-run")
+            self.assertTrue(pause_envelope["result"]["success"])
+
+            manifest_path = work_dir / "manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["runtime"]["status"] = utils.PAUSED_RUNTIME_STATUS
+            manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+
+            resume_envelope = utils.run_kernel_command(
+                "resume-run",
+                work_dir=str(work_dir),
+                reason="api resume",
+            )
+            self.assertEqual(resume_envelope["command"], "resume-run")
+            self.assertTrue(resume_envelope["result"]["success"])
+            self.assertTrue(resume_envelope["result"]["resumed"])
+
     def test_cli_api_envelope_wraps_cancel_run(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             source = Path(tmpdir) / "raw.txt"

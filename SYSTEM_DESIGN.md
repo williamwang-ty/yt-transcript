@@ -1,10 +1,10 @@
-# System Design (v5.9-stage9)
+# System Design (v5.10-stage10)
 
-**Stage**: 9
+**Stage**: 10
 
 **Status**: accepted and implemented
 
-**Behavior change in this stage**: extracted mutation wrappers and bounded auto-replan orchestration into `kernel_controller.py`, added a public `cancel-run` command, and made `process-chunks` consume local cancellation markers safely while preserving Stage 8 state and Stage 7 ownership contracts
+**Behavior change in this stage**: generalized local runtime control signals in `kernel_state.py`, added public `pause-run` / `resume-run` commands, and made `process-chunks` stop cleanly on safe-boundary pause requests while preserving resumability and ownership contracts
 
 **Source of truth**: This file is the canonical system design document for the repository.
 
@@ -12,18 +12,18 @@
 
 ---
 
-## 1. Stage 9 Goal
+## 1. Stage 10 Goal
 
-Stage 9 hardens the controller boundary of the long-text kernel.
+Stage 10 hardens local runtime control semantics beyond cancellation-only operation.
 
 Its goals are:
 
-- extract mutation wrappers and bounded replan orchestration into a dedicated controller module
-- promote local cancellation from an inspectable marker to a public command contract
-- make chunk execution observe cancellation at safe boundaries without breaking ownership or resumability semantics
-- keep state-store, envelope, and telemetry contracts compatible while expanding runtime control behavior
+- generalize local runtime control markers into a reusable signal layer in `kernel_state.py`
+- promote safe-boundary pause / resume into public local command contracts
+- keep resumability, ownership, and manifest repair semantics compatible while expanding runtime control behavior
+- strengthen inspectable runtime state so paused runs can be resumed deterministically
 
-Stage 9 remains intentionally bounded. It does **not** introduce distributed scheduling, public pause/resume, or a fully concurrency-safe persistent state store.
+Stage 10 remains intentionally bounded. It does **not** introduce distributed scheduling, remote workers, or a fully concurrency-safe persistent state store.
 
 ---
 
@@ -47,6 +47,7 @@ Its current implemented use cases are:
 - local runtime ownership for manifest-mutating commands
 - local runtime status inspection for work directories
 - public local cancellation for active chunk-processing runs
+- public local pause / resume control for active chunk-processing runs
 - deterministic merge and final markdown assembly
 - workflow validation and stop/go quality checks
 
@@ -56,14 +57,13 @@ Its current implemented use cases are:
 
 ### 2.3 Current Non-Goals
 
-At Stage 9, the system is **not yet**:
+At Stage 10, the system is **not yet**:
 
 - a generalized multi-source document transformation framework
 - a reusable extracted kernel package
 - a global glossary / terminology propagation system
 - an LLM-judge semantic verification system
 - a fully concurrency-safe persistent state store beyond local single-owner work-dir mutation
-- a public pause / resume protocol for long-running jobs beyond cancellation
 - a telemetry-first production runtime with remote aggregation or tracing backends
 
 ---
@@ -103,6 +103,11 @@ read-only runtime inspection
 public runtime cancellation
   -> cancel-run writes local cancellation marker
   -> process-chunks consumes marker at the next safe boundary
+
+public runtime pause / resume
+  -> pause-run writes local pause marker
+  -> process-chunks stops at the next safe boundary and records paused runtime state
+  -> resume-run clears the pause marker and restores resumable runtime state
 ```
 
 ### 3.2 Current Persisted Artifacts
@@ -117,7 +122,7 @@ The current implementation relies on these persisted artifacts:
   - normalized source artifact
 - `manifest.json` in chunk work directories
   - chunk plan, chunk contract, continuity policy, runtime state, resume / autotune / replan metadata, and explicit operation-control state
-  - manifest schema remains `v5` in Stage 9
+  - manifest schema remains `v5` in Stage 10, now with explicit pause / resume runtime fields
 - `/tmp/${VIDEO_ID}_raw_text.txt`
   - raw extracted transcript-like text
 - `/tmp/${VIDEO_ID}_segments.json`
@@ -133,6 +138,8 @@ The current implementation relies on these persisted artifacts:
   - inspectable single-owner runtime marker used by `prepare-resume`, `process-chunks`, `replan-remaining`, and `process-chunks-with-replans`
 - optional `.runtime_cancel.json` inside chunk work directories
   - public local cancellation marker written by `cancel-run`, surfaced by `runtime-status`, and consumed by `process-chunks`
+- optional `.runtime_pause.json` inside chunk work directories
+  - public local pause marker written by `pause-run`, surfaced by `runtime-status`, observed by `process-chunks`, and cleared by `resume-run`
 
 ### 3.3 Current State Surfaces
 
@@ -483,30 +490,30 @@ New public interfaces should prefer additive envelope layers over breaking chang
 
 ---
 
-## 5. Stage 9 Deliverables
+## 5. Stage 10 Deliverables
 
 Completed in this stage:
 
-- extracted mutation wrappers and bounded auto-replan orchestration into `kernel_controller.py`
-- routed manifest-mutating command wrappers through the controller module while preserving Stage 7 ownership semantics
-- added `cancel-run` as a public local cancellation command on the stable kernel interface
-- made `process-chunks` consume `.runtime_cancel.json` before work starts and between chunks
-- recorded cancellation abort details in runtime state and returned cancellation details in command results
-- added regression coverage for cancellation requests, cancellation-aware chunk aborts, and CLI envelope behavior for `cancel-run`
+- generalized local runtime control files in `kernel_state.py` so cancel and pause share a common signal model
+- added public `pause-run` and `resume-run` commands on the stable kernel interface
+- made `process-chunks` stop cleanly when a pause is requested before work starts or between chunks
+- recorded paused and resumed runtime details in `manifest.json` while preserving Stage 9 cancellation behavior
+- surfaced pause state through `runtime-status`, including effective local runtime state derived from control markers
+- added regression coverage for pause requests, safe-boundary pausing, resume clearing, and envelope behavior for the new commands
 
 Not done in this stage:
 
-- no public pause / resume protocol yet
 - no distributed or remote runtime backend yet
 - no fully concurrency-safe persistent state store yet
 - no subsystem test-package split yet
 - no broad extraction of the chunk-execution algorithm itself yet
+- no telemetry query / aggregation subsystem yet
 
 ---
 
 ## 6. Current Known Gaps
 
-The implementation is meaningfully stronger after Stage 9, but still not fully kernelized.
+The implementation is meaningfully stronger after Stage 10, but still not fully kernelized.
 
 The main remaining gaps are:
 
@@ -515,7 +522,7 @@ The main remaining gaps are:
 3. verification remains deterministic / heuristic only and does not yet include semantic judge layers
 4. global terminology / entity consistency is still not first-class
 5. ownership is local single-writer gating, not a general concurrent state-store protocol
-6. cancellation is public and local, but pause / resume and long-lived job scheduling are not formalized
+6. cancellation and pause / resume are public and local, but long-lived job scheduling is not formalized
 7. test coverage is stronger around runtime control, but fixtures are not yet split into dedicated suites by subsystem
 
 ---
@@ -571,38 +578,47 @@ Implemented scope:
 
 ### Stage 10 — Stronger Runtime Guarantees and Deeper Extraction
 
+Implemented scope:
+
+- generalized local runtime control markers in `kernel_state.py`
+- added public local `pause-run` / `resume-run` commands
+- integrated safe-boundary pause checks into `process-chunks` and preserved resumable manifest state
+
+### Stage 11 — Local Telemetry Query Surfaces
+
 Planned scope:
 
-- decide what stronger multi-process state guarantees are worth adding beyond the current owner-file gate
-- extract more of the chunk-execution algorithm from `yt_transcript_utils.py`
-- decide whether pause / resume becomes part of the public runtime contract
+- extract local telemetry reading and summarization into a dedicated subsystem
+- add public query surfaces for local telemetry journals
+- keep append-only telemetry compatibility while making local debugging easier
 
 ---
 
-## 8. Stage 9 Validation
+## 8. Stage 10 Validation
 
-The Stage 9 implementation is considered valid because:
+The Stage 10 implementation is considered valid because:
 
-- mutating command wrappers and bounded replan orchestration now have a dedicated controller module in `kernel_controller.py`
-- `cancel-run` exposes a public cancellation contract without breaking Stage 8 runtime inspection or Stage 7 ownership behavior
-- `process-chunks` now aborts cleanly at safe boundaries when cancellation is requested, without touching completed outputs
-- Stage 6 envelope behavior remains compatible for the new cancellation command
-- local runtime-control artifacts remain inspectable on disk while becoming operationally useful
+- `kernel_state.py` now exposes a shared local signal model for cancellation and pause control
+- `pause-run` and `resume-run` expose public local runtime-control contracts without breaking Stage 9 cancellation behavior
+- `process-chunks` now pauses cleanly at safe boundaries, without touching completed chunk outputs or clearing the pause request prematurely
+- `resume-run` clears the pause marker and restores resumable manifest runtime state under the same ownership guard used for other manifest mutations
+- Stage 6 envelope behavior remains compatible for the new runtime-control commands
 
 Representative validated behaviors in this stage include:
 
-- writing `.runtime_cancel.json` through `cancel-run`
-- surfacing the same cancellation marker through `runtime-status`
-- consuming and clearing cancellation markers before `process-chunks` makes further LLM calls
-- recording cancellation abort reasons in manifest runtime state
-- emitting `yt_transcript.command_result/v1` envelopes for `cancel-run` in CLI `--api-envelope` mode
+- writing `.runtime_pause.json` through `pause-run`
+- surfacing pause markers and effective runtime state through `runtime-status`
+- pausing a run before any LLM call when a pause is already pending
+- pausing a run between chunks after the current chunk completes
+- clearing pause markers and restoring `resumable` runtime state through `resume-run`
+- emitting `yt_transcript.command_result/v1` envelopes for `pause-run` and `resume-run`
 
 ---
 
 ## 9. Next Stage Entry Criteria
 
-Stage 10 should begin only when the following are agreed:
+Stage 11 should begin only when the following are agreed:
 
-1. which parts of the chunk-execution algorithm should move out of `yt_transcript_utils.py` next
-2. what stronger state-store guarantees are worth adding beyond `.runtime_owner.json` plus local cancellation markers
-3. whether pause / resume should remain local-only or become a public runtime contract
+1. which local telemetry queries are worth making public first
+2. how much aggregation should happen in-process versus in a dedicated telemetry helper module
+3. what telemetry summaries are stable enough to treat as compatibility surfaces

@@ -85,6 +85,9 @@ def run_auto_replan_loop(*, work_dir: str, prompt_name: str, extra_instruction: 
         "request_url": "",
         "aborted": False,
         "aborted_reason": "",
+        "paused": False,
+        "pause_reason": "",
+        "pause": {},
         "success": False,
         "control": {},
         "cancellation": {},
@@ -111,6 +114,7 @@ def run_auto_replan_loop(*, work_dir: str, prompt_name: str, extra_instruction: 
         aggregate["request_url"] = last_result.get("request_url", aggregate["request_url"])
         aggregate["control"] = last_result.get("control", aggregate.get("control", {}))
         aggregate["cancellation"] = last_result.get("cancellation", aggregate.get("cancellation", {}))
+        aggregate["pause"] = last_result.get("pause", aggregate.get("pause", {}))
         aggregate["superseded_count"] = current_superseded_count_fn()
 
         if not last_result.get("replan_required", False):
@@ -118,6 +122,8 @@ def run_auto_replan_loop(*, work_dir: str, prompt_name: str, extra_instruction: 
                 "success": last_result.get("success", False),
                 "aborted": last_result.get("aborted", False),
                 "aborted_reason": last_result.get("aborted_reason", ""),
+                "paused": last_result.get("paused", False),
+                "pause_reason": last_result.get("pause_reason", ""),
                 "replan_required": False,
                 "replan_reason": "",
                 "plan": last_result.get("plan", {}),
@@ -134,6 +140,8 @@ def run_auto_replan_loop(*, work_dir: str, prompt_name: str, extra_instruction: 
                 "success": False,
                 "aborted": True,
                 "aborted_reason": last_result.get("aborted_reason", "Reached max auto-replan limit"),
+                "paused": last_result.get("paused", False),
+                "pause_reason": last_result.get("pause_reason", ""),
                 "replan_required": True,
                 "replan_reason": last_result.get("replan_reason", ""),
                 "plan": last_result.get("plan", {}),
@@ -161,6 +169,8 @@ def run_auto_replan_loop(*, work_dir: str, prompt_name: str, extra_instruction: 
                 "success": False,
                 "aborted": True,
                 "aborted_reason": f"Auto-replan failed: {replan_error}",
+                "paused": last_result.get("paused", False),
+                "pause_reason": last_result.get("pause_reason", ""),
                 "replan_required": True,
                 "replan_reason": last_result.get("replan_reason", "") or replan_error,
                 "plan": last_result.get("plan", {}),
@@ -176,6 +186,8 @@ def run_auto_replan_loop(*, work_dir: str, prompt_name: str, extra_instruction: 
         "success": False,
         "aborted": True,
         "aborted_reason": last_result.get("aborted_reason", "Reached max auto-replan limit"),
+        "paused": last_result.get("paused", False),
+        "pause_reason": last_result.get("pause_reason", ""),
         "replan_required": last_result.get("replan_required", False),
         "replan_reason": last_result.get("replan_reason", ""),
         "plan": last_result.get("plan", {}),
