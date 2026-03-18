@@ -23,6 +23,7 @@ Commands:
     split-audio <audio_path>       Split large audio at silence points (--max-size, --max-deviation)
     chunk-text <input> <output_dir> Split text file into chunks by sentence boundary
     chunk-segments <segments_json> <output_dir> Split aligned source segments into timed chunks (--chapters for chapter-aware boundaries)
+    chunk-document <normalized_document> <output_dir> Chunk a normalized document using its preferred source shape
     get-chapters <video_url>       Fetch YouTube video chapter metadata
     build-chapter-plan <chapters_json> <work_dir> <output_json>  Map YouTube chapters onto timed chunks
     merge-content <work_dir> <output_file>  Merge processed chunks with chapter headers
@@ -278,7 +279,8 @@ DEFAULT_AUTOTUNE_MIN_TARGET_RATIO = 0.5
 DEFAULT_AUTOTUNE_CANARY_CHUNKS = 3
 DEFAULT_LLM_CHUNK_RECOVERY_ATTEMPTS = 1
 DEFAULT_LLM_CHUNK_RECOVERY_BACKOFF_SEC = 1.0
-MANIFEST_SCHEMA_VERSION = 2
+MANIFEST_SCHEMA_VERSION = 3
+CHUNK_CONTRACT_SCHEMA_VERSION = 1
 DEFAULT_UNKNOWN_CHUNK_TOKENS = 900
 CHUNK_SEPARATOR = "\n\n"
 DEFAULT_UNKNOWN_OUTPUT_RATIO = 1.0
@@ -532,8 +534,33 @@ def _resolve_previous_section_title(previous_chunk: dict | None,
         return ""
 
 
+def _continuity_tail_sentence_count(config: dict | None = None,
+                                     continuity_policy: dict | None = None) -> int:
+    policy = continuity_policy if isinstance(continuity_policy, dict) else {}
+    if "tail_sentences" in policy:
+        return max(0, _parse_int(policy.get("tail_sentences"), 0))
+    return _parse_int_min(
+        (config or {}).get("chunk_context_tail_sentences"),
+        DEFAULT_CHUNK_CONTEXT_TAIL_SENTENCES,
+        0,
+    )
+
+
+def _continuity_summary_token_cap(config: dict | None = None,
+                                  continuity_policy: dict | None = None) -> int:
+    policy = continuity_policy if isinstance(continuity_policy, dict) else {}
+    if "summary_token_cap" in policy:
+        return max(0, _parse_int(policy.get("summary_token_cap"), 0))
+    return _parse_int_min(
+        (config or {}).get("chunk_context_summary_tokens"),
+        DEFAULT_CHUNK_CONTEXT_SUMMARY_TOKENS,
+        0,
+    )
+
+
 def _resolve_previous_tail_text(previous_chunk: dict | None, work_path: Path,
-                                input_key: str, config: dict | None = None) -> str:
+                                input_key: str, config: dict | None = None,
+                                continuity_policy: dict | None = None) -> str:
     """Resolve continuity tail text for the previous chunk.
 
     Priority for `processed_path` chains:
@@ -562,11 +589,7 @@ def _resolve_previous_tail_text(previous_chunk: dict | None, work_path: Path,
                     processed_text = processed_path.read_text(encoding="utf-8")
                     return _extract_tail_sentences(
                         processed_text,
-                        _parse_int_min(
-                            config.get("chunk_context_tail_sentences"),
-                            DEFAULT_CHUNK_CONTEXT_TAIL_SENTENCES,
-                            0,
-                        ),
+                        _continuity_tail_sentence_count(config, continuity_policy),
                         config,
                     )
                 except OSError:
@@ -577,14 +600,22 @@ def _resolve_previous_tail_text(previous_chunk: dict | None, work_path: Path,
 
 def _build_continuity_context(previous_chunk: dict | None, work_path: Path,
                               config: dict | None = None,
-                              input_key: str = "raw_path") -> dict:
+                              input_key: str = "raw_path",
+                              continuity_policy: dict | None = None) -> dict:
     """Build the lightweight continuity block inserted before the next chunk.
 
     `input_key` decides whether continuity should be derived from the raw-stage
     chunk files (`raw_path`) or from prior-stage processed files (`processed_path`).
     """
     previous_chunk = previous_chunk or {}
-    tail_text = _resolve_previous_tail_text(previous_chunk, work_path, input_key, config)
+    continuity_policy = continuity_policy if isinstance(continuity_policy, dict) else {}
+    tail_text = _resolve_previous_tail_text(
+        previous_chunk,
+        work_path,
+        input_key,
+        config,
+        continuity_policy=continuity_policy,
+    )
     section_title = _resolve_previous_section_title(previous_chunk, work_path, input_key)
     if not tail_text and not section_title:
         return {
@@ -593,13 +624,17 @@ def _build_continuity_context(previous_chunk: dict | None, work_path: Path,
             "section_title": "",
             "source_chunk_id": None,
             "token_count": 0,
+            "mode": str(continuity_policy.get("mode", "")).strip() or "reference_only",
         }
 
+    boundary_rule = str(continuity_policy.get("boundary_rule", "")).strip() or "Only transform the current chunk body below."
+    output_rule = str(continuity_policy.get("output_rule", "")).strip() or "Do not repeat or rewrite this context in the output."
     parts = [
         "## Continuity Context",
         "",
         "Use this only as continuity reference from the previous chunk.",
-        "Do not repeat or rewrite this context in the output.",
+        boundary_rule,
+        output_rule,
         "",
     ]
     if section_title:
@@ -614,6 +649,7 @@ def _build_continuity_context(previous_chunk: dict | None, work_path: Path,
         "section_title": section_title,
         "source_chunk_id": previous_chunk.get("id"),
         "token_count": _estimate_tokens(context_text, "tokens", config),
+        "mode": str(continuity_policy.get("mode", "")).strip() or "reference_only",
     }
 
 
@@ -637,18 +673,11 @@ def _build_chunk_prompt(prompt_template: str, chunk_body: str,
     return template.rstrip() + "\n\n" + chunk_body
 
 
-def _estimate_continuity_reserve_tokens(config: dict | None = None) -> int:
+def _estimate_continuity_reserve_tokens(config: dict | None = None,
+                                        continuity_policy: dict | None = None) -> int:
     config = config or {}
-    tail_sentences = _parse_int_min(
-        config.get("chunk_context_tail_sentences"),
-        DEFAULT_CHUNK_CONTEXT_TAIL_SENTENCES,
-        0,
-    )
-    summary_token_cap = _parse_int_min(
-        config.get("chunk_context_summary_tokens"),
-        DEFAULT_CHUNK_CONTEXT_SUMMARY_TOKENS,
-        0,
-    )
+    tail_sentences = _continuity_tail_sentence_count(config, continuity_policy)
+    summary_token_cap = _continuity_summary_token_cap(config, continuity_policy)
     if tail_sentences <= 0:
         return 0
 
@@ -665,6 +694,7 @@ def _estimate_continuity_reserve_tokens(config: dict | None = None) -> int:
         placeholder_previous_chunk,
         _skill_root(),
         config,
+        continuity_policy=continuity_policy,
     )["text"]
     return _estimate_tokens(continuity_text, "tokens", config)
 
@@ -738,9 +768,60 @@ def _new_plan_id() -> str:
     return f"plan_{time.strftime('%Y%m%d%H%M%S', time.localtime())}_{random.randint(1000, 9999)}"
 
 
+def _build_manifest_chunk_contract(source_kind: str = "text", *, driver: str = "",
+                                   normalized_document_path: str = "", source_adapter: str = "",
+                                   has_timing: bool = False, chapters_enabled: bool = False) -> dict:
+    normalized_source_kind = "segments" if str(source_kind).strip() == "segments" else "text"
+    default_driver = "chunk-segments" if normalized_source_kind == "segments" else "chunk-text"
+    return {
+        "version": CHUNK_CONTRACT_SCHEMA_VERSION,
+        "driver": str(driver or default_driver).strip(),
+        "source_kind": normalized_source_kind,
+        "boundary_mode": "strict",
+        "output_scope": "current_chunk_only",
+        "continuity_mode": "reference_only",
+        "merge_strategy": "ordered_concat",
+        "overlap_strategy": "context_only_no_output_overlap",
+        "normalized_document_path": str(normalized_document_path).strip(),
+        "source_adapter": str(source_adapter).strip(),
+        "has_timing": bool(has_timing),
+        "chapters_enabled": bool(chapters_enabled),
+    }
+
+
+def _build_manifest_continuity_policy(config: dict | None = None, *, tail_sentences: int | None = None,
+                                      summary_token_cap: int | None = None) -> dict:
+    config = config or {}
+    resolved_tail_sentences = max(
+        0,
+        _parse_int(
+            tail_sentences,
+            _parse_int_min(config.get("chunk_context_tail_sentences"), DEFAULT_CHUNK_CONTEXT_TAIL_SENTENCES, 0),
+        ),
+    )
+    resolved_summary_token_cap = max(
+        0,
+        _parse_int(
+            summary_token_cap,
+            _parse_int_min(config.get("chunk_context_summary_tokens"), DEFAULT_CHUNK_CONTEXT_SUMMARY_TOKENS, 0),
+        ),
+    )
+    return {
+        "mode": "reference_only",
+        "tail_sentences": resolved_tail_sentences,
+        "summary_token_cap": resolved_summary_token_cap,
+        "carry_section_title": True,
+        "carry_tail_text": resolved_tail_sentences > 0,
+        "boundary_rule": "Only transform the current chunk body below.",
+        "output_rule": "Do not repeat or rewrite this context in the output.",
+    }
+
+
 def _build_manifest_plan(prompt_name: str, chunk_mode: str, recommended_chunk_size: int,
                          effective_chunk_size: int, budget: dict, *, source_file: str = "",
-                         plan_id: str = "", prior_plan_id: str = "") -> dict:
+                         plan_id: str = "", prior_plan_id: str = "",
+                         chunk_contract: dict | None = None,
+                         continuity_policy: dict | None = None) -> dict:
     return {
         "plan_id": plan_id or _new_plan_id(),
         "prior_plan_id": prior_plan_id,
@@ -760,6 +841,8 @@ def _build_manifest_plan(prompt_name: str, chunk_mode: str, recommended_chunk_si
         "continuity_reserve_tokens": budget.get("continuity_reserve_tokens", 0),
         "token_count_source": budget.get("token_count_source", ""),
         "source_file": source_file,
+        "chunk_contract": chunk_contract if isinstance(chunk_contract, dict) else _build_manifest_chunk_contract(),
+        "continuity": continuity_policy if isinstance(continuity_policy, dict) else _build_manifest_continuity_policy(),
         "created_at": _now_iso(),
     }
 
@@ -784,14 +867,22 @@ def _build_manifest_runtime(plan_id: str, request_url: str = "") -> dict:
 def _new_chunk_manifest_entry(chunk_id: int, chunk_content: str, budget: dict,
                               config: dict | None = None, *, raw_path: str = "",
                               processed_path: str = "", plan_id: str = "",
-                              continuity_prev_chunk_id: int | None = None) -> dict:
+                              continuity_prev_chunk_id: int | None = None,
+                              chunk_contract: dict | None = None,
+                              continuity_policy: dict | None = None) -> dict:
     config = config or {}
+    chunk_contract = chunk_contract if isinstance(chunk_contract, dict) else _build_manifest_chunk_contract()
+    continuity_policy = continuity_policy if isinstance(continuity_policy, dict) else _build_manifest_continuity_policy(config)
     return {
         "id": chunk_id,
         "chunk_id": chunk_id,
         "plan_id": plan_id,
         "raw_path": raw_path,
         "processed_path": processed_path,
+        "source_kind": str(chunk_contract.get("source_kind", "text")).strip() or "text",
+        "boundary_mode": str(chunk_contract.get("boundary_mode", "strict")).strip() or "strict",
+        "output_scope": str(chunk_contract.get("output_scope", "current_chunk_only")).strip() or "current_chunk_only",
+        "continuity_mode": str(continuity_policy.get("mode", "reference_only")).strip() or "reference_only",
         "char_count": len(chunk_content),
         "input_chars": len(chunk_content),
         "estimated_input_tokens": _estimate_tokens(chunk_content, "tokens", config),
@@ -799,11 +890,7 @@ def _new_chunk_manifest_entry(chunk_id: int, chunk_content: str, budget: dict,
         "token_count_source": budget.get("token_count_source", ""),
         "tail_context_text": _extract_tail_sentences(
             chunk_content,
-            _parse_int_min(
-                config.get("chunk_context_tail_sentences"),
-                DEFAULT_CHUNK_CONTEXT_TAIL_SENTENCES,
-                0,
-            ),
+            max(0, _parse_int(continuity_policy.get("tail_sentences"), DEFAULT_CHUNK_CONTEXT_TAIL_SENTENCES)),
             config,
         ),
         "processed_tail_context_text": "",
@@ -843,6 +930,8 @@ def _sync_manifest_legacy_fields(manifest: dict) -> dict:
     plan = manifest.get("plan", {}) if isinstance(manifest, dict) else {}
     runtime = manifest.get("runtime", {}) if isinstance(manifest, dict) else {}
     autotune = manifest.get("autotune", {}) if isinstance(manifest, dict) else {}
+    chunk_contract = plan.get("chunk_contract", {}) if isinstance(plan.get("chunk_contract", {}), dict) else {}
+    continuity = plan.get("continuity", {}) if isinstance(plan.get("continuity", {}), dict) else {}
 
     manifest["schema_version"] = MANIFEST_SCHEMA_VERSION
     manifest["last_prompt"] = plan.get("prompt_name", manifest.get("last_prompt", ""))
@@ -860,6 +949,22 @@ def _sync_manifest_legacy_fields(manifest: dict) -> dict:
     manifest["chunk_safety_buffer_tokens"] = plan.get("chunk_safety_buffer_tokens", manifest.get("chunk_safety_buffer_tokens", 0))
     manifest["continuity_reserve_tokens"] = plan.get("continuity_reserve_tokens", manifest.get("continuity_reserve_tokens", 0))
     manifest["token_count_source"] = str(manifest.get("token_count_source", "")).strip() or plan.get("token_count_source", "")
+    manifest["chunk_context_tail_sentences"] = _parse_int(
+        continuity.get("tail_sentences"),
+        manifest.get("chunk_context_tail_sentences", DEFAULT_CHUNK_CONTEXT_TAIL_SENTENCES),
+    )
+    manifest["chunk_context_summary_tokens"] = _parse_int(
+        continuity.get("summary_token_cap"),
+        manifest.get("chunk_context_summary_tokens", DEFAULT_CHUNK_CONTEXT_SUMMARY_TOKENS),
+    )
+    manifest["normalized_document_path"] = str(
+        chunk_contract.get("normalized_document_path", manifest.get("normalized_document_path", ""))
+    ).strip()
+    manifest["chunk_driver"] = str(chunk_contract.get("driver", manifest.get("chunk_driver", ""))).strip()
+    manifest["source_adapter"] = str(chunk_contract.get("source_adapter", manifest.get("source_adapter", ""))).strip()
+    manifest["chunk_source_kind"] = str(chunk_contract.get("source_kind", manifest.get("chunk_source_kind", ""))).strip()
+    manifest["boundary_mode"] = str(chunk_contract.get("boundary_mode", manifest.get("boundary_mode", "strict"))).strip() or "strict"
+    manifest["continuity_mode"] = str(continuity.get("mode", manifest.get("continuity_mode", "reference_only"))).strip() or "reference_only"
     manifest["autotune"] = autotune
     manifest["replan_required"] = runtime.get("replan_required", manifest.get("replan_required", False))
     manifest["replan_reason"] = runtime.get("replan_reason", manifest.get("replan_reason", ""))
@@ -868,13 +973,52 @@ def _sync_manifest_legacy_fields(manifest: dict) -> dict:
 
 def _ensure_manifest_structure(manifest: dict, *, prompt_name: str = "", prompt_budget: dict | None = None,
                                recommended_chunk_size: int = 0, request_url: str = "",
-                               source_file: str = "") -> dict:
+                               source_file: str = "", config: dict | None = None) -> dict:
     manifest = manifest if isinstance(manifest, dict) else {}
     prompt_budget = prompt_budget or {}
+    config = config or {}
     chunk_mode = _normalize_chunk_mode(
         manifest.get("chunk_mode", prompt_budget.get("chunk_mode", DEFAULT_CHUNK_MODE))
     )
     effective_chunk_size = max(0, _parse_int(manifest.get("chunk_size"), 0))
+    existing_plan = manifest.get("plan", {}) if isinstance(manifest.get("plan", {}), dict) else {}
+    source_kind = str(
+        manifest.get("chunk_source_kind")
+        or existing_plan.get("chunk_contract", {}).get("source_kind", "")
+        or ("segments" if str(manifest.get("source_segments_file", "")).strip() else "text")
+    ).strip()
+    has_timing = any(
+        chunk.get("start_time") is not None or chunk.get("end_time") is not None
+        for chunk in manifest.get("chunks", [])
+        if isinstance(chunk, dict)
+    )
+    normalized_document_path = str(
+        manifest.get("normalized_document_path")
+        or existing_plan.get("chunk_contract", {}).get("normalized_document_path", "")
+    ).strip()
+    chunk_contract = existing_plan.get("chunk_contract") if isinstance(existing_plan.get("chunk_contract", {}), dict) else None
+    if not chunk_contract:
+        chunk_contract = _build_manifest_chunk_contract(
+            source_kind,
+            driver=str(manifest.get("chunk_driver", "")).strip() or ("chunk-segments" if source_kind == "segments" else "chunk-text"),
+            normalized_document_path=normalized_document_path,
+            source_adapter=str(manifest.get("source_adapter", "")).strip(),
+            has_timing=has_timing,
+            chapters_enabled=False,
+        )
+    continuity_policy = existing_plan.get("continuity") if isinstance(existing_plan.get("continuity", {}), dict) else None
+    if not continuity_policy:
+        continuity_policy = _build_manifest_continuity_policy(
+            config,
+            tail_sentences=_parse_int(
+                manifest.get("chunk_context_tail_sentences"),
+                _parse_int_min(config.get("chunk_context_tail_sentences"), DEFAULT_CHUNK_CONTEXT_TAIL_SENTENCES, 0),
+            ),
+            summary_token_cap=_parse_int(
+                manifest.get("chunk_context_summary_tokens"),
+                _parse_int_min(config.get("chunk_context_summary_tokens"), DEFAULT_CHUNK_CONTEXT_SUMMARY_TOKENS, 0),
+            ),
+        )
     if not isinstance(manifest.get("plan"), dict):
         manifest["plan"] = _build_manifest_plan(
             prompt_name or str(manifest.get("last_prompt", manifest.get("prompt_name", ""))).strip(),
@@ -895,7 +1039,12 @@ def _ensure_manifest_structure(manifest: dict, *, prompt_name: str = "", prompt_
             },
             source_file=source_file or str(manifest.get("source_file", "")).strip(),
             plan_id=str(manifest.get("plan_id", "")).strip(),
+            chunk_contract=chunk_contract,
+            continuity_policy=continuity_policy,
         )
+    else:
+        manifest["plan"].setdefault("chunk_contract", chunk_contract)
+        manifest["plan"].setdefault("continuity", continuity_policy)
     if not isinstance(manifest.get("runtime"), dict):
         manifest["runtime"] = _build_manifest_runtime(
             manifest["plan"].get("plan_id", _new_plan_id()),
@@ -2315,18 +2464,8 @@ def test_deepgram_api(api_key: str) -> dict:
         return {"valid": False, "error": f"Unexpected error: {e}", "balance_warning": False}
 
 
-def chunk_text(input_path: str, output_dir: str, chunk_size: int = 0,
-               prompt_name: str = "", config_path: str = None) -> dict:
-    """
-    Split text file into chunks by sentence boundary.
-
-    When chunk_size is omitted or non-positive, choose a prompt-aware default.
-    """
-    path = Path(input_path)
-    if not path.exists():
-        print(f"Error: File does not exist {input_path}", file=sys.stderr)
-        sys.exit(1)
-
+def _prepare_chunking_context(prompt_name: str = "", chunk_size: int = 0,
+                              config_path: str = None) -> dict:
     config = _load_optional_config(config_path)
     prompt_template = ""
     if prompt_name:
@@ -2353,15 +2492,39 @@ def chunk_text(input_path: str, output_dir: str, chunk_size: int = 0,
     autotune_budget["chunk_mode"] = chunk_mode
     autotune_state = _build_autotune_state(autotune_budget, config)
     autotune_state["enabled"] = autotune_state["enabled"] and chunk_mode == "tokens"
+    return {
+        "config": config,
+        "prompt_template": prompt_template,
+        "budget": budget,
+        "chunk_mode": chunk_mode,
+        "use_legacy_char_override": use_legacy_char_override,
+        "recommended_chunk_size": recommended_chunk_size,
+        "effective_chunk_size": effective_chunk_size,
+        "hard_cap_size": hard_cap_size,
+        "target_tokens": target_tokens,
+        "hard_cap_tokens": hard_cap_tokens,
+        "autotune_state": autotune_state,
+    }
+
+
+def _chunk_text_payload(text: str, source_file: str, output_dir: str, chunk_size: int = 0,
+                        prompt_name: str = "", config_path: str = None, *, driver: str = "chunk-text",
+                        source_kind: str = "text", normalized_document_path: str = "",
+                        source_adapter: str = "") -> dict:
+    chunking = _prepare_chunking_context(prompt_name, chunk_size, config_path)
+    config = chunking["config"]
+    budget = chunking["budget"]
+    chunk_mode = chunking["chunk_mode"]
+    use_legacy_char_override = chunking["use_legacy_char_override"]
+    recommended_chunk_size = chunking["recommended_chunk_size"]
+    effective_chunk_size = chunking["effective_chunk_size"]
+    hard_cap_size = chunking["hard_cap_size"]
+    target_tokens = chunking["target_tokens"]
+    hard_cap_tokens = chunking["hard_cap_tokens"]
+    autotune_state = chunking["autotune_state"]
 
     out_dir = Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-
-    try:
-        text = path.read_text(encoding='utf-8')
-    except Exception as e:
-        print(f"Error: Cannot read file {e}", file=sys.stderr)
-        sys.exit(2)
 
     sentences = _split_sentences(text)
     chunks, warnings = _split_text_into_chunks(
@@ -2373,16 +2536,24 @@ def chunk_text(input_path: str, output_dir: str, chunk_size: int = 0,
     )
 
     plan_id = _new_plan_id()
+    continuity_policy = _build_manifest_continuity_policy(config)
+    chunk_contract = _build_manifest_chunk_contract(
+        source_kind,
+        driver=driver,
+        normalized_document_path=normalized_document_path,
+        source_adapter=source_adapter,
+        has_timing=False,
+        chapters_enabled=False,
+    )
     manifest = {
         "schema_version": MANIFEST_SCHEMA_VERSION,
         "total_chunks": len(chunks),
-        "chunk_context_tail_sentences": _parse_int_min(
-            config.get("chunk_context_tail_sentences"),
-            DEFAULT_CHUNK_CONTEXT_TAIL_SENTENCES,
-            0,
-        ),
-        "source_file": str(path.absolute()),
+        "chunk_context_tail_sentences": continuity_policy["tail_sentences"],
+        "chunk_context_summary_tokens": continuity_policy["summary_token_cap"],
+        "source_file": str(Path(source_file).absolute()) if source_file else "",
+        "source_adapter": str(source_adapter).strip(),
         "work_dir": str(out_dir.absolute()),
+        "normalized_document_path": str(normalized_document_path).strip(),
         "plan": _build_manifest_plan(
             prompt_name,
             chunk_mode,
@@ -2393,8 +2564,10 @@ def chunk_text(input_path: str, output_dir: str, chunk_size: int = 0,
                 "target_tokens": target_tokens,
                 "hard_cap_tokens": hard_cap_tokens,
             },
-            source_file=str(path.absolute()),
+            source_file=str(Path(source_file).absolute()) if source_file else "",
             plan_id=plan_id,
+            chunk_contract=chunk_contract,
+            continuity_policy=continuity_policy,
         ),
         "runtime": _build_manifest_runtime(plan_id),
         "autotune": autotune_state,
@@ -2402,20 +2575,22 @@ def chunk_text(input_path: str, output_dir: str, chunk_size: int = 0,
         "chunks": [],
     }
 
-    for i, chunk_content in enumerate(chunks):
-        chunk_filename = f"chunk_{i:03d}.txt"
+    for index, chunk_content in enumerate(chunks):
+        chunk_filename = f"chunk_{index:03d}.txt"
         chunk_path = out_dir / chunk_filename
         _atomic_write_text(chunk_path, chunk_content)
 
         chunk_entry = _new_chunk_manifest_entry(
-            i,
+            index,
             chunk_content,
             budget,
             config,
             raw_path=chunk_filename,
-            processed_path=f"processed_{i:03d}.md",
+            processed_path=f"processed_{index:03d}.md",
             plan_id=plan_id,
-            continuity_prev_chunk_id=i - 1 if i > 0 else None,
+            continuity_prev_chunk_id=index - 1 if index > 0 else None,
+            chunk_contract=chunk_contract,
+            continuity_policy=continuity_policy,
         )
         chunk_entry["autotune_target_tokens"] = autotune_state["current_target_tokens"]
         chunk_entry["autotune_next_target_tokens"] = autotune_state["current_target_tokens"]
@@ -2444,14 +2619,47 @@ def chunk_text(input_path: str, output_dir: str, chunk_size: int = 0,
         "total_chunks": len(chunks),
         "manifest_path": str(manifest_path),
         "plan_id": plan_id,
-        "chunks": [c["raw_path"] for c in manifest["chunks"]],
+        "chunks": [chunk["raw_path"] for chunk in manifest["chunks"]],
         "warnings": warnings,
         "chunk_size": effective_chunk_size,
         "recommended_chunk_size": manifest["recommended_chunk_size"],
         "chunk_mode": chunk_mode,
         "target_tokens": manifest["target_tokens"],
         "hard_cap_tokens": manifest["hard_cap_tokens"],
+        "source_kind": chunk_contract["source_kind"],
+        "driver": chunk_contract["driver"],
+        "normalized_document_path": str(normalized_document_path).strip(),
     }
+
+
+def chunk_text(input_path: str, output_dir: str, chunk_size: int = 0,
+               prompt_name: str = "", config_path: str = None) -> dict:
+    """
+    Split text file into chunks by sentence boundary.
+
+    When chunk_size is omitted or non-positive, choose a prompt-aware default.
+    """
+    path = Path(input_path)
+    if not path.exists():
+        print(f"Error: File does not exist {input_path}", file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        text = path.read_text(encoding='utf-8')
+    except Exception as error:
+        print(f"Error: Cannot read file {error}", file=sys.stderr)
+        sys.exit(2)
+
+    return _chunk_text_payload(
+        text,
+        str(path.absolute()),
+        output_dir,
+        chunk_size,
+        prompt_name,
+        config_path,
+        driver="chunk-text",
+        source_kind="text",
+    )
 
 
 def _load_segment_document(segments_path: str) -> tuple[dict, list[dict]]:
@@ -2606,39 +2814,73 @@ def _split_timed_segment(segment: dict, max_size: int, chunk_mode: str,
     return split_segments, warnings
 
 
-def chunk_segments(segments_path: str, output_dir: str, chunk_size: int = 0,
-                   prompt_name: str = "", config_path: str = None,
-                   chapters_path: str = "") -> dict:
-    """Split aligned source segments into timed chunks."""
-    metadata, segments = _load_segment_document(segments_path)
+def _load_normalized_document(normalized_document_path: str) -> dict:
+    path = Path(normalized_document_path)
+    if not path.exists():
+        print(f"Error: File does not exist {normalized_document_path}", file=sys.stderr)
+        sys.exit(1)
 
-    config = _load_optional_config(config_path)
-    prompt_template = ""
-    if prompt_name:
-        try:
-            prompt_path = _resolve_prompt_template_path(prompt_name)
-        except ValueError as error:
-            print(f"Error: {error}", file=sys.stderr)
-            print(f"Available prompts: {_available_prompt_names()}", file=sys.stderr)
-            sys.exit(1)
-        prompt_template = prompt_path.read_text(encoding="utf-8")
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as error:
+        print(f"Error: JSON parsing failed {error}", file=sys.stderr)
+        sys.exit(2)
+    except Exception as error:
+        print(f"Error: Cannot read file {error}", file=sys.stderr)
+        sys.exit(2)
 
-    chunk_plan = _build_chunk_plan(prompt_name, chunk_size, config, prompt_template)
-    budget = chunk_plan["budget"]
-    chunk_mode = chunk_plan["chunk_mode"]
-    use_legacy_char_override = chunk_plan["use_legacy_char_override"]
-    recommended_chunk_size = chunk_plan["recommended_chunk_size"]
-    effective_chunk_size = chunk_plan["effective_chunk_size"]
-    hard_cap_size = chunk_plan["hard_cap_size"]
-    target_tokens = chunk_plan["target_tokens"]
-    hard_cap_tokens = chunk_plan["hard_cap_tokens"]
+    if not isinstance(payload, dict):
+        print("Error: Normalized document must be a JSON object", file=sys.stderr)
+        sys.exit(2)
 
-    autotune_budget = dict(budget)
-    autotune_budget["target_tokens"] = target_tokens
-    autotune_budget["hard_cap_tokens"] = hard_cap_tokens
-    autotune_budget["chunk_mode"] = chunk_mode
-    autotune_state = _build_autotune_state(autotune_budget, config)
-    autotune_state["enabled"] = autotune_state["enabled"] and chunk_mode == "tokens"
+    content = payload.get("content", {}) if isinstance(payload.get("content", {}), dict) else {}
+    payload.setdefault("content", content)
+    payload["content"]["text"] = _normalize_text_body(content.get("text", ""))
+
+    normalized_segments = []
+    for index, raw_segment in enumerate(payload.get("segments", [])):
+        if not isinstance(raw_segment, dict):
+            continue
+        segment_text = " ".join(_normalize_text_body(raw_segment.get("text", "")).split())
+        if not segment_text:
+            continue
+        normalized_segments.append({
+            "id": _parse_int(raw_segment.get("id"), index),
+            "text": segment_text,
+            "start_time": _coerce_float_or_none(raw_segment.get("start_time")),
+            "end_time": _coerce_float_or_none(raw_segment.get("end_time")),
+            "speaker": raw_segment.get("speaker"),
+            "segment_part_index": raw_segment.get("segment_part_index"),
+        })
+    payload["segments"] = normalized_segments
+
+    if not payload["segments"] and not str(payload.get("content", {}).get("text", "")).strip():
+        print("Error: Normalized document does not contain usable text or segments", file=sys.stderr)
+        sys.exit(2)
+
+    return payload
+
+
+def _chunk_segments_payload(metadata: dict, segments: list[dict], source_file: str, output_dir: str,
+                            chunk_size: int = 0, prompt_name: str = "", config_path: str = None,
+                            *, chapters_path: str = "", driver: str = "chunk-segments",
+                            source_kind: str = "segments", normalized_document_path: str = "",
+                            source_adapter: str = "", source_segments_file: str = "") -> dict:
+    if not segments:
+        print("Error: No usable segments found", file=sys.stderr)
+        sys.exit(2)
+
+    chunking = _prepare_chunking_context(prompt_name, chunk_size, config_path)
+    config = chunking["config"]
+    budget = chunking["budget"]
+    chunk_mode = chunking["chunk_mode"]
+    use_legacy_char_override = chunking["use_legacy_char_override"]
+    recommended_chunk_size = chunking["recommended_chunk_size"]
+    effective_chunk_size = chunking["effective_chunk_size"]
+    hard_cap_size = chunking["hard_cap_size"]
+    target_tokens = chunking["target_tokens"]
+    hard_cap_tokens = chunking["hard_cap_tokens"]
+    autotune_state = chunking["autotune_state"]
 
     prepared_segments = []
     warnings = []
@@ -2703,19 +2945,28 @@ def chunk_segments(segments_path: str, output_dir: str, chunk_size: int = 0,
     out_dir.mkdir(parents=True, exist_ok=True)
 
     plan_id = _new_plan_id()
+    continuity_policy = _build_manifest_continuity_policy(config)
+    has_timing = any(segment.get("start_time") is not None or segment.get("end_time") is not None for segment in segments)
+    chunk_contract = _build_manifest_chunk_contract(
+        source_kind,
+        driver=driver,
+        normalized_document_path=normalized_document_path,
+        source_adapter=source_adapter,
+        has_timing=has_timing,
+        chapters_enabled=bool(chapters_path),
+    )
     manifest = {
         "schema_version": MANIFEST_SCHEMA_VERSION,
         "total_chunks": len(chunk_specs),
-        "chunk_context_tail_sentences": _parse_int_min(
-            config.get("chunk_context_tail_sentences"),
-            DEFAULT_CHUNK_CONTEXT_TAIL_SENTENCES,
-            0,
-        ),
-        "source_file": str(Path(segments_path).absolute()),
-        "source_segments_file": str(Path(segments_path).absolute()),
+        "chunk_context_tail_sentences": continuity_policy["tail_sentences"],
+        "chunk_context_summary_tokens": continuity_policy["summary_token_cap"],
+        "source_file": str(Path(source_file).absolute()) if source_file else "",
+        "source_segments_file": str(Path(source_segments_file or source_file).absolute()) if (source_segments_file or source_file) else "",
         "source_segments_count": len(segments),
         "source_kind": str(metadata.get("source", "")).strip(),
+        "source_adapter": str(source_adapter or metadata.get("source", "")).strip(),
         "work_dir": str(out_dir.absolute()),
+        "normalized_document_path": str(normalized_document_path).strip(),
         "plan": _build_manifest_plan(
             prompt_name,
             chunk_mode,
@@ -2726,8 +2977,10 @@ def chunk_segments(segments_path: str, output_dir: str, chunk_size: int = 0,
                 "target_tokens": target_tokens,
                 "hard_cap_tokens": hard_cap_tokens,
             },
-            source_file=str(Path(segments_path).absolute()),
+            source_file=str(Path(source_file).absolute()) if source_file else "",
             plan_id=plan_id,
+            chunk_contract=chunk_contract,
+            continuity_policy=continuity_policy,
         ),
         "runtime": _build_manifest_runtime(plan_id),
         "autotune": autotune_state,
@@ -2749,6 +3002,8 @@ def chunk_segments(segments_path: str, output_dir: str, chunk_size: int = 0,
             processed_path=f"processed_{index:03d}.md",
             plan_id=plan_id,
             continuity_prev_chunk_id=index - 1 if index > 0 else None,
+            chunk_contract=chunk_contract,
+            continuity_policy=continuity_policy,
         )
         chunk_entry["autotune_target_tokens"] = autotune_state["current_target_tokens"]
         chunk_entry["autotune_next_target_tokens"] = autotune_state["current_target_tokens"]
@@ -2783,7 +3038,7 @@ def chunk_segments(segments_path: str, output_dir: str, chunk_size: int = 0,
         "total_chunks": len(chunk_specs),
         "manifest_path": str(manifest_path),
         "plan_id": plan_id,
-        "chunks": [c["raw_path"] for c in manifest["chunks"]],
+        "chunks": [chunk["raw_path"] for chunk in manifest["chunks"]],
         "warnings": warnings,
         "chunk_size": effective_chunk_size,
         "recommended_chunk_size": manifest["recommended_chunk_size"],
@@ -2791,7 +3046,101 @@ def chunk_segments(segments_path: str, output_dir: str, chunk_size: int = 0,
         "target_tokens": manifest["target_tokens"],
         "hard_cap_tokens": manifest["hard_cap_tokens"],
         "source_segments_count": len(segments),
+        "source_kind": chunk_contract["source_kind"],
+        "driver": chunk_contract["driver"],
+        "normalized_document_path": str(normalized_document_path).strip(),
     }
+
+
+def chunk_segments(segments_path: str, output_dir: str, chunk_size: int = 0,
+                   prompt_name: str = "", config_path: str = None,
+                   chapters_path: str = "") -> dict:
+    """Split aligned source segments into timed chunks."""
+    metadata, segments = _load_segment_document(segments_path)
+    return _chunk_segments_payload(
+        metadata,
+        segments,
+        str(Path(segments_path).absolute()),
+        output_dir,
+        chunk_size,
+        prompt_name,
+        config_path,
+        chapters_path=chapters_path,
+        driver="chunk-segments",
+        source_kind="segments",
+        source_adapter=str(metadata.get("source", "")).strip(),
+        source_segments_file=str(Path(segments_path).absolute()),
+    )
+
+
+def chunk_document(normalized_document_path: str, output_dir: str, chunk_size: int = 0,
+                   prompt_name: str = "", config_path: str = None,
+                   chapters_path: str = "", prefer: str = "auto") -> dict:
+    """Chunk a normalized document using its preferred canonical source shape."""
+    payload = _load_normalized_document(normalized_document_path)
+    preference = str(prefer or "auto").strip().lower()
+    if preference not in {"auto", "segments", "text"}:
+        print(f"Error: Unsupported chunk-document preference: {prefer}", file=sys.stderr)
+        sys.exit(2)
+
+    content = payload.get("content", {}) if isinstance(payload.get("content", {}), dict) else {}
+    preferred_source = str(content.get("preferred_chunk_source", "")).strip().lower()
+    segments = payload.get("segments", []) if isinstance(payload.get("segments", []), list) else []
+    has_segments = bool(segments)
+    source_adapter = str(payload.get("source_adapter", "")).strip()
+    artifacts = payload.get("artifacts", {}) if isinstance(payload.get("artifacts", {}), dict) else {}
+    normalized_path = str(Path(normalized_document_path).absolute())
+
+    if preference == "segments":
+        use_segments = has_segments
+        if not use_segments:
+            print("Error: Normalized document does not contain segments", file=sys.stderr)
+            sys.exit(2)
+    elif preference == "text":
+        use_segments = False
+    else:
+        use_segments = preferred_source == "segments" and has_segments
+
+    if use_segments:
+        metadata = {
+            "source": source_adapter,
+            "document_id": payload.get("document_id", ""),
+        }
+        result = _chunk_segments_payload(
+            metadata,
+            segments,
+            normalized_path,
+            output_dir,
+            chunk_size,
+            prompt_name,
+            config_path,
+            chapters_path=chapters_path,
+            driver="chunk-document",
+            source_kind="segments",
+            normalized_document_path=normalized_path,
+            source_adapter=source_adapter,
+            source_segments_file=str(artifacts.get("segments_path", "") or normalized_path),
+        )
+    else:
+        text_body = str(content.get("text", "")).strip()
+        if not text_body:
+            print("Error: Normalized document does not contain usable text", file=sys.stderr)
+            sys.exit(2)
+        result = _chunk_text_payload(
+            text_body,
+            normalized_path,
+            output_dir,
+            chunk_size,
+            prompt_name,
+            config_path,
+            driver="chunk-document",
+            source_kind="text",
+            normalized_document_path=normalized_path,
+            source_adapter=source_adapter,
+        )
+
+    result["preferred_source_kind"] = preferred_source or ("segments" if has_segments else "text")
+    return result
 
 
 def get_chapters(video_url: str, timeout: int = 30) -> dict:
@@ -3514,9 +3863,12 @@ def process_chunks(work_dir: str, prompt_name: str, extra_instruction: str = "",
         recommended_chunk_size=_recommended_chunk_size(prompt_name, config),
         request_url=request_url,
         source_file=str(manifest.get("source_file", "")).strip(),
+        config=config,
     )
     plan = manifest["plan"]
     runtime = manifest["runtime"]
+    plan_continuity = plan.get("continuity", {}) if isinstance(plan.get("continuity", {}), dict) else _build_manifest_continuity_policy(config)
+    plan_chunk_contract = plan.get("chunk_contract", {}) if isinstance(plan.get("chunk_contract", {}), dict) else _build_manifest_chunk_contract()
     manifest_chunk_size = max(0, _parse_int(plan.get("chunk_size"), manifest.get("chunk_size", 0)))
     manifest_chunk_mode = _normalize_chunk_mode(plan.get("chunk_mode", manifest.get("chunk_mode", config.get("chunk_mode", DEFAULT_CHUNK_MODE))))
     plan_target_tokens = max(1, _parse_int(plan.get("target_input_tokens", plan.get("target_tokens", prompt_budget["target_tokens"])), prompt_budget["target_tokens"]))
@@ -3722,7 +4074,13 @@ def process_chunks(work_dir: str, prompt_name: str, extra_instruction: str = "",
             config,
         )
         previous_chunk = _find_previous_active_chunk(manifest["chunks"], chunk_index)
-        continuity_context = _build_continuity_context(previous_chunk, work_path, config, input_key=input_key)
+        continuity_context = _build_continuity_context(
+            previous_chunk,
+            work_path,
+            config,
+            input_key=input_key,
+            continuity_policy=plan_continuity,
+        )
         prompt = _build_chunk_prompt(prompt_template, chunk_text, continuity_context["text"])
         actual_prompt_tokens = (
             prompt_budget["prompt_template_tokens"] + continuity_context["token_count"]
@@ -4046,6 +4404,7 @@ def replan_remaining(work_dir: str, prompt_name: str = "", config_path: str = No
         prompt_budget=prompt_budget,
         recommended_chunk_size=_recommended_chunk_size(plan_prompt_name, config),
         source_file=str(manifest.get("source_file", "")).strip(),
+        config=config,
     )
 
     pending_indices = [
@@ -4181,6 +4540,8 @@ def replan_remaining(work_dir: str, prompt_name: str = "", config_path: str = No
     next_chunk_id = max((_parse_int(chunk.get("id"), 0) for chunk in manifest["chunks"]), default=-1) + 1
     new_chunk_start_index = len(manifest["chunks"])
     previous_continuity_chunk_id = previous_chunk.get("id") if previous_chunk else None
+    plan_chunk_contract = manifest.get("plan", {}).get("chunk_contract", {}) if isinstance(manifest.get("plan", {}).get("chunk_contract", {}), dict) else _build_manifest_chunk_contract()
+    plan_continuity = manifest.get("plan", {}).get("continuity", {}) if isinstance(manifest.get("plan", {}).get("continuity", {}), dict) else _build_manifest_continuity_policy(config)
     autotune_state = _build_autotune_state(manifest["plan"], config, manifest.get("autotune"))
     autotune_state["enabled"] = _parse_bool(config.get("enable_chunk_autotune"), DEFAULT_ENABLE_CHUNK_AUTOTUNE) and chunk_mode == "tokens"
 
@@ -4198,6 +4559,8 @@ def replan_remaining(work_dir: str, prompt_name: str = "", config_path: str = No
             processed_path=f"processed_{chunk_id:03d}.md",
             plan_id=new_plan_id,
             continuity_prev_chunk_id=previous_continuity_chunk_id,
+            chunk_contract=plan_chunk_contract,
+            continuity_policy=plan_continuity,
         )
         chunk_entry["autotune_target_tokens"] = autotune_state["current_target_tokens"]
         chunk_entry["autotune_next_target_tokens"] = autotune_state["current_target_tokens"]
@@ -5467,6 +5830,16 @@ def plan_optimization(state_path: str) -> dict:
                 }
             )
 
+    chunk_driver = "chunk-document" if normalization.get("materialized") else ("chunk-segments" if Path(str(state.get("segments_path", "") or f"/tmp/{video_id}_segments.json")).exists() else "chunk-text")
+    chunking = {
+        "driver": chunk_driver,
+        "normalized_document_path": normalization.get("normalized_document_path", ""),
+        "preferred_source_kind": normalization.get("preferred_chunk_source", ""),
+        "boundary_mode": "strict",
+        "continuity_mode": "reference_only",
+        "merge_strategy": "ordered_concat",
+    }
+
     return {
         "passed": True,
         "machine_state_path": validation.get("machine_state_path", ""),
@@ -5488,6 +5861,7 @@ def plan_optimization(state_path: str) -> dict:
             "segment_count": normalization.get("segment_count", 0),
             "normalized_document_path": normalization.get("normalized_document_path", ""),
         },
+        "chunking": chunking,
         "requires_llm_preflight": video_path == "long",
         "requires_quality_check": True,
         "replan_contract": {
@@ -5815,6 +6189,24 @@ def main():
     chunk_segments_parser.add_argument('--chapters', default='',
                                        help='Optional YouTube chapters JSON path; forces chunk boundaries at chapter starts')
 
+    # chunk-document command
+    chunk_document_parser = subparsers.add_parser(
+        'chunk-document',
+        help='Chunk a normalized document using its preferred source shape'
+    )
+    chunk_document_parser.add_argument('normalized_document_path', help='normalized_document.json path')
+    chunk_document_parser.add_argument('output_dir', help='Output directory for chunks')
+    chunk_document_parser.add_argument('--chunk-size', type=int, default=0,
+                                       help='Target chunk size in the active chunk_mode; without --prompt it keeps legacy character sizing')
+    chunk_document_parser.add_argument('--prompt', default='',
+                                       help='Optional prompt name for task-aware auto chunk sizing')
+    chunk_document_parser.add_argument('--config-path', default=None,
+                                       help='Optional path to config file for chunk planning')
+    chunk_document_parser.add_argument('--chapters', default='',
+                                       help='Optional YouTube chapters JSON path; forces chunk boundaries at chapter starts when timed segments exist')
+    chunk_document_parser.add_argument('--prefer', default='auto', choices=['auto', 'segments', 'text'],
+                                       help='Preferred normalized source shape for chunking')
+
     # get-chapters command
     chapters_parser = subparsers.add_parser(
         'get-chapters',
@@ -6033,6 +6425,18 @@ def main():
 
     elif args.command == 'chunk-segments':
         result = chunk_segments(args.segments_path, args.output_dir, args.chunk_size, args.prompt, args.config_path, chapters_path=args.chapters)
+        print(json.dumps(result, ensure_ascii=False))
+
+    elif args.command == 'chunk-document':
+        result = chunk_document(
+            args.normalized_document_path,
+            args.output_dir,
+            args.chunk_size,
+            args.prompt,
+            args.config_path,
+            chapters_path=args.chapters,
+            prefer=args.prefer,
+        )
         print(json.dumps(result, ensure_ascii=False))
 
     elif args.command == 'get-chapters':

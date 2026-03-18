@@ -453,6 +453,83 @@ class RegressionTests(unittest.TestCase):
             self.assertEqual(manifest["chunks"][0]["end_time"], 20.0)
             self.assertEqual(manifest["chunks"][1]["start_time"], 20.0)
             self.assertEqual(manifest["chunks"][1]["end_time"], 30.0)
+
+    def test_chunk_document_prefers_segments_and_writes_formal_contract(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            normalized_document = Path(tmpdir) / "normalized_document.json"
+            work_dir = Path(tmpdir) / "chunks"
+            normalized_document.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "format": utils.NORMALIZED_DOCUMENT_FORMAT,
+                        "document_id": "vid001",
+                        "source_adapter": "segments_json",
+                        "artifacts": {
+                            "segments_path": "/tmp/vid001_segments.json",
+                            "normalized_document": str(normalized_document),
+                        },
+                        "content": {
+                            "text": "First line\nSecond line",
+                            "preferred_chunk_source": "segments",
+                        },
+                        "segments": [
+                            {"id": 0, "text": "First line", "start_time": 0.0, "end_time": 1.0},
+                            {"id": 1, "text": "Second line", "start_time": 1.0, "end_time": 2.0},
+                        ],
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+
+            result = utils.chunk_document(str(normalized_document), str(work_dir), chunk_size=1000)
+
+            self.assertEqual(result["driver"], "chunk-document")
+            self.assertEqual(result["source_kind"], "segments")
+            manifest = json.loads((work_dir / "manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest["plan"]["chunk_contract"]["driver"], "chunk-document")
+            self.assertEqual(manifest["plan"]["chunk_contract"]["source_kind"], "segments")
+            self.assertEqual(manifest["plan"]["chunk_contract"]["boundary_mode"], "strict")
+            self.assertEqual(manifest["plan"]["continuity"]["mode"], "reference_only")
+            self.assertEqual(
+                manifest["plan"]["chunk_contract"]["normalized_document_path"],
+                str(normalized_document.absolute()),
+            )
+            self.assertEqual(manifest["chunks"][0]["source_kind"], "segments")
+            self.assertEqual(manifest["chunks"][0]["boundary_mode"], "strict")
+            self.assertEqual(manifest["chunks"][0]["start_time"], 0.0)
+
+    def test_chunk_document_can_force_text_mode(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            normalized_document = Path(tmpdir) / "normalized_document.json"
+            work_dir = Path(tmpdir) / "chunks"
+            normalized_document.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "format": utils.NORMALIZED_DOCUMENT_FORMAT,
+                        "document_id": "vid001",
+                        "source_adapter": "segments_json",
+                        "content": {
+                            "text": "Alpha. Beta. Gamma.",
+                            "preferred_chunk_source": "segments",
+                        },
+                        "segments": [
+                            {"id": 0, "text": "Alpha", "start_time": 0.0, "end_time": 1.0},
+                        ],
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+
+            result = utils.chunk_document(str(normalized_document), str(work_dir), chunk_size=1000, prefer="text")
+
+            self.assertEqual(result["source_kind"], "text")
+            manifest = json.loads((work_dir / "manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest["plan"]["chunk_contract"]["source_kind"], "text")
+            self.assertNotIn("start_time", manifest["chunks"][0])
     def test_build_chapter_plan_maps_chapters_to_timed_chunks(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             segments_path = Path(tmpdir) / "segments.json"
@@ -820,6 +897,38 @@ class RegressionTests(unittest.TestCase):
             self.assertTrue(Path(result["normalization"]["normalized_document_path"]).exists())
             self.assertEqual(result["outputs"]["normalized_document"], result["normalization"]["normalized_document_path"])
 
+
+    def test_plan_optimization_reports_chunk_document_contract(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state = Path(tmpdir) / "vid001_state.md"
+            raw_text = Path(tmpdir) / "vid001_raw.txt"
+            raw_text.write_text("Hello world", encoding="utf-8")
+            state.write_text(
+                f"""# State
+vid: vid001
+url: https://example.com/watch?v=1
+title: Sample
+channel: Channel
+upload_date: 20260308
+duration: 3600
+output_dir: /tmp/out
+mode: bilingual
+src: youtube
+source_language: en
+subtitle_source: YouTube Subtitles
+raw_text: {raw_text}
+work_dir: /tmp/vid001_chunks
+""",
+                encoding="utf-8",
+            )
+
+            result = utils.plan_optimization(str(state))
+
+            self.assertTrue(result["passed"], result)
+            self.assertEqual(result["chunking"]["driver"], "chunk-document")
+            self.assertEqual(result["chunking"]["preferred_source_kind"], "text")
+            self.assertEqual(result["chunking"]["boundary_mode"], "strict")
+            self.assertEqual(result["chunking"]["continuity_mode"], "reference_only")
 
     def test_plan_optimization_returns_short_bilingual_operations(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -2154,6 +2263,59 @@ exit 1
             self.assertEqual(manifest["chunks"][1]["continuity_prev_chunk_id"], 0)
             self.assertGreater(manifest["chunks"][1]["continuity_context_tokens"], 0)
             self.assertEqual(manifest["chunks"][0]["last_section_title"], "## Intro")
+
+
+    def test_process_chunks_uses_manifest_continuity_policy_even_if_runtime_config_disables_it(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source = Path(tmpdir) / "raw.txt"
+            work_dir = Path(tmpdir) / "chunks"
+            config_path = Path(tmpdir) / "chunk_config.yaml"
+            source.write_text("第一句。第二句。第三句。第四句。", encoding="utf-8")
+            config_path.write_text(
+                f"""output_dir: "{tmpdir}"
+chunk_mode: "chars"
+chunk_context_tail_sentences: 1
+chunk_context_summary_tokens: 20
+""",
+                encoding="utf-8",
+            )
+            utils.chunk_text(str(source), str(work_dir), 8, config_path=str(config_path))
+
+            runtime_config = utils._default_config_values()
+            runtime_config.update({
+                "llm_api_key": "key",
+                "llm_base_url": "https://api.example.com",
+                "llm_model": "demo",
+                "llm_api_format": "openai",
+                "chunk_context_tail_sentences": 0,
+                "chunk_context_summary_tokens": 0,
+            })
+
+            recorded_prompts = []
+            fake_outputs = iter([
+                "## Intro" + chr(10) + chr(10) + "整理后的第一部分。",
+                "## Follow-up" + chr(10) + chr(10) + "整理后的第二部分。",
+                "## Third" + chr(10) + chr(10) + "整理后的第三部分。",
+                "## Final" + chr(10) + chr(10) + "整理后的第四部分。",
+            ])
+
+            with mock.patch.object(utils, "load_config", return_value=runtime_config), mock.patch.object(
+                utils,
+                "_call_llm_api",
+                side_effect=lambda **kwargs: recorded_prompts.append(kwargs["messages"][0]["content"]) or {
+                    "text": next(fake_outputs),
+                    "latency_ms": 12,
+                    "request_url": "https://api.example.com/v1/chat/completions",
+                    "streaming_used": False,
+                    "attempts": 1,
+                },
+            ):
+                result = utils.process_chunks(str(work_dir), "structure_only")
+
+            self.assertTrue(result["success"])
+            self.assertIn("## Continuity Context", recorded_prompts[1])
+            self.assertIn("Only transform the current chunk body below.", recorded_prompts[1])
+            self.assertIn("Do not repeat or rewrite this context in the output.", recorded_prompts[1])
 
     def test_process_chunks_reuses_manifest_token_estimates_without_remote_probe(self):
         with tempfile.TemporaryDirectory() as tmpdir:

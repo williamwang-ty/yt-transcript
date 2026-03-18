@@ -95,7 +95,19 @@ python3 <skill-root>/yt_transcript_utils.py get-chapters "$VIDEO_URL" > /tmp/${V
 
 ### Step 2: Build Chunk Work Dir
 
-Prefer time-aligned segments when available (`/tmp/${VIDEO_ID}_segments.json` is produced by Deepgram `--output-segments` or `parse-vtt-segments` in the subtitle workflow):
+Canonical Stage 3 path: if `PLAN_JSON.normalization.materialized=true`, chunk from the normalized document directly:
+
+```bash
+python3 <skill-root>/yt_transcript_utils.py chunk-document \
+    /tmp/${VIDEO_ID}_normalized_document.json \
+    /tmp/${VIDEO_ID}_chunks \
+    --prompt structure_only \
+    --chapters /tmp/${VIDEO_ID}_chapters.json
+```
+
+`chunk-document` auto-selects `segments` when the normalized document carries timed segments, and otherwise falls back to normalized text.
+
+Compatibility fallback: if you do not have a normalized document yet, the lower-level chunkers still work:
 
 ```bash
 python3 <skill-root>/yt_transcript_utils.py chunk-segments \
@@ -104,8 +116,6 @@ python3 <skill-root>/yt_transcript_utils.py chunk-segments \
     --prompt structure_only \
     --chapters /tmp/${VIDEO_ID}_chapters.json
 ```
-
-If no segments file exists (e.g. subtitle-driven source), fall back to text-only chunking:
 
 ```bash
 python3 <skill-root>/yt_transcript_utils.py chunk-text \
@@ -122,7 +132,7 @@ Update state:
 
 ### Step 3: Build Chapter Plan (Optional)
 
-If `/tmp/${VIDEO_ID}_chapters.json` reports `has_chapters=true` **and** your chunk manifest includes timing metadata (i.e. you used `chunk-segments`), generate `/tmp/${VIDEO_ID}_chunks/chapter_plan.json`:
+If `/tmp/${VIDEO_ID}_chapters.json` reports `has_chapters=true` **and** your chunk manifest includes timing metadata (i.e. `chunk-document` selected timed segments, or you used `chunk-segments` directly), generate `/tmp/${VIDEO_ID}_chunks/chapter_plan.json`:
 
 ```bash
 python3 <skill-root>/yt_transcript_utils.py build-chapter-plan \
@@ -134,7 +144,7 @@ python3 <skill-root>/yt_transcript_utils.py build-chapter-plan \
 
 Notes:
 
-- `build-chapter-plan` requires each chunk in `manifest.json` to have `start_time` / `end_time`; if you used `chunk-text`, it will STOP with an error.
+- `build-chapter-plan` requires each chunk in `manifest.json` to have `start_time` / `end_time`; this works when `chunk-document` selected timed segments, or when you used `chunk-segments` directly. If the plan resolved to text-only chunking, it will STOP with an error.
 - If you cannot produce timed chunks, continue without `chapter_plan.json`; `merge-content` still succeeds, just without injected YouTube chapter headers.
 - If you must have headings but lack timing, generate a best-effort plan by summarizing chunks and creating `chapter_plan.json` manually (this is not a true YouTube-chapter mapping).
 
@@ -143,6 +153,7 @@ Notes:
 Read `operations` from `PLAN_JSON`.
 
 - The first chunk operation always uses `prompt=structure_only`
+- Read `PLAN_JSON.chunking.driver`; when it is `chunk-document`, prefer the canonical normalized-document chunking path above instead of re-deriving raw-text vs timed-segment branching manually
 - If its `extra_instruction` is non-empty, pass it through `--extra-instruction`
 - Every chunk operation includes an `execution` object; follow it instead of re-deriving replan behavior in prose
 - When `execution.supports_auto_replan=true`, include every flag in `execution.recommended_cli_flags`

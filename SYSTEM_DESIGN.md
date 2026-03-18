@@ -1,37 +1,37 @@
-# System Design (v5.2-stage2)
+# System Design (v5.3-stage3)
 
-**Stage**: 2
+**Stage**: 3
 
 **Status**: accepted and implemented
 
-**Behavior change in this stage**: introduced an explicit normalization layer and a minimal source-adapter boundary, with `normalized_document.json` materialized from raw text or timed segments
+**Behavior change in this stage**: formalized chunk contracts and continuity policy, introduced `chunk-document` as the canonical normalized-document chunker, and made planning expose an explicit chunking contract
 
 **Source of truth**: This file is the canonical system design document for the repository.
 
-**Temporary companion document**: `LONG_TEXT_TRANSFORMATION_KERNEL.md` remains a non-authoritative staging draft. Stable content is folded into this file only when implemented or accepted for the next stage.
+**Non-authoritative companion**: `LONG_TEXT_TRANSFORMATION_KERNEL.md` remains a staging draft for future kernelization ideas and does not override this document.
 
 ---
 
-## 1. Stage 2 Goal
+## 1. Stage 3 Goal
 
-Stage 2 makes source normalization explicit without attempting a full kernel extraction.
+Stage 3 formalizes the boundary between normalization and long-text execution.
 
 Its goals are:
 
-- introduce a first-class normalized document artifact
-- make current source adaptation visible at the helper-command boundary
-- reduce hidden assumptions between source extraction and planning
-- keep current transcript workflows backward-compatible
+- turn chunking assumptions into explicit manifest contract data
+- make continuity policy explicit and plan-owned instead of purely config-implied
+- add a canonical chunker that consumes `normalized_document.json`
+- preserve existing `chunk-text` and `chunk-segments` workflows as compatible lower-level drivers
 
-Stage 2 is still intentionally small. It does **not** yet introduce a fully generalized multi-source document model, but it makes the current normalization path explicit enough for later chunking and control-loop work.
+Stage 3 is still intentionally bounded. It does **not** yet redesign the whole transform runner or verification / repair loop.
 
 ---
 
-## 2. Current System Identity
+## 2. System Scope
 
-### 2.1 What This Repository Is Today
+### 2.1 What This Repository Is
 
-At the current implementation stage, this repository is a **script-first long-text processing system centered on YouTube transcript workflows**, with an emerging kernel-style core.
+This repository is a script-first long-text transformation system specialized around YouTube transcript workflows.
 
 Its current implemented use cases are:
 
@@ -39,35 +39,31 @@ Its current implemented use cases are:
 - transcript cleanup and structure restoration
 - bilingual translation workflow
 - explicit normalization from raw text or timed segments
+- canonical chunking from normalized documents
 - chunked processing for long inputs
 - deterministic merge and final markdown assembly
 - workflow validation and stop/go quality checks
 
-This is broader than a simple transcript downloader, but still narrower than a fully generalized long-text transformation framework.
+### 2.2 Current Primary Design Goal
 
-### 2.2 Primary Design Goal
-
-The current primary design goal is:
-
-> Enable reliable long-text transcript transformation under context limits, especially on weaker models, using script-owned state, explicit normalization, chunking, and deterministic verification.
+> Enable reliable long-text transcript transformation under context limits, especially on weaker models, using script-owned state, explicit normalization, explicit chunk contracts, bounded continuity, and deterministic verification.
 
 ### 2.3 Current Non-Goals
 
-At Stage 2, the system is **not yet**:
+At Stage 3, the system is **not yet**:
 
 - a generalized multi-source document transformation framework
-- a formalized reusable kernel package layout
-- a concurrent chunk execution runtime with per-chunk authoritative state stores
-- a fully specified repair/replan engine
-- a complete observability platform
-
-These remain future stages, not current contract.
+- a formal reusable kernel package layout
+- a global glossary / terminology propagation system
+- a unified verification / repair / replan kernel
+- a concurrency-optimized state store
+- a telemetry-first production runtime
 
 ---
 
-## 3. Current Implemented Architecture
+## 3. Current Architecture
 
-### 3.1 Current Execution Shape
+### 3.1 Current End-to-End Flow
 
 The current system behaves approximately like this:
 
@@ -77,15 +73,16 @@ source acquisition
   -> raw text and/or timed segments extraction
   -> state synchronization
   -> normalization
-  -> optimization planning
-  -> chunking for long inputs
+  -> planning
+  -> canonical chunk contract selection
+  -> chunking
   -> per-chunk prompt execution
   -> deterministic merge
   -> deterministic final assembly
   -> quality verification
 ```
 
-This flow is implemented through shell scripts, workflow documents, prompts, and the Python utility layer.
+This flow is implemented through shell scripts, workflow documents, prompt templates, and the Python utility layer.
 
 ### 3.2 Current Persisted Artifacts
 
@@ -93,18 +90,15 @@ The current implementation relies on these persisted artifacts:
 
 - `/tmp/${VIDEO_ID}_machine_state.json`
   - authoritative machine-readable state surface introduced in Stage 1
-  - materialized automatically from legacy state when needed
 - `/tmp/${VIDEO_ID}_state.md`
   - workflow-facing compatibility projection
-  - still accepted by current workflow docs and current operator habits
 - `/tmp/${VIDEO_ID}_normalized_document.json`
-  - explicit normalized document artifact introduced in Stage 2
-  - materialized from raw text or timed segments
+  - normalized source artifact introduced in Stage 2
 - `manifest.json` in chunk work directories
-  - chunk plan + runtime execution metadata
-  - used for resumability and chunk-level processing state
+  - chunk plan, chunk contract, continuity policy, runtime state, and autotune / replan metadata
+  - Stage 3 manifest schema is now `v3`
 - `/tmp/${VIDEO_ID}_raw_text.txt`
-  - raw extracted text
+  - raw extracted transcript-like text
 - `/tmp/${VIDEO_ID}_segments.json`
   - optional timed source segments from subtitles or Deepgram
 - `/tmp/${VIDEO_ID}_structured.txt`
@@ -113,67 +107,135 @@ The current implementation relies on these persisted artifacts:
   - transformed output before final assembly
 - final markdown output under configured output directory
 
-### 3.3 Current State Model
+### 3.3 Current State Surfaces
 
-The current system uses a two-surface state model:
+The current system still uses a two-surface state model:
 
 #### Authoritative surface
 
-- `machine_state.json` is the authoritative state surface for helper commands
-- it stores machine-readable state plus a compatibility projection
-- it also records normalization metadata and the normalized artifact path when normalization is materialized
+- `machine_state.json` is authoritative for helper commands
+- it stores machine-readable source, artifact, workflow, and normalization metadata
+- normalization writes normalized artifact references back into this state
 
 #### Compatibility surface
 
 - `state.md` remains the workflow-facing compatibility surface
-- current workflow docs can continue reading and writing it
-- helper commands automatically import it into `machine_state.json`
-- helper commands also accept direct `machine_state.json` input
+- helper commands still accept it directly and auto-sync `machine_state.json`
 
-#### Current authority rule
+#### Authority rule
 
-At Stage 2, authority works as follows:
+At Stage 3, authority works as follows:
 
-- if a legacy `state.md` is passed to a helper command, the command syncs or refreshes `machine_state.json`
-- if a `machine_state.json` path is passed directly, the helper uses it as authoritative input
-- `sync-state` exists for explicit manual synchronization and recovery tasks
-- normalization writes its artifact path and summary back into `machine_state.json`
+- legacy `state.md` input is synced into `machine_state.json`
+- direct `machine_state.json` input is treated as authoritative
+- planning and normalization read through that bridge
+- chunking operates on downstream artifacts, not on chat-memory assumptions
 
 ### 3.4 Current Normalization Layer
 
-Stage 2 introduces an explicit normalization artifact and a minimal source-adapter boundary.
+Stage 2 introduced an explicit normalization layer, and Stage 3 now treats it as the canonical chunking input whenever available.
 
-The current supported source adapters are:
+The current supported normalization source adapters are:
 
 - `raw_text_file`
-  - reads a transcript-like raw text artifact
-  - normalizes line endings, trailing whitespace, and blank-line density
 - `segments_json`
-  - reads a timed segments payload
-  - normalizes segment text and emits a segment-aware normalized document
 
-The normalization layer currently produces a `normalized_document.json` with:
+The current `normalized_document.json` contains:
 
 - source metadata
 - workflow mode metadata
 - artifact references
-- normalized text content
+- normalized plain text
 - optional normalized segment list
-- a preferred chunk source hint (`text` vs `segments`)
+- `preferred_chunk_source` (`text` or `segments`)
 
-### 3.5 Current Planning Behavior
+### 3.5 Current Chunking Layer
 
-`plan-optimization` now attempts to materialize normalization automatically when source artifacts are available.
+Stage 3 formalizes chunking around three drivers:
 
-This means:
+- `chunk-text`
+  - low-level text chunker
+  - still supported for direct raw-text chunking
+- `chunk-segments`
+  - low-level timed chunker
+  - still supported for direct timed-segment chunking
+- `chunk-document`
+  - new Stage 3 canonical chunker
+  - consumes `normalized_document.json`
+  - auto-selects `segments` vs `text` from normalized content, unless overridden with `--prefer`
 
-- planning still works when only legacy state is provided
-- if raw text or segments are already present, a normalized document artifact is generated during planning
-- if normalization artifacts are not yet available, planning continues without failure and reports normalization as not materialized
+#### Canonical rule
 
-This keeps current workflows working while making the normalization layer real instead of purely conceptual.
+When a normalized document exists, `chunk-document` is the preferred chunking entrypoint.
 
-### 3.6 Current Core Commands
+The lower-level chunkers remain valid compatibility tools and internal building blocks.
+
+#### Current chunk contract
+
+Stage 3 adds an explicit `plan.chunk_contract` section to `manifest.json`.
+
+Its current contract expresses:
+
+- `driver`
+- `source_kind` (`text` or `segments`)
+- `boundary_mode = strict`
+- `output_scope = current_chunk_only`
+- `continuity_mode = reference_only`
+- `merge_strategy = ordered_concat`
+- `overlap_strategy = context_only_no_output_overlap`
+- optional normalized-document reference and source-adapter metadata
+
+This formalizes the current merge assumption:
+
+- chunk outputs should correspond only to the chunk body being transformed
+- continuity is reference-only, not part of emitted output
+- merge remains deterministic ordered concatenation, not fuzzy overlap deduplication
+
+### 3.6 Current Continuity Model
+
+Stage 3 also formalizes continuity as `plan.continuity` in `manifest.json`.
+
+The current policy expresses:
+
+- `mode = reference_only`
+- `tail_sentences`
+- `summary_token_cap`
+- `carry_section_title`
+- `carry_tail_text`
+- `boundary_rule`
+- `output_rule`
+
+#### Important behavioral rule
+
+`process-chunks` now consumes continuity policy from the manifest plan, not only from current runtime config.
+
+That means:
+
+- chunk planning decides continuity policy once
+- execution follows that recorded policy
+- later config drift does not silently change continuity semantics for an existing plan
+
+This is an explicit Stage 3 hardening step.
+
+### 3.7 Current Planning Behavior
+
+`plan-optimization` now does three relevant things:
+
+- validates workflow state
+- auto-materializes normalization when source artifacts exist
+- emits an explicit `chunking` block
+
+The current `chunking` block reports:
+
+- canonical chunk driver (`chunk-document` when normalization is materialized)
+- preferred source kind for chunking
+- boundary mode
+- continuity mode
+- merge strategy
+
+This makes chunking behavior visible at the planning boundary instead of leaving it implicit in workflow prose.
+
+### 3.8 Current Core Commands
 
 The current Python utility surface includes the following architectural primitives:
 
@@ -181,25 +243,26 @@ The current Python utility surface includes the following architectural primitiv
 - `normalize-document`
 - `validate-state`
 - `plan-optimization`
+- `chunk-document`
 - `chunk-text`
 - `chunk-segments`
 - `process-chunks`
+- `replan-remaining`
 - `merge-content`
 - `assemble-final`
 - `verify-quality`
 
-These commands remain the system’s current orchestration center.
+### 3.9 Current Architectural Strengths
 
-### 3.7 Current Architectural Strengths
-
-The system already has several strong design properties:
+The system now has the following concrete strengths:
 
 - script-first routing for high-risk decisions
-- explicit state instead of relying only on chat memory
+- explicit state instead of relying on chat memory
 - backward-compatible state evolution
-- explicit normalization instead of hidden raw-source assumptions
-- prompt specialization by task
-- chunked long-text execution
+- explicit normalization instead of hidden source assumptions
+- explicit chunk contract instead of implied merge behavior
+- plan-owned continuity instead of runtime drift
+- canonical normalized-document chunking
 - manifest-backed resumability for chunk runs
 - deterministic merge and final file assembly
 - explicit verification checkpoints before final output
@@ -212,78 +275,73 @@ These principles are already true in the implemented system and should remain tr
 
 ### 4.1 Script-First Decisions
 
-Branching and validation logic should live in scripts, not in prompt prose, whenever reliability matters.
+Branching and validation logic should live in scripts, not prompt prose, whenever reliability matters.
 
-### 4.2 Narrow Prompt Responsibilities
+### 4.2 Explicit State over Conversational Recall
 
-One prompt should have one primary job whenever possible.
+The system should prefer persisted state files and structured artifacts over model memory.
 
-### 4.3 Explicit State over Conversational Recall
+### 4.3 Explicit Normalization over Implicit Source Assumptions
 
-The system should prefer persisted state files and structured artifacts over relying on model memory.
+Downstream logic should consume a named normalized artifact whenever possible.
 
-### 4.4 Explicit Normalization over Implicit Source Assumptions
+### 4.4 Explicit Chunk Contract over Hidden Merge Assumptions
 
-The system should prefer a named normalized artifact over having downstream logic infer source shape indirectly from raw files.
+Chunk boundaries, output scope, continuity mode, and merge expectations should be recorded in the manifest plan.
 
-### 4.5 Deterministic Steps Stay out of Prompts
+### 4.5 Plan-Owned Continuity over Runtime Drift
 
-Tasks such as state validation, normalization, file assembly, and basic quality gating should remain deterministic.
+Once a chunk plan exists, continuity semantics should come from the manifest plan rather than from whichever config happens to be loaded later.
 
-### 4.6 Weak-Model Compatibility Matters
+### 4.6 Deterministic Steps Stay out of Prompts
 
-The system should keep working with smaller or weaker models by reducing prompt burden and maintaining explicit checkpoints.
+State validation, normalization, chunk-plan metadata, and final assembly should stay deterministic.
 
-### 4.7 Debuggability Is a First-Class Requirement
+### 4.7 Weak-Model Compatibility Matters
 
-Contributors should be able to inspect intermediate artifacts, chunk state, and quality outputs without reverse-engineering hidden runtime behavior.
+The system should continue to work with smaller or weaker models by keeping prompt responsibilities narrow and chunk contracts explicit.
 
-### 4.8 Compatibility Is Allowed When It Preserves Forward Motion
+### 4.8 Debuggability Is a First-Class Requirement
 
-State and artifact evolution are allowed to proceed behind compatibility layers, as long as:
-
-- existing workflows continue to operate
-- the new authoritative or canonical surface is explicit
-- the migration path remains inspectable and reversible
+Intermediate artifacts, manifest plans, chunk contracts, and continuity settings should all remain inspectable on disk.
 
 ---
 
-## 5. Stage 2 Deliverables
+## 5. Stage 3 Deliverables
 
 Completed in this stage:
 
-- introduced `normalized_document.json` as an explicit normalized artifact
-- introduced a minimal source-adapter boundary for `raw_text_file` and `segments_json`
-- added `normalize-document` command for explicit normalization
-- made `plan-optimization` auto-materialize normalization when source artifacts are available
-- extended machine state to retain normalization metadata and normalized artifact references
-- preserved Stage 1 backward compatibility with legacy `state.md` and direct machine-state input
-- added regression coverage for raw-text normalization, segments-based normalization, and planning-driven normalization materialization
+- introduced `chunk-document` as the canonical normalized-document chunker
+- formalized `plan.chunk_contract` in `manifest.json`
+- formalized `plan.continuity` in `manifest.json`
+- made chunk manifests record strict boundary / reference-only continuity assumptions explicitly
+- made `process-chunks` consume continuity policy from the manifest plan
+- made `plan-optimization` emit a `chunking` contract block
+- preserved compatibility with direct `chunk-text` and `chunk-segments` workflows
+- added regression coverage for normalized-document chunking, planning contract output, and plan-owned continuity behavior
 
 Not done in this stage:
 
-- no generalized document schema across many source domains yet
-- no dedicated kernel package layout yet
-- no formal chunk contract or continuity model yet
-- no formal repair/replan contract yet
-- no telemetry module yet
+- no unified chunk lifecycle state machine beyond the current manifest/runtime model
+- no generalized global glossary extraction pass
+- no formal verification / repair / replan policy module
+- no concurrency-safe state store redesign yet
+- no dedicated telemetry module yet
 
 ---
 
 ## 6. Current Known Gaps
 
-The current implementation is stronger than Stage 1, but still not fully kernelized.
+The implementation is meaningfully stronger after Stage 3, but still not fully kernelized.
 
 The main remaining gaps are:
 
-1. chunk contracts and continuity metadata are still implicit or lightweight
-2. normalization exists, but the broader canonical document model is still transcript-shaped
-3. global glossary / entity / style constraint handling is not yet first-class
-4. verification, repair, resume, and replan are not yet unified in one canonical control model
-5. concurrency, testing structure, and telemetry are not yet fully specified as system-level modules
-6. module boundaries are still mostly logical rather than extracted into a dedicated kernel package structure
-
-These gaps define the next implementation stages.
+1. transform runner lifecycle and resume semantics are still embedded in the current manifest/runtime logic
+2. global terminology / entity consistency is still not first-class
+3. verification, repair, and replan are still not unified as one explicit control model
+4. concurrency, state-store strategy, and cancellation are not yet formal system modules
+5. telemetry and testing structure are stronger, but not yet extracted into dedicated subsystems
+6. module boundaries are still logical inside one script, not yet split into a kernel package layout
 
 ---
 
@@ -298,20 +356,12 @@ Each stage should satisfy all of the following:
 - tests or validation steps are updated with the change
 - planned work remains clearly separated from implemented behavior
 
-### Stage 3 — Chunking and Continuity Formalization
-
-Planned scope:
-
-- formalize chunk contracts
-- improve continuity metadata
-- tighten chunk boundaries and merge assumptions
-
 ### Stage 4 — Transform Runner and Resume Semantics
 
 Planned scope:
 
-- harden resumability
-- improve chunk lifecycle semantics
+- harden resumability and partial-run recovery
+- clarify chunk lifecycle states and checkpoint rules
 - prepare for safer concurrency or more explicit execution control
 
 ### Stage 5 — Verification, Repair, and Replan Control Loops
@@ -319,43 +369,44 @@ Planned scope:
 Planned scope:
 
 - formalize verification policy
-- separate repair from replan
-- add bounded control-loop behavior
+- separate repair from replan more explicitly
+- add bounded control-loop behavior and failure contracts
 
 ### Stage 6 — Interfaces, Testing, and Observability
 
 Planned scope:
 
 - formalize CLI and Python API layers
-- improve tests and fixtures
-- define telemetry and debugging expectations
+- improve fixture and regression structure
+- define telemetry and debugging expectations more explicitly
 
 ---
 
-## 8. Stage 2 Validation
+## 8. Stage 3 Validation
 
-The Stage 2 implementation is considered valid because:
+The Stage 3 implementation is considered valid because:
 
-- normalization is now a real artifact rather than a conceptual step
-- planning can materialize normalization automatically when source artifacts already exist
-- both raw-text and timed-segment source shapes are now handled explicitly at the helper boundary
-- current workflows remain compatible with Stage 1 state surfaces
-- regression coverage now exercises both normalization paths
+- chunking is now routed through an explicit canonical driver when normalization exists
+- manifest plans now record chunk and continuity contracts explicitly
+- execution follows manifest continuity policy rather than silently drifting with runtime config
+- direct `chunk-text` and `chunk-segments` compatibility is preserved
+- planning now exposes chunking assumptions explicitly
 
 Representative validated behaviors in this stage include:
 
-- materializing normalized documents from raw text artifacts
-- preferring timed segments when both segments and raw text exist
-- recording normalization metadata back into machine state
-- materializing normalized documents during `plan-optimization`
+- chunking normalized documents through `chunk-document`
+- preferring segment-aware chunking when normalized segments are available
+- forcing text-mode chunking from the same normalized document when requested
+- recording strict boundary and reference-only continuity in manifest plans
+- exposing chunking contract data from `plan-optimization`
+- keeping continuity behavior stable even when runtime config disables it after planning
 
 ---
 
 ## 9. Next Stage Entry Criteria
 
-Stage 3 should begin only when the following are agreed:
+Stage 4 should begin only when the following are agreed:
 
-1. what the minimum explicit chunk contract should be
-2. what continuity metadata belongs to chunk planning versus chunk execution
-3. whether chunk boundary strictness should become a hard contract or remain a best-effort behavior in this repository
-
+1. what the minimum explicit chunk lifecycle state machine should be
+2. what counts as a resumable checkpoint versus a recoverable partial write
+3. whether resumability remains file-based only or gains a more explicit state-store abstraction
