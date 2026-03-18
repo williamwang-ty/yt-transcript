@@ -1,10 +1,10 @@
-# System Design (v5.7-stage7)
+# System Design (v5.8-stage8)
 
-**Stage**: 7
+**Stage**: 8
 
 **Status**: accepted and implemented
 
-**Behavior change in this stage**: extracted the Stage 6 envelope and telemetry helpers into `kernel_runtime.py`, added inspectable work-dir ownership files for manifest-mutating commands, and kept the Stage 6 Python and CLI interfaces backward compatible
+**Behavior change in this stage**: extracted local manifest and runtime-control file handling into `kernel_state.py`, added a public `runtime-status` inspection command, and preserved the Stage 7 runtime ownership and Stage 6 envelope contracts
 
 **Source of truth**: This file is the canonical system design document for the repository.
 
@@ -12,18 +12,18 @@
 
 ---
 
-## 1. Stage 7 Goal
+## 1. Stage 8 Goal
 
-Stage 7 hardens the runtime boundary of the long-text kernel.
+Stage 8 hardens the local state-store boundary of the long-text kernel.
 
 Its goals are:
 
-- extract stable envelope, telemetry, and command-dispatch helpers into a dedicated runtime module
-- formalize single-owner mutation semantics for manifest-mutating commands at the work-dir level
-- make runtime ownership conflicts and stale-owner recovery explicit and inspectable on disk
-- decide which envelope and telemetry fields are stable enough to preserve across future extraction work
+- extract manifest and local runtime-control file handling into a dedicated state module
+- add a public runtime inspection command without entangling mutation logic with CLI-only behavior
+- keep ownership, envelope, and telemetry contracts compatible while making local state surfaces easier to reuse
+- keep cancellation state local and inspectable while deferring public cancellation control to the next stage
 
-Stage 7 remains intentionally bounded. It does **not** introduce cancellation, a distributed runtime, or a fully concurrency-safe persistent state store.
+Stage 8 remains intentionally bounded. It does **not** yet extract the controller loops or expose cancellation as a public mutation command.
 
 ---
 
@@ -45,6 +45,7 @@ Its current implemented use cases are:
 - stable kernel command envelopes for Python and CLI consumers
 - local telemetry journals for kernel command runs
 - local runtime ownership for manifest-mutating commands
+- local runtime status inspection for work directories
 - deterministic merge and final markdown assembly
 - workflow validation and stop/go quality checks
 
@@ -54,14 +55,14 @@ Its current implemented use cases are:
 
 ### 2.3 Current Non-Goals
 
-At Stage 7, the system is **not yet**:
+At Stage 8, the system is **not yet**:
 
 - a generalized multi-source document transformation framework
 - a reusable extracted kernel package
 - a global glossary / terminology propagation system
 - an LLM-judge semantic verification system
 - a fully concurrency-safe persistent state store beyond local single-owner work-dir mutation
-- a cancellation / pause protocol for long-running jobs
+- a public cancellation / pause protocol for long-running jobs
 - a telemetry-first production runtime with remote aggregation or tracing backends
 
 ---
@@ -93,6 +94,10 @@ source acquisition
   -> quality verification
   -> runtime ownership release
   -> local telemetry journal append
+
+read-only runtime inspection
+  -> manifest / ownership / local control snapshot
+  -> stable runtime-status result
 ```
 
 ### 3.2 Current Persisted Artifacts
@@ -107,7 +112,7 @@ The current implementation relies on these persisted artifacts:
   - normalized source artifact
 - `manifest.json` in chunk work directories
   - chunk plan, chunk contract, continuity policy, runtime state, resume / autotune / replan metadata, and explicit operation-control state
-  - manifest schema remains `v5` in Stage 7
+  - manifest schema remains `v5` in Stage 8
 - `/tmp/${VIDEO_ID}_raw_text.txt`
   - raw extracted transcript-like text
 - `/tmp/${VIDEO_ID}_segments.json`
@@ -121,6 +126,8 @@ The current implementation relies on these persisted artifacts:
   - append-only local command journal for envelope-producing kernel commands
 - `.runtime_owner.json` inside chunk work directories during manifest-mutating operations
   - inspectable single-owner runtime marker used by `prepare-resume`, `process-chunks`, `replan-remaining`, and `process-chunks-with-replans`
+- optional `.runtime_cancel.json` inside chunk work directories
+  - reserved local runtime-control marker surfaced by `runtime-status`; public cancellation commands are not implemented until the next stage
 
 ### 3.3 Current State Surfaces
 
@@ -258,7 +265,7 @@ Its current role is:
 
 `process-chunks` now calls the same repair logic automatically before execution starts and returns the resume report in its JSON result.
 
-### 3.11 Current Planning, Interface, Control, and Ownership Surfaces
+### 3.11 Current Planning, Interface, State, Control, and Ownership Surfaces
 
 `plan-optimization` now:
 
@@ -291,6 +298,15 @@ Its current responsibilities are:
 - local telemetry sink inference and append-only journal writes
 - compatibility-preserving command dispatch wrapping for kernel commands
 - local runtime ownership acquisition / release helpers for manifest-mutating commands
+
+Stage 8 now also defines a state-store boundary in `kernel_state.py`.
+
+Its current responsibilities are:
+
+- manifest path resolution and JSON read/write helpers
+- atomic local file writes for manifest-adjacent runtime artifacts
+- local runtime-control file summaries
+- read-only runtime inspection via `runtime-status`
 
 The stable envelope now treated as long-term compatible uses:
 
@@ -327,6 +343,12 @@ Stage 7 also adds a local runtime ownership surface:
 - `work_dir`
 - `acquired_at`
 - owner file path `.runtime_owner.json`
+
+Stage 8 also adds a read-only runtime status surface:
+
+- `runtime-status` is a stable kernel command for local inspection
+- it reports manifest presence, runtime state, chunk-status counts, ownership state, and local cancellation-marker state
+- it does not mutate the work directory and therefore does not acquire runtime ownership
 
 The current ownership policy is:
 
@@ -365,6 +387,7 @@ The current Python utility surface includes the following architectural primitiv
 - `prepare-resume`
 - `process-chunks`
 - `replan-remaining`
+- `runtime-status`
 - `merge-content`
 - `assemble-final`
 - `verify-quality`
@@ -436,40 +459,39 @@ New public interfaces should prefer additive envelope layers over breaking chang
 
 ---
 
-## 5. Stage 7 Deliverables
+## 5. Stage 8 Deliverables
 
 Completed in this stage:
 
-- extracted the Stage 6 envelope, telemetry, and command-dispatch helpers into `kernel_runtime.py`
-- kept `run_kernel_command(...)` and CLI `--api-envelope` behavior compatible while routing through the extracted runtime module
-- formalized `yt_transcript.runtime_owner/v1` as the current local ownership record format
-- added `.runtime_owner.json` ownership files for manifest-mutating work directories
-- gated `prepare-resume`, `process-chunks`, `replan-remaining`, and `process-chunks-with-replans` behind local ownership acquisition
-- added stale-owner recovery for invalid or dead owners before reacquiring a work-dir mutation lock
-- added regression coverage for ownership conflicts, stale-owner recovery, and shared ownership across auto-replan loops
+- extracted manifest and adjacent local runtime-control file handling into `kernel_state.py`
+- moved atomic manifest-adjacent file writes behind the new state-store module
+- added `runtime-status` as a read-only kernel command for inspecting work-dir runtime state
+- exposed current ownership and local cancellation-marker state through the runtime-status result
+- kept Stage 7 ownership semantics and Stage 6 envelope / telemetry contracts compatible
+- added regression coverage for runtime-status in both direct Python use and CLI envelope mode
 
 Not done in this stage:
 
-- no cancellation or pause protocol yet
-- no distributed or remote ownership backend yet
+- no public cancellation command yet
+- no extracted controller module yet
 - no fully concurrency-safe persistent state store yet
+- no distributed or remote runtime backend yet
 - no subsystem test-package split yet
-- no controller extraction beyond the runtime boundary module yet
 
 ---
 
 ## 6. Current Known Gaps
 
-The implementation is meaningfully stronger after Stage 7, but still not fully kernelized.
+The implementation is meaningfully stronger after Stage 8, but still not fully kernelized.
 
 The main remaining gaps are:
 
-1. the runtime boundary is extracted, but most controller and state logic still lives in one large script
+1. the runtime and state-store boundaries are extracted, but most controller logic still lives in one large script
 2. telemetry is local and append-only, but not yet a first-class subsystem with querying or aggregation
 3. verification remains deterministic / heuristic only and does not yet include semantic judge layers
 4. global terminology / entity consistency is still not first-class
 5. ownership is local single-writer gating, not a general concurrent state-store protocol
-6. cancellation, pause, and long-lived job control are not formalized
+6. cancellation state is inspectable locally, but not yet part of the public mutation command surface
 7. test coverage is stronger around the runtime boundary, but fixtures are not yet split into dedicated suites by subsystem
 
 ---
@@ -507,40 +529,48 @@ Implemented scope:
 - formalized local work-dir ownership for manifest-mutating commands
 - fixed stable envelope / telemetry fields for future extraction work
 
-### Stage 8 — Controller Extraction and Stateful Runtime Control
+### Stage 8 — State Store Extraction and Runtime Inspection
+
+Implemented scope:
+
+- extracted local manifest and runtime-control file handling into `kernel_state.py`
+- added read-only `runtime-status` inspection for work directories
+- kept ownership and interface contracts stable while making state surfaces reusable
+
+### Stage 9 — Controller Extraction and Public Cancellation
 
 Planned scope:
 
-- extract more controller and state-store responsibilities from `yt_transcript_utils.py`
-- decide whether cancellation remains local-only or becomes part of the public runtime contract
-- formalize stronger multi-process state handling beyond the current owner-file gate
+- extract mutation wrappers and bounded control-loop orchestration into a controller module
+- promote local cancellation from an inspectable marker to a public command contract
+- integrate cancellation checks into long-running chunk execution without breaking current ownership guarantees
 
 ---
 
-## 8. Stage 7 Validation
+## 8. Stage 8 Validation
 
-The Stage 7 implementation is considered valid because:
+The Stage 8 implementation is considered valid because:
 
-- Stage 6 envelope behavior remains compatible while the runtime helpers now live in `kernel_runtime.py`
-- manifest-mutating commands now reject concurrent ownership conflicts instead of mutating shared state silently
-- stale local owners can be recovered deterministically when their owner files are invalid or their pids are dead
-- auto-replan loops now reuse one outer ownership claim instead of recursively reacquiring the same work-dir lock
-- ownership artifacts remain inspectable on disk without introducing a remote runtime dependency
+- manifest-adjacent file handling now has a dedicated module in `kernel_state.py`
+- `runtime-status` exposes current runtime, ownership, and local control state without mutating the work directory
+- Stage 7 ownership semantics remain intact for mutating commands
+- Stage 6 envelope behavior remains compatible for the new read-only runtime command
+- local state artifacts remain inspectable on disk without requiring a remote runtime service
 
 Representative validated behaviors in this stage include:
 
-- returning `yt_transcript.command_result/v1` envelopes from `run_kernel_command(...)` after runtime extraction
-- appending `yt_transcript.telemetry_event/v1` entries into inferred local `telemetry.jsonl` sinks through `kernel_runtime.py`
-- writing and releasing `.runtime_owner.json` during manifest-mutating command execution
-- returning structured ownership conflicts from `process-chunks` when another active owner already holds the work directory
-- recovering stale owner files during `prepare-resume` and preserving a shared owner across `process-chunks-with-replans`
+- reading manifest runtime and chunk-status counts through `runtime-status`
+- reporting current `.runtime_owner.json` state through the same read-only command
+- surfacing the current `.runtime_cancel.json` marker state, even before public cancellation commands exist
+- emitting `yt_transcript.command_result/v1` envelopes for `runtime-status` in CLI `--api-envelope` mode
+- keeping existing manifest mutation and telemetry flows compatible while reusing `kernel_state.py`
 
 ---
 
 ## 9. Next Stage Entry Criteria
 
-Stage 8 should begin only when the following are agreed:
+Stage 9 should begin only when the following are agreed:
 
-1. which controller and state responsibilities should move out of `yt_transcript_utils.py` next
-2. whether cancellation becomes a public runtime contract or remains an internal/local concern
-3. what stronger state-store guarantees are worth adding beyond the current `.runtime_owner.json` single-owner gate
+1. which mutation wrappers and orchestration helpers should move into a controller module first
+2. whether public cancellation should clear local markers automatically on consumption or preserve them for inspection
+3. how cancellation should interact with ownership and resumable manifest state transitions

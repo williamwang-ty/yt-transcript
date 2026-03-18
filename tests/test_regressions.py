@@ -1306,6 +1306,65 @@ exit 1
             self.assertTrue(result["dry_run"])
             self.assertEqual(result["request_url"], "")
 
+    def test_runtime_status_reports_manifest_runtime_ownership_and_counts(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source = Path(tmpdir) / "raw.txt"
+            work_dir = Path(tmpdir) / "chunks"
+            source.write_text("第一句。第二句。第三句。第四句。", encoding="utf-8")
+            utils.chunk_text(str(source), str(work_dir), 4, "structure_only")
+
+            manifest_path = work_dir / "manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["chunks"][0]["status"] = "done"
+            manifest["chunks"][1]["status"] = "failed"
+            manifest["runtime"]["status"] = "running"
+            manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+
+            ownership = utils.kernel_runtime.acquire_runtime_ownership(str(work_dir), "status-test")
+            try:
+                result = utils.runtime_status(str(work_dir))
+            finally:
+                utils.kernel_runtime.release_runtime_ownership(str(work_dir), ownership["owner_id"])
+
+            self.assertTrue(result["success"])
+            self.assertTrue(result["manifest_present"])
+            self.assertEqual(result["runtime"]["status"], "running")
+            self.assertEqual(result["total_chunks"], len(manifest["chunks"]))
+            self.assertEqual(result["completed_chunks"], 1)
+            self.assertEqual(result["failed_chunks"], 1)
+            self.assertEqual(result["ownership"]["status"], "held")
+            self.assertTrue(result["ownership"]["held"])
+            self.assertFalse(result["cancellation"]["requested"])
+
+    def test_cli_api_envelope_wraps_runtime_status(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source = Path(tmpdir) / "raw.txt"
+            work_dir = Path(tmpdir) / "chunks"
+            source.write_text("第一句。第二句。第三句。第四句。", encoding="utf-8")
+            utils.chunk_text(str(source), str(work_dir), 4, "structure_only")
+
+            result = subprocess.run(
+                [
+                    "python3",
+                    str(PROJECT_ROOT / "yt_transcript_utils.py"),
+                    "--api-envelope",
+                    "runtime-status",
+                    str(work_dir),
+                ],
+                cwd=PROJECT_ROOT,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+            payload = json.loads(result.stdout)
+            telemetry_path = Path(payload["telemetry"]["telemetry_path"])
+            self.assertEqual(payload["format"], utils.COMMAND_RESULT_FORMAT)
+            self.assertEqual(payload["command"], "runtime-status")
+            self.assertTrue(payload["ok"])
+            self.assertTrue(payload["result"]["manifest_present"])
+            self.assertTrue(telemetry_path.exists())
+
     def test_cli_api_envelope_wraps_plan_optimization(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             state = Path(tmpdir) / "state.md"

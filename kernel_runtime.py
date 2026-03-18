@@ -308,6 +308,46 @@ def _classify_stale_owner(record: dict | None, read_error: str = "") -> str:
     return ""
 
 
+def read_runtime_ownership(work_dir: str) -> dict:
+    owner_path = _runtime_owner_path(work_dir)
+    existing_record, read_error = _load_runtime_owner(owner_path)
+    if not owner_path.exists():
+        result = summarize_runtime_ownership(None, owner_path, status="absent")
+        result.update({
+            "success": True,
+            "held": False,
+        })
+        return result
+
+    stale_reason = _classify_stale_owner(existing_record, read_error)
+    if read_error:
+        result = summarize_runtime_ownership({"error": read_error}, owner_path, status="invalid")
+        result.update({
+            "success": False,
+            "held": False,
+            "error": read_error,
+        })
+        return result
+    if stale_reason:
+        payload = dict(existing_record or {})
+        payload["stale_reason"] = stale_reason
+        result = summarize_runtime_ownership(payload, owner_path, status="stale")
+        result.update({
+            "success": True,
+            "held": False,
+            "stale": True,
+        })
+        return result
+
+    result = summarize_runtime_ownership(existing_record, owner_path, status="held")
+    result.update({
+        "success": True,
+        "held": True,
+        "held_by_current_process": _parse_int((existing_record or {}).get("pid"), 0) == os.getpid(),
+    })
+    return result
+
+
 def acquire_runtime_ownership(work_dir: str, operation: str, owner_id: str = "") -> dict:
     work_path = Path(str(work_dir or "")).expanduser()
     resolved_work_dir = str(work_path.resolve())

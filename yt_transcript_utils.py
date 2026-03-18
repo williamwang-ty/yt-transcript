@@ -30,6 +30,7 @@ Commands:
     process-chunks <work_dir> --prompt <name>  Process chunks with isolated LLM API calls (--input-key for chained processing)
     prepare-resume <work_dir>      Repair stale chunk/runtime state before resuming a run
     replan-remaining <work_dir>    Re-plan unfinished raw chunks after canary/autotune aborts
+    runtime-status <work_dir>      Inspect manifest runtime, ownership, and local runtime-control status
     assemble-final <optimized_text> <output_file>  Assemble final markdown from optimized text + metadata
     verify-quality <optimized_text>  Verify quality of optimized text (structural checks)
     sync-state <state_ref>         Sync legacy state.md and authoritative machine_state.json
@@ -58,6 +59,7 @@ import urllib.parse
 from pathlib import Path
 
 import kernel_runtime
+import kernel_state
 
 
 def _skill_root() -> Path:
@@ -2301,14 +2303,8 @@ def _split_text_into_chunks(sentences: list[str], chunk_mode: str,
     return chunks, warnings
 
 
-def _atomic_write_text(path: Path, content: str) -> None:
-    tmp_path = path.with_name(f".{path.name}.tmp")
-    tmp_path.write_text(content, encoding="utf-8")
-    os.replace(tmp_path, path)
-
-
-def _write_manifest(manifest_path: Path, manifest: dict) -> None:
-    _atomic_write_text(manifest_path, json.dumps(manifest, ensure_ascii=False, indent=2))
+_atomic_write_text = kernel_state.atomic_write_text
+_write_manifest = kernel_state.write_manifest
 
 
 def _is_retryable_status(status_code: int) -> bool:
@@ -3194,6 +3190,10 @@ def test_deepgram_api(api_key: str) -> dict:
 build_command_result_envelope = kernel_runtime.build_command_result_envelope
 
 
+def runtime_status(work_dir: str) -> dict:
+    return kernel_state.summarize_runtime_status(work_dir)
+
+
 def _kernel_command_registry() -> dict[str, object]:
     return {
         "validate-state": validate_state,
@@ -3204,6 +3204,7 @@ def _kernel_command_registry() -> dict[str, object]:
         "chunk-document": chunk_document,
         "prepare-resume": prepare_resume,
         "replan-remaining": replan_remaining,
+        "runtime-status": runtime_status,
         "merge-content": lambda *, work_dir, output_file, header="": merge_content(work_dir, output_file, header_content=header),
         "assemble-final": assemble_final,
         "verify-quality": verify_quality,
@@ -7230,6 +7231,13 @@ def main():
     replan_parser.add_argument('--config-path', default=None,
                                help='Optional path to config file')
 
+    # runtime-status command
+    runtime_status_parser = subparsers.add_parser(
+        'runtime-status',
+        help='Inspect manifest runtime, ownership, and local runtime-control state'
+    )
+    runtime_status_parser.add_argument('work_dir', help='Working directory to inspect')
+
     # assemble-final command
     af_parser = subparsers.add_parser(
         'assemble-final',
@@ -7473,6 +7481,13 @@ def main():
         print(json.dumps(envelope if args.api_envelope else result, ensure_ascii=False))
         if not result.get('success', False):
             sys.exit(1)
+
+    elif args.command == 'runtime-status':
+        envelope = run_kernel_command(
+            'runtime-status',
+            work_dir=args.work_dir,
+        )
+        print(json.dumps(envelope if args.api_envelope else envelope['result'], ensure_ascii=False))
 
     elif args.command == 'assemble-final':
         envelope = run_kernel_command(
