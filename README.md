@@ -236,6 +236,8 @@ Current policy is intentional and explicit:
 - `manifest.json` now separates immutable `plan` metadata from `runtime` state, and `process-chunks` records attempt-level telemetry (`attempt_logs`) in addition to chunk-level fields
 - `process-chunks` no longer rewrites the current batch budget on the fly; when canary chunks or retry history show the plan is unhealthy, it aborts with `replan_required=true` so `replan-remaining` can generate a new plan for unfinished raw chunks
 - `process-chunks --auto-replan` preserves that architecture boundary while automating the orchestration loop (`process -> replan-remaining -> resume`) for raw-path plans
+- `run_kernel_command(...)` is the stable Python envelope API for kernel commands, and `python3 yt_transcript_utils.py --api-envelope ...` emits the same `yt_transcript.command_result/v1` envelope on the CLI without breaking legacy flat JSON output
+- envelope-producing kernel commands append local `yt_transcript.telemetry_event/v1` records to `telemetry.jsonl` when a stable nearby sink path can be inferred
 - `runtime.status` now distinguishes `completed`, `completed_with_errors`, and `aborted`, and raw-path replans remap existing `chapter_plan.json` chunk starts so merged chapter headers still land on valid chunk boundaries
 - runtime token estimation remains heuristic by default; `test-token-count` / `preflight.sh --require-llm` probe provider-side token counting and clearly fall back to local estimates when unavailable
 - `chunk_hard_cap_multiplier` is constrained to a conservative `1.0-2.0` range so misconfiguration cannot silently blow up chunk envelopes

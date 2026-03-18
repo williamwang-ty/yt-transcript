@@ -9,7 +9,7 @@ This module also owns the script-first workflow checkpoints:
 - `verify-quality` for final stop/go gating
 
 Usage:
-    python3 yt_transcript_utils.py <command> [args]
+    python3 yt_transcript_utils.py [--api-envelope] <command> [args]
 
 Commands:
     parse-vtt <vtt_path>           Parse VTT subtitle file, output plain text
@@ -36,6 +36,9 @@ Commands:
     normalize-document <state_ref> Materialize normalized_document.json from raw text or segments
     validate-state <state_path>    Validate workflow state fields for a given stage
     plan-optimization <state_path> Generate a structured optimization plan from workflow state
+
+Global flags:
+    --api-envelope               Emit stable `yt_transcript.command_result/v1` envelopes for kernel commands
 """
 
 import argparse
@@ -283,6 +286,10 @@ DEFAULT_LLM_CHUNK_RECOVERY_BACKOFF_SEC = 1.0
 MANIFEST_SCHEMA_VERSION = 5
 CHUNK_CONTRACT_SCHEMA_VERSION = 1
 CONTROL_CONTRACT_SCHEMA_VERSION = 1
+COMMAND_RESULT_SCHEMA_VERSION = 1
+COMMAND_RESULT_FORMAT = "yt_transcript.command_result/v1"
+TELEMETRY_EVENT_SCHEMA_VERSION = 1
+TELEMETRY_EVENT_FORMAT = "yt_transcript.telemetry_event/v1"
 DEFAULT_UNKNOWN_CHUNK_TOKENS = 900
 CHUNK_SEPARATOR = "\n\n"
 DEFAULT_UNKNOWN_OUTPUT_RATIO = 1.0
@@ -3052,6 +3059,265 @@ def test_deepgram_api(api_key: str) -> dict:
         return {"valid": False, "error": f"Network error: {e.reason}", "balance_warning": False}
     except Exception as e:
         return {"valid": False, "error": f"Unexpected error: {e}", "balance_warning": False}
+
+
+def _new_trace_id(command: str = "") -> str:
+    payload = f"{command}:{time.time_ns()}:{os.getpid()}:{random.random()}"
+    return hashlib.sha1(payload.encode("utf-8")).hexdigest()[:16]
+
+
+def _command_warning_count(result) -> int:
+    if not isinstance(result, dict):
+        return 0
+    if "warning_count" in result:
+        return max(0, _parse_int(result.get("warning_count"), 0))
+    warnings = result.get("warnings", [])
+    return len(warnings) if isinstance(warnings, list) else 0
+
+
+def _infer_command_success(result) -> bool:
+    if isinstance(result, dict):
+        if "success" in result:
+            return bool(result.get("success"))
+        if "passed" in result:
+            return bool(result.get("passed"))
+        if "valid" in result:
+            return bool(result.get("valid"))
+        hard_failures = result.get("hard_failures")
+        if isinstance(hard_failures, list):
+            return len(hard_failures) == 0
+    return True
+
+
+def _coerce_path(value: str = "") -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    return str(Path(text).expanduser().resolve())
+
+
+def _infer_command_document_id(command: str, result, context: dict | None = None) -> str:
+    context = context or {}
+    if isinstance(result, dict):
+        outputs = result.get("outputs", {}) if isinstance(result.get("outputs", {}), dict) else {}
+        if outputs.get("work_dir"):
+            return Path(str(outputs["work_dir"])).name
+        manifest_path = str(result.get("manifest_path", "") or "").strip()
+        if manifest_path:
+            return Path(manifest_path).resolve().parent.name
+        normalized_document_path = str(result.get("normalized_document_path", "") or "").strip()
+        if normalized_document_path:
+            return Path(normalized_document_path).resolve().stem
+    for key in ("work_dir", "output_dir"):
+        value = str(context.get(key, "") or "").strip()
+        if value:
+            return Path(value).resolve().name
+    for key in ("state_path", "state_ref"):
+        value = str(context.get(key, "") or "").strip()
+        if value:
+            return Path(value).resolve().stem
+    if command:
+        return command
+    return ""
+
+
+def _resolve_command_telemetry_path(command: str, result, context: dict | None = None) -> str:
+    del command
+    context = context or {}
+    candidates = []
+
+    for key in ("work_dir", "output_dir"):
+        value = str(context.get(key, "") or "").strip()
+        if value:
+            candidates.append(Path(value).expanduser())
+
+    if isinstance(result, dict):
+        manifest_path = str(result.get("manifest_path", "") or "").strip()
+        if manifest_path:
+            candidates.append(Path(manifest_path).expanduser().parent)
+        result_work_dir = str(result.get("work_dir", "") or "").strip()
+        if result_work_dir:
+            candidates.append(Path(result_work_dir).expanduser())
+        normalized_document_path = str(result.get("normalized_document_path", "") or "").strip()
+        if normalized_document_path:
+            candidates.append(Path(normalized_document_path).expanduser().parent)
+        outputs = result.get("outputs", {}) if isinstance(result.get("outputs", {}), dict) else {}
+        output_work_dir = str(outputs.get("work_dir", "") or "").strip()
+        if output_work_dir:
+            candidates.append(Path(output_work_dir).expanduser())
+        for key in ("output_file", "optimized_text"):
+            value = str(result.get(key, outputs.get(key, "")) or "").strip()
+            if value:
+                candidates.append(Path(value).expanduser().parent)
+
+    for key in ("output_file", "optimized_text_path", "output_path", "normalized_document_path", "state_path", "state_ref"):
+        value = str(context.get(key, "") or "").strip()
+        if value:
+            candidates.append(Path(value).expanduser().parent)
+
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve()
+        except OSError:
+            continue
+        return str(resolved / "telemetry.jsonl")
+    return ""
+
+
+def _build_command_telemetry_event(command: str, result, *, trace_id: str,
+                                   started_at: float, context: dict | None = None,
+                                   telemetry_path: str = "") -> dict:
+    context = context or {}
+    duration_ms = max(0, int((time.monotonic() - started_at) * 1000))
+    warning_count = _command_warning_count(result)
+    event = {
+        "schema_version": TELEMETRY_EVENT_SCHEMA_VERSION,
+        "format": TELEMETRY_EVENT_FORMAT,
+        "event_type": "command_result",
+        "command": str(command or "").strip(),
+        "trace_id": trace_id,
+        "timestamp": _now_iso(),
+        "duration_ms": duration_ms,
+        "success": _infer_command_success(result),
+        "warning_count": warning_count,
+        "document_id": _infer_command_document_id(command, result, context),
+        "telemetry_path": telemetry_path,
+    }
+    if isinstance(result, dict):
+        event["request_url"] = str(result.get("request_url", "") or "")
+        if "processed_count" in result:
+            event["processed_count"] = _parse_int(result.get("processed_count"), 0)
+        if "failed_count" in result:
+            event["failed_count"] = _parse_int(result.get("failed_count"), 0)
+        if "replan_required" in result:
+            event["replan_required"] = bool(result.get("replan_required", False))
+        if "dry_run" in result:
+            event["dry_run"] = bool(result.get("dry_run", False))
+    prompt_name = str(context.get("prompt_name", context.get("prompt", "")) or "").strip()
+    if not prompt_name and isinstance(result, dict):
+        prompt_name = str(result.get("prompt_name", result.get("plan", {}).get("prompt_name", "")) or "").strip()
+    if prompt_name:
+        event["prompt_name"] = prompt_name
+    return event
+
+
+def _append_command_telemetry_event(telemetry_path: str, event: dict) -> str:
+    path_text = str(telemetry_path or "").strip()
+    if not path_text:
+        return ""
+    telemetry_file = Path(path_text)
+    try:
+        telemetry_file.parent.mkdir(parents=True, exist_ok=True)
+        with telemetry_file.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(event, ensure_ascii=False) + "\n")
+        return str(telemetry_file)
+    except OSError:
+        return ""
+
+
+def build_command_result_envelope(command: str, result, *, trace_id: str = "",
+                                  started_at: float | None = None,
+                                  telemetry_path: str = "",
+                                  context: dict | None = None) -> dict:
+    context = context or {}
+    resolved_trace_id = str(trace_id or _new_trace_id(command)).strip()
+    started = started_at if started_at is not None else time.monotonic()
+    resolved_telemetry_path = telemetry_path or _resolve_command_telemetry_path(command, result, context)
+    event = _build_command_telemetry_event(
+        command,
+        result,
+        trace_id=resolved_trace_id,
+        started_at=started,
+        context=context,
+        telemetry_path=resolved_telemetry_path,
+    )
+    persisted_telemetry_path = _append_command_telemetry_event(resolved_telemetry_path, event)
+    event["telemetry_path"] = persisted_telemetry_path
+    return {
+        "schema_version": COMMAND_RESULT_SCHEMA_VERSION,
+        "format": COMMAND_RESULT_FORMAT,
+        "command": str(command or "").strip(),
+        "trace_id": resolved_trace_id,
+        "generated_at": event["timestamp"],
+        "ok": bool(event["success"]),
+        "telemetry": {
+            "event_type": event["event_type"],
+            "duration_ms": event["duration_ms"],
+            "warning_count": event["warning_count"],
+            "document_id": event.get("document_id", ""),
+            "telemetry_path": persisted_telemetry_path,
+        },
+        "result": result,
+    }
+
+
+def _kernel_command_registry() -> dict[str, object]:
+    return {
+        "validate-state": validate_state,
+        "normalize-document": normalize_document,
+        "plan-optimization": plan_optimization,
+        "chunk-text": chunk_text,
+        "chunk-segments": chunk_segments,
+        "chunk-document": chunk_document,
+        "prepare-resume": prepare_resume,
+        "replan-remaining": replan_remaining,
+        "merge-content": lambda *, work_dir, output_file, header="": merge_content(work_dir, output_file, header_content=header),
+        "assemble-final": assemble_final,
+        "verify-quality": verify_quality,
+    }
+
+
+def _dispatch_process_chunks_command(*, work_dir: str, prompt_name: str, extra_instruction: str = "",
+                                     config_path: str = None, dry_run: bool = False,
+                                     input_key: str = "raw_path", force: bool = False,
+                                     auto_replan: bool = False, max_replans: int = 3) -> dict:
+    if auto_replan and not dry_run:
+        return process_chunks_with_replans(
+            work_dir,
+            prompt_name,
+            extra_instruction=extra_instruction,
+            config_path=config_path,
+            input_key=input_key,
+            force=force,
+            max_replans=max_replans,
+        )
+    return process_chunks(
+        work_dir,
+        prompt_name,
+        extra_instruction=extra_instruction,
+        config_path=config_path,
+        dry_run=dry_run,
+        input_key=input_key,
+        force=force,
+    )
+
+
+def run_kernel_command(command: str, **kwargs) -> dict:
+    normalized_command = str(command or "").strip()
+    started_at = time.monotonic()
+    trace_id = _new_trace_id(normalized_command)
+
+    if normalized_command == "process-chunks":
+        result = _dispatch_process_chunks_command(**kwargs)
+        return build_command_result_envelope(
+            normalized_command,
+            result,
+            trace_id=trace_id,
+            started_at=started_at,
+            context=kwargs,
+        )
+
+    registry = _kernel_command_registry()
+    if normalized_command not in registry:
+        raise ValueError(f"Unsupported kernel command: {normalized_command}")
+    result = registry[normalized_command](**kwargs)
+    return build_command_result_envelope(
+        normalized_command,
+        result,
+        trace_id=trace_id,
+        started_at=started_at,
+        context=kwargs,
+    )
 
 
 def _prepare_chunking_context(prompt_name: str = "", chunk_size: int = 0,
@@ -6710,6 +6976,11 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__
     )
+    parser.add_argument(
+        '--api-envelope',
+        action='store_true',
+        help='Emit stable kernel-command result envelopes instead of legacy flat JSON for kernel commands',
+    )
     subparsers = parser.add_subparsers(dest='command', help='Available commands')
 
     # parse-vtt command
@@ -7077,24 +7348,40 @@ def main():
         print(json.dumps(result, ensure_ascii=False))
 
     elif args.command == 'chunk-text':
-        result = chunk_text(args.input_path, args.output_dir, args.chunk_size, args.prompt, args.config_path)
-        print(json.dumps(result, ensure_ascii=False))
+        envelope = run_kernel_command(
+            'chunk-text',
+            input_path=args.input_path,
+            output_dir=args.output_dir,
+            chunk_size=args.chunk_size,
+            prompt_name=args.prompt,
+            config_path=args.config_path,
+        )
+        print(json.dumps(envelope if args.api_envelope else envelope['result'], ensure_ascii=False))
 
     elif args.command == 'chunk-segments':
-        result = chunk_segments(args.segments_path, args.output_dir, args.chunk_size, args.prompt, args.config_path, chapters_path=args.chapters)
-        print(json.dumps(result, ensure_ascii=False))
+        envelope = run_kernel_command(
+            'chunk-segments',
+            segments_path=args.segments_path,
+            output_dir=args.output_dir,
+            chunk_size=args.chunk_size,
+            prompt_name=args.prompt,
+            config_path=args.config_path,
+            chapters_path=args.chapters,
+        )
+        print(json.dumps(envelope if args.api_envelope else envelope['result'], ensure_ascii=False))
 
     elif args.command == 'chunk-document':
-        result = chunk_document(
-            args.normalized_document_path,
-            args.output_dir,
-            args.chunk_size,
-            args.prompt,
-            args.config_path,
+        envelope = run_kernel_command(
+            'chunk-document',
+            normalized_document_path=args.normalized_document_path,
+            output_dir=args.output_dir,
+            chunk_size=args.chunk_size,
+            prompt_name=args.prompt,
+            config_path=args.config_path,
             chapters_path=args.chapters,
             prefer=args.prefer,
         )
-        print(json.dumps(result, ensure_ascii=False))
+        print(json.dumps(envelope if args.api_envelope else envelope['result'], ensure_ascii=False))
 
     elif args.command == 'get-chapters':
         result = get_chapters(args.video_url)
@@ -7105,66 +7392,81 @@ def main():
         print(json.dumps(result, ensure_ascii=False))
 
     elif args.command == 'merge-content':
-        result = merge_content(args.work_dir, args.output_file, args.header)
-        print(json.dumps(result, ensure_ascii=False))
+        envelope = run_kernel_command(
+            'merge-content',
+            work_dir=args.work_dir,
+            output_file=args.output_file,
+            header=args.header,
+        )
+        print(json.dumps(envelope if args.api_envelope else envelope['result'], ensure_ascii=False))
 
     elif args.command == 'process-chunks':
-        if args.auto_replan and not args.dry_run:
-            result = process_chunks_with_replans(
-                args.work_dir,
-                args.prompt,
-                extra_instruction=args.extra_instruction,
-                config_path=args.config_path,
-                input_key=args.input_key,
-                force=args.force,
-                max_replans=args.max_replans,
-            )
-        else:
-            result = process_chunks(
-                args.work_dir, args.prompt, args.extra_instruction,
-                args.config_path, args.dry_run, args.input_key, args.force
-            )
-        print(json.dumps(result, ensure_ascii=False))
+        envelope = run_kernel_command(
+            'process-chunks',
+            work_dir=args.work_dir,
+            prompt_name=args.prompt,
+            extra_instruction=args.extra_instruction,
+            config_path=args.config_path,
+            dry_run=args.dry_run,
+            input_key=args.input_key,
+            force=args.force,
+            auto_replan=args.auto_replan,
+            max_replans=args.max_replans,
+        )
+        result = envelope['result']
+        print(json.dumps(envelope if args.api_envelope else result, ensure_ascii=False))
         if not result.get('success', False) and not result.get('dry_run', False):
             sys.exit(1)
 
     elif args.command == 'prepare-resume':
-        result = prepare_resume(
-            args.work_dir,
+        envelope = run_kernel_command(
+            'prepare-resume',
+            work_dir=args.work_dir,
             prompt_name=args.prompt,
             config_path=args.config_path,
             input_key=args.input_key,
         )
-        print(json.dumps(result, ensure_ascii=False))
+        print(json.dumps(envelope if args.api_envelope else envelope['result'], ensure_ascii=False))
 
     elif args.command == 'replan-remaining':
-        result = replan_remaining(
-            args.work_dir,
+        envelope = run_kernel_command(
+            'replan-remaining',
+            work_dir=args.work_dir,
             prompt_name=args.prompt,
             config_path=args.config_path,
             chunk_size=args.chunk_size,
             input_key=args.input_key,
         )
-        print(json.dumps(result, ensure_ascii=False))
+        result = envelope['result']
+        print(json.dumps(envelope if args.api_envelope else result, ensure_ascii=False))
         if not result.get('success', False):
             sys.exit(1)
 
     elif args.command == 'assemble-final':
-        result = assemble_final(
-            args.optimized_text_path, args.output_file,
-            title=args.title, source=args.source, channel=args.channel,
-            date=args.date, created=args.created, duration=args.duration,
-            transcript_source=args.transcript_source, bilingual=args.bilingual
+        envelope = run_kernel_command(
+            'assemble-final',
+            optimized_text_path=args.optimized_text_path,
+            output_file=args.output_file,
+            title=args.title,
+            source=args.source,
+            channel=args.channel,
+            date=args.date,
+            created=args.created,
+            duration=args.duration,
+            transcript_source=args.transcript_source,
+            bilingual=args.bilingual,
         )
-        print(json.dumps(result, ensure_ascii=False))
+        print(json.dumps(envelope if args.api_envelope else envelope['result'], ensure_ascii=False))
 
     elif args.command == 'verify-quality':
-        result = verify_quality(
-            args.optimized_text_path,
+        envelope = run_kernel_command(
+            'verify-quality',
+            optimized_text_path=args.optimized_text_path,
             raw_text_path=args.raw_text,
-            bilingual=args.bilingual
+            bilingual=args.bilingual,
         )
-        print(json.dumps(result, ensure_ascii=False))
+        result = envelope['result']
+        print(json.dumps(envelope if args.api_envelope else result, ensure_ascii=False))
         if not result['passed']:
             sys.exit(1)
 
@@ -7177,25 +7479,37 @@ def main():
         print(json.dumps(result, ensure_ascii=False))
 
     elif args.command == 'normalize-document':
-        result = normalize_document(
-            args.state_ref,
+        envelope = run_kernel_command(
+            'normalize-document',
+            state_ref=args.state_ref,
             output_path=args.output,
             prefer=args.prefer,
             allow_missing=args.allow_missing,
         )
-        print(json.dumps(result, ensure_ascii=False))
+        result = envelope['result']
+        print(json.dumps(envelope if args.api_envelope else result, ensure_ascii=False))
         if not result['passed']:
             sys.exit(1)
 
     elif args.command == 'validate-state':
-        result = validate_state(args.state_path, stage=args.stage, require=args.require)
-        print(json.dumps(result, ensure_ascii=False))
+        envelope = run_kernel_command(
+            'validate-state',
+            state_path=args.state_path,
+            stage=args.stage,
+            require=args.require,
+        )
+        result = envelope['result']
+        print(json.dumps(envelope if args.api_envelope else result, ensure_ascii=False))
         if not result['passed']:
             sys.exit(1)
 
     elif args.command == 'plan-optimization':
-        result = plan_optimization(args.state_path)
-        print(json.dumps(result, ensure_ascii=False))
+        envelope = run_kernel_command(
+            'plan-optimization',
+            state_path=args.state_path,
+        )
+        result = envelope['result']
+        print(json.dumps(envelope if args.api_envelope else result, ensure_ascii=False))
         if not result['passed']:
             sys.exit(1)
 

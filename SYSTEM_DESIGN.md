@@ -1,10 +1,10 @@
-# System Design (v5.5-stage5)
+# System Design (v5.6-stage6)
 
-**Stage**: 5
+**Stage**: 6
 
 **Status**: accepted and implemented
 
-**Behavior change in this stage**: formalized explicit verification / repair / replan control contracts, persisted per-run control state in `manifest.json`, and made `process-chunks` / `plan-optimization` emit inspectable control metadata
+**Behavior change in this stage**: formalized a stable kernel command envelope for Python and CLI use, added local telemetry journals, and documented a compatibility-preserving public interface layer on top of the Stage 5 control model
 
 **Source of truth**: This file is the canonical system design document for the repository.
 
@@ -12,18 +12,18 @@
 
 ---
 
-## 1. Stage 5 Goal
+## 1. Stage 6 Goal
 
-Stage 5 hardens the control side of the long-text kernel.
+Stage 6 hardens the interface and observability side of the long-text kernel.
 
 Its goals are:
 
-- make verification policy explicit and inspectable
-- separate chunk-local repair from document-level replan
-- bound both chunk repair loops and document auto-replan loops
-- persist control outcomes in manifest state and CLI JSON results
+- define a stable Python command API without breaking existing flat function returns
+- define a stable CLI envelope mode without breaking existing flat JSON output
+- persist lightweight command telemetry in a local journal for debugging and post-run inspection
+- turn interface-level regression checks into part of the kernel contract
 
-Stage 5 remains intentionally bounded. It does **not** add semantic LLM-as-judge verification, global glossary propagation, or concurrency-safe task ownership.
+Stage 6 remains intentionally bounded. It does **not** extract a separate telemetry module, split tests into multiple packages, or solve concurrency-safe task ownership.
 
 ---
 
@@ -42,23 +42,25 @@ Its current implemented use cases are:
 - canonical chunking from normalized documents
 - resumable chunk execution with manifest repair
 - explicit chunk verification, bounded repair, and bounded replan control loops
+- stable kernel command envelopes for Python and CLI consumers
+- local telemetry journals for kernel command runs
 - deterministic merge and final markdown assembly
 - workflow validation and stop/go quality checks
 
 ### 2.2 Current Primary Design Goal
 
-> Enable reliable long-text transcript transformation under context limits, especially on weaker models, using script-owned state, explicit normalization, explicit chunk contracts, bounded continuity, explicit lifecycle semantics, explicit control contracts, and deterministic verification.
+> Enable reliable long-text transcript transformation under context limits, especially on weaker models, using script-owned state, explicit normalization, explicit chunk contracts, bounded continuity, explicit lifecycle semantics, explicit control contracts, deterministic verification, and compatibility-preserving command interfaces.
 
 ### 2.3 Current Non-Goals
 
-At Stage 5, the system is **not yet**:
+At Stage 6, the system is **not yet**:
 
 - a generalized multi-source document transformation framework
 - a reusable extracted kernel package
 - a global glossary / terminology propagation system
 - an LLM-judge semantic verification system
 - a concurrency-safe persistent state store
-- a telemetry-first production runtime
+- a telemetry-first production runtime with remote aggregation or tracing backends
 
 ---
 
@@ -77,6 +79,7 @@ source acquisition
   -> planning
   -> canonical chunk contract selection
   -> operation control contract emission
+  -> stable command envelope / trace allocation
   -> chunking
   -> resume preflight / manifest repair
   -> per-chunk prompt execution
@@ -85,6 +88,7 @@ source acquisition
   -> deterministic merge
   -> deterministic final assembly
   -> quality verification
+  -> local telemetry journal append
 ```
 
 ### 3.2 Current Persisted Artifacts
@@ -99,7 +103,7 @@ The current implementation relies on these persisted artifacts:
   - normalized source artifact
 - `manifest.json` in chunk work directories
   - chunk plan, chunk contract, continuity policy, runtime state, resume / autotune / replan metadata, and explicit operation-control state
-  - Stage 5 manifest schema is now `v5`
+  - manifest schema remains `v5` in Stage 6
 - `/tmp/${VIDEO_ID}_raw_text.txt`
   - raw extracted transcript-like text
 - `/tmp/${VIDEO_ID}_segments.json`
@@ -109,6 +113,8 @@ The current implementation relies on these persisted artifacts:
 - `/tmp/${VIDEO_ID}_optimized.txt`
   - transformed output before final assembly
 - final markdown output under configured output directory
+- `telemetry.jsonl` beside inferred kernel work artifacts when a stable local sink can be resolved
+  - append-only local command journal for envelope-producing kernel commands
 
 ### 3.3 Current State Surfaces
 
@@ -246,7 +252,7 @@ Its current role is:
 
 `process-chunks` now calls the same repair logic automatically before execution starts and returns the resume report in its JSON result.
 
-### 3.11 Current Planning and Control Surfaces
+### 3.11 Current Planning, Interface, and Control Surfaces
 
 `plan-optimization` now:
 
@@ -271,7 +277,36 @@ The current per-operation `control` contract reports:
 - replan triggers and the required action (`auto_replan_remaining` or `stop_and_review`)
 - final quality-gate expectations for the operation output
 
-`process-chunks` now persists the active operation surface into `manifest.json` via:
+Stage 6 also defines a compatibility-preserving interface layer:
+
+- direct Python functions still return the existing flat dictionaries
+- `run_kernel_command(...)` is now the stable Python envelope API for kernel commands
+- `python3 yt_transcript_utils.py --api-envelope ...` emits the same stable envelope for kernel commands on the CLI
+
+The stable envelope currently uses:
+
+- `format = yt_transcript.command_result/v1`
+- `schema_version = 1`
+- `command`
+- `trace_id`
+- `generated_at`
+- `ok`
+- `telemetry`
+- `result`
+
+The local telemetry journal currently uses:
+
+- `format = yt_transcript.telemetry_event/v1`
+- `event_type = command_result`
+- `trace_id`
+- `command`
+- `timestamp`
+- `duration_ms`
+- `success`
+- `warning_count`
+- inferred local sink path in `telemetry.jsonl`
+
+`process-chunks` continues to persist the active operation surface into `manifest.json` via:
 
 - `runtime.operation_prompt_name`
 - `runtime.operation_input_key`
@@ -279,7 +314,7 @@ The current per-operation `control` contract reports:
 - `runtime.control` counters and last replan trigger/action
 - per-chunk `control` status (`verification_status`, warnings, retry reasons, repair exhaustion)
 
-Current control semantics are:
+Current control semantics remain:
 
 - verification = inspect produced text and classify warnings versus hard stop/go failures
 - repair = rerun the same chunk under the same active plan
@@ -320,6 +355,8 @@ The system now has the following concrete strengths:
 - explicit operation control contracts from planner to runner
 - explicit separation between repair and replan
 - bounded same-plan recovery and bounded auto-replan behavior
+- compatibility-preserving stable envelope APIs for kernel commands
+- lightweight append-only telemetry journals for kernel command runs
 - deterministic merge and final file assembly
 - explicit verification checkpoints before final output
 
@@ -361,46 +398,48 @@ The system should continue to work with smaller or weaker models by keeping prom
 
 ### 4.9 Debuggability Is a First-Class Requirement
 
-Intermediate artifacts, manifest plans, lifecycle state, and resume repairs should all remain inspectable on disk.
+Intermediate artifacts, manifest plans, lifecycle state, resume repairs, and local telemetry journals should all remain inspectable on disk.
+
+### 4.10 Stable Interfaces Should Preserve Compatibility
+
+New public interfaces should prefer additive envelope layers over breaking changes to existing flat command results.
 
 ---
 
-## 5. Stage 5 Deliverables
+## 5. Stage 6 Deliverables
 
 Completed in this stage:
 
-- formalized explicit control contracts for verification, repair, and replan
-- exposed those control contracts from `plan-optimization`
-- persisted active operation control state into `manifest.json`
-- recorded per-chunk verification state and repair exhaustion metadata
-- separated suspicious-output repair from plan-invalid replan behavior in `process-chunks`
-- made document auto-replan bounds explicit in `process-chunks-with-replans`
-- preserved Stage 4 resume and checkpoint semantics
-- added regression coverage for control-contract emission, repair accounting, repair exhaustion, and bounded auto-replan reporting
+- introduced `run_kernel_command(...)` as the stable Python envelope API for kernel commands
+- introduced CLI `--api-envelope` output mode for the same kernel command surface
+- formalized `yt_transcript.command_result/v1` as the current command envelope format
+- formalized `yt_transcript.telemetry_event/v1` as the current local telemetry event format
+- appended kernel command telemetry to local `telemetry.jsonl` sinks when a stable path can be inferred
+- kept legacy flat Python and default CLI JSON outputs compatible
+- added interface-level regression coverage for envelope behavior and telemetry persistence
 
 Not done in this stage:
 
-- no semantic LLM-judge verification layer yet
-- no global glossary extraction pass yet
-- no concurrency-safe shared state store yet
-- no cancellation / pause API yet
-- no dedicated telemetry module yet
+- no remote telemetry backend or distributed tracing yet
+- no extracted telemetry / interface package yet
+- no test directory split by subsystem yet
+- no concurrency-safe task ownership or cancellation protocol yet
 
 ---
 
 ## 6. Current Known Gaps
 
-The implementation is meaningfully stronger after Stage 5, but still not fully kernelized.
+The implementation is meaningfully stronger after Stage 6, but still not fully kernelized.
 
 The main remaining gaps are:
 
-1. control contracts are now explicit, but they still live inside one script instead of dedicated modules
-2. verification remains deterministic / heuristic only and does not yet include semantic judge layers
-3. global terminology / entity consistency is still not first-class
-4. runtime control is resumable, but not yet concurrency-safe
-5. cancellation, pause, and long-lived task ownership are not formalized
-6. telemetry and test layout are stronger, but not yet extracted into dedicated subsystems
-7. module boundaries are still logical inside one script, not yet split into a kernel package layout
+1. the stable interface layer exists, but it still wraps one large script instead of dedicated packages
+2. telemetry is local and append-only, but not yet a first-class subsystem with querying or aggregation
+3. verification remains deterministic / heuristic only and does not yet include semantic judge layers
+4. global terminology / entity consistency is still not first-class
+5. runtime control is resumable, but not yet concurrency-safe
+6. cancellation, pause, and long-lived task ownership are not formalized
+7. test coverage is stronger at the interface level, but fixtures are not yet split into dedicated suites by subsystem
 
 ---
 
@@ -423,40 +462,46 @@ Implemented scope:
 
 ### Stage 6 — Interfaces, Testing, and Observability
 
+Implemented scope:
+
+- formalized CLI and Python API layers through a stable envelope mode
+- improved regression coverage for interface-level contracts
+- defined local telemetry and debugging expectations explicitly
+
+### Stage 7 — Module Extraction and Runtime Ownership
+
 Planned scope:
 
-- formalize CLI and Python API layers
-- improve fixture and regression structure
-- define telemetry and debugging expectations more explicitly
+- extract interface / telemetry / controller code into dedicated modules
+- formalize task ownership, cancellation, and concurrency-safe state handling
+- decide which envelope and telemetry fields are now long-term stable
 
 ---
 
-## 8. Stage 5 Validation
+## 8. Stage 6 Validation
 
-The Stage 5 implementation is considered valid because:
+The Stage 6 implementation is considered valid because:
 
-- planner output now exposes explicit control contracts instead of leaving repair / replan behavior implicit
-- manifest runtime now records active operation control state in an inspectable way
-- suspicious chunk outputs are treated as bounded repair within the same plan
-- plan-invalid conditions are treated as replan triggers instead of more silent retries
-- bounded auto-replan reporting now survives all the way to the wrapper result surface
-- Stage 4 resume and checkpoint guarantees remain preserved
+- kernel commands now have one stable envelope surface for both Python and CLI consumers
+- the default flat outputs remain compatible for existing workflows
+- telemetry is persisted locally without entangling prompt logic or remote services
+- interface-level regressions now verify both the envelope surface and telemetry side effects
+- Stage 5 control semantics remain preserved underneath the new interface layer
 
 Representative validated behaviors in this stage include:
 
-- emitting per-operation `control` contracts from `plan-optimization`
-- initializing manifest runtime and chunk-level control state during chunking
-- incrementing repair counters when suspicious output triggers a same-plan retry
-- marking repair exhaustion when suspicious output is accepted after the repair budget is exhausted
-- recording explicit replan trigger/action metadata when timeout instability or canary shrink aborts the run
-- reporting `auto_replan_count` and `max_auto_replans` from `process-chunks-with-replans`
+- returning `yt_transcript.command_result/v1` envelopes from `run_kernel_command(...)`
+- appending `yt_transcript.telemetry_event/v1` entries into inferred local `telemetry.jsonl` sinks
+- emitting the same envelope format from CLI kernel commands when `--api-envelope` is used
+- preserving legacy flat JSON output when `--api-envelope` is not used
+- keeping Stage 5 repair / replan behavior intact behind the new interface layer
 
 ---
 
 ## 9. Next Stage Entry Criteria
 
-Stage 6 should begin only when the following are agreed:
+Stage 7 should begin only when the following are agreed:
 
-1. which CLI and Python-return fields now count as stable public interfaces
-2. how regression fixtures and test layering should split by module responsibility
-3. which telemetry and debugging fields are required before extracting dedicated runtime modules
+1. which envelope and telemetry fields are now stable enough to preserve across extraction
+2. how controller, interface, and telemetry responsibilities should split into modules
+3. what concurrency, ownership, and cancellation guarantees the extracted runtime must enforce

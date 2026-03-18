@@ -545,6 +545,35 @@ class RegressionTests(unittest.TestCase):
             self.assertEqual(manifest["runtime"]["operation_control"], {})
             self.assertEqual(manifest["chunks"][0]["control"]["verification_status"], "pending")
             self.assertFalse(manifest["chunks"][0]["control"]["repair_exhausted"])
+
+    def test_run_kernel_command_returns_envelope_and_writes_telemetry(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source = Path(tmpdir) / "raw.txt"
+            work_dir = Path(tmpdir) / "chunks"
+            source.write_text("第一句。第二句。第三句。第四句。", encoding="utf-8")
+
+            envelope = utils.run_kernel_command(
+                "chunk-text",
+                input_path=str(source),
+                output_dir=str(work_dir),
+                chunk_size=4,
+                prompt_name="structure_only",
+                config_path=None,
+            )
+
+            telemetry_path = Path(envelope["telemetry"]["telemetry_path"])
+            self.assertEqual(envelope["format"], utils.COMMAND_RESULT_FORMAT)
+            self.assertEqual(envelope["command"], "chunk-text")
+            self.assertTrue(envelope["ok"])
+            self.assertTrue(telemetry_path.exists())
+            lines = [line for line in telemetry_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+            event = json.loads(lines[-1])
+            self.assertEqual(event["format"], utils.TELEMETRY_EVENT_FORMAT)
+            self.assertEqual(event["command"], "chunk-text")
+            self.assertEqual(event["trace_id"], envelope["trace_id"])
+            self.assertTrue(event["success"])
+            self.assertEqual(envelope["result"]["driver"], "chunk-text")
+
     def test_build_chapter_plan_maps_chapters_to_timed_chunks(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             segments_path = Path(tmpdir) / "segments.json"
@@ -1277,6 +1306,51 @@ exit 1
             self.assertTrue(result["dry_run"])
             self.assertEqual(result["request_url"], "")
 
+    def test_cli_api_envelope_wraps_plan_optimization(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state = Path(tmpdir) / "state.md"
+            work_dir = Path(tmpdir) / "vid001_chunks"
+            state.write_text(
+                "# State\n"
+                "vid: vid001\n"
+                "url: https://example.com/watch?v=1\n"
+                "title: Sample\n"
+                "channel: Channel\n"
+                "upload_date: 20260308\n"
+                "duration: 3600\n"
+                "output_dir: /tmp/out\n"
+                "mode: bilingual\n"
+                "src: youtube\n"
+                "source_language: en\n"
+                "subtitle_source: YouTube Subtitles\n"
+                f"work_dir: {work_dir}\n",
+                encoding="utf-8",
+            )
+
+            result = subprocess.run(
+                [
+                    "python3",
+                    str(PROJECT_ROOT / "yt_transcript_utils.py"),
+                    "--api-envelope",
+                    "plan-optimization",
+                    str(state),
+                ],
+                cwd=PROJECT_ROOT,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+            payload = json.loads(result.stdout)
+            telemetry_path = Path(payload["telemetry"]["telemetry_path"])
+            self.assertEqual(payload["format"], utils.COMMAND_RESULT_FORMAT)
+            self.assertEqual(payload["command"], "plan-optimization")
+            self.assertTrue(payload["ok"])
+            self.assertTrue(payload["result"]["passed"])
+            self.assertTrue(telemetry_path.exists())
+            event = json.loads(telemetry_path.read_text(encoding="utf-8").splitlines()[-1])
+            self.assertEqual(event["command"], "plan-optimization")
+            self.assertEqual(event["trace_id"], payload["trace_id"])
     def test_subtitle_info_prefers_english_for_bilingual(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             fake_bin = Path(tmpdir) / "yt-dlp"
