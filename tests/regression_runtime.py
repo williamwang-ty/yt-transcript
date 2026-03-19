@@ -93,8 +93,45 @@ class RuntimeRegressionTests(unittest.TestCase):
             self.assertEqual(bundle["quality_report"]["format"], runtime_contracts.QUALITY_REPORT_FORMAT)
             self.assertFalse(bundle["quality_report"]["passed"])
             self.assertEqual(bundle["quality_report"]["recommended_action"], "repair_or_replan")
+            self.assertEqual(bundle["evaluator_report"]["recommended_action"], "repair_chunk")
             self.assertIn("repair_chunk", bundle["policy"]["allowed_actions"])
             self.assertEqual(bundle["decision_record"]["selected_action"], "repair_chunk")
+
+    def test_llm_assisted_decision_selects_only_allowed_actions(self):
+        """Test llm-assisted decisioning can rank within the allowed action set only."""
+        from kernel.task_runtime import decision as runtime_decision
+
+        run_state = {
+            "active_stage": "processing",
+            "lifecycle_state": "processing",
+            "effective_runtime_status": "processing",
+        }
+        policy_evaluation = {
+            "profile": "default",
+            "allowed_actions": ["continue_stage", "switch_model_profile", "shrink_chunk_size"],
+            "budget_pressure_level": "normal",
+        }
+
+        def fake_ranker(payload):
+            self.assertEqual(payload["allowed_actions"], ["continue_stage", "switch_model_profile", "shrink_chunk_size"])
+            return {
+                "selected_action": "switch_model_profile",
+                "reason": "smaller model profile is cheaper for this ambiguous case",
+                "confidence": 0.81,
+            }
+
+        decision_record = runtime_decision.build_decision_record_for_command(
+            "process-chunks",
+            run_state=run_state,
+            result={"success": True},
+            policy_evaluation=policy_evaluation,
+            evaluator_report={"recommended_action": ""},
+            llm_ranker=fake_ranker,
+            decision_mode="llm_assisted",
+        )
+
+        self.assertEqual(decision_record["selected_action"], "switch_model_profile")
+        self.assertEqual(decision_record["decider_type"], "llm-assisted")
 
     def test_policy_prefers_replan_for_timeout_driven_processing_failure(self):
         """Test policy and decision select replan for timeout-driven processing failures."""

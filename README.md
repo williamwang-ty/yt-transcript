@@ -156,6 +156,7 @@ yt-transcript/
 │   │   ├── contracts.py    # Runtime contracts for task/run/action/artifact envelopes
 │   │   ├── lifecycle.py    # Lifecycle shell and transition summaries for runtime stages
 │   │   ├── policy.py       # Allowed-action derivation and budget-pressure policy checks
+│   │   ├── evaluator.py    # Quality-gated evaluator reports and action recommendations
 │   │   ├── decision.py     # Rule-first action selection and decision records
 │   │   ├── ledger.py       # Runtime budget and action accounting summaries
 │   │   ├── recovery.py     # Resume-safe recovery summaries and processing sub-states
@@ -201,6 +202,7 @@ Phase 1 of the runtime-upgrade path also introduces `kernel/task_runtime/contrac
 Phase 2 adds `kernel/task_runtime/lifecycle.py`, which wraps runtime-sensitive commands in an explicit lifecycle shell so state transitions become observable before richer policy logic is introduced.
 Phase 3 adds `kernel/task_runtime/policy.py`, `decision.py`, and `ledger.py` so command envelopes can expose allowed actions, budget-pressure summaries, and rule-first decision records in a uniform way.
 Phase 4 adds `kernel/task_runtime/recovery.py` and `artifacts.py` so long-text runs expose processing sub-states, recovery recommendations, and artifact-graph views without changing the core chunk-processing algorithms.
+Phase 5 adds `kernel/task_runtime/evaluator.py` plus constrained llm-assisted ranking hooks so quality-gated recommendations and optional model-assisted action selection can coexist without bypassing the allowed-action contract.
 
 The hardest internal subsystem is long-text transformation. It activates only when the planning layer determines that the input is long enough to require chunking, continuity control, consistency protection, verification, repair / replan, and deterministic merge.
 
