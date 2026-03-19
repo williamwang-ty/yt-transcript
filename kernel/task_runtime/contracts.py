@@ -255,30 +255,46 @@ def build_quality_report(*, coverage_score: float = 0.0, missing_sections=None,
 
 def _stage_for_command(command: str, result, context: dict | None = None) -> str:
     """Infer the business stage associated with a command."""
-    del result
     context = context or {}
+    payload = result if isinstance(result, dict) else {}
+    nested_run_state = payload.get("run_state", {}) if isinstance(payload.get("run_state", {}), dict) else {}
+    explicit_stage = str(
+        nested_run_state.get("active_stage", "")
+        or payload.get("active_stage", "")
+        or context.get("active_stage", "")
+    ).strip()
+    if explicit_stage:
+        return explicit_stage
+
     normalized = str(command or "").strip()
-    if normalized in {"pause-run", "cancel-run", "resume-run", "runtime-status", "prepare-resume", "replan-remaining", "process-chunks"}:
+    if normalized in {"pause-run", "cancel-run", "resume-run", "runtime-status", "prepare-resume", "replan-remaining", "process-chunks", "advance-run", "inspect-run", "apply-control"}:
         return "processing"
-    if normalized in {"validate-state", "plan-optimization", "chunk-text", "chunk-segments", "chunk-document", "get-chapters", "build-chapter-plan"}:
+    if normalized in {"create-run", "validate-state", "plan-optimization", "chunk-text", "chunk-segments", "chunk-document", "get-chapters", "build-chapter-plan"}:
         return "planning"
     if normalized in {"normalize-document", "sync-state"}:
         return "normalize"
     if normalized in {"verify-quality"}:
         return "verify"
-    if normalized in {"assemble-final", "merge-content"}:
+    if normalized in {"assemble-final", "merge-content", "finalize-run"}:
         return "assemble"
     if normalized in {"load-config", "preflight"}:
         return "preflight"
     if normalized in {"download-subtitles", "download-audio", "download-metadata"}:
         return "source"
-    return str(context.get("active_stage", "")).strip() or normalized.replace("-", "_")
+    return normalized.replace("-", "_")
 
 
 def _lifecycle_state_for_command(command: str, result, context: dict | None = None) -> str:
     """Infer a lifecycle state from a command result."""
     context = context or {}
     if isinstance(result, dict):
+        nested_run_state = result.get("run_state", {}) if isinstance(result.get("run_state", {}), dict) else {}
+        explicit_state = str(
+            nested_run_state.get("lifecycle_state", "")
+            or result.get("lifecycle_state", "")
+        ).strip()
+        if explicit_state:
+            return explicit_state
         effective = str(result.get("effective_runtime_status", "")).strip()
         runtime = result.get("runtime", {}) if isinstance(result.get("runtime", {}), dict) else {}
         runtime_status = str(runtime.get("status", "")).strip()
@@ -299,7 +315,7 @@ def _lifecycle_state_for_command(command: str, result, context: dict | None = No
         if result.get("success", False):
             if str(command or "").strip() == "verify-quality":
                 return "verifying"
-            if str(command or "").strip() in {"assemble-final", "merge-content"}:
+            if str(command or "").strip() in {"assemble-final", "merge-content", "finalize-run"}:
                 return "completed"
             return _stage_for_command(command, result, context)
     return _stage_for_command(command, result, context)
@@ -310,28 +326,41 @@ def derive_task_spec(command: str, result=None, *, context: dict | None = None,
     """Derive a task spec from a command invocation and result payload."""
     context = context or {}
     result = result if isinstance(result, dict) else {}
+    nested_task_spec = result.get("task_spec", {}) if isinstance(result.get("task_spec", {}), dict) else {}
     source_ref = (
-        str(context.get("video_url", "") or context.get("url", "") or result.get("work_dir", "")
-            or context.get("work_dir", "") or context.get("state_path", "")
-            or context.get("output_dir", "") or trace_id).strip()
+        str(
+            nested_task_spec.get("source_ref", "")
+            or context.get("video_url", "")
+            or context.get("url", "")
+            or result.get("work_dir", "")
+            or context.get("work_dir", "")
+            or context.get("state_path", "")
+            or context.get("output_dir", "")
+            or trace_id
+        ).strip()
     )
-    allowed_fallbacks = context.get("allowed_fallbacks", [])
-    bilingual = _parse_bool(context.get("bilingual", result.get("bilingual", False)), False)
+    allowed_fallbacks = nested_task_spec.get("allowed_fallbacks", context.get("allowed_fallbacks", []))
+    bilingual = _parse_bool(
+        nested_task_spec.get("bilingual", context.get("bilingual", result.get("bilingual", False))),
+        False,
+    )
+    metadata = nested_task_spec.get("metadata", {}) if isinstance(nested_task_spec.get("metadata", {}), dict) else {}
+    metadata = dict(metadata)
+    metadata.setdefault("command", str(command or "").strip())
+    metadata.setdefault("trace_id", str(trace_id or "").strip())
     return build_task_spec(
-        task_id=str(context.get("task_id", "") or result.get("task_id", "") or _stable_id("task", source_ref)).strip(),
+        task_id=str(context.get("task_id", "") or nested_task_spec.get("task_id", "") or result.get("task_id", "") or _stable_id("task", source_ref)).strip(),
         source_ref=source_ref,
-        output_mode=str(context.get("output_mode", result.get("output_mode", "markdown"))).strip() or "markdown",
+        output_mode=str(context.get("output_mode", nested_task_spec.get("output_mode", result.get("output_mode", "markdown")))).strip() or "markdown",
         bilingual=bilingual,
-        quality_profile=str(context.get("quality_profile", "balanced")).strip() or "balanced",
-        speed_priority=str(context.get("speed_priority", "balanced")).strip() or "balanced",
-        cost_budget=_parse_float(context.get("cost_budget", 0.0), 0.0),
-        latency_budget=_parse_float(context.get("latency_budget", 0.0), 0.0),
+        quality_profile=str(context.get("quality_profile", nested_task_spec.get("quality_profile", "balanced"))).strip() or "balanced",
+        speed_priority=str(context.get("speed_priority", nested_task_spec.get("speed_priority", "balanced"))).strip() or "balanced",
+        cost_budget=_parse_float(nested_task_spec.get("cost_budget", context.get("cost_budget", 0.0)), 0.0),
+        latency_budget=_parse_float(nested_task_spec.get("latency_budget", context.get("latency_budget", 0.0)), 0.0),
         allowed_fallbacks=allowed_fallbacks,
-        human_escalation_policy=str(context.get("human_escalation_policy", "on_blocking_failure")).strip(),
-        metadata={
-            "command": str(command or "").strip(),
-            "trace_id": str(trace_id or "").strip(),
-        },
+        human_escalation_policy=str(context.get("human_escalation_policy", nested_task_spec.get("human_escalation_policy", "on_blocking_failure"))).strip() or "on_blocking_failure",
+        metadata=metadata,
+        created_at=str(nested_task_spec.get("created_at", "")).strip(),
     )
 
 
@@ -341,21 +370,42 @@ def derive_run_state(command: str, result=None, *, context: dict | None = None,
     context = context or {}
     result = result if isinstance(result, dict) else {}
     task_payload = task_spec if isinstance(task_spec, dict) else derive_task_spec(command, result, context=context, trace_id=trace_id)
+    nested_run_state = result.get("run_state", {}) if isinstance(result.get("run_state", {}), dict) else {}
     runtime = result.get("runtime", {}) if isinstance(result.get("runtime", {}), dict) else {}
     plan = result.get("plan", {}) if isinstance(result.get("plan", {}), dict) else {}
-    work_dir = str(result.get("work_dir", "") or context.get("work_dir", "")).strip()
+    work_dir = str(nested_run_state.get("work_dir", "") or result.get("work_dir", "") or context.get("work_dir", "")).strip()
     run_id = (
-        str(runtime.get("run_id", "") or result.get("run_id", "") or context.get("run_id", "")
-            or plan.get("plan_id", "") or trace_id).strip()
+        str(
+            nested_run_state.get("run_id", "")
+            or runtime.get("run_id", "")
+            or result.get("run_id", "")
+            or context.get("run_id", "")
+            or plan.get("plan_id", "")
+            or trace_id
+        ).strip()
     )
-    lifecycle_state = _lifecycle_state_for_command(command, result, context)
-    active_stage = _stage_for_command(command, result, context)
+    lifecycle_state = str(nested_run_state.get("lifecycle_state", "") or _lifecycle_state_for_command(command, result, context)).strip()
+    active_stage = str(nested_run_state.get("active_stage", "") or _stage_for_command(command, result, context)).strip()
     effective_runtime_status = (
-        str(result.get("effective_runtime_status", "") or runtime.get("status", "") or lifecycle_state).strip()
+        str(
+            nested_run_state.get("effective_runtime_status", "")
+            or result.get("effective_runtime_status", "")
+            or runtime.get("status", "")
+            or lifecycle_state
+        ).strip()
     )
     from . import ledger as kernel_ledger
 
-    budget_ledger = kernel_ledger.derive_budget_ledger(result, context=context)
+    budget_ledger = (
+        nested_run_state.get("budget_ledger", {})
+        if isinstance(nested_run_state.get("budget_ledger", {}), dict)
+        else kernel_ledger.derive_budget_ledger(result, context=context)
+    )
+    metadata = nested_run_state.get("metadata", {}) if isinstance(nested_run_state.get("metadata", {}), dict) else {}
+    metadata = dict(metadata)
+    metadata.setdefault("command", str(command or "").strip())
+    metadata.setdefault("trace_id", str(trace_id or "").strip())
+    metadata.setdefault("manifest_path", str(result.get("manifest_path", "")).strip())
 
     return build_run_state(
         run_id=run_id,
@@ -364,16 +414,16 @@ def derive_run_state(command: str, result=None, *, context: dict | None = None,
         active_stage=active_stage,
         effective_runtime_status=effective_runtime_status,
         work_dir=work_dir,
-        policy_profile=str(context.get("policy_profile", "default")).strip() or "default",
-        ownership=result.get("ownership", {}) if isinstance(result.get("ownership", {}), dict) else {},
+        policy_profile=str(context.get("policy_profile", nested_run_state.get("policy_profile", "default"))).strip() or "default",
+        ownership=(
+            nested_run_state.get("ownership", {})
+            if isinstance(nested_run_state.get("ownership", {}), dict)
+            else result.get("ownership", {}) if isinstance(result.get("ownership", {}), dict) else {}
+        ),
         budget_ledger=budget_ledger,
-        metadata={
-            "command": str(command or "").strip(),
-            "trace_id": str(trace_id or "").strip(),
-            "manifest_path": str(result.get("manifest_path", "")).strip(),
-        },
-        started_at=str(runtime.get("started_at", "") or result.get("started_at", "") or _now_iso()).strip(),
-        updated_at=str(runtime.get("updated_at", "") or result.get("updated_at", "") or _now_iso()).strip(),
+        metadata=metadata,
+        started_at=str(nested_run_state.get("started_at", "") or runtime.get("started_at", "") or result.get("started_at", "") or _now_iso()).strip(),
+        updated_at=str(nested_run_state.get("updated_at", "") or runtime.get("updated_at", "") or result.get("updated_at", "") or _now_iso()).strip(),
     )
 
 
@@ -385,6 +435,26 @@ def derive_artifacts(command: str, result=None, *, context: dict | None = None,
     result = result if isinstance(result, dict) else {}
     artifacts = []
     seen_paths = set()
+
+    explicit_artifacts = result.get("artifacts", []) if isinstance(result.get("artifacts", []), list) else []
+    for artifact in explicit_artifacts:
+        if not isinstance(artifact, dict):
+            continue
+        path_text = str(artifact.get("path", "")).strip()
+        if path_text and path_text in seen_paths:
+            continue
+        if path_text:
+            seen_paths.add(path_text)
+        artifacts.append(build_artifact_ref(
+            artifact_id=str(artifact.get("artifact_id", "")).strip(),
+            artifact_type=str(artifact.get("artifact_type", "") or "unknown").strip() or "unknown",
+            path=path_text,
+            source_action_id=str(artifact.get("source_action_id", "") or action_id).strip(),
+            version=artifact.get("version", 1),
+            parent_artifacts=artifact.get("parent_artifacts", []),
+            quality_status=str(artifact.get("quality_status", "")).strip(),
+        ))
+
     candidates = [
         ("manifest", result.get("manifest_path", "")),
         ("work_dir", result.get("work_dir", "") or context.get("work_dir", "")),
@@ -418,6 +488,22 @@ def derive_quality_report(command: str, result=None, *, context: dict | None = N
     """Infer a quality report from verify-quality and related command outputs."""
     del context
     result = result if isinstance(result, dict) else {}
+    nested_quality_report = result.get("quality_report", {}) if isinstance(result.get("quality_report", {}), dict) else {}
+    if nested_quality_report:
+        return build_quality_report(
+            coverage_score=nested_quality_report.get("coverage_score", 0.0),
+            missing_sections=nested_quality_report.get("missing_sections", []),
+            term_consistency_score=nested_quality_report.get("term_consistency_score", 0.0),
+            translation_risk=nested_quality_report.get("translation_risk", ""),
+            structure_integrity=nested_quality_report.get("structure_integrity", ""),
+            recommended_action=nested_quality_report.get("recommended_action", ""),
+            passed=nested_quality_report.get("passed", False),
+            warnings=nested_quality_report.get("warnings", []),
+            hard_failures=nested_quality_report.get("hard_failures", []),
+            checks=nested_quality_report.get("checks", {}),
+            generated_at=str(nested_quality_report.get("generated_at", "")).strip(),
+        )
+
     normalized = str(command or "").strip()
     if normalized == "verify-quality" or {"passed", "hard_failures", "checks"}.issubset(result.keys()):
         warnings = result.get("warnings", []) if isinstance(result.get("warnings", []), list) else []

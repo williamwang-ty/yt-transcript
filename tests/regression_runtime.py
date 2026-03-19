@@ -2093,3 +2093,145 @@ chunk_context_summary_tokens: 20
             self.assertIn("Chapter One", merged_text)
             self.assertIn("第一章", merged_text)
             self.assertNotEqual(chapter_plan[0]["start_chunk"], 1)
+
+    def test_create_run_persists_task_record_and_contracts(self):
+        """Test create-run persists a runtime task record and stable envelope contracts."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            work_dir = Path(tmpdir) / "runtime"
+
+            envelope = utils.run_kernel_command(
+                "create-run",
+                work_dir=str(work_dir),
+                source_ref="youtube:abc123",
+                bilingual=True,
+                quality_profile="strict",
+            )
+
+            result = envelope["result"]
+            task_record_path = work_dir / ".runtime_task.json"
+            self.assertTrue(result["success"])
+            self.assertTrue(task_record_path.exists())
+            self.assertEqual(result["task_spec"]["source_ref"], "youtube:abc123")
+            self.assertTrue(result["task_spec"]["bilingual"])
+            self.assertEqual(result["run_state"]["work_dir"], str(work_dir.resolve()))
+            self.assertEqual(envelope["contracts"]["task_spec"]["source_ref"], "youtube:abc123")
+            self.assertEqual(envelope["contracts"]["run_state"]["run_id"], result["run_id"])
+            self.assertEqual(envelope["contracts"]["run_state"]["lifecycle_state"], "created")
+
+    def test_inspect_run_reads_task_record_and_runtime_summary(self):
+        """Test inspect-run merges persisted task metadata with live runtime summary."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source = Path(tmpdir) / "raw.txt"
+            work_dir = Path(tmpdir) / "chunks"
+            source.write_text("第一句。第二句。第三句。第四句。", encoding="utf-8")
+            utils.chunk_text(str(source), str(work_dir), 4, "structure_only")
+
+            created = utils.create_run(str(work_dir), source_ref="youtube:inspect")
+            inspected = utils.inspect_run(str(work_dir))
+
+            self.assertTrue(created["success"])
+            self.assertTrue(inspected["success"])
+            self.assertTrue(inspected["task_record_present"])
+            self.assertTrue(inspected["manifest_present"])
+            self.assertEqual(inspected["run_id"], created["run_id"])
+            self.assertEqual(inspected["task_spec"]["source_ref"], "youtube:inspect")
+            self.assertTrue(inspected["available_actions"])
+            self.assertEqual(inspected["processing_state"]["substate"], "chunk_queue_ready")
+            self.assertIn("create-run", inspected["runtime_api"]["preferred_commands"])
+
+    def test_apply_control_maps_pause_and_cancel_signals(self):
+        """Test apply-control maps stable signals onto compatibility runtime commands."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source = Path(tmpdir) / "raw.txt"
+            work_dir = Path(tmpdir) / "chunks"
+            source.write_text("第一句。第二句。第三句。第四句。", encoding="utf-8")
+            utils.chunk_text(str(source), str(work_dir), 4, "structure_only")
+            utils.create_run(str(work_dir), source_ref="youtube:control")
+
+            pause_result = utils.apply_control(str(work_dir), "pause", reason="operator pause")
+            cancel_result = utils.apply_control(str(work_dir), "cancel", reason="operator stop")
+
+            self.assertTrue(pause_result["success"])
+            self.assertEqual(pause_result["signal"], "pause")
+            self.assertEqual(pause_result["delegate_command"], "pause-run")
+            self.assertTrue(pause_result["requested"])
+            self.assertTrue(cancel_result["success"])
+            self.assertEqual(cancel_result["signal"], "cancel")
+            self.assertEqual(cancel_result["delegate_command"], "cancel-run")
+            self.assertTrue(cancel_result["requested"])
+
+    def test_advance_run_uses_stable_runtime_api_for_dry_run(self):
+        """Test advance-run routes through the stable runtime API while preserving dry-run behavior."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source = Path(tmpdir) / "raw.txt"
+            work_dir = Path(tmpdir) / "chunks"
+            source.write_text("第一句。第二句。第三句。第四句。", encoding="utf-8")
+            utils.chunk_text(str(source), str(work_dir), 4, "structure_only")
+            created = utils.create_run(str(work_dir), source_ref="youtube:advance")
+
+            result = utils.advance_run(str(work_dir), "structure_only", dry_run=True)
+
+            self.assertTrue(result["success"])
+            self.assertTrue(result["advanced"])
+            self.assertTrue(result["dry_run"])
+            self.assertEqual(result["delegate_command"], "process-chunks")
+            self.assertEqual(result["run_id"], created["run_id"])
+            self.assertEqual(result["task_spec"]["source_ref"], "youtube:advance")
+
+    def test_finalize_run_merges_output_and_returns_artifact_graph(self):
+        """Test finalize-run can materialize merged output while returning runtime artifacts."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source = Path(tmpdir) / "raw.txt"
+            work_dir = Path(tmpdir) / "chunks"
+            output_file = Path(tmpdir) / "final.md"
+            source.write_text("第一句。第二句。第三句。第四句。", encoding="utf-8")
+            utils.chunk_text(str(source), str(work_dir), 4, "structure_only")
+            utils.create_run(str(work_dir), source_ref="youtube:finalize")
+
+            manifest_path = work_dir / "manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            for chunk in manifest["chunks"]:
+                processed_path = work_dir / chunk["processed_path"]
+                processed_path.write_text(f"chunk-{chunk['chunk_id']}", encoding="utf-8")
+                chunk["status"] = "done"
+            manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+
+            result = utils.finalize_run(str(work_dir), output_file=str(output_file), header="# Title")
+
+            self.assertTrue(result["success"])
+            self.assertTrue(result["finalized"])
+            self.assertEqual(result["delegate_command"], "merge-content")
+            self.assertTrue(output_file.exists())
+            self.assertGreaterEqual(result["artifact_graph"]["node_count"], 2)
+            self.assertEqual(result["task_spec"]["source_ref"], "youtube:finalize")
+
+    def test_cli_api_envelope_wraps_inspect_run(self):
+        """Test CLI api envelope wraps inspect-run with stable runtime contracts."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source = Path(tmpdir) / "raw.txt"
+            work_dir = Path(tmpdir) / "chunks"
+            source.write_text("第一句。第二句。第三句。第四句。", encoding="utf-8")
+            utils.chunk_text(str(source), str(work_dir), 4, "structure_only")
+            created = utils.create_run(str(work_dir), source_ref="youtube:cli-inspect")
+
+            result = subprocess.run(
+                [
+                    "python3",
+                    str(PROJECT_ROOT / "yt_transcript_utils.py"),
+                    "--api-envelope",
+                    "inspect-run",
+                    str(work_dir),
+                ],
+                cwd=PROJECT_ROOT,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+            payload = json.loads(result.stdout)
+            self.assertEqual(payload["format"], utils.COMMAND_RESULT_FORMAT)
+            self.assertEqual(payload["command"], "inspect-run")
+            self.assertTrue(payload["ok"])
+            self.assertEqual(payload["result"]["run_id"], created["run_id"])
+            self.assertEqual(payload["contracts"]["run_state"]["run_id"], created["run_id"])
+            self.assertEqual(payload["contracts"]["task_spec"]["source_ref"], "youtube:cli-inspect")

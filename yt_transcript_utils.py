@@ -27,7 +27,12 @@ Commands:
     get-chapters <video_url>       Fetch YouTube video chapter metadata
     build-chapter-plan <chapters_json> <work_dir> <output_json>  Map YouTube chapters onto timed chunks
     merge-content <work_dir> <output_file>  Merge processed chunks with chapter headers
-    process-chunks <work_dir> --prompt <name>  Process chunks with isolated LLM API calls (--input-key for chained processing)
+    create-run <work_dir>          Persist a stable runtime task record for outer-agent orchestration
+    inspect-run <work_dir>         Inspect run/task state through the stable runtime-facing API
+    advance-run <work_dir>         Advance the runtime through the preferred bounded control path
+    apply-control <work_dir>       Apply pause or cancel through the stable runtime-facing API
+    finalize-run <work_dir>        Finalize a run summary and optionally materialize merged output
+    process-chunks <work_dir> --prompt <name>  Compatibility helper for direct chunk processing (--input-key for chained processing)
     prepare-resume <work_dir>      Repair stale chunk/runtime state before resuming a run
     replan-remaining <work_dir>    Re-plan unfinished raw chunks after canary/autotune aborts
     runtime-status <work_dir>      Inspect manifest runtime, ownership, and local runtime-control status
@@ -68,6 +73,7 @@ from kernel.task_runtime import runtime as kernel_runtime
 from kernel.task_runtime import state as kernel_state
 from kernel.task_runtime import controller as kernel_controller
 from kernel.task_runtime import telemetry as kernel_telemetry
+from kernel.task_runtime import api as kernel_runtime_api
 from kernel.long_text import glossary as kernel_glossary
 from kernel.long_text import semantic as kernel_semantic
 from kernel.long_text import chunking as kernel_chunking
@@ -2642,8 +2648,79 @@ def prepare_resume(work_dir: str, prompt_name: str = "", config_path: str = None
     )
 
 
+def create_run(work_dir: str, task_spec: dict | None = None, *, task_id: str = "",
+               source_ref: str = "", output_mode: str = "markdown",
+               bilingual: bool = False, quality_profile: str = "balanced",
+               speed_priority: str = "balanced", cost_budget: float = 0.0,
+               latency_budget: float = 0.0, allowed_fallbacks=None,
+               human_escalation_policy: str = "on_blocking_failure",
+               policy_profile: str = "default", migration_mode: str = "") -> dict:
+    """Persist a stable runtime-task record for outer-agent orchestration."""
+    return kernel_runtime_api.create_run(
+        task_spec,
+        work_dir=work_dir,
+        task_id=task_id,
+        source_ref=source_ref,
+        output_mode=output_mode,
+        bilingual=bilingual,
+        quality_profile=quality_profile,
+        speed_priority=speed_priority,
+        cost_budget=cost_budget,
+        latency_budget=latency_budget,
+        allowed_fallbacks=allowed_fallbacks,
+        human_escalation_policy=human_escalation_policy,
+        policy_profile=policy_profile,
+        migration_mode=migration_mode,
+    )
+
+
+def inspect_run(work_dir: str, *, run_id: str = "", policy_profile: str = "default") -> dict:
+    """Inspect run/task state through the stable runtime-facing API."""
+    return kernel_runtime_api.inspect_run(
+        work_dir,
+        run_id=run_id,
+        policy_profile=policy_profile,
+    )
+
+
+def advance_run(work_dir: str, prompt_name: str = "", *, run_id: str = "",
+                action: str = "auto", extra_instruction: str = "",
+                config_path: str = None, dry_run: bool = False,
+                input_key: str = "raw_path", force: bool = False,
+                auto_replan: bool = True, max_replans: int = 3,
+                chunk_size: int = 0, policy_profile: str = "default") -> dict:
+    """Advance the runtime through the preferred bounded control path."""
+    return kernel_runtime_api.advance_run(
+        work_dir,
+        prompt_name,
+        run_id=run_id,
+        action=action,
+        extra_instruction=extra_instruction,
+        config_path=config_path,
+        dry_run=dry_run,
+        input_key=input_key,
+        force=force,
+        auto_replan=auto_replan,
+        max_replans=max_replans,
+        chunk_size=chunk_size,
+        policy_profile=policy_profile,
+    )
+
+
+def apply_control(work_dir: str, signal: str, *, run_id: str = "",
+                  reason: str = "", policy_profile: str = "default") -> dict:
+    """Apply pause or cancel through the stable runtime-facing API."""
+    return kernel_runtime_api.apply_control(
+        work_dir,
+        signal,
+        run_id=run_id,
+        reason=reason,
+        policy_profile=policy_profile,
+    )
+
+
 def runtime_status(work_dir: str) -> dict:
-    """Delegate runtime status inspection to `kernel.long_text.execution`."""
+    """Compatibility helper for runtime inspection; prefer `inspect_run` for new integrations."""
     return kernel_execution.runtime_status(work_dir)
 
 
@@ -2671,8 +2748,22 @@ def _build_resume_run_ownership_conflict_result(ownership: dict) -> dict:
 
 
 def resume_run(work_dir: str, reason: str = "", runtime_ownership: dict | None = None) -> dict:
-    """Delegate resume requests to `kernel.long_text.execution`."""
+    """Resume a paused runtime; stable API entrypoint retained for compatibility."""
     return kernel_execution.resume_run(work_dir, reason=reason, runtime_ownership=runtime_ownership)
+
+
+def finalize_run(work_dir: str, *, run_id: str = "", output_file: str = "",
+                 header: str = "", inspect_only: bool = False,
+                 policy_profile: str = "default") -> dict:
+    """Finalize a run summary and optionally materialize merged output."""
+    return kernel_runtime_api.finalize_run(
+        work_dir,
+        run_id=run_id,
+        output_file=output_file,
+        header=header,
+        inspect_only=inspect_only,
+        policy_profile=policy_profile,
+    )
 
 
 def _resume_run_impl(work_dir: str, reason: str = "") -> dict:
@@ -2721,6 +2812,22 @@ def _parse_optional_success_filter(value) -> bool | None:
     if text in {"0", "false", "no", "failure", "fail"}:
         return False
     raise ValueError(f"Unsupported success filter: {value}")
+
+
+def _load_optional_json_object(*, inline_json: str = "", file_path: str = "") -> dict:
+    """Load an optional JSON object from inline text or a file path."""
+    inline_payload = str(inline_json or "").strip()
+    file_ref = str(file_path or "").strip()
+    if inline_payload and file_ref:
+        raise ValueError("Provide either --task-spec-json or --task-spec-file, not both")
+    if file_ref:
+        inline_payload = Path(file_ref).expanduser().read_text(encoding="utf-8")
+    if not inline_payload:
+        return {}
+    payload = json.loads(inline_payload)
+    if not isinstance(payload, dict):
+        raise ValueError("task spec input must decode to a JSON object")
+    return payload
 
 
 def telemetry_summary(telemetry_ref: str = "", *, telemetry_path: str = "", work_dir: str = "",
@@ -2773,6 +2880,11 @@ def _kernel_command_registry() -> dict[str, object]:
         "chunk-text": chunk_text,
         "chunk-segments": chunk_segments,
         "chunk-document": chunk_document,
+        "create-run": create_run,
+        "inspect-run": inspect_run,
+        "advance-run": advance_run,
+        "apply-control": apply_control,
+        "finalize-run": finalize_run,
         "prepare-resume": prepare_resume,
         "replan-remaining": replan_remaining,
         "runtime-status": runtime_status,
@@ -5350,6 +5462,79 @@ def main():
     merge_parser.add_argument('output_file', help='Output file path')
     merge_parser.add_argument('--header', default='', help='Optional header content to prepend')
 
+    # create-run command
+    create_run_parser = subparsers.add_parser(
+        'create-run',
+        help='Persist a stable runtime task record for outer-agent orchestration'
+    )
+    create_run_parser.add_argument('work_dir', help='Working directory to bind to the runtime task')
+    create_run_parser.add_argument('--task-spec-json', default='', help='Optional inline JSON object with task_spec fields')
+    create_run_parser.add_argument('--task-spec-file', default='', help='Optional JSON file with task_spec fields')
+    create_run_parser.add_argument('--task-id', default='', help='Optional stable task identifier override')
+    create_run_parser.add_argument('--source-ref', default='', help='Optional source reference; defaults to work_dir')
+    create_run_parser.add_argument('--output-mode', default='markdown', help='Task output mode (default: markdown)')
+    create_run_parser.add_argument('--bilingual', action='store_true', help='Record bilingual output intent in the task spec')
+    create_run_parser.add_argument('--quality-profile', default='balanced', help='Quality profile recorded in task spec')
+    create_run_parser.add_argument('--speed-priority', default='balanced', help='Speed priority recorded in task spec')
+    create_run_parser.add_argument('--cost-budget', type=float, default=0.0, help='Optional cost budget recorded in task spec')
+    create_run_parser.add_argument('--latency-budget', type=float, default=0.0, help='Optional latency budget recorded in task spec')
+    create_run_parser.add_argument('--allowed-fallback', dest='allowed_fallbacks', action='append', default=[], help='Repeatable allowed fallback entry')
+    create_run_parser.add_argument('--human-escalation-policy', default='on_blocking_failure', help='Human escalation policy recorded in task spec')
+    create_run_parser.add_argument('--policy-profile', default='default', help='Policy profile recorded in run state')
+    create_run_parser.add_argument('--migration-mode', choices=['runtime_api', 'legacy_cli'], default='', help='Optional runtime API migration mode override')
+
+    # inspect-run command
+    inspect_run_parser = subparsers.add_parser(
+        'inspect-run',
+        help='Inspect run/task state through the stable runtime-facing API'
+    )
+    inspect_run_parser.add_argument('work_dir', help='Working directory to inspect')
+    inspect_run_parser.add_argument('--run-id', default='', help='Optional run identifier assertion for the persisted runtime task')
+    inspect_run_parser.add_argument('--policy-profile', default='default', help='Policy profile used for allowed-action derivation')
+
+    # advance-run command
+    advance_run_parser = subparsers.add_parser(
+        'advance-run',
+        help='Advance the runtime through the preferred bounded control path'
+    )
+    advance_run_parser.add_argument('work_dir', help='Working directory with manifest.json')
+    advance_run_parser.add_argument('--run-id', default='', help='Optional run identifier assertion for the persisted runtime task')
+    advance_run_parser.add_argument('--prompt', default='', help='Optional prompt override; defaults to manifest/runtime metadata')
+    advance_run_parser.add_argument('--action', choices=['auto', 'process', 'process-chunks', 'process-with-replans', 'prepare-resume', 'replan-remaining'], default='auto', help='Runtime action to execute (default: auto)')
+    advance_run_parser.add_argument('--extra-instruction', default='', help='Additional instruction to append to prompt')
+    advance_run_parser.add_argument('--config-path', default=None, help='Optional path to config file')
+    advance_run_parser.add_argument('--dry-run', action='store_true', help='Validate setup without calling the model API')
+    advance_run_parser.add_argument('--input-key', default='raw_path', help='Manifest key for input files')
+    advance_run_parser.add_argument('--force', action='store_true', help='Reprocess work even when manifest state is already done')
+    advance_run_parser.add_argument('--no-auto-replan', dest='auto_replan', action='store_false', help='Use direct processing instead of the bounded auto-replan path')
+    advance_run_parser.set_defaults(auto_replan=True)
+    advance_run_parser.add_argument('--max-replans', type=int, default=3, help='Maximum bounded replans when the preferred path uses auto-replan')
+    advance_run_parser.add_argument('--chunk-size', type=int, default=0, help='Optional override for replan-remaining target chunk size')
+    advance_run_parser.add_argument('--policy-profile', default='default', help='Policy profile used for allowed-action derivation')
+
+    # apply-control command
+    apply_control_parser = subparsers.add_parser(
+        'apply-control',
+        help='Apply pause or cancel through the stable runtime-facing API'
+    )
+    apply_control_parser.add_argument('work_dir', help='Working directory to control')
+    apply_control_parser.add_argument('--run-id', default='', help='Optional run identifier assertion for the persisted runtime task')
+    apply_control_parser.add_argument('--signal', choices=['pause', 'cancel'], required=True, help='Control signal to apply')
+    apply_control_parser.add_argument('--reason', default='', help='Optional operator reason for the control signal')
+    apply_control_parser.add_argument('--policy-profile', default='default', help='Policy profile used for allowed-action derivation')
+
+    # finalize-run command
+    finalize_run_parser = subparsers.add_parser(
+        'finalize-run',
+        help='Finalize a run summary and optionally materialize merged output'
+    )
+    finalize_run_parser.add_argument('work_dir', help='Working directory to finalize')
+    finalize_run_parser.add_argument('--run-id', default='', help='Optional run identifier assertion for the persisted runtime task')
+    finalize_run_parser.add_argument('--output-file', default='', help='Optional merged output path; omit for inspection-only finalization')
+    finalize_run_parser.add_argument('--header', default='', help='Optional header content passed to merge-content when output-file is set')
+    finalize_run_parser.add_argument('--inspect-only', action='store_true', help='Return an inspection-only final summary without merging output')
+    finalize_run_parser.add_argument('--policy-profile', default='default', help='Policy profile used for allowed-action derivation')
+
     # process-chunks command
     pc_parser = subparsers.add_parser(
         'process-chunks',
@@ -5665,6 +5850,104 @@ def main():
             header=args.header,
         )
         print(json.dumps(envelope if args.api_envelope else envelope['result'], ensure_ascii=False))
+
+    elif args.command == 'create-run':
+        try:
+            task_spec = _load_optional_json_object(
+                inline_json=args.task_spec_json,
+                file_path=args.task_spec_file,
+            )
+        except (OSError, ValueError, json.JSONDecodeError) as error:
+            print(json.dumps({
+                'success': False,
+                'error': 'invalid_task_spec',
+                'message': str(error),
+            }, ensure_ascii=False))
+            sys.exit(1)
+        envelope = run_kernel_command(
+            'create-run',
+            work_dir=args.work_dir,
+            task_spec=task_spec,
+            task_id=args.task_id,
+            source_ref=args.source_ref,
+            output_mode=args.output_mode,
+            bilingual=args.bilingual,
+            quality_profile=args.quality_profile,
+            speed_priority=args.speed_priority,
+            cost_budget=args.cost_budget,
+            latency_budget=args.latency_budget,
+            allowed_fallbacks=args.allowed_fallbacks,
+            human_escalation_policy=args.human_escalation_policy,
+            policy_profile=args.policy_profile,
+            migration_mode=args.migration_mode,
+        )
+        result = envelope['result']
+        print(json.dumps(envelope if args.api_envelope else result, ensure_ascii=False))
+        if not result.get('success', False):
+            sys.exit(1)
+
+    elif args.command == 'inspect-run':
+        envelope = run_kernel_command(
+            'inspect-run',
+            work_dir=args.work_dir,
+            run_id=args.run_id,
+            policy_profile=args.policy_profile,
+        )
+        result = envelope['result']
+        print(json.dumps(envelope if args.api_envelope else result, ensure_ascii=False))
+        if not result.get('success', False):
+            sys.exit(1)
+
+    elif args.command == 'advance-run':
+        envelope = run_kernel_command(
+            'advance-run',
+            work_dir=args.work_dir,
+            prompt_name=args.prompt,
+            run_id=args.run_id,
+            action=args.action,
+            extra_instruction=args.extra_instruction,
+            config_path=args.config_path,
+            dry_run=args.dry_run,
+            input_key=args.input_key,
+            force=args.force,
+            auto_replan=args.auto_replan,
+            max_replans=args.max_replans,
+            chunk_size=args.chunk_size,
+            policy_profile=args.policy_profile,
+        )
+        result = envelope['result']
+        print(json.dumps(envelope if args.api_envelope else result, ensure_ascii=False))
+        if not result.get('success', False) and not result.get('dry_run', False):
+            sys.exit(1)
+
+    elif args.command == 'apply-control':
+        envelope = run_kernel_command(
+            'apply-control',
+            work_dir=args.work_dir,
+            run_id=args.run_id,
+            signal=args.signal,
+            reason=args.reason,
+            policy_profile=args.policy_profile,
+        )
+        result = envelope['result']
+        print(json.dumps(envelope if args.api_envelope else result, ensure_ascii=False))
+        if not result.get('success', False):
+            sys.exit(1)
+
+    elif args.command == 'finalize-run':
+        envelope = run_kernel_command(
+            'finalize-run',
+            work_dir=args.work_dir,
+            run_id=args.run_id,
+            output_file=args.output_file,
+            header=args.header,
+            inspect_only=args.inspect_only,
+            policy_profile=args.policy_profile,
+        )
+        result = envelope['result']
+        print(json.dumps(envelope if args.api_envelope else result, ensure_ascii=False))
+        if not result.get('success', False):
+            sys.exit(1)
 
     elif args.command == 'process-chunks':
         envelope = run_kernel_command(

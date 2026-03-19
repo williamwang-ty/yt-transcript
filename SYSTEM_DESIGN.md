@@ -334,6 +334,8 @@ This is especially important for long-video chunk execution, but the design prin
 
 - `kernel/task_runtime/runtime.py`
   - runtime ownership, command envelopes, and append-only command telemetry
+- `kernel/task_runtime/api.py`
+  - stable outer-agent runtime API for `create-run / inspect-run / advance-run / apply-control / resume-run / finalize-run`
 - `kernel/task_runtime/state.py`
   - manifest persistence plus pause / cancel control files and runtime status summaries
 - `kernel/task_runtime/controller.py`
@@ -357,9 +359,12 @@ This layer is not specific to transcript rewriting. It exists because any long-r
 In the current repository, that generic runtime layer lives in:
 
 - `kernel/task_runtime/runtime.py`
+- `kernel/task_runtime/api.py`
 - `kernel/task_runtime/state.py`
 - `kernel/task_runtime/controller.py`
 - `kernel/task_runtime/telemetry.py`
+
+Phase 6 also adds a runtime-facing convergence layer in `kernel/task_runtime/api.py`. It keeps `work_dir` as the durable local run reference, returns a stable `run_id` contract, and makes `create-run / inspect-run / advance-run / apply-control / resume-run / finalize-run` the preferred outer integration surface while older helpers remain compatibility wrappers.
 
 This layer answers the question:
 
@@ -1016,6 +1021,8 @@ YouTube URL
 
 - `kernel/task_runtime/runtime.py`
   - runtime ownership、command envelope，以及 append-only 的命令 telemetry
+- `kernel/task_runtime/api.py`
+  - 面向外层 agent 的稳定 runtime API：`create-run / inspect-run / advance-run / apply-control / resume-run / finalize-run`
 - `kernel/task_runtime/state.py`
   - manifest 持久化，以及 pause / cancel 控制文件和 runtime 状态汇总
 - `kernel/task_runtime/controller.py`
@@ -1039,9 +1046,12 @@ YouTube URL
 在当前仓库里，这个通用 runtime 层主要落在：
 
 - `kernel/task_runtime/runtime.py`
+- `kernel/task_runtime/api.py`
 - `kernel/task_runtime/state.py`
 - `kernel/task_runtime/controller.py`
 - `kernel/task_runtime/telemetry.py`
+
+Phase 6 还增加了 `kernel/task_runtime/api.py` 这一层 runtime-facing convergence layer：它以 `work_dir` 作为本地持久 run 引用，返回稳定的 `run_id` contract，并把 `create-run / inspect-run / advance-run / apply-control / resume-run / finalize-run` 设为首选外部集成面，而旧 helper 保留为兼容包装。
 
 这一层回答的问题是：
 

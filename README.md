@@ -153,6 +153,7 @@ yt-transcript/
 ├── kernel/                 # Two-layer kernel package
 │   ├── task_runtime/       # Generic task runtime layer
 │   │   ├── runtime.py      # Ownership, command envelopes, telemetry append
+│   │   ├── api.py          # Stable runtime-facing API for create/inspect/advance/control/finalize
 │   │   ├── contracts.py    # Runtime contracts for task/run/action/artifact envelopes
 │   │   ├── lifecycle.py    # Lifecycle shell and transition summaries for runtime stages
 │   │   ├── policy.py       # Allowed-action derivation and budget-pressure policy checks
@@ -203,10 +204,24 @@ Phase 2 adds `kernel/task_runtime/lifecycle.py`, which wraps runtime-sensitive c
 Phase 3 adds `kernel/task_runtime/policy.py`, `decision.py`, and `ledger.py` so command envelopes can expose allowed actions, budget-pressure summaries, and rule-first decision records in a uniform way.
 Phase 4 adds `kernel/task_runtime/recovery.py` and `artifacts.py` so long-text runs expose processing sub-states, recovery recommendations, and artifact-graph views without changing the core chunk-processing algorithms.
 Phase 5 adds `kernel/task_runtime/evaluator.py` plus constrained llm-assisted ranking hooks so quality-gated recommendations and optional model-assisted action selection can coexist without bypassing the allowed-action contract.
+Phase 6 adds `kernel/task_runtime/api.py`, making `create-run`, `inspect-run`, `advance-run`, `apply-control`, `resume-run`, and `finalize-run` the preferred outer runtime contract while preserving the older control commands as compatibility helpers.
 
 The hardest internal subsystem is long-text transformation. It activates only when the planning layer determines that the input is long enough to require chunking, continuity control, consistency protection, verification, repair / replan, and deterministic merge.
 
 [Read separate System Design Document](SYSTEM_DESIGN.md)
+
+### 🔁 Preferred Runtime API
+
+For new outer-agent integrations, prefer the stable runtime-facing commands over the older path-oriented helpers:
+
+- `create-run <work_dir>` initializes or refreshes the persisted runtime task record
+- `inspect-run <work_dir>` returns stable task/run state, recovery summary, and allowed actions
+- `advance-run <work_dir>` selects the bounded next runtime action and dispatches it
+- `apply-control <work_dir> --signal pause|cancel` applies operator control signals
+- `resume-run <work_dir>` resumes a paused run
+- `finalize-run <work_dir>` returns a final summary and can optionally call `merge-content`
+
+The default migration mode is `runtime_api`. Set `YT_TRANSCRIPT_RUNTIME_API_MODE=legacy_cli` only when you need to force the older compatibility framing.
 
 ### 🔧 Preflight Modes
 
@@ -464,6 +479,7 @@ yt-transcript/
 ├── kernel/                 # 两层 kernel 包
 │   ├── task_runtime/       # 通用任务运行时层
 │   │   ├── runtime.py      # ownership、command envelope、telemetry append
+│   │   ├── api.py          # 对外稳定 runtime API：create/inspect/advance/control/finalize
 │   │   ├── state.py        # manifest/runtime 持久化与控制文件
 │   │   ├── controller.py   # owned mutation 与 bounded control-loop 辅助
 │   │   └── telemetry.py    # telemetry 查询与汇总辅助
@@ -501,9 +517,24 @@ yt-transcript/
 
 代码结构也按照这套设计拆成两层 kernel：`kernel/task_runtime/*` 负责通用长程任务控制，`kernel/long_text/*` 负责长文本变换行为。`yt_transcript_utils.py` 仍然是主 CLI 和 workflow façade，但现在会直接把职责委托给这两层。
 
+Phase 6 进一步加入了 `kernel/task_runtime/api.py`，把 `create-run`、`inspect-run`、`advance-run`、`apply-control`、`resume-run`、`finalize-run` 收敛为首选外部运行时接口；原来的 `runtime-status`、`process-chunks`、`pause-run`、`cancel-run` 等命令仍然保留，但定位为兼容辅助入口。
+
 其中最难的内部子系统是长文本变换。它只会在 planning 层判断输入足够长、必须进入 chunk 处理时激活，并负责 chunking、continuity、一致性保护、verification、repair / replan 与确定性 merge。
 
 [阅读详细系统设计文档](SYSTEM_DESIGN.md)
+
+### 🔁 首选 Runtime API
+
+对于新的外层 agent 集成，建议优先使用稳定的 runtime-facing 命令，而不是旧的 path-oriented helper：
+
+- `create-run <work_dir>`：初始化或刷新持久化 runtime task record
+- `inspect-run <work_dir>`：返回稳定的 task/run state、recovery summary 与 allowed actions
+- `advance-run <work_dir>`：选择受限的下一步 runtime action 并执行
+- `apply-control <work_dir> --signal pause|cancel`：施加操作级控制信号
+- `resume-run <work_dir>`：恢复暂停中的 run
+- `finalize-run <work_dir>`：返回最终摘要，并可选调用 `merge-content`
+
+默认迁移模式是 `runtime_api`。只有在必须强制走旧兼容包装时，才设置 `YT_TRANSCRIPT_RUNTIME_API_MODE=legacy_cli`。
 
 ### 🔧 预检模式
 
