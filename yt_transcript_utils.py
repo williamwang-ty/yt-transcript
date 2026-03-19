@@ -64,12 +64,21 @@ import time
 import urllib.parse
 from pathlib import Path
 
-import kernel_runtime
-import kernel_state
-import kernel_controller
-import kernel_telemetry
-import kernel_glossary
-import kernel_semantic
+from kernel.task_runtime import runtime as kernel_runtime
+from kernel.task_runtime import state as kernel_state
+from kernel.task_runtime import controller as kernel_controller
+from kernel.task_runtime import telemetry as kernel_telemetry
+from kernel.long_text import glossary as kernel_glossary
+from kernel.long_text import semantic as kernel_semantic
+from kernel.long_text import chunking as kernel_chunking
+from kernel.long_text import merge as kernel_merge
+from kernel.long_text import execution as kernel_execution
+from kernel.long_text import contracts as kernel_contracts
+from kernel.long_text import autotune as kernel_autotune
+from kernel.long_text import lifecycle as kernel_lifecycle
+from kernel.long_text import prompting as kernel_prompting
+from kernel.long_text import llm as kernel_llm
+from kernel.long_text import processing as kernel_processing
 
 
 def _skill_root() -> Path:
@@ -685,38 +694,31 @@ def _build_continuity_context(previous_chunk: dict | None, work_path: Path,
 
 
 def _inject_context_block(prompt_template: str, context_text: str) -> str:
-    if not context_text:
-        return prompt_template
-
-    input_anchor = "\n## Input Text\n"
-    if input_anchor in prompt_template:
-        return prompt_template.replace(input_anchor, f"\n{context_text}\n\n## Input Text\n", 1)
-    return prompt_template.rstrip() + "\n\n" + context_text + "\n"
+    return kernel_prompting._inject_context_block(prompt_template, context_text)
 
 
 def _inject_continuity_context(prompt_template: str, continuity_text: str) -> str:
-    return _inject_context_block(prompt_template, continuity_text)
+    return kernel_prompting._inject_continuity_context(prompt_template, continuity_text)
 
 
 def _inject_glossary_context(prompt_template: str, glossary_text: str) -> str:
-    return _inject_context_block(prompt_template, glossary_text)
+    return kernel_prompting._inject_glossary_context(prompt_template, glossary_text)
 
 
 def _inject_semantic_context(prompt_template: str, semantic_text: str) -> str:
-    return _inject_context_block(prompt_template, semantic_text)
+    return kernel_prompting._inject_semantic_context(prompt_template, semantic_text)
 
 
 def _build_chunk_prompt(prompt_template: str, chunk_body: str,
                         continuity_text: str = "", glossary_text: str = "",
                         semantic_text: str = "") -> str:
-    template = _inject_semantic_context(prompt_template, semantic_text)
-    template = _inject_glossary_context(template, glossary_text)
-    template = _inject_continuity_context(template, continuity_text)
-    if "{RAW_TEXT}" in template:
-        return template.replace("{RAW_TEXT}", chunk_body)
-    if "{STRUCTURED_TEXT}" in template:
-        return template.replace("{STRUCTURED_TEXT}", chunk_body)
-    return template.rstrip() + "\n\n" + chunk_body
+    return kernel_prompting._build_chunk_prompt(
+        prompt_template,
+        chunk_body,
+        continuity_text=continuity_text,
+        glossary_text=glossary_text,
+        semantic_text=semantic_text,
+    )
 
 
 def _estimate_continuity_reserve_tokens(config: dict | None = None,
@@ -811,56 +813,29 @@ def _recommended_chunk_size(prompt_name: str = "", config: dict | None = None) -
 
 
 def _new_plan_id() -> str:
-    return f"plan_{time.strftime('%Y%m%d%H%M%S', time.localtime())}_{random.randint(1000, 9999)}"
+    return kernel_contracts.new_plan_id()
 
 
 def _build_manifest_chunk_contract(source_kind: str = "text", *, driver: str = "",
                                    normalized_document_path: str = "", source_adapter: str = "",
                                    has_timing: bool = False, chapters_enabled: bool = False) -> dict:
-    normalized_source_kind = "segments" if str(source_kind).strip() == "segments" else "text"
-    default_driver = "chunk-segments" if normalized_source_kind == "segments" else "chunk-text"
-    return {
-        "version": CHUNK_CONTRACT_SCHEMA_VERSION,
-        "driver": str(driver or default_driver).strip(),
-        "source_kind": normalized_source_kind,
-        "boundary_mode": "strict",
-        "output_scope": "current_chunk_only",
-        "continuity_mode": "reference_only",
-        "merge_strategy": "ordered_concat",
-        "overlap_strategy": "context_only_no_output_overlap",
-        "normalized_document_path": str(normalized_document_path).strip(),
-        "source_adapter": str(source_adapter).strip(),
-        "has_timing": bool(has_timing),
-        "chapters_enabled": bool(chapters_enabled),
-    }
+    return kernel_contracts.build_manifest_chunk_contract(
+        source_kind,
+        driver=driver,
+        normalized_document_path=normalized_document_path,
+        source_adapter=source_adapter,
+        has_timing=has_timing,
+        chapters_enabled=chapters_enabled,
+    )
 
 
 def _build_manifest_continuity_policy(config: dict | None = None, *, tail_sentences: int | None = None,
                                       summary_token_cap: int | None = None) -> dict:
-    config = config or {}
-    resolved_tail_sentences = max(
-        0,
-        _parse_int(
-            tail_sentences,
-            _parse_int_min(config.get("chunk_context_tail_sentences"), DEFAULT_CHUNK_CONTEXT_TAIL_SENTENCES, 0),
-        ),
+    return kernel_contracts.build_manifest_continuity_policy(
+        config,
+        tail_sentences=tail_sentences,
+        summary_token_cap=summary_token_cap,
     )
-    resolved_summary_token_cap = max(
-        0,
-        _parse_int(
-            summary_token_cap,
-            _parse_int_min(config.get("chunk_context_summary_tokens"), DEFAULT_CHUNK_CONTEXT_SUMMARY_TOKENS, 0),
-        ),
-    )
-    return {
-        "mode": "reference_only",
-        "tail_sentences": resolved_tail_sentences,
-        "summary_token_cap": resolved_summary_token_cap,
-        "carry_section_title": True,
-        "carry_tail_text": resolved_tail_sentences > 0,
-        "boundary_rule": "Only transform the current chunk body below.",
-        "output_rule": "Do not repeat or rewrite this context in the output.",
-    }
 
 
 def _build_manifest_plan(prompt_name: str, chunk_mode: str, recommended_chunk_size: int,
@@ -868,205 +843,49 @@ def _build_manifest_plan(prompt_name: str, chunk_mode: str, recommended_chunk_si
                          plan_id: str = "", prior_plan_id: str = "",
                          chunk_contract: dict | None = None,
                          continuity_policy: dict | None = None) -> dict:
-    return {
-        "plan_id": plan_id or _new_plan_id(),
-        "prior_plan_id": prior_plan_id,
-        "prompt_name": prompt_name,
-        "chunk_mode": _normalize_chunk_mode(chunk_mode),
-        "chunk_size": effective_chunk_size,
-        "recommended_chunk_size": recommended_chunk_size,
-        "target_input_tokens": budget.get("target_tokens", 0),
-        "target_tokens": budget.get("target_tokens", 0),
-        "hard_cap_tokens": budget.get("hard_cap_tokens", 0),
-        "planned_max_output_tokens": budget.get("planned_max_output_tokens", 0),
-        "prompt_tokens": budget.get("prompt_tokens", 0),
-        "prompt_template_tokens": budget.get("prompt_template_tokens", 0),
-        "effective_budget_tokens": budget.get("effective_budget_tokens", 0),
-        "output_ratio": budget.get("output_ratio", DEFAULT_UNKNOWN_OUTPUT_RATIO),
-        "chunk_safety_buffer_tokens": budget.get("safety_buffer_tokens", 0),
-        "continuity_reserve_tokens": budget.get("continuity_reserve_tokens", 0),
-        "token_count_source": budget.get("token_count_source", ""),
-        "source_file": source_file,
-        "chunk_contract": chunk_contract if isinstance(chunk_contract, dict) else _build_manifest_chunk_contract(),
-        "continuity": continuity_policy if isinstance(continuity_policy, dict) else _build_manifest_continuity_policy(),
-        "created_at": _now_iso(),
-    }
+    return kernel_contracts.build_manifest_plan(
+        prompt_name,
+        chunk_mode,
+        recommended_chunk_size,
+        effective_chunk_size,
+        budget,
+        source_file=source_file,
+        plan_id=plan_id,
+        prior_plan_id=prior_plan_id,
+        chunk_contract=chunk_contract,
+        continuity_policy=continuity_policy,
+    )
 
 
 def _normalize_operation_input_key(input_key: str = "") -> str:
-    normalized = str(input_key or "").strip()
-    return normalized or "raw_path"
+    return kernel_contracts.normalize_operation_input_key(input_key)
 
 
 def _resolve_replan_action(input_key: str = "") -> str:
-    return "auto_replan_remaining" if _normalize_operation_input_key(input_key) == "raw_path" else "stop_and_review"
+    return kernel_contracts.resolve_replan_action(input_key)
 
 
 def _build_quality_gate_contract(*, bilingual: bool = False) -> dict:
-    hard_failure_checks = [
-        {"id": "file_exists", "severity": "hard_failure"},
-        {"id": "file_readable", "severity": "hard_failure"},
-        {"id": "non_empty", "severity": "hard_failure"},
-        {
-            "id": "section_headers_for_long_text",
-            "severity": "hard_failure",
-            "min_chars": 1200,
-            "required_header_prefix": "## ",
-        },
-    ]
-    warning_checks = [
-        {
-            "id": "body_paragraph_count",
-            "severity": "warning",
-            "min_paragraphs": 2,
-            "min_chars": 400,
-        },
-        {"id": "no_truncation", "severity": "warning"},
-        {
-            "id": "size_ratio_vs_raw",
-            "severity": "warning",
-            "expected_range": [1.2, 4.0] if bilingual else [0.7, 2.0],
-        },
-    ]
-    if bilingual:
-        hard_failure_checks.append({
-            "id": "bilingual_pairs",
-            "severity": "hard_failure",
-            "required_pair_order": ["english", "chinese"],
-        })
-        warning_checks.append({
-            "id": "bilingual_balance",
-            "severity": "warning",
-            "min_cn_ratio": 0.1,
-            "min_en_ratio": 0.05,
-        })
-    return {
-        "version": CONTROL_CONTRACT_SCHEMA_VERSION,
-        "scope": "final_output",
-        "stop_rule": "hard_failures_stop",
-        "warning_rule": "warnings_require_review",
-        "hard_failure_checks": hard_failure_checks,
-        "warning_checks": warning_checks,
-    }
+    return kernel_contracts.build_quality_gate_contract(bilingual=bilingual)
 
 
 def _build_chunk_verification_contract(prompt_name: str, *, applicable: bool = True) -> dict:
-    if not applicable:
-        return {
-            "version": CONTROL_CONTRACT_SCHEMA_VERSION,
-            "scope": "single_pass_output",
-            "retryable_checks": [],
-            "warning_rule": "warnings_are_recorded",
-        }
-
-    retryable_checks = []
-    if prompt_name != "summarize":
-        retryable_checks.append({
-            "id": "short_output",
-            "severity": "repairable_warning",
-            "retry_action": "retry_same_chunk_same_plan",
-            "min_output_input_ratio": SHORT_OUTPUT_WARNING_RATIO,
-        })
-    if prompt_name in ("structure_only", "quick_cleanup"):
-        retryable_checks.append({
-            "id": "missing_headers",
-            "severity": "repairable_warning",
-            "retry_action": "retry_same_chunk_same_plan",
-            "required_header_prefix": "## ",
-            "min_input_chars": STRUCTURE_HEADER_WARNING_MIN_CHARS,
-        })
-    if prompt_name == "translate_only":
-        retryable_checks.append({
-            "id": "translation_skipped",
-            "severity": "repairable_warning",
-            "retry_action": "retry_same_chunk_same_plan",
-            "min_cn_char_ratio": TRANSLATION_WARNING_CN_RATIO,
-        })
-    return {
-        "version": CONTROL_CONTRACT_SCHEMA_VERSION,
-        "scope": "chunk_output",
-        "retryable_checks": retryable_checks,
-        "warning_rule": "warnings_are_recorded",
-    }
+    return kernel_contracts.build_chunk_verification_contract(prompt_name, applicable=applicable)
 
 
 def _build_repair_contract(prompt_name: str, config: dict | None = None, *, applicable: bool = True) -> dict:
-    config = config or {}
-    if not applicable:
-        return {
-            "version": CONTROL_CONTRACT_SCHEMA_VERSION,
-            "mode": "not_applicable",
-            "max_retries_per_chunk": 0,
-            "backoff_sec": 0.0,
-            "retry_on_checks": [],
-            "after_max_retries": "not_applicable",
-        }
-
-    retry_on_checks = [check["id"] for check in _build_chunk_verification_contract(prompt_name)["retryable_checks"]]
-    return {
-        "version": CONTROL_CONTRACT_SCHEMA_VERSION,
-        "mode": "bounded_retry",
-        "max_retries_per_chunk": _parse_int_min(
-            config.get("llm_chunk_recovery_attempts"),
-            DEFAULT_LLM_CHUNK_RECOVERY_ATTEMPTS,
-            0,
-        ),
-        "backoff_sec": round(_parse_float_min(
-            config.get("llm_chunk_recovery_backoff_sec"),
-            DEFAULT_LLM_CHUNK_RECOVERY_BACKOFF_SEC,
-            0.0,
-        ), 2),
-        "retry_on_checks": retry_on_checks,
-        "retry_action": "retry_same_chunk_same_plan",
-        "after_max_retries": "accept_with_warnings",
-    }
+    return kernel_contracts.build_repair_contract(prompt_name, config, applicable=applicable)
 
 
 def _build_replan_contract(input_key: str = "raw_path", *, applicable: bool = True,
                            canary_chunks: int = DEFAULT_AUTOTUNE_CANARY_CHUNKS,
                            max_auto_replans: int | None = None) -> dict:
-    if not applicable:
-        return {
-            "version": CONTROL_CONTRACT_SCHEMA_VERSION,
-            "mode": "not_applicable",
-            "supports_auto_replan": False,
-            "recommended_cli_flags": [],
-            "on_replan_required": "not_applicable",
-            "trigger_conditions": [],
-        }
-
-    action = _resolve_replan_action(input_key)
-    supports_auto_replan = action == "auto_replan_remaining"
-    contract = {
-        "version": CONTROL_CONTRACT_SCHEMA_VERSION,
-        "mode": "document_abort_and_replan",
-        "supports_auto_replan": supports_auto_replan,
-        "recommended_cli_flags": ["--auto-replan"] if supports_auto_replan else [],
-        "on_replan_required": action,
-        "auto_replan_eligible_input_keys": ["raw_path"],
-        "trigger_conditions": [
-            {
-                "id": "timeout_retry_instability",
-                "effect": "abort_current_run_and_replan_remaining",
-            },
-            {
-                "id": "context_or_budget_error",
-                "effect": "abort_current_run_and_replan_remaining",
-            },
-            {
-                "id": "bad_response_requires_replan",
-                "effect": "abort_current_run_and_replan_remaining",
-            },
-            {
-                "id": "canary_autotune_shrink",
-                "effect": "abort_current_run_and_replan_remaining",
-                "canary_chunk_limit": max(1, _parse_int_min(canary_chunks, DEFAULT_AUTOTUNE_CANARY_CHUNKS, 1)),
-            },
-        ],
-    }
-    if max_auto_replans is not None:
-        contract["max_auto_replans"] = max(0, _parse_int(max_auto_replans, 0))
-    return contract
+    return kernel_contracts.build_replan_contract(
+        input_key,
+        applicable=applicable,
+        canary_chunks=canary_chunks,
+        max_auto_replans=max_auto_replans,
+    )
 
 
 def _build_operation_control_contract(kind: str, prompt_name: str, *,
@@ -1074,191 +893,70 @@ def _build_operation_control_contract(kind: str, prompt_name: str, *,
                                       config: dict | None = None,
                                       bilingual: bool = False,
                                       max_auto_replans: int | None = None) -> dict:
-    config = config or {}
-    is_chunk = kind == "chunk"
-    return {
-        "version": CONTROL_CONTRACT_SCHEMA_VERSION,
-        "kind": "chunk" if is_chunk else "single_pass",
-        "prompt_name": str(prompt_name or "").strip(),
-        "input_key": _normalize_operation_input_key(input_key) if is_chunk else "",
-        "verification": _build_chunk_verification_contract(prompt_name, applicable=is_chunk),
-        "repair": _build_repair_contract(prompt_name, config, applicable=is_chunk),
-        "replan": _build_replan_contract(
-            input_key,
-            applicable=is_chunk,
-            canary_chunks=_parse_int_min(
-                config.get("autotune_canary_chunks"),
-                DEFAULT_AUTOTUNE_CANARY_CHUNKS,
-                1,
-            ),
-            max_auto_replans=max_auto_replans,
-        ),
-        "quality_gate": _build_quality_gate_contract(bilingual=bilingual),
-    }
+    return kernel_contracts.build_operation_control_contract(
+        kind,
+        prompt_name,
+        input_key=input_key,
+        config=config,
+        bilingual=bilingual,
+        max_auto_replans=max_auto_replans,
+    )
 
 
 def _build_runtime_control_state() -> dict:
-    return {
-        "verification_warning_count": 0,
-        "repair_attempted_count": 0,
-        "repair_exhausted_count": 0,
-        "last_replan_trigger": "",
-        "last_replan_action": "",
-        "last_replan_chunk_id": None,
-        "pause_requested": False,
-        "pause_reason": "",
-        "paused_at": "",
-        "resumed_at": "",
-    }
+    return kernel_contracts.build_runtime_control_state()
 
 
 def _ensure_runtime_control_state(runtime: dict) -> dict:
-    control = runtime.get("control")
-    if not isinstance(control, dict):
-        control = _build_runtime_control_state()
-        runtime["control"] = control
-    control.setdefault("verification_warning_count", 0)
-    control.setdefault("repair_attempted_count", 0)
-    control.setdefault("repair_exhausted_count", 0)
-    control.setdefault("last_replan_trigger", "")
-    control.setdefault("last_replan_action", "")
-    control.setdefault("last_replan_chunk_id", None)
-    control.setdefault("pause_requested", False)
-    control.setdefault("pause_reason", "")
-    control.setdefault("paused_at", "")
-    control.setdefault("resumed_at", "")
-    return control
+    return kernel_contracts.ensure_runtime_control_state(runtime)
 
 
 def _build_chunk_control_state() -> dict:
-    return {
-        "verification_status": "pending",
-        "warning_count": 0,
-        "warnings": [],
-        "retry_reasons": [],
-        "repair_exhausted": False,
-        "last_verified_at": "",
-    }
+    return kernel_contracts.build_chunk_control_state()
 
 
 def _ensure_chunk_control_state(chunk_info: dict) -> dict:
-    control = chunk_info.get("control")
-    if not isinstance(control, dict):
-        control = _build_chunk_control_state()
-        chunk_info["control"] = control
-    control.setdefault("verification_status", "pending")
-    control.setdefault("warning_count", 0)
-    control.setdefault("warnings", [])
-    control.setdefault("retry_reasons", [])
-    control.setdefault("repair_exhausted", False)
-    control.setdefault("last_verified_at", "")
-    return control
+    return kernel_contracts.ensure_chunk_control_state(chunk_info)
 
 
 def _record_chunk_verification(chunk_info: dict, *, status: str, warnings: list[str],
                                retry_reasons: list[str], repair_exhausted: bool = False) -> None:
-    control = _ensure_chunk_control_state(chunk_info)
-    control["verification_status"] = str(status or "pending")
-    control["warning_count"] = len([warning for warning in (warnings or []) if str(warning).strip()])
-    control["warnings"] = [str(warning) for warning in (warnings or []) if str(warning).strip()]
-    control["retry_reasons"] = [str(reason) for reason in (retry_reasons or []) if str(reason).strip()]
-    control["repair_exhausted"] = bool(repair_exhausted)
-    control["last_verified_at"] = _now_iso()
+    kernel_contracts.record_chunk_verification(
+        chunk_info,
+        status=status,
+        warnings=warnings,
+        retry_reasons=retry_reasons,
+        repair_exhausted=repair_exhausted,
+    )
 
 
 def _classify_replan_trigger(error: Exception | None = None, *,
                              had_timeout_retry: bool = False,
                              autotune_last_event: str = "") -> str:
-    if had_timeout_retry:
-        return "timeout_retry_instability"
-    if autotune_last_event == "shrink":
-        return "canary_autotune_shrink"
-    if error is not None:
-        if _is_timeout_error(error):
-            return "timeout_retry_instability"
-        status_code = getattr(error, "status_code", None)
-        response_hint = str(getattr(error, "response_body", "") or "").lower()
-        if status_code in {413, 422}:
-            return "context_or_budget_error"
-        if status_code == 400 and any(token in response_hint for token in ("context", "prompt", "max token", "too long", "token limit")):
-            return "context_or_budget_error"
-        if str(getattr(error, "error_type", "") or "") == "bad_response":
-            return "bad_response_requires_replan"
-    return "manual_review"
+    return kernel_contracts.classify_replan_trigger(
+        error,
+        had_timeout_retry=had_timeout_retry,
+        autotune_last_event=autotune_last_event,
+    )
 
 
 def _mark_runtime_replan(runtime: dict, *, reason: str, trigger: str,
                          input_key: str, chunk_id: int | None = None) -> None:
-    runtime["replan_required"] = True
-    runtime["replan_reason"] = str(reason or "").strip()
-    control = _ensure_runtime_control_state(runtime)
-    control["last_replan_trigger"] = str(trigger or "manual_review")
-    control["last_replan_action"] = _resolve_replan_action(input_key)
-    control["last_replan_chunk_id"] = chunk_id
+    kernel_contracts.mark_runtime_replan(
+        runtime,
+        reason=reason,
+        trigger=trigger,
+        input_key=input_key,
+        chunk_id=chunk_id,
+    )
 
 
 def _build_process_control_summary(runtime: dict, operation_control: dict) -> dict:
-    runtime_control = _ensure_runtime_control_state(runtime)
-    replan_contract = operation_control.get("replan", {}) if isinstance(operation_control.get("replan", {}), dict) else {}
-    repair_contract = operation_control.get("repair", {}) if isinstance(operation_control.get("repair", {}), dict) else {}
-    return {
-        "operation": operation_control,
-        "verification": {
-            "warning_count": runtime_control.get("verification_warning_count", 0),
-        },
-        "repair": {
-            "attempted_count": runtime_control.get("repair_attempted_count", 0),
-            "exhausted_count": runtime_control.get("repair_exhausted_count", 0),
-            "max_retries_per_chunk": repair_contract.get("max_retries_per_chunk", 0),
-            "backoff_sec": repair_contract.get("backoff_sec", 0.0),
-            "after_max_retries": repair_contract.get("after_max_retries", "not_applicable"),
-        },
-        "replan": {
-            "required": bool(runtime.get("replan_required", False)),
-            "reason": str(runtime.get("replan_reason", "") or ""),
-            "trigger": str(runtime_control.get("last_replan_trigger", "") or ""),
-            "action": str(runtime_control.get("last_replan_action", replan_contract.get("on_replan_required", "not_applicable")) or ""),
-            "supports_auto_replan": bool(replan_contract.get("supports_auto_replan", False)),
-            "last_replan_chunk_id": runtime_control.get("last_replan_chunk_id"),
-        },
-        "pause": {
-            "requested": bool(runtime_control.get("pause_requested", False)),
-            "reason": str(runtime_control.get("pause_reason", "") or ""),
-            "paused_at": str(runtime_control.get("paused_at", "") or ""),
-            "resumed_at": str(runtime_control.get("resumed_at", "") or ""),
-        },
-    }
+    return kernel_contracts.build_process_control_summary(runtime, operation_control)
 
 
 def _build_manifest_runtime(plan_id: str, request_url: str = "") -> dict:
-    return {
-        "status": "pending",
-        "active_plan_id": plan_id,
-        "last_request_url": request_url,
-        "processed_count": 0,
-        "failed_count": 0,
-        "skipped_count": 0,
-        "superseded_count": 0,
-        "interrupted_count": 0,
-        "current_chunk_index": 0,
-        "replan_required": False,
-        "replan_reason": "",
-        "last_replanned_at": "",
-        "last_resume_check_at": "",
-        "last_resume_repair_at": "",
-        "resume_repair_count": 0,
-        "last_paused_at": "",
-        "last_pause_reason": "",
-        "pause_count": 0,
-        "last_resumed_at": "",
-        "last_resume_reason": "",
-        "run_id": "",
-        "operation_prompt_name": "",
-        "operation_input_key": "raw_path",
-        "operation_control": {},
-        "control": _build_runtime_control_state(),
-        "updated_at": _now_iso(),
-    }
+    return kernel_contracts.build_manifest_runtime(plan_id, request_url=request_url)
 
 
 def _new_chunk_manifest_entry(chunk_id: int, chunk_content: str, budget: dict,
@@ -1267,417 +965,63 @@ def _new_chunk_manifest_entry(chunk_id: int, chunk_content: str, budget: dict,
                               continuity_prev_chunk_id: int | None = None,
                               chunk_contract: dict | None = None,
                               continuity_policy: dict | None = None) -> dict:
-    config = config or {}
-    chunk_contract = chunk_contract if isinstance(chunk_contract, dict) else _build_manifest_chunk_contract()
-    continuity_policy = continuity_policy if isinstance(continuity_policy, dict) else _build_manifest_continuity_policy(config)
-    return {
-        "id": chunk_id,
-        "chunk_id": chunk_id,
-        "plan_id": plan_id,
-        "raw_path": raw_path,
-        "processed_path": processed_path,
-        "source_kind": str(chunk_contract.get("source_kind", "text")).strip() or "text",
-        "boundary_mode": str(chunk_contract.get("boundary_mode", "strict")).strip() or "strict",
-        "output_scope": str(chunk_contract.get("output_scope", "current_chunk_only")).strip() or "current_chunk_only",
-        "continuity_mode": str(continuity_policy.get("mode", "reference_only")).strip() or "reference_only",
-        "char_count": len(chunk_content),
-        "input_chars": len(chunk_content),
-        "estimated_input_tokens": _estimate_tokens(chunk_content, "tokens", config),
-        "input_tokens": _estimate_tokens(chunk_content, "tokens", config),
-        "token_count_source": budget.get("token_count_source", ""),
-        "tail_context_text": _extract_tail_sentences(
-            chunk_content,
-            max(0, _parse_int(continuity_policy.get("tail_sentences"), DEFAULT_CHUNK_CONTEXT_TAIL_SENTENCES)),
-            config,
-        ),
-        "processed_tail_context_text": "",
-        "processed_input_tail_context_text": "",
-        "processed_input_section_title": "",
-        "continuity_prev_chunk_id": continuity_prev_chunk_id,
-        "continuity_context_chars": 0,
-        "continuity_context_tokens": 0,
-        "continuity_section_title": "",
-        "glossary_terms": [],
-        "glossary_term_count": 0,
-        "glossary_context_tokens": 0,
-        "semantic_anchors": [],
-        "semantic_anchor_count": 0,
-        "semantic_context_tokens": 0,
-        "last_section_title": "",
-        "output_chars": 0,
-        "actual_output_tokens": 0,
-        "planned_max_output_tokens": budget.get("planned_max_output_tokens", 0),
-        "status": "pending",
-        "attempts": 0,
-        "attempt_logs": [],
-        "recovery_attempts": 0,
-        "recovery_logs": [],
-        "last_error": "",
-        "last_error_type": "",
-        "error_type": "",
-        "latency_ms": None,
-        "request_url": "",
-        "streaming_used": False,
-        "autotune_target_tokens": 0,
-        "autotune_next_target_tokens": 0,
-        "autotune_event": "",
-        "autotune_reason": "",
-        "superseded_by_plan_id": "",
-        "updated_at": "",
-        "started_at": "",
-        "completed_at": "",
-        "control": _build_chunk_control_state(),
-    }
+    return kernel_lifecycle._new_chunk_manifest_entry(
+        chunk_id,
+        chunk_content,
+        budget,
+        config,
+        raw_path=raw_path,
+        processed_path=processed_path,
+        plan_id=plan_id,
+        continuity_prev_chunk_id=continuity_prev_chunk_id,
+        chunk_contract=chunk_contract,
+        continuity_policy=continuity_policy,
+    )
 
 
 def _resolve_chunk_output_filename(chunk_info: dict, prompt_name: str = "") -> str:
-    chunk_id = _parse_int(chunk_info.get("id", chunk_info.get("chunk_id", 0)), 0)
-    if prompt_name == "summarize":
-        return f"summary_chunk_{chunk_id:03d}.txt"
-    filename = str(chunk_info.get("processed_path", "")).strip()
-    return filename or f"processed_{chunk_id:03d}.md"
+    return kernel_lifecycle._resolve_chunk_output_filename(chunk_info, prompt_name)
 
 
 def _resolve_chunk_output_path(work_path: Path, chunk_info: dict, prompt_name: str = "") -> Path:
-    return work_path / _resolve_chunk_output_filename(chunk_info, prompt_name)
+    return kernel_lifecycle._resolve_chunk_output_path(work_path, chunk_info, prompt_name)
 
 
 def _ensure_chunk_runtime_defaults(manifest: dict, runtime: dict, plan: dict,
                                    prompt_budget: dict, request_url: str,
                                    planned_max_output_tokens: int,
                                    autotune_state: dict) -> None:
-    for chunk_info in manifest.get("chunks", []):
-        chunk_info.setdefault("chunk_id", chunk_info.get("id", 0))
-        chunk_info.setdefault("plan_id", runtime.get("active_plan_id", plan.get("plan_id", "")))
-        chunk_info.setdefault("status", "pending")
-        chunk_info.setdefault("attempts", 0)
-        chunk_info.setdefault("attempt_logs", [])
-        chunk_info.setdefault("recovery_attempts", 0)
-        chunk_info.setdefault("recovery_logs", [])
-        chunk_info.setdefault("last_error", "")
-        chunk_info.setdefault("last_error_type", "")
-        chunk_info.setdefault("error_type", chunk_info.get("last_error_type", ""))
-        chunk_info.setdefault("latency_ms", None)
-        chunk_info.setdefault("input_chars", chunk_info.get("char_count", 0))
-        chunk_info.setdefault("estimated_input_tokens", 0)
-        chunk_info.setdefault("input_tokens", chunk_info.get("estimated_input_tokens", 0))
-        chunk_info.setdefault("token_count_source", prompt_budget["token_count_source"])
-        chunk_info.setdefault("tail_context_text", "")
-        chunk_info.setdefault("processed_tail_context_text", "")
-        chunk_info.setdefault("processed_input_tail_context_text", "")
-        chunk_info.setdefault("processed_input_section_title", "")
-        chunk_info.setdefault("continuity_prev_chunk_id", None)
-        chunk_info.setdefault("continuity_context_chars", 0)
-        chunk_info.setdefault("continuity_context_tokens", 0)
-        chunk_info.setdefault("continuity_section_title", "")
-        chunk_info.setdefault("glossary_terms", [])
-        chunk_info.setdefault("glossary_term_count", 0)
-        chunk_info.setdefault("glossary_context_tokens", 0)
-        chunk_info.setdefault("semantic_anchors", [])
-        chunk_info.setdefault("semantic_anchor_count", 0)
-        chunk_info.setdefault("semantic_context_tokens", 0)
-        chunk_info.setdefault("last_section_title", "")
-        chunk_info.setdefault("output_chars", 0)
-        chunk_info.setdefault("actual_output_tokens", 0)
-        chunk_info.setdefault("prompt_tokens", prompt_budget["prompt_tokens"])
-        chunk_info.setdefault("planned_max_output_tokens", planned_max_output_tokens)
-        chunk_info.setdefault("request_url", request_url)
-        chunk_info.setdefault("streaming_used", False)
-        chunk_info.setdefault("autotune_target_tokens", autotune_state["current_target_tokens"])
-        chunk_info.setdefault("autotune_next_target_tokens", autotune_state["current_target_tokens"])
-        chunk_info.setdefault("autotune_event", "")
-        chunk_info.setdefault("autotune_reason", "")
-        chunk_info.setdefault("superseded_by_plan_id", "")
-        chunk_info.setdefault("updated_at", "")
-        chunk_info.setdefault("started_at", "")
-        chunk_info.setdefault("completed_at", "")
-        _ensure_chunk_control_state(chunk_info)
-
-
-def _infer_resume_runtime_status(runtime: dict, chunks: list[dict]) -> str:
-    active_chunks = [chunk for chunk in (chunks or []) if chunk.get("status") != SUPERSEDED_CHUNK_STATUS]
-    active_statuses = {str(chunk.get("status", "pending")).strip() or "pending" for chunk in active_chunks}
-    previous_status = str(runtime.get("status", "pending")).strip() or "pending"
-
-    if runtime.get("replan_required", False):
-        return "aborted"
-    if active_chunks and active_statuses == {"done"}:
-        return "completed"
-    if INTERRUPTED_CHUNK_STATUS in active_statuses:
-        return RESUMABLE_RUNTIME_STATUS
-    if active_statuses and active_statuses.issubset({"done", "failed"}) and "failed" in active_statuses:
-        return "completed_with_errors"
-    if previous_status in {"running", PAUSED_RUNTIME_STATUS}:
-        return RESUMABLE_RUNTIME_STATUS
-    if "pending" in active_statuses:
-        if previous_status in {RESUMABLE_RUNTIME_STATUS, PAUSED_RUNTIME_STATUS, "aborted", "completed", "completed_with_errors"}:
-            return RESUMABLE_RUNTIME_STATUS
-        return "pending"
-    if "failed" in active_statuses:
-        if previous_status in {RESUMABLE_RUNTIME_STATUS, PAUSED_RUNTIME_STATUS, "aborted"}:
-            return RESUMABLE_RUNTIME_STATUS
-        return "completed_with_errors"
-    return previous_status
-
-
-def _prepare_manifest_for_resume(manifest: dict, work_path: Path, prompt_name: str = "") -> dict:
-    runtime = manifest.get("runtime", {}) if isinstance(manifest.get("runtime", {}), dict) else {}
-    now = _now_iso()
-    report = {
-        "repaired": False,
-        "repair_count": 0,
-        "promoted_done_chunk_ids": [],
-        "interrupted_chunk_ids": [],
-        "demoted_missing_output_chunk_ids": [],
-        "runtime_status_before": str(runtime.get("status", "pending")).strip() or "pending",
-        "runtime_status_after": "",
-        "interrupted_count": 0,
-        "warnings": [],
-    }
-
-    def mark_promoted_done(chunk_info: dict, output_path: Path, reason: str) -> None:
-        try:
-            output_text = output_path.read_text(encoding="utf-8")
-        except OSError:
-            output_text = ""
-        chunk_info["status"] = "done"
-        chunk_info["output_chars"] = len(output_text)
-        chunk_info["actual_output_tokens"] = max(
-            _parse_int(chunk_info.get("actual_output_tokens"), 0),
-            _estimate_tokens(output_text, "tokens") if output_text else 0,
-        )
-        chunk_info["last_error"] = ""
-        chunk_info["last_error_type"] = ""
-        chunk_info["error_type"] = ""
-        chunk_info["completed_at"] = str(chunk_info.get("completed_at", "")).strip() or now
-        chunk_info["updated_at"] = now
-        report["promoted_done_chunk_ids"].append(_parse_int(chunk_info.get("id"), 0))
-        report["warnings"].append(reason)
-
-    def mark_interrupted(chunk_info: dict, reason: str, bucket: str) -> None:
-        chunk_info["status"] = INTERRUPTED_CHUNK_STATUS
-        chunk_info["last_error"] = reason
-        chunk_info["last_error_type"] = "resume_interrupted"
-        chunk_info["error_type"] = "resume_interrupted"
-        chunk_info["completed_at"] = ""
-        chunk_info["updated_at"] = now
-        report[bucket].append(_parse_int(chunk_info.get("id"), 0))
-        report["warnings"].append(reason)
-
-    for chunk_info in manifest.get("chunks", []):
-        if chunk_info.get("status") == SUPERSEDED_CHUNK_STATUS:
-            continue
-        output_path = _resolve_chunk_output_path(work_path, chunk_info, prompt_name)
-        output_exists = output_path.exists()
-        status = str(chunk_info.get("status", "pending")).strip() or "pending"
-
-        if status == "running":
-            if output_exists:
-                mark_promoted_done(
-                    chunk_info,
-                    output_path,
-                    f"Resume repair: promoted stale running chunk {_parse_int(chunk_info.get('id'), 0)} to done from {output_path.name}",
-                )
-            else:
-                mark_interrupted(
-                    chunk_info,
-                    f"Resume repair: marked stale running chunk {_parse_int(chunk_info.get('id'), 0)} as interrupted because {output_path.name} is missing",
-                    "interrupted_chunk_ids",
-                )
-        elif status == "done" and not output_exists:
-            mark_interrupted(
-                chunk_info,
-                f"Resume repair: demoted done chunk {_parse_int(chunk_info.get('id'), 0)} because checkpoint file {output_path.name} is missing",
-                "demoted_missing_output_chunk_ids",
-            )
-        elif status == INTERRUPTED_CHUNK_STATUS and output_exists:
-            mark_promoted_done(
-                chunk_info,
-                output_path,
-                f"Resume repair: promoted interrupted chunk {_parse_int(chunk_info.get('id'), 0)} to done from {output_path.name}",
-            )
-
-    runtime_status_after = _infer_resume_runtime_status(runtime, manifest.get("chunks", []))
-    runtime["last_resume_check_at"] = now
-    runtime["interrupted_count"] = sum(
-        1
-        for chunk in manifest.get("chunks", [])
-        if chunk.get("status") == INTERRUPTED_CHUNK_STATUS
-    )
-    if report["promoted_done_chunk_ids"] or report["interrupted_chunk_ids"] or report["demoted_missing_output_chunk_ids"]:
-        runtime["last_resume_repair_at"] = now
-        runtime["resume_repair_count"] = max(0, _parse_int(runtime.get("resume_repair_count"), 0)) +             len(report["promoted_done_chunk_ids"]) + len(report["interrupted_chunk_ids"]) + len(report["demoted_missing_output_chunk_ids"])
-    runtime["status"] = runtime_status_after
-    runtime["updated_at"] = now
-
-    report["runtime_status_after"] = runtime_status_after
-    report["interrupted_count"] = runtime["interrupted_count"]
-    report["repair_count"] = len(report["promoted_done_chunk_ids"]) + len(report["interrupted_chunk_ids"]) + len(report["demoted_missing_output_chunk_ids"])
-    report["repaired"] = report["repair_count"] > 0 or report["runtime_status_before"] != runtime_status_after
-    return report
-
-
-def _format_resume_report(report: dict) -> str:
-    if not isinstance(report, dict) or not report.get("repaired", False):
-        return ""
-    parts = []
-    if report.get("promoted_done_chunk_ids"):
-        parts.append(f"promoted={len(report['promoted_done_chunk_ids'])}")
-    if report.get("interrupted_chunk_ids"):
-        parts.append(f"interrupted={len(report['interrupted_chunk_ids'])}")
-    if report.get("demoted_missing_output_chunk_ids"):
-        parts.append(f"demoted_missing_output={len(report['demoted_missing_output_chunk_ids'])}")
-    parts.append(f"runtime={report.get('runtime_status_before', '')}->{report.get('runtime_status_after', '')}")
-    return "Resume repair: " + ", ".join(parts)
-
-
-_resolve_runtime_mutation_ownership = kernel_controller.resolve_runtime_mutation_ownership
-_finalize_mutation_result = kernel_controller.finalize_mutation_result
-_runtime_ownership_error_parts = kernel_controller.runtime_ownership_error_parts
-
-def _build_prepare_resume_ownership_conflict_result(manifest_path: Path, prompt_name: str,
-                                                    ownership: dict) -> dict:
-    error, message = _runtime_ownership_error_parts(ownership)
-    return _finalize_mutation_result({
-        "success": False,
-        "manifest_path": str(manifest_path),
-        "prompt_name": str(prompt_name or "").strip(),
-        "resume": {"repaired": False, "warnings": []},
-        "runtime": {},
-        "error": error,
-        "message": message,
-    }, ownership)
-
-
-def _build_process_ownership_conflict_result(ownership: dict) -> dict:
-    error, message = _runtime_ownership_error_parts(ownership)
-    return _finalize_mutation_result({
-        "success": False,
-        "processed_count": 0,
-        "failed_count": 0,
-        "skipped_count": 0,
-        "superseded_count": 0,
-        "total_chunks": 0,
-        "warnings": [],
-        "warning_count": 0,
-        "output_files": [],
-        "aborted": True,
-        "aborted_reason": message,
-        "replan_required": False,
-        "replan_reason": "",
-        "resume": {"repaired": False, "warnings": []},
-        "plan": {},
-        "control": {},
-        "request_url": "",
-        "error": error,
-        "message": message,
-    }, ownership)
-
-
-def _build_replan_ownership_conflict_result(ownership: dict) -> dict:
-    error, message = _runtime_ownership_error_parts(ownership)
-    return _finalize_mutation_result({
-        "success": False,
-        "replanned": False,
-        "warnings": [],
-        "error": error,
-        "message": message,
-    }, ownership)
-
-
-def _build_process_with_replans_ownership_conflict_result(ownership: dict) -> dict:
-    error, message = _runtime_ownership_error_parts(ownership)
-    return _finalize_mutation_result({
-        "processed_count": 0,
-        "failed_count": 0,
-        "skipped_count": 0,
-        "superseded_count": 0,
-        "warnings": [],
-        "warning_count": 0,
-        "output_files": [],
-        "replan_count": 0,
-        "request_url": "",
-        "aborted": True,
-        "aborted_reason": message,
-        "success": False,
-        "replan_required": False,
-        "replan_reason": "",
-        "plan": {},
-        "control": {},
-        "error": error,
-        "message": message,
-    }, ownership)
-
-
-def prepare_resume(work_dir: str, prompt_name: str = "", config_path: str = None,
-                   input_key: str = "raw_path", runtime_ownership: dict | None = None) -> dict:
-    manifest_path = Path(work_dir) / "manifest.json"
-    if not manifest_path.exists():
-        print(f"Error: manifest.json not found in {work_dir}", file=sys.stderr)
-        sys.exit(1)
-
-    return kernel_controller.run_owned_mutation(
-        work_dir,
-        "prepare-resume",
-        runtime_ownership=runtime_ownership,
-        conflict_result_builder=lambda ownership: _build_prepare_resume_ownership_conflict_result(manifest_path, prompt_name, ownership),
-        mutation_fn=lambda ownership: _prepare_resume_impl(
-            work_dir,
-            prompt_name=prompt_name,
-            config_path=config_path,
-            input_key=input_key,
-        ),
-    )
-
-
-def _prepare_resume_impl(work_dir: str, prompt_name: str = "", config_path: str = None,
-                         input_key: str = "raw_path") -> dict:
-    del input_key
-    work_path = Path(work_dir)
-    manifest_path = work_path / "manifest.json"
-    if not manifest_path.exists():
-        print(f"Error: manifest.json not found in {work_dir}", file=sys.stderr)
-        sys.exit(1)
-
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    config = _load_optional_config(config_path)
-    resolved_prompt_name = str(prompt_name or manifest.get("plan", {}).get("prompt_name", manifest.get("prompt_name", ""))).strip()
-    prompt_template = ""
-    if resolved_prompt_name:
-        prompt_template = _resolve_prompt_template_path(resolved_prompt_name).read_text(encoding="utf-8")
-    prompt_budget = _calculate_chunk_budget(resolved_prompt_name, prompt_template, config)
-    manifest = _ensure_manifest_structure(
-        manifest,
-        prompt_name=resolved_prompt_name,
-        prompt_budget=prompt_budget,
-        recommended_chunk_size=_recommended_chunk_size(resolved_prompt_name, config),
-        source_file=str(manifest.get("source_file", "")).strip(),
-        config=config,
-    )
-    plan = manifest["plan"]
-    runtime = manifest["runtime"]
-    planned_max_output_tokens = max(1, _parse_int(plan.get("planned_max_output_tokens"), prompt_budget["planned_max_output_tokens"]))
-    autotune_state = _build_autotune_state(plan, config, manifest.get("autotune"))
-    _ensure_chunk_runtime_defaults(
+    kernel_lifecycle._ensure_chunk_runtime_defaults(
         manifest,
         runtime,
         plan,
         prompt_budget,
-        request_url=str(runtime.get("last_request_url", "")).strip(),
-        planned_max_output_tokens=planned_max_output_tokens,
-        autotune_state=autotune_state,
+        request_url,
+        planned_max_output_tokens,
+        autotune_state,
     )
-    resume = _prepare_manifest_for_resume(manifest, work_path, resolved_prompt_name)
-    _refresh_manifest_token_source_summary(manifest)
-    _sync_manifest_legacy_fields(manifest)
-    _write_manifest(manifest_path, manifest)
-    return {
-        "success": True,
-        "manifest_path": str(manifest_path),
-        "prompt_name": resolved_prompt_name,
-        "resume": resume,
-        "runtime": manifest.get("runtime", {}),
-    }
+
+
+def _infer_resume_runtime_status(runtime: dict, chunks: list[dict]) -> str:
+    return kernel_lifecycle._infer_resume_runtime_status(runtime, chunks)
+
+
+def _prepare_manifest_for_resume(manifest: dict, work_path: Path, prompt_name: str = "") -> dict:
+    return kernel_lifecycle._prepare_manifest_for_resume(manifest, work_path, prompt_name)
+
+
+def _format_resume_report(report: dict) -> str:
+    return kernel_lifecycle._format_resume_report(report)
+
+
+def _prepare_resume_impl(work_dir: str, prompt_name: str = "", config_path: str = None,
+                         input_key: str = "raw_path") -> dict:
+    return kernel_lifecycle._prepare_resume_impl(
+        work_dir,
+        prompt_name=prompt_name,
+        config_path=config_path,
+        input_key=input_key,
+    )
 
 
 def _sync_manifest_legacy_fields(manifest: dict) -> dict:
@@ -1851,182 +1195,20 @@ def _estimate_p95(values: list[int]) -> int | None:
 
 def _build_autotune_state(prompt_budget: dict, config: dict | None = None,
                           existing: dict | None = None) -> dict:
-    config = config or {}
-    existing = existing if isinstance(existing, dict) else {}
-
-    enabled = _parse_bool(config.get("enable_chunk_autotune"), DEFAULT_ENABLE_CHUNK_AUTOTUNE)
-    reduce_percent = _parse_float_range(
-        config.get("autotune_reduce_percent"),
-        DEFAULT_AUTOTUNE_REDUCE_PERCENT,
-        0.01,
-        0.90,
-    )
-    increase_percent = _parse_float_range(
-        config.get("autotune_increase_percent"),
-        DEFAULT_AUTOTUNE_INCREASE_PERCENT,
-        0.01,
-        0.50,
-    )
-    success_window = _parse_int_min(
-        config.get("autotune_success_window"),
-        DEFAULT_AUTOTUNE_SUCCESS_WINDOW,
-        1,
-    )
-    p95_latency_threshold_ms = _parse_int_min(
-        config.get("autotune_p95_latency_threshold_ms"),
-        DEFAULT_AUTOTUNE_P95_LATENCY_THRESHOLD_MS,
-        1,
-    )
-
-    base_target_tokens = max(1, _parse_int(prompt_budget.get("target_tokens"), DEFAULT_UNKNOWN_CHUNK_TOKENS))
-    max_target_tokens = max(
-        base_target_tokens,
-        _parse_int(prompt_budget.get("hard_cap_tokens"), base_target_tokens),
-    )
-    min_target_tokens = max(1, int(math.floor(base_target_tokens * DEFAULT_AUTOTUNE_MIN_TARGET_RATIO)))
-    min_target_tokens = min(min_target_tokens, base_target_tokens)
-
-    latency_window_ms = [
-        max(0, _parse_int(value, 0))
-        for value in existing.get("latency_window_ms", [])
-        if max(0, _parse_int(value, 0)) > 0
-    ][-success_window:]
-
-    current_target_tokens = max(1, _parse_int(existing.get("current_target_tokens"), base_target_tokens))
-    current_target_tokens = max(min_target_tokens, min(max_target_tokens, current_target_tokens))
-
-    state = {
-        "enabled": enabled,
-        "base_target_tokens": base_target_tokens,
-        "current_target_tokens": current_target_tokens,
-        "min_target_tokens": min_target_tokens,
-        "max_target_tokens": max_target_tokens,
-        "reduce_percent": reduce_percent,
-        "increase_percent": increase_percent,
-        "success_window": success_window,
-        "p95_latency_threshold_ms": p95_latency_threshold_ms,
-        "latency_window_ms": latency_window_ms,
-        "p95_latency_ms": _estimate_p95(latency_window_ms),
-        "consecutive_successes": max(0, _parse_int(existing.get("consecutive_successes"), 0)),
-        "last_event": str(existing.get("last_event", "")).strip(),
-        "last_reason": str(existing.get("last_reason", "")).strip(),
-        "updated_at": str(existing.get("updated_at", "")).strip(),
-        "current_planned_max_output_tokens": max(
-            1,
-            _parse_int(
-                existing.get("current_planned_max_output_tokens"),
-                prompt_budget.get("planned_max_output_tokens", DEFAULT_UNKNOWN_MAX_OUTPUT_TOKENS),
-            ),
-        ),
-    }
-    return state
+    return kernel_autotune.build_autotune_state(prompt_budget, config, existing)
 
 
 def _update_autotune_state(autotune_state: dict | None, *, success: bool,
                            latency_ms: int | None = None, timeout: bool = False,
                            error_type: str = "", chunk_id: int | None = None) -> dict:
-    state = dict(autotune_state or {})
-    state.setdefault("enabled", False)
-    state.setdefault("current_target_tokens", 0)
-    state.setdefault("min_target_tokens", 1)
-    state.setdefault("max_target_tokens", max(1, state.get("current_target_tokens", 1)))
-    state.setdefault("reduce_percent", DEFAULT_AUTOTUNE_REDUCE_PERCENT)
-    state.setdefault("increase_percent", DEFAULT_AUTOTUNE_INCREASE_PERCENT)
-    state.setdefault("success_window", DEFAULT_AUTOTUNE_SUCCESS_WINDOW)
-    state.setdefault("p95_latency_threshold_ms", DEFAULT_AUTOTUNE_P95_LATENCY_THRESHOLD_MS)
-    state.setdefault("latency_window_ms", [])
-    state["last_event"] = ""
-    state["last_reason"] = ""
-    state["updated_at"] = _now_iso()
-
-    if not state.get("enabled"):
-        return state
-
-    current_target_tokens = max(1, _parse_int(state.get("current_target_tokens"), 1))
-    min_target_tokens = max(1, _parse_int(state.get("min_target_tokens"), 1))
-    max_target_tokens = max(current_target_tokens, _parse_int(state.get("max_target_tokens"), current_target_tokens))
-    reduce_percent = _parse_float_range(state.get("reduce_percent"), DEFAULT_AUTOTUNE_REDUCE_PERCENT, 0.01, 0.90)
-    increase_percent = _parse_float_range(state.get("increase_percent"), DEFAULT_AUTOTUNE_INCREASE_PERCENT, 0.01, 0.50)
-    success_window = _parse_int_min(state.get("success_window"), DEFAULT_AUTOTUNE_SUCCESS_WINDOW, 1)
-    threshold_ms = _parse_int_min(
-        state.get("p95_latency_threshold_ms"),
-        DEFAULT_AUTOTUNE_P95_LATENCY_THRESHOLD_MS,
-        1,
+    return kernel_autotune.update_autotune_state(
+        autotune_state,
+        success=success,
+        latency_ms=latency_ms,
+        timeout=timeout,
+        error_type=error_type,
+        chunk_id=chunk_id,
     )
-
-    latency_window_ms = [
-        max(0, _parse_int(value, 0))
-        for value in state.get("latency_window_ms", [])
-        if max(0, _parse_int(value, 0)) > 0
-    ][-success_window:]
-
-    if success:
-        parsed_latency = max(0, _parse_int(latency_ms, 0))
-        if parsed_latency > 0:
-            latency_window_ms = (latency_window_ms + [parsed_latency])[-success_window:]
-        state["latency_window_ms"] = latency_window_ms
-        state["p95_latency_ms"] = _estimate_p95(latency_window_ms)
-        state["consecutive_successes"] = max(0, _parse_int(state.get("consecutive_successes"), 0)) + 1
-
-        if state["p95_latency_ms"] is not None and state["p95_latency_ms"] > threshold_ms:
-            next_target = max(
-                min_target_tokens,
-                int(math.floor(current_target_tokens * (1.0 - reduce_percent))),
-            )
-            next_target = min(max_target_tokens, max(1, next_target))
-            if next_target < current_target_tokens:
-                state["current_target_tokens"] = next_target
-                state["last_event"] = "shrink"
-                state["last_reason"] = (
-                    f"p95 latency {state['p95_latency_ms']}ms exceeded threshold {threshold_ms}ms"
-                )
-            else:
-                state["last_event"] = "steady"
-                state["last_reason"] = "p95 latency exceeded threshold but target already at minimum"
-            state["consecutive_successes"] = 0
-            return state
-
-        if state["consecutive_successes"] >= success_window:
-            next_target = min(
-                max_target_tokens,
-                int(math.ceil(current_target_tokens * (1.0 + increase_percent))),
-            )
-            next_target = max(min_target_tokens, max(1, next_target))
-            if next_target > current_target_tokens:
-                state["current_target_tokens"] = next_target
-                state["last_event"] = "increase"
-                state["last_reason"] = (
-                    f"{success_window} consecutive successful chunks stayed within latency threshold"
-                )
-            else:
-                state["last_event"] = "steady"
-                state["last_reason"] = "success window reached but target already at maximum"
-            state["consecutive_successes"] = 0
-            return state
-
-        return state
-
-    state["consecutive_successes"] = 0
-    if timeout:
-        next_target = max(
-            min_target_tokens,
-            int(math.floor(current_target_tokens * (1.0 - reduce_percent))),
-        )
-        next_target = min(max_target_tokens, max(1, next_target))
-        if next_target < current_target_tokens:
-            state["current_target_tokens"] = next_target
-            state["last_event"] = "shrink"
-            chunk_label = f" chunk {chunk_id}" if chunk_id is not None else ""
-            state["last_reason"] = f"timeout on{chunk_label}; reduce target for future requests"
-        else:
-            state["last_event"] = "steady"
-            state["last_reason"] = "timeout observed but target already at minimum"
-        return state
-
-    if error_type:
-        state["last_event"] = "observe"
-        state["last_reason"] = f"{error_type} did not change target"
-    return state
 
 
 def _build_attempt_log_from_result(result: dict, attempt_index: int | None = None) -> dict:
@@ -3253,16 +2435,106 @@ def test_deepgram_api(api_key: str) -> dict:
 build_command_result_envelope = kernel_runtime.build_command_result_envelope
 
 
+_resolve_runtime_mutation_ownership = kernel_controller.resolve_runtime_mutation_ownership
+_finalize_mutation_result = kernel_controller.finalize_mutation_result
+_runtime_ownership_error_parts = kernel_controller.runtime_ownership_error_parts
+
+
+def _build_prepare_resume_ownership_conflict_result(manifest_path: Path, prompt_name: str,
+                                                    ownership: dict) -> dict:
+    error, message = _runtime_ownership_error_parts(ownership)
+    return _finalize_mutation_result({
+        "success": False,
+        "manifest_path": str(manifest_path),
+        "prompt_name": str(prompt_name or "").strip(),
+        "resume": {"repaired": False, "warnings": []},
+        "runtime": {},
+        "error": error,
+        "message": message,
+    }, ownership)
+
+
+def _build_process_ownership_conflict_result(ownership: dict) -> dict:
+    error, message = _runtime_ownership_error_parts(ownership)
+    return _finalize_mutation_result({
+        "success": False,
+        "processed_count": 0,
+        "failed_count": 0,
+        "skipped_count": 0,
+        "superseded_count": 0,
+        "total_chunks": 0,
+        "warnings": [],
+        "warning_count": 0,
+        "output_files": [],
+        "aborted": True,
+        "aborted_reason": message,
+        "replan_required": False,
+        "replan_reason": "",
+        "resume": {"repaired": False, "warnings": []},
+        "plan": {},
+        "control": {},
+        "request_url": "",
+        "error": error,
+        "message": message,
+    }, ownership)
+
+
+def _build_replan_ownership_conflict_result(ownership: dict) -> dict:
+    error, message = _runtime_ownership_error_parts(ownership)
+    return _finalize_mutation_result({
+        "success": False,
+        "replanned": False,
+        "warnings": [],
+        "error": error,
+        "message": message,
+    }, ownership)
+
+
+def _build_process_with_replans_ownership_conflict_result(ownership: dict) -> dict:
+    error, message = _runtime_ownership_error_parts(ownership)
+    return _finalize_mutation_result({
+        "processed_count": 0,
+        "failed_count": 0,
+        "skipped_count": 0,
+        "superseded_count": 0,
+        "warnings": [],
+        "warning_count": 0,
+        "output_files": [],
+        "replan_count": 0,
+        "request_url": "",
+        "aborted": True,
+        "aborted_reason": message,
+        "success": False,
+        "replan_required": False,
+        "replan_reason": "",
+        "plan": {},
+        "control": {},
+        "error": error,
+        "message": message,
+    }, ownership)
+
+
+def prepare_resume(work_dir: str, prompt_name: str = "", config_path: str = None,
+                   input_key: str = "raw_path", runtime_ownership: dict | None = None) -> dict:
+    return kernel_execution.prepare_resume(
+        work_dir,
+        prompt_name=prompt_name,
+        config_path=config_path,
+        input_key=input_key,
+        runtime_ownership=runtime_ownership,
+    )
+
+
 def runtime_status(work_dir: str) -> dict:
-    return kernel_state.summarize_runtime_status(work_dir)
+    return kernel_execution.runtime_status(work_dir)
 
 
 def cancel_run(work_dir: str, reason: str = "") -> dict:
-    return kernel_state.request_runtime_cancel(work_dir, reason=reason)
+    return kernel_execution.cancel_run(work_dir, reason=reason)
 
 
 def pause_run(work_dir: str, reason: str = "") -> dict:
-    return kernel_state.request_runtime_pause(work_dir, reason=reason)
+    return kernel_execution.pause_run(work_dir, reason=reason)
 
 
 def _build_resume_run_ownership_conflict_result(ownership: dict) -> dict:
@@ -3278,61 +2550,11 @@ def _build_resume_run_ownership_conflict_result(ownership: dict) -> dict:
 
 
 def resume_run(work_dir: str, reason: str = "", runtime_ownership: dict | None = None) -> dict:
-    manifest_path = Path(work_dir) / "manifest.json"
-    if not manifest_path.exists():
-        print(f"Error: manifest.json not found in {work_dir}", file=sys.stderr)
-        sys.exit(1)
-
-    return kernel_controller.run_owned_mutation(
-        work_dir,
-        "resume-run",
-        runtime_ownership=runtime_ownership,
-        conflict_result_builder=_build_resume_run_ownership_conflict_result,
-        mutation_fn=lambda ownership: _resume_run_impl(work_dir, reason=reason),
-    )
+    return kernel_execution.resume_run(work_dir, reason=reason, runtime_ownership=runtime_ownership)
 
 
 def _resume_run_impl(work_dir: str, reason: str = "") -> dict:
-    work_path = Path(work_dir)
-    manifest_path = work_path / "manifest.json"
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    manifest = _ensure_manifest_structure(manifest)
-    runtime = manifest.get("runtime", {})
-    runtime_control = _ensure_runtime_control_state(runtime)
-
-    pause_before = kernel_state.summarize_runtime_pause_request(work_dir)
-    pause_after = kernel_state.clear_runtime_pause(work_dir)
-
-    runtime_status_before = str(runtime.get("status", "pending")).strip() or "pending"
-    runtime_status_after = _infer_resume_runtime_status(runtime, manifest.get("chunks", []))
-    if runtime_status_before == PAUSED_RUNTIME_STATUS and runtime_status_after == PAUSED_RUNTIME_STATUS:
-        runtime_status_after = RESUMABLE_RUNTIME_STATUS
-
-    now = _now_iso()
-    runtime["status"] = runtime_status_after
-    runtime["last_resumed_at"] = now
-    runtime["last_resume_reason"] = str(reason or "").strip() or str(pause_before.get("reason", "") or "").strip()
-    runtime["updated_at"] = now
-    runtime_control["pause_requested"] = False
-    runtime_control["pause_reason"] = ""
-    runtime_control["resumed_at"] = now
-    if not runtime_control.get("paused_at"):
-        runtime_control["paused_at"] = str(runtime.get("last_paused_at", "") or "")
-    _sync_manifest_legacy_fields(manifest)
-    _refresh_manifest_token_source_summary(manifest)
-    _write_manifest(manifest_path, manifest)
-    return {
-        "success": True,
-        "resumed": True,
-        "pause": {
-            "before": pause_before,
-            "after": kernel_state.summarize_runtime_pause_request(work_dir),
-        },
-        "runtime": runtime,
-        "runtime_status_before": runtime_status_before,
-        "runtime_status_after": runtime_status_after,
-        "message": "Runtime pause cleared; run may now be resumed.",
-    }
+    return kernel_lifecycle._resume_run_impl(work_dir, reason=reason)
 
 
 def _resolve_telemetry_ref_kwargs(telemetry_ref: str = "", *, telemetry_path: str = "", work_dir: str = "") -> dict:
@@ -3472,45 +2694,11 @@ def run_kernel_command(command: str, **kwargs) -> dict:
 
 def _prepare_chunking_context(prompt_name: str = "", chunk_size: int = 0,
                               config_path: str = None) -> dict:
-    config = _load_optional_config(config_path)
-    prompt_template = ""
-    if prompt_name:
-        try:
-            prompt_path = _resolve_prompt_template_path(prompt_name)
-        except ValueError as error:
-            print(f"Error: {error}", file=sys.stderr)
-            print(f"Available prompts: {_available_prompt_names()}", file=sys.stderr)
-            sys.exit(1)
-        prompt_template = prompt_path.read_text(encoding="utf-8")
-
-    chunk_plan = _build_chunk_plan(prompt_name, chunk_size, config, prompt_template)
-    budget = chunk_plan["budget"]
-    chunk_mode = chunk_plan["chunk_mode"]
-    use_legacy_char_override = chunk_plan["use_legacy_char_override"]
-    recommended_chunk_size = chunk_plan["recommended_chunk_size"]
-    effective_chunk_size = chunk_plan["effective_chunk_size"]
-    hard_cap_size = chunk_plan["hard_cap_size"]
-    target_tokens = chunk_plan["target_tokens"]
-    hard_cap_tokens = chunk_plan["hard_cap_tokens"]
-    autotune_budget = dict(budget)
-    autotune_budget["target_tokens"] = target_tokens
-    autotune_budget["hard_cap_tokens"] = hard_cap_tokens
-    autotune_budget["chunk_mode"] = chunk_mode
-    autotune_state = _build_autotune_state(autotune_budget, config)
-    autotune_state["enabled"] = autotune_state["enabled"] and chunk_mode == "tokens"
-    return {
-        "config": config,
-        "prompt_template": prompt_template,
-        "budget": budget,
-        "chunk_mode": chunk_mode,
-        "use_legacy_char_override": use_legacy_char_override,
-        "recommended_chunk_size": recommended_chunk_size,
-        "effective_chunk_size": effective_chunk_size,
-        "hard_cap_size": hard_cap_size,
-        "target_tokens": target_tokens,
-        "hard_cap_tokens": hard_cap_tokens,
-        "autotune_state": autotune_state,
-    }
+    return kernel_prompting._prepare_chunking_context(
+        prompt_name=prompt_name,
+        chunk_size=chunk_size,
+        config_path=config_path,
+    )
 
 
 def _chunk_text_payload(text: str, source_file: str, output_dir: str, chunk_size: int = 0,
@@ -3640,31 +2828,12 @@ def _chunk_text_payload(text: str, source_file: str, output_dir: str, chunk_size
 
 def chunk_text(input_path: str, output_dir: str, chunk_size: int = 0,
                prompt_name: str = "", config_path: str = None) -> dict:
-    """
-    Split text file into chunks by sentence boundary.
-
-    When chunk_size is omitted or non-positive, choose a prompt-aware default.
-    """
-    path = Path(input_path)
-    if not path.exists():
-        print(f"Error: File does not exist {input_path}", file=sys.stderr)
-        sys.exit(1)
-
-    try:
-        text = path.read_text(encoding='utf-8')
-    except Exception as error:
-        print(f"Error: Cannot read file {error}", file=sys.stderr)
-        sys.exit(2)
-
-    return _chunk_text_payload(
-        text,
-        str(path.absolute()),
+    return kernel_chunking.chunk_text(
+        input_path,
         output_dir,
-        chunk_size,
-        prompt_name,
-        config_path,
-        driver="chunk-text",
-        source_kind="text",
+        chunk_size=chunk_size,
+        prompt_name=prompt_name,
+        config_path=config_path,
     )
 
 
@@ -4061,92 +3230,28 @@ def _chunk_segments_payload(metadata: dict, segments: list[dict], source_file: s
 def chunk_segments(segments_path: str, output_dir: str, chunk_size: int = 0,
                    prompt_name: str = "", config_path: str = None,
                    chapters_path: str = "") -> dict:
-    """Split aligned source segments into timed chunks."""
-    metadata, segments = _load_segment_document(segments_path)
-    return _chunk_segments_payload(
-        metadata,
-        segments,
-        str(Path(segments_path).absolute()),
+    return kernel_chunking.chunk_segments(
+        segments_path,
         output_dir,
-        chunk_size,
-        prompt_name,
-        config_path,
+        chunk_size=chunk_size,
+        prompt_name=prompt_name,
+        config_path=config_path,
         chapters_path=chapters_path,
-        driver="chunk-segments",
-        source_kind="segments",
-        source_adapter=str(metadata.get("source", "")).strip(),
-        source_segments_file=str(Path(segments_path).absolute()),
     )
 
 
 def chunk_document(normalized_document_path: str, output_dir: str, chunk_size: int = 0,
                    prompt_name: str = "", config_path: str = None,
                    chapters_path: str = "", prefer: str = "auto") -> dict:
-    """Chunk a normalized document using its preferred canonical source shape."""
-    payload = _load_normalized_document(normalized_document_path)
-    preference = str(prefer or "auto").strip().lower()
-    if preference not in {"auto", "segments", "text"}:
-        print(f"Error: Unsupported chunk-document preference: {prefer}", file=sys.stderr)
-        sys.exit(2)
-
-    content = payload.get("content", {}) if isinstance(payload.get("content", {}), dict) else {}
-    preferred_source = str(content.get("preferred_chunk_source", "")).strip().lower()
-    segments = payload.get("segments", []) if isinstance(payload.get("segments", []), list) else []
-    has_segments = bool(segments)
-    source_adapter = str(payload.get("source_adapter", "")).strip()
-    artifacts = payload.get("artifacts", {}) if isinstance(payload.get("artifacts", {}), dict) else {}
-    normalized_path = str(Path(normalized_document_path).absolute())
-
-    if preference == "segments":
-        use_segments = has_segments
-        if not use_segments:
-            print("Error: Normalized document does not contain segments", file=sys.stderr)
-            sys.exit(2)
-    elif preference == "text":
-        use_segments = False
-    else:
-        use_segments = preferred_source == "segments" and has_segments
-
-    if use_segments:
-        metadata = {
-            "source": source_adapter,
-            "document_id": payload.get("document_id", ""),
-        }
-        result = _chunk_segments_payload(
-            metadata,
-            segments,
-            normalized_path,
-            output_dir,
-            chunk_size,
-            prompt_name,
-            config_path,
-            chapters_path=chapters_path,
-            driver="chunk-document",
-            source_kind="segments",
-            normalized_document_path=normalized_path,
-            source_adapter=source_adapter,
-            source_segments_file=str(artifacts.get("segments_path", "") or normalized_path),
-        )
-    else:
-        text_body = str(content.get("text", "")).strip()
-        if not text_body:
-            print("Error: Normalized document does not contain usable text", file=sys.stderr)
-            sys.exit(2)
-        result = _chunk_text_payload(
-            text_body,
-            normalized_path,
-            output_dir,
-            chunk_size,
-            prompt_name,
-            config_path,
-            driver="chunk-document",
-            source_kind="text",
-            normalized_document_path=normalized_path,
-            source_adapter=source_adapter,
-        )
-
-    result["preferred_source_kind"] = preferred_source or ("segments" if has_segments else "text")
-    return result
+    return kernel_chunking.chunk_document(
+        normalized_document_path,
+        output_dir,
+        chunk_size=chunk_size,
+        prompt_name=prompt_name,
+        config_path=config_path,
+        chapters_path=chapters_path,
+        prefer=prefer,
+    )
 
 
 def get_chapters(video_url: str, timeout: int = 30) -> dict:
@@ -4204,256 +3309,11 @@ def _resolve_manifest_path(manifest_ref: str) -> Path:
 
 
 def build_chapter_plan(chapters_path: str, manifest_ref: str, output_path: str = "") -> dict:
-    chapters_file = Path(chapters_path)
-    if not chapters_file.exists():
-        print(f"Error: File does not exist {chapters_path}", file=sys.stderr)
-        sys.exit(1)
-
-    manifest_path = _resolve_manifest_path(manifest_ref)
-    if not manifest_path.exists():
-        print(f"Error: manifest.json not found: {manifest_path}", file=sys.stderr)
-        sys.exit(1)
-
-    try:
-        chapters_data = json.loads(chapters_file.read_text(encoding="utf-8"))
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as e:
-        print(f"Error: JSON parsing failed {e}", file=sys.stderr)
-        sys.exit(2)
-    except Exception as e:
-        print(f"Error: Cannot read file {e}", file=sys.stderr)
-        sys.exit(2)
-
-    if isinstance(chapters_data, dict):
-        chapters = chapters_data.get("chapters", [])
-    elif isinstance(chapters_data, list):
-        chapters = chapters_data
-    else:
-        print("Error: Chapters JSON must be an array or an object with 'chapters'", file=sys.stderr)
-        sys.exit(2)
-
-    timed_chunks = []
-    missing_timing = 0
-    for chunk in manifest.get("chunks", []):
-        status = str(chunk.get("status", "")).strip().lower()
-        if status == SUPERSEDED_CHUNK_STATUS:
-            continue
-        start_time = _coerce_float_or_none(chunk.get("start_time"))
-        end_time = _coerce_float_or_none(chunk.get("end_time"))
-        if start_time is None or end_time is None:
-            missing_timing += 1
-            continue
-        timed_chunks.append({**chunk, "start_time": start_time, "end_time": end_time})
-
-    if not timed_chunks:
-        print("Error: Manifest does not contain timed chunks; run chunk-segments first", file=sys.stderr)
-        sys.exit(2)
-
-    timed_chunks.sort(key=lambda item: int(item.get("id", 0)))
-
-    def map_time(timestamp: float | None) -> tuple[dict, str, str]:
-        if timestamp is None:
-            return timed_chunks[0], "missing_time", "low"
-        for chunk in timed_chunks:
-            start_time = chunk["start_time"]
-            end_time = chunk["end_time"]
-            if start_time <= timestamp < end_time or math.isclose(timestamp, start_time):
-                return chunk, "time_contains", "high"
-            if timestamp < start_time:
-                return chunk, "next_chunk", "medium"
-        return timed_chunks[-1], "after_last_chunk", "low"
-
-    def is_untitled(title: str) -> bool:
-        if not title:
-            return True
-        lowered = title.strip().lower()
-        return lowered.startswith("<untitled") or "untitled chapter" in lowered
-
-    warnings = []
-    plan_entries = []
-
-    if missing_timing:
-        warnings.append(f"Skipped {missing_timing} chunks without timing metadata")
-
-    for index, chapter in enumerate(chapters):
-        if not isinstance(chapter, dict):
-            continue
-
-        start_time = _coerce_float_or_none(chapter.get("start_time"))
-        end_time = _coerce_float_or_none(chapter.get("end_time"))
-        start_chunk, match_strategy, confidence = map_time(start_time)
-        end_chunk = start_chunk
-        if end_time is not None:
-            end_probe = max(start_time or end_time, end_time - 1e-6)
-            end_chunk, _, _ = map_time(end_probe)
-
-        title = str(chapter.get("title", "")).strip()
-        if title and is_untitled(title):
-            title = ""
-        title_en = str(chapter.get("title_en", "")).strip()
-        title_zh = str(chapter.get("title_zh", "")).strip()
-
-        if not title_zh and not title_en and title and not is_untitled(title):
-            title_zh = title
-
-        if match_strategy != "time_contains":
-            warnings.append(f"Chapter {index} used fallback strategy '{match_strategy}'")
-
-        plan_entries.append({
-            "chapter_index": index,
-            "title": title,
-            "title_en": title_en,
-            "title_zh": title_zh,
-            "start_time": start_time,
-            "end_time": end_time,
-            "start_chunk": int(start_chunk.get("id", 0)),
-            "end_chunk": int(end_chunk.get("id", start_chunk.get("id", 0))),
-            "anchor_segment_id": start_chunk.get("source_segment_start"),
-            "match_strategy": match_strategy,
-            "confidence": confidence,
-        })
-
-    output_file = str(output_path or (manifest_path.parent / "chapter_plan.json"))
-    Path(output_file).write_text(json.dumps(plan_entries, ensure_ascii=False, indent=2), encoding="utf-8")
-
-    return {
-        "success": True,
-        "output_file": output_file,
-        "chapter_count": len(chapters),
-        "mapped_count": len(plan_entries),
-        "warnings": warnings,
-    }
+    return kernel_merge.build_chapter_plan(chapters_path, manifest_ref, output_path=output_path)
 
 
 def merge_content(work_dir: str, output_file: str, header_content: str = "") -> dict:
-    """
-    Merge processed chunks with chapter headers based on chapter_plan.json
-    
-    Algorithm:
-    1. Read manifest.json to get chunk list
-    2. Read chapter_plan.json (if exists) to get chapter structure
-    3. For each chunk:
-       - If chunk ID matches a chapter start, insert chapter header
-       - Append processed chunk content
-    4. Write final merged file
-    
-    Args:
-        work_dir: Directory containing manifest.json, chapter_plan.json, and processed_*.md files
-        output_file: Path to write merged output
-        header_content: Optional header content to prepend (e.g., YAML frontmatter)
-    
-    Returns:
-        {"success": bool, "output_file": str, "total_lines": int, "chapters_inserted": int}
-    """
-    work_path = Path(work_dir)
-    
-    # Read manifest
-    manifest_path = work_path / "manifest.json"
-    if not manifest_path.exists():
-        print(f"Error: manifest.json not found in {work_dir}", file=sys.stderr)
-        sys.exit(1)
-    
-    manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
-
-    # Read chapter plan (optional)
-    chapter_plan_path = work_path / "chapter_plan.json"
-    chapter_starts = {}  # {chunk_id: [{"title": ..., "title_en": ..., "title_zh": ...}, ...]}
-    if chapter_plan_path.exists():
-        try:
-            chapter_plan = json.loads(chapter_plan_path.read_text(encoding='utf-8'))
-            if isinstance(chapter_plan, list):
-                for chapter in chapter_plan:
-                    if not isinstance(chapter, dict):
-                        continue
-
-                    start_chunk = chapter.get("start_chunk")
-                    if start_chunk is None:
-                        continue
-
-                    try:
-                        start_chunk_int = int(start_chunk)
-                    except (ValueError, TypeError):
-                        print(f"Warning: Invalid start_chunk value: {start_chunk}", file=sys.stderr)
-                        continue
-
-                    chapter_starts.setdefault(start_chunk_int, []).append({
-                        "title": str(chapter.get("title", "")),
-                        "title_en": str(chapter.get("title_en", "")),
-                        "title_zh": str(chapter.get("title_zh", "")),
-                    })
-        except (json.JSONDecodeError, KeyError) as e:
-            print(f"Warning: Could not parse chapter_plan.json: {e}", file=sys.stderr)
-
-    # Merge content
-    output_lines = []
-    chapters_inserted = 0  # Counts logical chapters, not individual title lines
-    missing_files = []
-    
-    # Smart header handling - avoid duplicate separators
-    if header_content:
-        header_content = header_content.strip()
-        output_lines.append(header_content)
-        # Only add separator if header doesn't already end with one
-        if not header_content.endswith('---'):
-            output_lines.append("\n---\n")
-        else:
-            output_lines.append("\n")
-    
-    for chunk_info in manifest["chunks"]:
-        chunk_id = chunk_info["id"]
-        processed_path = work_path / chunk_info["processed_path"]
-        status = str(chunk_info.get("status", "")).strip().lower()
-
-        if status == SUPERSEDED_CHUNK_STATUS:
-            continue
-
-        # Check if this is the start of a new chapter
-        if chunk_id in chapter_starts:
-            for chapter in chapter_starts[chunk_id]:
-                title = str(chapter.get("title", "")).strip()
-                title_en = str(chapter.get("title_en", "")).strip()
-                title_zh = str(chapter.get("title_zh", "")).strip()
-
-                headings = []
-                if title_en:
-                    headings.append(title_en)
-                if title_zh and title_zh not in headings:
-                    headings.append(title_zh)
-                if not headings and title:
-                    headings.append(title)
-
-                if not headings:
-                    continue
-
-                output_lines.append("\n")
-                for heading in headings:
-                    output_lines.append(f"## {heading}\n")
-                output_lines.append("\n")
-                chapters_inserted += 1
-
-        # Read and append processed content
-        if processed_path.exists():
-            content = processed_path.read_text(encoding='utf-8')
-            output_lines.append(content)
-            output_lines.append("\n")
-        elif status == "done":
-            missing_files.append(str(processed_path))
-            print(f"Warning: Processed file not found: {processed_path}", file=sys.stderr)
-    
-    # Write output file
-    output_path = Path(output_file)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    final_content = ''.join(output_lines)
-    output_path.write_text(final_content, encoding='utf-8')
-    
-    return {
-        "success": len(missing_files) == 0,
-        "output_file": str(output_path),
-        "total_lines": final_content.count('\n'),
-        "total_chars": len(final_content),
-        "chapters_inserted": chapters_inserted,
-        "missing_files": missing_files
-    }
+    return kernel_merge.merge_content(work_dir, output_file, header_content=header_content)
 
 
 def _call_llm_api(api_key: str, base_url: str, model: str, messages: list,
@@ -4461,71 +3321,19 @@ def _call_llm_api(api_key: str, base_url: str, model: str, messages: list,
                   temperature: float = 0.3, timeout_sec: int = 120,
                   max_retries: int = 3, backoff_sec: float = 1.5,
                   stream_mode: str = "auto") -> dict:
-    """
-    Call LLM API with configurable timeout, bounded retries, and optional streaming.
-
-    Returns:
-        {
-            "text": "...",
-            "latency_ms": 1234,
-            "request_url": "...",
-            "streaming_used": True,
-            "attempts": 2,
-        }
-    """
-    stream_mode = _normalize_stream_mode(stream_mode)
-    use_stream = stream_mode in {"auto", "true"}
-    last_error = None
-    attempt_history = []
-
-    for attempt in range(1, max_retries + 2):
-        try:
-            result = _execute_llm_request(
-                api_key=api_key,
-                base_url=base_url,
-                model=model,
-                messages=messages,
-                api_format=api_format,
-                max_tokens=max_tokens,
-                temperature=temperature,
-                timeout_sec=timeout_sec,
-                use_stream=use_stream,
-            )
-            result["attempts"] = attempt
-            result["stream_mode"] = stream_mode
-            attempt_history.append(_build_attempt_log_from_result(result, attempt))
-            result["attempt_history"] = attempt_history
-            return result
-        except LLMRequestError as error:
-            error.attempts = attempt
-            attempt_history.append(_build_attempt_log_from_error(error, attempt))
-            error.attempt_history = list(attempt_history)
-            last_error = error
-
-            response_hint = (error.response_body or "").lower()
-            stream_unsupported = any(token in response_hint for token in ("stream", "sse", "event-stream"))
-            if stream_mode == "auto" and use_stream and error.status_code in {400, 422} and stream_unsupported:
-                print(
-                    f"ℹ️ Streaming unsupported at {error.request_url or _build_api_url(base_url, api_format)}; retrying once without stream.",
-                    file=sys.stderr,
-                )
-                use_stream = False
-                continue
-
-            if not error.retryable or attempt > max_retries:
-                raise error
-
-            sleep_sec = (backoff_sec * (2 ** (attempt - 1))) + random.uniform(0, max(backoff_sec, 0.1))
-            print(
-                f"Retrying LLM request after {error.error_type} in {sleep_sec:.1f}s "
-                f"(attempt {attempt}/{max_retries}, url={error.request_url or _build_api_url(base_url, api_format)})",
-                file=sys.stderr,
-            )
-            time.sleep(sleep_sec)
-
-    if last_error is not None:
-        last_error.attempt_history = list(attempt_history)
-    raise last_error or LLMRequestError("LLM API request failed", retryable=False)
+    return kernel_llm._call_llm_api(
+        api_key,
+        base_url,
+        model,
+        messages,
+        api_format=api_format,
+        max_tokens=max_tokens,
+        temperature=temperature,
+        timeout_sec=timeout_sec,
+        max_retries=max_retries,
+        backoff_sec=backoff_sec,
+        stream_mode=stream_mode,
+    )
 
 
 def test_llm_api(config_path: str = None, api_key: str = "", base_url: str = "",
@@ -4768,1152 +3576,80 @@ def test_token_count(config_path: str = None, api_key: str = "", base_url: str =
 
 def _estimate_chunk_input_tokens(chunk_info: dict, input_key: str, text: str,
                                  config: dict | None = None) -> tuple[int, str]:
-    """Estimate input tokens without adding another network probe.
-
-    For `processed_path` chains we reuse `actual_output_tokens`, because that is
-    the closest measurement of the text now being fed into the next stage.
-    """
-    chunk_info = chunk_info or {}
-    config = config or {}
-
-    if input_key == "processed_path":
-        cached_tokens = max(0, _parse_int(chunk_info.get("actual_output_tokens"), 0))
-        if cached_tokens > 0:
-            return cached_tokens, "manifest_cached_output"
-    else:
-        cached_tokens = max(0, _parse_int(chunk_info.get("estimated_input_tokens"), 0))
-        if cached_tokens > 0:
-            return cached_tokens, "manifest_cached_input"
-
-    return _estimate_tokens(text, "tokens", config), "local_estimate"
+    return kernel_autotune.estimate_chunk_input_tokens(chunk_info, input_key, text, config)
 
 
 def _refresh_manifest_token_source_summary(manifest: dict) -> None:
-    chunks = manifest.get("chunks", []) if isinstance(manifest, dict) else []
-    sources = sorted({
-        str(chunk.get("token_count_source", "")).strip()
-        for chunk in chunks
-        if str(chunk.get("token_count_source", "")).strip()
-    })
-    manifest["token_count_sources"] = sources
-    if not sources:
-        manifest["token_count_source"] = ""
-    elif len(sources) == 1:
-        manifest["token_count_source"] = sources[0]
-    else:
-        manifest["token_count_source"] = "mixed"
+    kernel_autotune.refresh_manifest_token_source_summary(manifest)
 
 
 def process_chunks(work_dir: str, prompt_name: str, extra_instruction: str = "",
                    config_path: str = None, dry_run: bool = False,
                    input_key: str = "raw_path", force: bool = False,
                    runtime_ownership: dict | None = None) -> dict:
-    manifest_path = Path(work_dir) / "manifest.json"
-    if not manifest_path.exists():
-        print(f"Error: manifest.json not found in {work_dir}", file=sys.stderr)
-        sys.exit(1)
-
-    return kernel_controller.run_owned_mutation(
+    return kernel_execution.process_chunks(
         work_dir,
-        "process-chunks",
+        prompt_name,
+        extra_instruction=extra_instruction,
+        config_path=config_path,
+        dry_run=dry_run,
+        input_key=input_key,
+        force=force,
         runtime_ownership=runtime_ownership,
-        conflict_result_builder=_build_process_ownership_conflict_result,
-        mutation_fn=lambda ownership: _process_chunks_impl(
-            work_dir,
-            prompt_name,
-            extra_instruction=extra_instruction,
-            config_path=config_path,
-            dry_run=dry_run,
-            input_key=input_key,
-            force=force,
-        ),
     )
 
 
 def _process_chunks_impl(work_dir: str, prompt_name: str, extra_instruction: str = "",
                          config_path: str = None, dry_run: bool = False,
                          input_key: str = "raw_path", force: bool = False) -> dict:
-    """
-    Process each chunk with isolated LLM API calls for context isolation.
-
-    Adds resumability, bounded retries, atomic writes, and chunk-level telemetry.
-    """
-    work_path = Path(work_dir)
-    manifest_path = work_path / "manifest.json"
-    if not manifest_path.exists():
-        print(f"Error: manifest.json not found in {work_dir}", file=sys.stderr)
-        sys.exit(1)
-
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-
-    try:
-        prompt_path = _resolve_prompt_template_path(prompt_name)
-    except ValueError as error:
-        print(f"Error: {error}", file=sys.stderr)
-        print(f"Available prompts: {_available_prompt_names()}", file=sys.stderr)
-        sys.exit(1)
-
-    prompt_template = prompt_path.read_text(encoding="utf-8")
-    if extra_instruction:
-        prompt_template += f"\n\n**Additional Instructions**: {extra_instruction}\n"
-
-    if dry_run:
-        config = _load_optional_config(config_path)
-    else:
-        config = load_config(config_path)
-    api_key = config.get("llm_api_key", "")
-    base_url = config.get("llm_base_url", "")
-    model = config.get("llm_model", "")
-    api_format = config.get("llm_api_format", "openai")
-    timeout_sec = config.get("llm_timeout_sec", 120)
-    max_retries = config.get("llm_max_retries", 3)
-    backoff_sec = config.get("llm_backoff_sec", 1.5)
-    stream_mode = config.get("llm_stream", "auto")
-    stop_after_timeouts = config.get("llm_stop_after_consecutive_timeouts", 2)
-    chunk_recovery_attempt_limit = _parse_int_min(
-        config.get("llm_chunk_recovery_attempts"),
-        DEFAULT_LLM_CHUNK_RECOVERY_ATTEMPTS,
-        0,
-    )
-    chunk_recovery_backoff_sec = _parse_float_min(
-        config.get("llm_chunk_recovery_backoff_sec"),
-        DEFAULT_LLM_CHUNK_RECOVERY_BACKOFF_SEC,
-        0.0,
-    )
-    operation_control = _build_operation_control_contract(
-        "chunk",
+    return kernel_processing._process_chunks_impl(
+        work_dir,
         prompt_name,
+        extra_instruction=extra_instruction,
+        config_path=config_path,
+        dry_run=dry_run,
         input_key=input_key,
-        config=config,
-        bilingual=prompt_name == "translate_only",
+        force=force,
     )
-
-    request_url = _build_api_url(base_url, api_format) if base_url else ""
-    if not dry_run and (not api_key or not base_url or not model):
-        print("Error: LLM API not configured. Set llm_api_key, llm_base_url, llm_model in config.yaml", file=sys.stderr)
-        sys.exit(1)
-
-    is_summary = (prompt_name == "summarize")
-    prompt_budget = _calculate_chunk_budget(prompt_name, prompt_template, config)
-    manifest = _ensure_manifest_structure(
-        manifest,
-        prompt_name=prompt_name,
-        prompt_budget=prompt_budget,
-        recommended_chunk_size=_recommended_chunk_size(prompt_name, config),
-        request_url=request_url,
-        source_file=str(manifest.get("source_file", "")).strip(),
-        config=config,
-    )
-    plan = manifest["plan"]
-    runtime = manifest["runtime"]
-    glossary_payload = kernel_glossary.load_glossary(work_dir)
-    glossary_term_count = len(glossary_payload.get("terms", [])) if isinstance(glossary_payload.get("terms", []), list) else 0
-    plan["glossary"] = {
-        "mode": "local_file" if glossary_term_count > 0 else "disabled",
-        "glossary_path": str(kernel_glossary.glossary_path_for(work_dir)) if glossary_term_count > 0 else "",
-        "term_count": glossary_term_count,
-        "max_prompt_terms": max(0, _parse_int_min(config.get("chunk_glossary_max_prompt_terms"), 8, 0)),
-    }
-    plan["semantic_verification"] = {
-        "mode": "anchor_checks",
-        "max_anchors": max(0, _parse_int_min(config.get("chunk_semantic_max_anchors"), 8, 0)),
-        "judge_free": True,
-    }
-    plan_continuity = plan.get("continuity", {}) if isinstance(plan.get("continuity", {}), dict) else _build_manifest_continuity_policy(config)
-    plan_chunk_contract = plan.get("chunk_contract", {}) if isinstance(plan.get("chunk_contract", {}), dict) else _build_manifest_chunk_contract()
-    manifest_chunk_size = max(0, _parse_int(plan.get("chunk_size"), manifest.get("chunk_size", 0)))
-    manifest_chunk_mode = _normalize_chunk_mode(plan.get("chunk_mode", manifest.get("chunk_mode", config.get("chunk_mode", DEFAULT_CHUNK_MODE))))
-    plan_target_tokens = max(1, _parse_int(plan.get("target_input_tokens", plan.get("target_tokens", prompt_budget["target_tokens"])), prompt_budget["target_tokens"]))
-    plan_hard_cap_tokens = max(plan_target_tokens, _parse_int(plan.get("hard_cap_tokens"), prompt_budget["hard_cap_tokens"]))
-    planned_max_output_tokens = max(1, _parse_int(plan.get("planned_max_output_tokens"), prompt_budget["planned_max_output_tokens"]))
-    controller_budget = dict(prompt_budget)
-    controller_budget["target_tokens"] = plan_target_tokens
-    controller_budget["hard_cap_tokens"] = plan_hard_cap_tokens
-    controller_budget["planned_max_output_tokens"] = planned_max_output_tokens
-    controller_budget["chunk_mode"] = manifest_chunk_mode
-    autotune_state = _build_autotune_state(controller_budget, config, manifest.get("autotune"))
-    autotune_state["enabled"] = _parse_bool(config.get("enable_chunk_autotune"), DEFAULT_ENABLE_CHUNK_AUTOTUNE) and manifest_chunk_mode == "tokens"
-    autotune_state["current_planned_max_output_tokens"] = planned_max_output_tokens
-    if manifest_chunk_mode == "chars":
-        recommended_chunk_size = _legacy_chunk_target_chars(prompt_name, config)
-    else:
-        recommended_chunk_size = _get_task_chunk_target(prompt_name, config)
-    setup_warnings = []
-
-    if manifest_chunk_mode == "tokens":
-        manifest_target_tokens = max(0, _parse_int(manifest.get("target_tokens"), 0))
-        if manifest_target_tokens and manifest_target_tokens > prompt_budget["target_tokens"]:
-            setup_warning = (
-                f"⚠️ Chunk target {manifest_target_tokens} tokens is larger than the recommended "
-                f"{prompt_budget['target_tokens']} for prompt '{prompt_name}'. Long outputs may time out."
-            )
-            setup_warnings.append(setup_warning)
-            print(setup_warning, file=sys.stderr)
-    elif manifest_chunk_size and manifest_chunk_size > recommended_chunk_size:
-        setup_warning = (
-            f"⚠️ Chunk size {manifest_chunk_size} chars is larger than the recommended {recommended_chunk_size} chars "
-            f"for prompt '{prompt_name}'. Long outputs may time out."
-        )
-        setup_warnings.append(setup_warning)
-        print(setup_warning, file=sys.stderr)
-
-    _ensure_chunk_runtime_defaults(
-        manifest,
-        runtime,
-        plan,
-        prompt_budget,
-        request_url,
-        planned_max_output_tokens,
-        autotune_state,
-    )
-    resume_report = _prepare_manifest_for_resume(manifest, work_path, prompt_name)
-    resume_summary = _format_resume_report(resume_report)
-    if resume_summary:
-        setup_warnings.append(resume_summary)
-        print(f"ℹ️ {resume_summary}", file=sys.stderr)
-
-    runtime["active_plan_id"] = plan.get("plan_id", runtime.get("active_plan_id", _new_plan_id()))
-    runtime["last_request_url"] = request_url
-    runtime["operation_prompt_name"] = prompt_name
-    runtime["operation_input_key"] = _normalize_operation_input_key(input_key)
-    runtime["operation_control"] = operation_control
-    runtime_control = _ensure_runtime_control_state(runtime)
-    runtime_control["verification_warning_count"] = 0
-    runtime_control["repair_attempted_count"] = 0
-    runtime_control["repair_exhausted_count"] = 0
-    runtime_control["last_replan_trigger"] = ""
-    runtime_control["last_replan_action"] = operation_control.get("replan", {}).get("on_replan_required", "not_applicable")
-    runtime_control["last_replan_chunk_id"] = None
-    runtime["updated_at"] = _now_iso()
-    plan["prompt_name"] = plan.get("prompt_name", prompt_name) or prompt_name
-    plan["recommended_chunk_size"] = recommended_chunk_size
-    plan["chunk_mode"] = manifest_chunk_mode
-    plan["target_input_tokens"] = plan_target_tokens
-    plan["target_tokens"] = plan_target_tokens
-    plan["hard_cap_tokens"] = plan_hard_cap_tokens
-    plan["prompt_tokens"] = prompt_budget["prompt_tokens"]
-    plan["prompt_template_tokens"] = prompt_budget["prompt_template_tokens"]
-    plan["planned_max_output_tokens"] = planned_max_output_tokens
-    plan["effective_budget_tokens"] = prompt_budget["effective_budget_tokens"]
-    plan["output_ratio"] = prompt_budget["output_ratio"]
-    plan["chunk_safety_buffer_tokens"] = prompt_budget["safety_buffer_tokens"]
-    plan["continuity_reserve_tokens"] = prompt_budget["continuity_reserve_tokens"]
-    plan["token_count_source"] = prompt_budget["token_count_source"]
-    autotune_state["current_planned_max_output_tokens"] = planned_max_output_tokens
-    manifest["autotune"] = autotune_state
-    _sync_manifest_legacy_fields(manifest)
-    _refresh_manifest_token_source_summary(manifest)
-    if resume_report.get("repaired", False) and not dry_run:
-        _write_manifest(manifest_path, manifest)
-
-    if dry_run:
-        return {
-            "success": True,
-            "dry_run": True,
-            "total_chunks": manifest["total_chunks"],
-            "prompt_name": prompt_name,
-            "prompt_length": len(prompt_template),
-            "model": model,
-            "api_format": api_format,
-            "request_url": request_url,
-            "chunk_mode": manifest_chunk_mode,
-            "recommended_chunk_size": recommended_chunk_size,
-            "planned_max_output_tokens": planned_max_output_tokens,
-            "prompt_tokens": prompt_budget["prompt_tokens"],
-            "prompt_template_tokens": prompt_budget["prompt_template_tokens"],
-            "continuity_reserve_tokens": prompt_budget["continuity_reserve_tokens"],
-            "target_tokens": plan_target_tokens,
-            "hard_cap_tokens": plan_hard_cap_tokens,
-            "token_count_source": manifest.get("token_count_source", ""),
-            "autotune": manifest.get("autotune", {}),
-            "plan": manifest.get("plan", {}),
-            "glossary": plan.get("glossary", {}),
-            "semantic_verification": plan.get("semantic_verification", {}),
-            "resume": resume_report,
-            "control": _build_process_control_summary(runtime, operation_control),
-            "warnings": setup_warnings,
-            "cancellation": kernel_state.summarize_runtime_cancel_request(work_dir),
-            "pause": kernel_state.summarize_runtime_pause_request(work_dir),
-            "message": "Dry run: all validations passed"
-        }
-
-    runtime["status"] = "running"
-    runtime["run_id"] = kernel_runtime.new_trace_id("process-chunks")
-    runtime["replan_required"] = False
-    runtime["replan_reason"] = ""
-    runtime["updated_at"] = _now_iso()
-    runtime_control["pause_requested"] = False
-    runtime_control["pause_reason"] = ""
-    _write_manifest(manifest_path, manifest)
-
-    processed_count = 0
-    failed_count = 0
-    skipped_count = 0
-    superseded_count = 0
-    warnings = list(setup_warnings)
-    output_files = []
-    aborted = False
-    paused = False
-    aborted_reason = ""
-    pause_reason = ""
-    cancellation = kernel_state.summarize_runtime_cancel_request(work_dir)
-    pause = kernel_state.summarize_runtime_pause_request(work_dir)
-    consecutive_timeouts = 0
-    active_total = sum(1 for chunk in manifest["chunks"] if chunk.get("status") != SUPERSEDED_CHUNK_STATUS)
-    total = active_total
-    canary_limit = min(
-        _parse_int_min(config.get("autotune_canary_chunks"), DEFAULT_AUTOTUNE_CANARY_CHUNKS, 1),
-        active_total,
-    )
-    active_index = 0
-
-    def maybe_abort_for_cancellation() -> bool:
-        nonlocal aborted, aborted_reason, cancellation
-        cancellation_snapshot = kernel_state.summarize_runtime_cancel_request(work_dir)
-        if not cancellation_snapshot.get("requested", False):
-            return False
-        cancellation = kernel_state.consume_runtime_cancel(work_dir)
-        cancel_reason = str(cancellation.get("reason", "")).strip()
-        aborted = True
-        aborted_reason = "Cancellation requested"
-        if cancel_reason:
-            aborted_reason += f": {cancel_reason}"
-        now = _now_iso()
-        runtime["status"] = "aborted"
-        runtime["replan_required"] = False
-        runtime["replan_reason"] = ""
-        runtime["updated_at"] = now
-        runtime["last_cancelled_at"] = now
-        runtime["last_cancel_reason"] = cancel_reason
-        _refresh_manifest_token_source_summary(manifest)
-        _sync_manifest_legacy_fields(manifest)
-        _write_manifest(manifest_path, manifest)
-        print(f"Error: {aborted_reason}", file=sys.stderr)
-        return True
-
-    def maybe_pause_for_request() -> bool:
-        nonlocal paused, pause_reason, pause
-        pause_snapshot = kernel_state.summarize_runtime_pause_request(work_dir)
-        if not pause_snapshot.get("requested", False):
-            return False
-        pause = pause_snapshot
-        pause_reason = str(pause.get("reason", "")).strip()
-        paused = True
-        now = _now_iso()
-        runtime["status"] = PAUSED_RUNTIME_STATUS
-        runtime["replan_required"] = False
-        runtime["replan_reason"] = ""
-        runtime["updated_at"] = now
-        runtime["last_paused_at"] = now
-        runtime["last_pause_reason"] = pause_reason
-        runtime["pause_count"] = max(0, _parse_int(runtime.get("pause_count"), 0)) + 1
-        runtime_control["pause_requested"] = True
-        runtime_control["pause_reason"] = pause_reason
-        runtime_control["paused_at"] = now
-        _refresh_manifest_token_source_summary(manifest)
-        _sync_manifest_legacy_fields(manifest)
-        _write_manifest(manifest_path, manifest)
-        message = "Pause requested"
-        if pause_reason:
-            message += f": {pause_reason}"
-        print(f"ℹ️ {message}", file=sys.stderr)
-        return True
-
-    if maybe_abort_for_cancellation():
-        runtime["processed_count"] = processed_count
-        runtime["failed_count"] = failed_count
-        runtime["skipped_count"] = skipped_count
-        runtime["superseded_count"] = superseded_count
-        return {
-            "success": False,
-            "processed_count": processed_count,
-            "failed_count": failed_count,
-            "skipped_count": skipped_count,
-            "superseded_count": superseded_count,
-            "total_chunks": total,
-            "warnings": warnings,
-            "warning_count": len(warnings),
-            "output_files": output_files,
-            "aborted": True,
-            "aborted_reason": aborted_reason,
-            "paused": False,
-            "pause_reason": "",
-            "replan_required": False,
-            "replan_reason": "",
-            "resume": resume_report,
-            "plan": manifest.get("plan", {}),
-            "glossary": plan.get("glossary", {}),
-            "semantic_verification": plan.get("semantic_verification", {}),
-            "control": _build_process_control_summary(runtime, operation_control),
-            "request_url": request_url,
-            "cancellation": cancellation,
-            "pause": pause,
-        }
-
-    if maybe_pause_for_request():
-        runtime["processed_count"] = processed_count
-        runtime["failed_count"] = failed_count
-        runtime["skipped_count"] = skipped_count
-        runtime["superseded_count"] = superseded_count
-        return {
-            "success": False,
-            "processed_count": processed_count,
-            "failed_count": failed_count,
-            "skipped_count": skipped_count,
-            "superseded_count": superseded_count,
-            "total_chunks": total,
-            "warnings": warnings,
-            "warning_count": len(warnings),
-            "output_files": output_files,
-            "aborted": False,
-            "aborted_reason": "",
-            "paused": True,
-            "pause_reason": pause_reason,
-            "replan_required": False,
-            "replan_reason": "",
-            "resume": resume_report,
-            "plan": manifest.get("plan", {}),
-            "glossary": plan.get("glossary", {}),
-            "semantic_verification": plan.get("semantic_verification", {}),
-            "control": _build_process_control_summary(runtime, operation_control),
-            "request_url": request_url,
-            "cancellation": cancellation,
-            "pause": pause,
-        }
-
-    for chunk_index, chunk_info in enumerate(manifest["chunks"]):
-        chunk_id = chunk_info["id"]
-        if chunk_info.get("status") == SUPERSEDED_CHUNK_STATUS:
-            superseded_count += 1
-            continue
-        if maybe_abort_for_cancellation():
-            break
-        if maybe_pause_for_request():
-            break
-        active_index += 1
-        runtime["current_chunk_index"] = chunk_index
-        input_filename = chunk_info.get(input_key, chunk_info["raw_path"])
-        input_path = work_path / input_filename
-
-        if is_summary:
-            out_filename = f"summary_chunk_{chunk_id:03d}.txt"
-        else:
-            out_filename = chunk_info["processed_path"]
-        out_path = work_path / out_filename
-
-        if not force and chunk_info.get("status") == "done" and out_path.exists():
-            skipped_count += 1
-            print(f"Skipping chunk {active_index}/{total} (chunk_id={chunk_id}, output exists at {out_path.name})", file=sys.stderr)
-            continue
-
-        if not input_path.exists():
-            error_message = f"Input file not found: {input_path}"
-            print(f"Error: {error_message}", file=sys.stderr)
-            failed_count += 1
-            consecutive_timeouts = 0
-            chunk_info["status"] = "failed"
-            chunk_info["last_error"] = error_message
-            chunk_info["last_error_type"] = "input_missing"
-            chunk_info["error_type"] = "input_missing"
-            autotune_state = _update_autotune_state(
-                autotune_state,
-                success=False,
-                timeout=False,
-                error_type="input_missing",
-                chunk_id=chunk_id,
-            )
-            manifest["autotune"] = autotune_state
-            chunk_info["autotune_next_target_tokens"] = autotune_state["current_target_tokens"]
-            chunk_info["autotune_event"] = autotune_state["last_event"]
-            chunk_info["autotune_reason"] = autotune_state["last_reason"]
-            chunk_info["updated_at"] = _now_iso()
-            _write_manifest(manifest_path, manifest)
-            continue
-
-        chunk_text = input_path.read_text(encoding="utf-8")
-        chunk_char_count = len(chunk_text)
-        planned_max_output_tokens = max(
-            1,
-            _parse_int(chunk_info.get("planned_max_output_tokens"), plan.get("planned_max_output_tokens", planned_max_output_tokens)),
-        )
-        manifest["autotune"]["current_planned_max_output_tokens"] = planned_max_output_tokens
-        estimated_input_tokens, token_count_source = _estimate_chunk_input_tokens(
-            chunk_info,
-            input_key,
-            chunk_text,
-            config,
-        )
-        previous_chunk = _find_previous_active_chunk(manifest["chunks"], chunk_index)
-        continuity_context = _build_continuity_context(
-            previous_chunk,
-            work_path,
-            config,
-            input_key=input_key,
-            continuity_policy=plan_continuity,
-        )
-        glossary_context = kernel_glossary.build_glossary_prompt_context(
-            glossary_payload,
-            chunk_text,
-            max_terms=max(0, _parse_int_min(config.get("chunk_glossary_max_prompt_terms"), 8, 0)),
-        )
-        semantic_context = kernel_semantic.build_anchor_prompt_context(
-            chunk_text,
-            max_items=max(0, _parse_int_min(config.get("chunk_semantic_max_anchors"), 8, 0)),
-        )
-        prompt = _build_chunk_prompt(
-            prompt_template,
-            chunk_text,
-            continuity_context["text"],
-            glossary_context["text"],
-            semantic_context["text"],
-        )
-        actual_prompt_tokens = (
-            prompt_budget["prompt_template_tokens"]
-            + continuity_context["token_count"]
-            + _estimate_tokens(glossary_context["text"], "tokens", config)
-            + _estimate_tokens(semantic_context["text"], "tokens", config)
-        )
-
-        chunk_info["input_chars"] = chunk_char_count
-        chunk_info["estimated_input_tokens"] = estimated_input_tokens
-        chunk_info["input_tokens"] = estimated_input_tokens
-        chunk_info["token_count_source"] = token_count_source
-        chunk_info["prompt_tokens"] = actual_prompt_tokens
-        chunk_info["planned_max_output_tokens"] = planned_max_output_tokens
-        chunk_info["continuity_prev_chunk_id"] = continuity_context["source_chunk_id"]
-        chunk_info["continuity_context_chars"] = len(continuity_context["text"])
-        chunk_info["continuity_context_tokens"] = continuity_context["token_count"]
-        chunk_info["continuity_section_title"] = continuity_context["section_title"]
-        chunk_info["glossary_terms"] = [str(entry.get("term", "")).strip() for entry in glossary_context.get("terms", []) if str(entry.get("term", "")).strip()]
-        chunk_info["glossary_term_count"] = len(chunk_info["glossary_terms"])
-        chunk_info["glossary_context_tokens"] = _estimate_tokens(glossary_context["text"], "tokens", config) if glossary_context.get("text") else 0
-        chunk_info["semantic_anchors"] = list(semantic_context.get("anchors", {}).get("ordered", []))
-        chunk_info["semantic_anchor_count"] = len(chunk_info["semantic_anchors"])
-        chunk_info["semantic_context_tokens"] = _estimate_tokens(semantic_context["text"], "tokens", config) if semantic_context.get("text") else 0
-        chunk_info["autotune_target_tokens"] = autotune_state["current_target_tokens"]
-        chunk_info["autotune_next_target_tokens"] = autotune_state["current_target_tokens"]
-        chunk_info["autotune_event"] = ""
-        chunk_info["autotune_reason"] = ""
-
-        chunk_info["status"] = "running"
-        chunk_info["started_at"] = _now_iso()
-        chunk_info["updated_at"] = chunk_info["started_at"]
-        chunk_info["request_url"] = request_url
-        chunk_info["latency_ms"] = None
-        chunk_info["streaming_used"] = False
-        _refresh_manifest_token_source_summary(manifest)
-        _sync_manifest_legacy_fields(manifest)
-        _write_manifest(manifest_path, manifest)
-
-        print(
-            f"Processing chunk {active_index}/{total} chunk_id={chunk_id} status=running "
-            f"input_chars={chunk_char_count} estimated_input_tokens={estimated_input_tokens} input_tokens={estimated_input_tokens} "
-            f"est_source={token_count_source} prompt_tokens={actual_prompt_tokens} continuity_tokens={continuity_context['token_count']} "
-            f"planned_max_output_tokens={planned_max_output_tokens} autotune_target_tokens={autotune_state['current_target_tokens']} "
-            f"model={model} url={request_url}",
-            file=sys.stderr,
-        )
-
-        chunk_attempt_logs = []
-        while True:
-            try:
-                llm_result = _call_llm_api(
-                    api_key=api_key,
-                    base_url=base_url,
-                    model=model,
-                    messages=[{"role": "user", "content": prompt}],
-                    api_format=api_format,
-                    timeout_sec=timeout_sec,
-                    max_retries=max_retries,
-                    backoff_sec=backoff_sec,
-                    stream_mode=stream_mode,
-                    max_tokens=planned_max_output_tokens,
-                )
-                attempt_logs = _collect_attempt_logs(llm_result)
-                request_attempts = max(len(attempt_logs), _parse_int(llm_result.get("attempts"), 1))
-                chunk_attempt_logs.extend(attempt_logs)
-                chunk_info["attempts"] = chunk_info.get("attempts", 0) + request_attempts
-                chunk_info["attempt_logs"] = list(chunk_info.get("attempt_logs", [])) + attempt_logs
-
-                result_text = llm_result["text"]
-                actual_output_tokens = _estimate_tokens(result_text, "tokens", config)
-                output_health = _evaluate_chunk_output_health(
-                    prompt_name,
-                    chunk_id,
-                    chunk_char_count,
-                    result_text,
-                    source_text=chunk_text,
-                    glossary_payload=glossary_payload,
-                    glossary_max_terms=max(0, _parse_int_min(config.get("chunk_glossary_max_prompt_terms"), 8, 0)),
-                )
-                consecutive_timeouts = 0
-
-                if output_health["retry_reasons"] and chunk_info.get("recovery_attempts", 0) < chunk_recovery_attempt_limit:
-                    _append_chunk_recovery_log(
-                        chunk_info,
-                        action="retry",
-                        reasons=output_health["retry_reasons"],
-                        details=output_health["warnings"],
-                        request_attempts=request_attempts,
-                        request_url=llm_result.get("request_url", request_url),
-                        latency_ms=llm_result.get("latency_ms"),
-                        sleep_sec=chunk_recovery_backoff_sec,
-                    )
-                    runtime_control["repair_attempted_count"] = runtime_control.get("repair_attempted_count", 0) + 1
-                    _record_chunk_verification(
-                        chunk_info,
-                        status="repairable_failure",
-                        warnings=output_health["warnings"],
-                        retry_reasons=output_health["retry_reasons"],
-                        repair_exhausted=False,
-                    )
-                    chunk_info["status"] = "pending"
-                    chunk_info["last_error"] = " | ".join(output_health["warnings"])
-                    chunk_info["last_error_type"] = "quality_retry"
-                    chunk_info["error_type"] = "quality_retry"
-                    chunk_info["request_url"] = llm_result.get("request_url", request_url)
-                    chunk_info["latency_ms"] = llm_result.get("latency_ms")
-                    chunk_info["streaming_used"] = bool(llm_result.get("streaming_used", False))
-                    chunk_info["updated_at"] = _now_iso()
-                    print(
-                        f"Retrying chunk {active_index}/{total} chunk_id={chunk_id} after suspicious output "
-                        f"reasons={','.join(output_health['retry_reasons'])} recovery_attempt={chunk_info['recovery_attempts']}/{chunk_recovery_attempt_limit} "
-                        f"latency_ms={llm_result.get('latency_ms')} url={llm_result.get('request_url', request_url)}",
-                        file=sys.stderr,
-                    )
-                    _refresh_manifest_token_source_summary(manifest)
-                    _sync_manifest_legacy_fields(manifest)
-                    _write_manifest(manifest_path, manifest)
-                    if chunk_recovery_backoff_sec > 0:
-                        time.sleep(chunk_recovery_backoff_sec)
-                    continue
-
-                repair_exhausted = bool(output_health["retry_reasons"]) and chunk_info.get("recovery_attempts", 0) >= chunk_recovery_attempt_limit
-                if output_health["warnings"]:
-                    runtime_control["verification_warning_count"] = runtime_control.get("verification_warning_count", 0) + len(output_health["warnings"])
-                if repair_exhausted:
-                    runtime_control["repair_exhausted_count"] = runtime_control.get("repair_exhausted_count", 0) + 1
-                _record_chunk_verification(
-                    chunk_info,
-                    status="warning" if output_health["warnings"] else "passed",
-                    warnings=output_health["warnings"],
-                    retry_reasons=output_health["retry_reasons"],
-                    repair_exhausted=repair_exhausted,
-                )
-                for warning in output_health["warnings"]:
-                    warnings.append(warning)
-                    print(warning, file=sys.stderr)
-
-                result_char_count = output_health["result_chars"]
-                _atomic_write_text(out_path, result_text)
-                output_files.append(str(out_path))
-                processed_count += 1
-
-                chunk_info["status"] = "done"
-                chunk_info["last_error"] = ""
-                chunk_info["last_error_type"] = ""
-                chunk_info["error_type"] = ""
-                chunk_info["latency_ms"] = llm_result["latency_ms"]
-                chunk_info["output_chars"] = result_char_count
-                chunk_info["actual_output_tokens"] = actual_output_tokens
-                chunk_info["processed_tail_context_text"] = _extract_tail_sentences(
-                    result_text,
-                    _parse_int_min(
-                        config.get("chunk_context_tail_sentences"),
-                        DEFAULT_CHUNK_CONTEXT_TAIL_SENTENCES,
-                        0,
-                    ),
-                    config,
-                )
-                if input_key == "raw_path":
-                    chunk_info["processed_input_tail_context_text"] = chunk_info["processed_tail_context_text"]
-                    chunk_info["processed_input_section_title"] = _extract_last_section_title(result_text)
-                chunk_info["last_section_title"] = _extract_last_section_title(result_text)
-                chunk_info["request_url"] = llm_result["request_url"]
-                chunk_info["streaming_used"] = llm_result["streaming_used"]
-                had_timeout_retry = _has_timeout_attempt(chunk_attempt_logs)
-                if had_timeout_retry:
-                    autotune_state = _update_autotune_state(
-                        autotune_state,
-                        success=False,
-                        timeout=True,
-                        error_type="timeout",
-                        chunk_id=chunk_id,
-                    )
-                else:
-                    autotune_state = _update_autotune_state(
-                        autotune_state,
-                        success=True,
-                        latency_ms=llm_result["latency_ms"],
-                        chunk_id=chunk_id,
-                    )
-                autotune_state["current_planned_max_output_tokens"] = planned_max_output_tokens
-                manifest["autotune"] = autotune_state
-                chunk_info["autotune_next_target_tokens"] = autotune_state["current_target_tokens"]
-                chunk_info["autotune_event"] = autotune_state["last_event"]
-                chunk_info["autotune_reason"] = autotune_state["last_reason"]
-                chunk_info["completed_at"] = _now_iso()
-                chunk_info["updated_at"] = chunk_info["completed_at"]
-                print(
-                    f"Completed chunk {active_index}/{total} chunk_id={chunk_id} status=done "
-                    f"input_chars={chunk_char_count} estimated_input_tokens={estimated_input_tokens} "
-                    f"planned_max_output_tokens={planned_max_output_tokens} latency_ms={llm_result['latency_ms']} "
-                    f"attempts={chunk_info['attempts']} streaming_used={llm_result['streaming_used']} "
-                    f"output_chars={result_char_count} actual_output_tokens={actual_output_tokens} "
-                    f"recovery_attempts={chunk_info.get('recovery_attempts', 0)} "
-                    f"autotune_event={autotune_state['last_event']} next_autotune_target_tokens={autotune_state['current_target_tokens']}",
-                    file=sys.stderr,
-                )
-                if autotune_state["last_event"]:
-                    print(
-                        f"Autotune chunk_id={chunk_id} event={autotune_state['last_event']} "
-                        f"target_tokens={autotune_state['current_target_tokens']} reason={autotune_state['last_reason']}",
-                        file=sys.stderr,
-                    )
-                if had_timeout_retry or (autotune_state["last_event"] == "shrink" and active_index <= canary_limit):
-                    _mark_runtime_replan(
-                        runtime,
-                        reason=autotune_state["last_reason"] or "Observed unstable retries under the current plan",
-                        trigger=_classify_replan_trigger(
-                            had_timeout_retry=had_timeout_retry,
-                            autotune_last_event=autotune_state["last_event"],
-                        ),
-                        input_key=input_key,
-                        chunk_id=chunk_id,
-                    )
-                    runtime["status"] = "aborted"
-                    aborted = True
-                    aborted_reason = (
-                        "Current plan requires replanning before continuing. "
-                        f"{runtime['replan_reason']}"
-                    )
-                    print(f"Error: {aborted_reason}", file=sys.stderr)
-                break
-            except LLMRequestError as error:
-                attempt_logs = _collect_attempt_logs(error)
-                request_attempts = max(len(attempt_logs), _parse_int(getattr(error, "attempts", 1), 1))
-                chunk_attempt_logs.extend(attempt_logs)
-                failed_count += 1
-                chunk_info["status"] = "failed"
-                chunk_info["attempts"] = chunk_info.get("attempts", 0) + request_attempts
-                chunk_info["attempt_logs"] = list(chunk_info.get("attempt_logs", [])) + attempt_logs
-                chunk_info["last_error"] = str(error)
-                chunk_info["last_error_type"] = error.error_type
-                chunk_info["error_type"] = error.error_type
-                chunk_info["request_url"] = error.request_url or request_url
-                autotune_state = _update_autotune_state(
-                    autotune_state,
-                    success=False,
-                    timeout=_is_timeout_error(error),
-                    error_type=error.error_type,
-                    chunk_id=chunk_id,
-                )
-                autotune_state["current_planned_max_output_tokens"] = planned_max_output_tokens
-                manifest["autotune"] = autotune_state
-                chunk_info["autotune_next_target_tokens"] = autotune_state["current_target_tokens"]
-                chunk_info["autotune_event"] = autotune_state["last_event"]
-                chunk_info["autotune_reason"] = autotune_state["last_reason"]
-                chunk_info["updated_at"] = _now_iso()
-                print(
-                    f"Chunk {active_index}/{total} chunk_id={chunk_id} status=failed "
-                    f"input_chars={chunk_char_count} estimated_input_tokens={estimated_input_tokens} "
-                    f"planned_max_output_tokens={planned_max_output_tokens} latency_ms={chunk_info.get('latency_ms')} "
-                    f"attempts={getattr(error, 'attempts', 1)} streaming_used={chunk_info.get('streaming_used', False)} "
-                    f"error_type={error.error_type} url={error.request_url or request_url} error={error} "
-                    f"autotune_event={autotune_state['last_event']} next_autotune_target_tokens={autotune_state['current_target_tokens']}",
-                    file=sys.stderr,
-                )
-                if autotune_state["last_event"]:
-                    print(
-                        f"Autotune chunk_id={chunk_id} event={autotune_state['last_event']} "
-                        f"target_tokens={autotune_state['current_target_tokens']} reason={autotune_state['last_reason']}",
-                        file=sys.stderr,
-                    )
-
-                if _should_replan_after_error(error) or (autotune_state["last_event"] == "shrink" and active_index <= canary_limit):
-                    _mark_runtime_replan(
-                        runtime,
-                        reason=autotune_state["last_reason"] or str(error),
-                        trigger=_classify_replan_trigger(error, autotune_last_event=autotune_state["last_event"]),
-                        input_key=input_key,
-                        chunk_id=chunk_id,
-                    )
-                    runtime["status"] = "aborted"
-                    aborted = True
-                    aborted_reason = (
-                        "Current plan requires replanning before continuing. "
-                        f"{runtime['replan_reason']}"
-                    )
-                    print(f"Error: {aborted_reason}", file=sys.stderr)
-                    break
-
-                if _is_timeout_error(error):
-                    consecutive_timeouts += 1
-                else:
-                    consecutive_timeouts = 0
-
-                if stop_after_timeouts > 0 and consecutive_timeouts >= stop_after_timeouts:
-                    aborted = True
-                    aborted_reason = (
-                        f"Stopped after {consecutive_timeouts} consecutive timeout failures. "
-                        f"Check provider/gateway latency or reduce chunk size."
-                    )
-                    print(f"Error: {aborted_reason}", file=sys.stderr)
-                    _write_manifest(manifest_path, manifest)
-                    break
-                break
-        runtime["processed_count"] = processed_count
-        runtime["failed_count"] = failed_count
-        runtime["skipped_count"] = skipped_count
-        runtime["superseded_count"] = superseded_count
-        runtime["last_request_url"] = request_url
-        runtime["updated_at"] = _now_iso()
-        if not aborted and not paused:
-            runtime["status"] = "running"
-        _refresh_manifest_token_source_summary(manifest)
-        _sync_manifest_legacy_fields(manifest)
-        _write_manifest(manifest_path, manifest)
-
-        if aborted:
-            break
-
-    runtime["processed_count"] = processed_count
-    runtime["failed_count"] = failed_count
-    runtime["skipped_count"] = skipped_count
-    runtime["superseded_count"] = superseded_count
-    runtime["updated_at"] = _now_iso()
-    if aborted:
-        runtime["status"] = "aborted"
-    elif paused:
-        runtime["status"] = PAUSED_RUNTIME_STATUS
-    elif failed_count > 0:
-        runtime["status"] = "completed_with_errors"
-    else:
-        runtime["status"] = "completed"
-    _refresh_manifest_token_source_summary(manifest)
-    _sync_manifest_legacy_fields(manifest)
-    _write_manifest(manifest_path, manifest)
-
-    return {
-        "success": failed_count == 0 and not aborted and not paused,
-        "processed_count": processed_count,
-        "failed_count": failed_count,
-        "skipped_count": skipped_count,
-        "superseded_count": superseded_count,
-        "total_chunks": total,
-        "warnings": warnings,
-        "warning_count": len(warnings),
-        "output_files": output_files,
-        "aborted": aborted,
-        "aborted_reason": aborted_reason,
-        "paused": paused,
-        "pause_reason": pause_reason,
-        "replan_required": runtime.get("replan_required", False),
-        "replan_reason": runtime.get("replan_reason", ""),
-        "resume": resume_report,
-        "plan": manifest.get("plan", {}),
-        "glossary": plan.get("glossary", {}),
-        "semantic_verification": plan.get("semantic_verification", {}),
-        "control": _build_process_control_summary(runtime, operation_control),
-        "request_url": request_url,
-        "cancellation": cancellation,
-        "pause": kernel_state.summarize_runtime_pause_request(work_dir),
-    }
 
 
 def replan_remaining(work_dir: str, prompt_name: str = "", config_path: str = None,
                      chunk_size: int = 0, input_key: str = "raw_path",
                      runtime_ownership: dict | None = None) -> dict:
-    manifest_path = Path(work_dir) / "manifest.json"
-    if not manifest_path.exists():
-        print(f"Error: manifest.json not found in {work_dir}", file=sys.stderr)
-        sys.exit(1)
-
-    return kernel_controller.run_owned_mutation(
+    return kernel_execution.replan_remaining(
         work_dir,
-        "replan-remaining",
+        prompt_name=prompt_name,
+        config_path=config_path,
+        chunk_size=chunk_size,
+        input_key=input_key,
         runtime_ownership=runtime_ownership,
-        conflict_result_builder=_build_replan_ownership_conflict_result,
-        mutation_fn=lambda ownership: _replan_remaining_impl(
-            work_dir,
-            prompt_name=prompt_name,
-            config_path=config_path,
-            chunk_size=chunk_size,
-            input_key=input_key,
-        ),
     )
 
 
 def _replan_remaining_impl(work_dir: str, prompt_name: str = "", config_path: str = None,
                            chunk_size: int = 0, input_key: str = "raw_path") -> dict:
-    work_path = Path(work_dir)
-    manifest_path = work_path / "manifest.json"
-    if not manifest_path.exists():
-        print(f"Error: manifest.json not found in {work_dir}", file=sys.stderr)
-        sys.exit(1)
-
-    if input_key != "raw_path":
-        return {
-            "success": False,
-            "replanned": False,
-            "error": "replan-remaining currently supports raw_path only",
-        }
-
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    config = _load_optional_config(config_path)
-    plan_prompt_name = prompt_name or str(manifest.get("plan", {}).get("prompt_name", manifest.get("prompt_name", ""))).strip()
-    prompt_template = ""
-    if plan_prompt_name:
-        prompt_template = _resolve_prompt_template_path(plan_prompt_name).read_text(encoding="utf-8")
-    prompt_budget = _calculate_chunk_budget(plan_prompt_name, prompt_template, config)
-    manifest = _ensure_manifest_structure(
-        manifest,
-        prompt_name=plan_prompt_name,
-        prompt_budget=prompt_budget,
-        recommended_chunk_size=_recommended_chunk_size(plan_prompt_name, config),
-        source_file=str(manifest.get("source_file", "")).strip(),
-        config=config,
+    return kernel_processing._replan_remaining_impl(
+        work_dir,
+        prompt_name=prompt_name,
+        config_path=config_path,
+        chunk_size=chunk_size,
+        input_key=input_key,
     )
-
-    pending_indices = [
-        index for index, chunk in enumerate(manifest["chunks"])
-        if chunk.get("status") not in {"done", SUPERSEDED_CHUNK_STATUS}
-    ]
-    if not pending_indices:
-        return {
-            "success": True,
-            "replanned": False,
-            "plan_id": manifest["plan"].get("plan_id", ""),
-            "message": "No remaining chunks to replan",
-        }
-
-    first_pending_index = pending_indices[0]
-    previous_chunk = _find_previous_active_chunk(manifest["chunks"], first_pending_index)
-    pending_chunks = []
-    for index in pending_indices:
-        chunk_info = manifest["chunks"][index]
-        input_path = work_path / chunk_info["raw_path"]
-        if not input_path.exists():
-            return {
-                "success": False,
-                "replanned": False,
-                "error": f"Input file not found: {input_path}",
-            }
-        pending_chunks.append({
-            "chunk_id": chunk_info["id"],
-            "text": input_path.read_text(encoding="utf-8"),
-        })
-
-    replan_chunk_size = chunk_size
-    if replan_chunk_size <= 0:
-        suggested_target = max(0, _parse_int(manifest.get("autotune", {}).get("current_target_tokens"), 0))
-        if suggested_target > 0:
-            replan_chunk_size = suggested_target
-
-    chunk_plan = _build_chunk_plan(plan_prompt_name, replan_chunk_size, config, prompt_template)
-    budget = chunk_plan["budget"]
-    chunk_mode = chunk_plan["chunk_mode"]
-    effective_chunk_size = chunk_plan["effective_chunk_size"]
-    hard_cap_size = chunk_plan["hard_cap_size"]
-    recommended_chunk_size = chunk_plan["recommended_chunk_size"]
-    target_tokens = chunk_plan["target_tokens"]
-    hard_cap_tokens = chunk_plan["hard_cap_tokens"]
-
-    chapter_plan_path = work_path / "chapter_plan.json"
-    chapter_plan_entries = None
-    chapter_start_ids = set()
-    if chapter_plan_path.exists():
-        try:
-            loaded_chapter_plan = json.loads(chapter_plan_path.read_text(encoding="utf-8"))
-            if isinstance(loaded_chapter_plan, list):
-                chapter_plan_entries = loaded_chapter_plan
-                for chapter in chapter_plan_entries:
-                    if not isinstance(chapter, dict):
-                        continue
-                    start_chunk = chapter.get("start_chunk")
-                    try:
-                        chapter_start_ids.add(int(start_chunk))
-                    except (TypeError, ValueError):
-                        continue
-        except json.JSONDecodeError:
-            chapter_plan_entries = None
-
-    pending_chapter_start_ids = {chunk["chunk_id"] for chunk in pending_chunks if chunk["chunk_id"] in chapter_start_ids}
-    replan_segments = []
-    current_segment = []
-    for chunk in pending_chunks:
-        if current_segment and chunk["chunk_id"] in pending_chapter_start_ids:
-            replan_segments.append(current_segment)
-            current_segment = []
-        current_segment.append(chunk)
-    if current_segment:
-        replan_segments.append(current_segment)
-
-    chunk_specs = []
-    warnings = []
-    segment_start_remap = {}
-    for segment in replan_segments:
-        segment_text = CHUNK_SEPARATOR.join(part["text"] for part in segment if part["text"])
-        if not segment_text.strip():
-            continue
-        sentences = _split_sentences(segment_text)
-        segment_chunks, segment_warnings = _split_text_into_chunks(
-            sentences,
-            chunk_mode,
-            effective_chunk_size,
-            hard_cap_size,
-            config,
-        )
-        warnings.extend(segment_warnings)
-        if not segment_chunks:
-            segment_chunks = [segment_text]
-        segment_start_chunk_id = segment[0]["chunk_id"]
-        for offset, chunk_content in enumerate(segment_chunks):
-            chunk_specs.append({
-                "content": chunk_content,
-                "segment_start_chunk_id": segment_start_chunk_id,
-                "starts_segment": offset == 0,
-            })
-
-    prior_plan = dict(manifest.get("plan", {}))
-    prior_plan_id = str(prior_plan.get("plan_id", "")).strip()
-    new_plan_id = _new_plan_id()
-    manifest.setdefault("plan_history", []).append(prior_plan)
-    manifest["plan"] = _build_manifest_plan(
-        plan_prompt_name,
-        chunk_mode,
-        recommended_chunk_size,
-        effective_chunk_size,
-        {
-            **budget,
-            "target_tokens": target_tokens,
-            "hard_cap_tokens": hard_cap_tokens,
-        },
-        source_file=str(manifest.get("source_file", "")).strip(),
-        plan_id=new_plan_id,
-        prior_plan_id=prior_plan_id,
-    )
-
-    now = _now_iso()
-    superseded_count = 0
-    for index in pending_indices:
-        chunk_info = manifest["chunks"][index]
-        if chunk_info.get("status") == SUPERSEDED_CHUNK_STATUS:
-            continue
-        chunk_info["status"] = SUPERSEDED_CHUNK_STATUS
-        chunk_info["superseded_by_plan_id"] = new_plan_id
-        chunk_info["updated_at"] = now
-        superseded_count += 1
-
-    next_chunk_id = max((_parse_int(chunk.get("id"), 0) for chunk in manifest["chunks"]), default=-1) + 1
-    new_chunk_start_index = len(manifest["chunks"])
-    previous_continuity_chunk_id = previous_chunk.get("id") if previous_chunk else None
-    plan_chunk_contract = manifest.get("plan", {}).get("chunk_contract", {}) if isinstance(manifest.get("plan", {}).get("chunk_contract", {}), dict) else _build_manifest_chunk_contract()
-    plan_continuity = manifest.get("plan", {}).get("continuity", {}) if isinstance(manifest.get("plan", {}).get("continuity", {}), dict) else _build_manifest_continuity_policy(config)
-    autotune_state = _build_autotune_state(manifest["plan"], config, manifest.get("autotune"))
-    autotune_state["enabled"] = _parse_bool(config.get("enable_chunk_autotune"), DEFAULT_ENABLE_CHUNK_AUTOTUNE) and chunk_mode == "tokens"
-
-    for offset, chunk_spec in enumerate(chunk_specs):
-        chunk_id = next_chunk_id + offset
-        chunk_filename = f"chunk_{chunk_id:03d}.txt"
-        chunk_path = work_path / chunk_filename
-        _atomic_write_text(chunk_path, chunk_spec["content"])
-        chunk_entry = _new_chunk_manifest_entry(
-            chunk_id,
-            chunk_spec["content"],
-            budget,
-            config,
-            raw_path=chunk_filename,
-            processed_path=f"processed_{chunk_id:03d}.md",
-            plan_id=new_plan_id,
-            continuity_prev_chunk_id=previous_continuity_chunk_id,
-            chunk_contract=plan_chunk_contract,
-            continuity_policy=plan_continuity,
-        )
-        chunk_entry["autotune_target_tokens"] = autotune_state["current_target_tokens"]
-        chunk_entry["autotune_next_target_tokens"] = autotune_state["current_target_tokens"]
-        manifest["chunks"].append(chunk_entry)
-        if chunk_spec["starts_segment"]:
-            segment_start_remap[chunk_spec["segment_start_chunk_id"]] = chunk_id
-        previous_continuity_chunk_id = chunk_id
-
-    if chapter_plan_entries is not None and segment_start_remap:
-        chapter_plan_changed = False
-        for chapter in chapter_plan_entries:
-            if not isinstance(chapter, dict):
-                continue
-            try:
-                start_chunk_id = int(chapter.get("start_chunk"))
-            except (TypeError, ValueError):
-                continue
-            if start_chunk_id not in segment_start_remap:
-                continue
-            chapter.setdefault("original_start_chunk", start_chunk_id)
-            chapter["start_chunk"] = segment_start_remap[start_chunk_id]
-            chapter_plan_changed = True
-        if chapter_plan_changed:
-            _atomic_write_text(
-                chapter_plan_path,
-                json.dumps(chapter_plan_entries, ensure_ascii=False, indent=2),
-            )
-
-    runtime = manifest["runtime"]
-    runtime["status"] = "pending"
-    runtime["active_plan_id"] = new_plan_id
-    runtime["replan_required"] = False
-    runtime["replan_reason"] = ""
-    runtime["last_replanned_at"] = now
-    runtime["updated_at"] = now
-    runtime["current_chunk_index"] = new_chunk_start_index
-    runtime["superseded_count"] = sum(
-        1 for chunk in manifest["chunks"]
-        if chunk.get("status") == SUPERSEDED_CHUNK_STATUS
-    )
-    manifest["autotune"] = autotune_state
-    manifest["total_chunks"] = len(manifest["chunks"])
-    _sync_manifest_legacy_fields(manifest)
-    _refresh_manifest_token_source_summary(manifest)
-    _write_manifest(manifest_path, manifest)
-
-    for warning in warnings:
-        print(f"⚠️ {warning}", file=sys.stderr)
-
-    return {
-        "success": True,
-        "replanned": True,
-        "plan_id": new_plan_id,
-        "prior_plan_id": prior_plan_id,
-        "superseded_count": superseded_count,
-        "new_chunk_count": len(chunk_specs),
-        "chunk_size": effective_chunk_size,
-        "warnings": warnings,
-    }
 
 
 def process_chunks_with_replans(work_dir: str, prompt_name: str, extra_instruction: str = "",
                                 config_path: str = None, input_key: str = "raw_path",
                                 force: bool = False, max_replans: int = 3,
                                 runtime_ownership: dict | None = None) -> dict:
-    manifest_path = Path(work_dir) / "manifest.json"
-    if not manifest_path.exists():
-        print(f"Error: manifest.json not found in {work_dir}", file=sys.stderr)
-        sys.exit(1)
-
-    return kernel_controller.run_owned_mutation(
+    return kernel_execution.process_chunks_with_replans(
         work_dir,
-        "process-chunks-with-replans",
+        prompt_name,
+        extra_instruction=extra_instruction,
+        config_path=config_path,
+        input_key=input_key,
+        force=force,
+        max_replans=max_replans,
         runtime_ownership=runtime_ownership,
-        conflict_result_builder=_build_process_with_replans_ownership_conflict_result,
-        mutation_fn=lambda ownership: _process_chunks_with_replans_impl(
-            work_dir,
-            prompt_name,
-            extra_instruction=extra_instruction,
-            config_path=config_path,
-            input_key=input_key,
-            force=force,
-            max_replans=max_replans,
-            runtime_ownership=ownership,
-        ),
     )
 
 
@@ -5921,32 +3657,17 @@ def _process_chunks_with_replans_impl(work_dir: str, prompt_name: str, extra_ins
                                       config_path: str = None, input_key: str = "raw_path",
                                       force: bool = False, max_replans: int = 3,
                                       runtime_ownership: dict | None = None) -> dict:
-    def current_superseded_count() -> int:
-        manifest_path = Path(work_dir) / "manifest.json"
-        if not manifest_path.exists():
-            return 0
-        try:
-            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            return 0
-        return sum(
-            1 for chunk in manifest.get("chunks", [])
-            if chunk.get("status") == SUPERSEDED_CHUNK_STATUS
-        )
-
-    return kernel_controller.run_auto_replan_loop(
-        work_dir=work_dir,
-        prompt_name=prompt_name,
+    return kernel_processing._process_chunks_with_replans_impl(
+        work_dir,
+        prompt_name,
         extra_instruction=extra_instruction,
         config_path=config_path,
         input_key=input_key,
         force=force,
         max_replans=max_replans,
         runtime_ownership=runtime_ownership,
-        process_chunks_fn=process_chunks,
-        replan_remaining_fn=replan_remaining,
-        current_superseded_count_fn=current_superseded_count,
     )
+
 
 def detect_audio_content_type(audio_path: str) -> str:
     ext = Path(audio_path).suffix.lower().lstrip(".")

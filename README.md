@@ -149,13 +149,25 @@ yt-transcript/
 ├── workflows/               # Modular workflow files
 ├── prompts/                 # Single-task prompt templates
 ├── scripts/                 # Helper shell scripts
-├── yt_transcript_utils.py   # Main Python entry + orchestration utilities
-├── kernel_state.py          # Persisted state and runtime control helpers
-├── kernel_runtime.py        # Runtime ownership and command telemetry helpers
-├── kernel_controller.py     # Owned mutation and bounded control-loop helpers
-├── kernel_telemetry.py      # Telemetry query and summary helpers
-├── kernel_glossary.py       # Glossary extraction and terminology checks
-├── kernel_semantic.py       # Semantic anchor extraction and checks
+├── yt_transcript_utils.py   # Main Python entry; imports the two kernel layers directly
+├── kernel/                 # Two-layer kernel package
+│   ├── task_runtime/       # Generic task runtime layer
+│   │   ├── runtime.py      # Ownership, command envelopes, telemetry append
+│   │   ├── state.py        # Manifest/runtime persistence and control files
+│   │   ├── controller.py   # Owned mutation and bounded control-loop helpers
+│   │   └── telemetry.py    # Telemetry query and summary helpers
+│   └── long_text/          # Long-text transformation layer
+│       ├── glossary.py     # Glossary extraction and terminology checks
+│       ├── semantic.py     # Semantic anchor extraction and checks
+│       ├── contracts.py    # Control contracts and policy state
+│       ├── autotune.py     # Chunk autotune and token-source summarization
+│       ├── lifecycle.py    # Manifest lifecycle and resume-state helpers
+│       ├── prompting.py    # Prompt assembly and chunking-context helpers
+│       ├── llm.py          # LLM request loop and retry helpers
+│       ├── processing.py   # Chunk-processing and replan execution loops
+│       ├── chunking.py     # Chunking command surfaces
+│       ├── merge.py        # Merge and chapter-plan command surfaces
+│       └── execution.py    # Execution, resume, and replan command surfaces
 ├── tests/                   # Regression test suite
 ├── config.yaml              # Local config (gitignored)
 ├── config.example.yaml      # Config template
@@ -432,13 +444,25 @@ yt-transcript/
 ├── workflows/               # 模块化工作流文件
 ├── prompts/                 # 单任务 Prompt 模板
 ├── scripts/                 # Shell 辅助脚本
-├── yt_transcript_utils.py   # 主 Python 入口与编排工具
-├── kernel_state.py          # 状态持久化与 runtime control 辅助
-├── kernel_runtime.py        # runtime ownership 与 command telemetry 辅助
-├── kernel_controller.py     # owned mutation 与 bounded control-loop 辅助
-├── kernel_telemetry.py      # telemetry 查询与汇总辅助
-├── kernel_glossary.py       # glossary 提取与术语检查
-├── kernel_semantic.py       # semantic anchor 提取与检查
+├── yt_transcript_utils.py   # 主 Python 入口；现直接依赖两层 kernel 子包
+├── kernel/                 # 两层 kernel 包
+│   ├── task_runtime/       # 通用任务运行时层
+│   │   ├── runtime.py      # ownership、command envelope、telemetry append
+│   │   ├── state.py        # manifest/runtime 持久化与控制文件
+│   │   ├── controller.py   # owned mutation 与 bounded control-loop 辅助
+│   │   └── telemetry.py    # telemetry 查询与汇总辅助
+│   └── long_text/          # 长文本变换层
+│       ├── glossary.py     # glossary 提取与术语检查
+│       ├── semantic.py     # semantic anchor 提取与检查
+│       ├── contracts.py    # control contract 与 policy state
+│       ├── autotune.py     # chunk autotune 与 token source 汇总
+│       ├── lifecycle.py    # manifest 生命周期与 resume state 辅助
+│       ├── prompting.py    # prompt 组装与 chunking context 辅助
+│       ├── llm.py          # LLM 请求循环与重试辅助
+│       ├── processing.py   # chunk 处理与 replan 执行循环
+│       ├── chunking.py     # 分块命令表面
+│       ├── merge.py        # merge 与 chapter-plan 命令表面
+│       └── execution.py    # 执行、resume 与 replan 命令表面
 ├── tests/                   # 回归测试集
 ├── config.yaml              # 本地配置（已 gitignore）
 ├── config.example.yaml      # 配置模板

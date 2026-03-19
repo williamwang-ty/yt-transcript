@@ -1,4 +1,4 @@
-import kernel_runtime
+from . import runtime as kernel_runtime
 
 
 def build_delegated_runtime_ownership(runtime_ownership: dict | None = None) -> dict | None:

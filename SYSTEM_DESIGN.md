@@ -522,6 +522,8 @@ Those may be future directions, but they are not the current system design goal.
 
 This section is not a spec. It helps relate design concepts to the current repository surfaces.
 
+The internal implementation is organized into two layers: `task_runtime` for generic long-running task control, and `long_text` for long-text transformation behavior.
+
 - `SKILL.md`
   - top-level human/agent workflow entry
 - `workflows/*.md`
@@ -533,19 +535,37 @@ This section is not a spec. It helps relate design concepts to the current repos
 - `scripts/download.sh`
   - metadata, subtitle, and audio acquisition surface
 - `yt_transcript_utils.py`
-  - main orchestration, planning, chunking, merge, verification, and adapter commands
-- `kernel_state.py`
-  - persisted manifest and runtime control state helpers
-- `kernel_runtime.py`
-  - runtime ownership, command envelopes, and command-level telemetry helpers
-- `kernel_controller.py`
+  - main Python entry, CLI façade, workflow orchestration, planning, verification, and adapter commands; it imports the two kernel layers directly
+- `kernel/task_runtime/runtime.py`
+  - task ownership, command envelopes, and telemetry append helpers
+- `kernel/task_runtime/state.py`
+  - persistent manifest, runtime state, and control-file helpers
+- `kernel/task_runtime/controller.py`
   - owned mutation and bounded control-loop behavior
-- `kernel_glossary.py`
-  - terminology extraction and checks for long-text consistency
-- `kernel_semantic.py`
-  - high-signal anchor extraction and checks
-- `kernel_telemetry.py`
+- `kernel/task_runtime/telemetry.py`
   - telemetry inspection and summaries
+- `kernel/long_text/glossary.py`
+  - terminology extraction and checks for long-text consistency
+- `kernel/long_text/semantic.py`
+  - high-signal anchor extraction and checks
+- `kernel/long_text/contracts.py`
+  - control contracts, replan policy state, and chunk/runtime control helpers
+- `kernel/long_text/autotune.py`
+  - chunk autotune policy and token-source summary helpers
+- `kernel/long_text/lifecycle.py`
+  - manifest lifecycle, resume repair, and chunk/runtime defaulting
+- `kernel/long_text/prompting.py`
+  - prompt assembly and chunking-context preparation helpers
+- `kernel/long_text/llm.py`
+  - LLM request, retry, and streaming fallback helpers
+- `kernel/long_text/processing.py`
+  - chunk-processing, replan, and auto-replan execution loops
+- `kernel/long_text/chunking.py`
+  - public chunking command surfaces for long-text processing
+- `kernel/long_text/merge.py`
+  - chapter-plan mapping and deterministic merge command surfaces
+- `kernel/long_text/execution.py`
+  - execution, resume, and replan command surfaces for long-text jobs
 - `README.md`
   - user-facing overview and operational entrypoints
 - `SYSTEM_DESIGN.md`
@@ -1083,6 +1103,8 @@ merge 被刻意设计得尽量简单。
 
 这一节不是 spec，只是帮助把设计概念映射到当前仓库表面。
 
+当前内部实现分成两层：`task_runtime` 负责通用长程任务控制，`long_text` 负责长文本变换行为。
+
 - `SKILL.md`
   - 顶层的人类/agent 工作流入口
 - `workflows/*.md`
@@ -1094,19 +1116,37 @@ merge 被刻意设计得尽量简单。
 - `scripts/download.sh`
   - metadata、字幕、音频的获取接口
 - `yt_transcript_utils.py`
-  - 主要编排、planning、chunking、merge、verification 与适配命令
-- `kernel_state.py`
-  - manifest、runtime control state 的持久化辅助
-- `kernel_runtime.py`
-  - runtime ownership、command envelope、command telemetry 辅助
-- `kernel_controller.py`
+  - 主 Python 入口、CLI façade、workflow 编排、planning、verification 与适配命令；现直接依赖两层 kernel 子包
+- `kernel/task_runtime/runtime.py`
+  - 任务 ownership、command envelope 与 telemetry append 辅助
+- `kernel/task_runtime/state.py`
+  - manifest、runtime state 与控制文件的持久化辅助
+- `kernel/task_runtime/controller.py`
   - owned mutation 与 bounded control-loop 行为
-- `kernel_glossary.py`
-  - 长文本一致性的术语提取与检查
-- `kernel_semantic.py`
-  - 高信号 anchor 的提取与检查
-- `kernel_telemetry.py`
+- `kernel/task_runtime/telemetry.py`
   - telemetry 查询与汇总
+- `kernel/long_text/glossary.py`
+  - 长文本一致性的术语提取与检查
+- `kernel/long_text/semantic.py`
+  - 高信号 anchor 的提取与检查
+- `kernel/long_text/contracts.py`
+  - control contract、replan policy state 与 chunk/runtime control 辅助
+- `kernel/long_text/autotune.py`
+  - chunk autotune 策略与 token source 汇总辅助
+- `kernel/long_text/lifecycle.py`
+  - manifest 生命周期、resume repair 与 chunk/runtime 默认化
+- `kernel/long_text/prompting.py`
+  - prompt 组装与 chunking-context 准备辅助
+- `kernel/long_text/llm.py`
+  - LLM 请求、重试与 streaming fallback 辅助
+- `kernel/long_text/processing.py`
+  - chunk 处理、replan 与 auto-replan 执行循环
+- `kernel/long_text/chunking.py`
+  - 长文本分块相关的公开命令表面
+- `kernel/long_text/merge.py`
+  - chapter-plan 映射与确定性 merge 的公开命令表面
+- `kernel/long_text/execution.py`
+  - 长文本作业的执行、resume 与 replan 命令表面
 - `README.md`
   - 面向用户的总览与操作入口
 - `SYSTEM_DESIGN.md`

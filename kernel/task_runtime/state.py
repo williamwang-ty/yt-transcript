@@ -3,7 +3,7 @@ import os
 import time
 from pathlib import Path
 
-import kernel_runtime
+from . import runtime as kernel_runtime
 
 
 MANIFEST_FILENAME = "manifest.json"
