@@ -1,3 +1,5 @@
+"""Deterministic merge and chapter-plan helpers for processed chunk output."""
+
 import json
 import math
 import sys
@@ -5,6 +7,7 @@ from pathlib import Path
 
 
 def _resolve_manifest_path(manifest_ref: str) -> Path:
+    """Resolve a manifest reference to an absolute manifest path."""
     path = Path(manifest_ref)
     if path.is_dir():
         return path / "manifest.json"
@@ -12,6 +15,7 @@ def _resolve_manifest_path(manifest_ref: str) -> Path:
 
 
 def build_chapter_plan(chapters_path: str, manifest_ref: str, output_path: str = "") -> dict:
+    """Map source chapters onto chunk boundaries for deterministic final assembly."""
     import yt_transcript_utils as utils
 
     chapters_file = Path(chapters_path)
@@ -62,6 +66,7 @@ def build_chapter_plan(chapters_path: str, manifest_ref: str, output_path: str =
     timed_chunks.sort(key=lambda item: int(item.get("id", 0)))
 
     def map_time(timestamp: float | None) -> tuple[dict, str, str]:
+        """Map a timestamp onto the chunk that first covers that source position."""
         if timestamp is None:
             return timed_chunks[0], "missing_time", "low"
         for chunk in timed_chunks:
@@ -74,6 +79,7 @@ def build_chapter_plan(chapters_path: str, manifest_ref: str, output_path: str =
         return timed_chunks[-1], "after_last_chunk", "low"
 
     def is_untitled(title: str) -> bool:
+        """Return whether a chapter title should be treated as effectively empty."""
         if not title:
             return True
         lowered = title.strip().lower()
@@ -136,6 +142,7 @@ def build_chapter_plan(chapters_path: str, manifest_ref: str, output_path: str =
 
 
 def merge_content(work_dir: str, output_file: str, header_content: str = "") -> dict:
+    """Merge processed chunk outputs into the final Markdown document."""
     import yt_transcript_utils as utils
 
     work_path = Path(work_dir)

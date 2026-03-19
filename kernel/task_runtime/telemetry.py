@@ -1,3 +1,5 @@
+"""Telemetry loading, filtering, and summarization helpers."""
+
 import json
 from pathlib import Path
 
@@ -6,6 +8,7 @@ TELEMETRY_FILENAME = "telemetry.jsonl"
 
 
 def _parse_int(value, default: int = 0) -> int:
+    """Parse an integer value and fall back to `default` on invalid input."""
     try:
         return int(value)
     except (TypeError, ValueError):
@@ -13,6 +16,7 @@ def _parse_int(value, default: int = 0) -> int:
 
 
 def _resolve_telemetry_file(work_dir: str = "", telemetry_path: str = "") -> tuple[Path, dict]:
+    """Resolve the telemetry JSONL file and describe how it was chosen."""
     candidate = str(telemetry_path or "").strip()
     if candidate:
         path = Path(candidate).expanduser().resolve()
@@ -40,6 +44,7 @@ def _resolve_telemetry_file(work_dir: str = "", telemetry_path: str = "") -> tup
 
 
 def _load_events(path: Path) -> tuple[list[dict], int]:
+    """Load valid JSONL telemetry events and count malformed lines."""
     invalid_line_count = 0
     events = []
     try:
@@ -67,6 +72,7 @@ def _load_events(path: Path) -> tuple[list[dict], int]:
 
 def _matches_filters(event: dict, *, command: str = "", trace_id: str = "",
                      document_id: str = "", success: bool | None = None) -> bool:
+    """Return whether a telemetry event matches the requested filters."""
     if command and str(event.get("command", "")).strip() != str(command).strip():
         return False
     if trace_id and str(event.get("trace_id", "")).strip() != str(trace_id).strip():
@@ -81,6 +87,7 @@ def _matches_filters(event: dict, *, command: str = "", trace_id: str = "",
 def read_telemetry_events(*, work_dir: str = "", telemetry_path: str = "",
                           limit: int = 20, command: str = "", trace_id: str = "",
                           document_id: str = "", success: bool | None = None) -> dict:
+    """Read recent telemetry events with optional command and document filters."""
     path, resolved = _resolve_telemetry_file(work_dir=work_dir, telemetry_path=telemetry_path)
     if not path.exists():
         return {
@@ -127,6 +134,7 @@ def read_telemetry_events(*, work_dir: str = "", telemetry_path: str = "",
 def summarize_telemetry(*, work_dir: str = "", telemetry_path: str = "",
                         command: str = "", document_id: str = "",
                         success: bool | None = None, recent_limit: int = 5) -> dict:
+    """Summarize telemetry volume, success rate, warnings, and recent activity."""
     path, resolved = _resolve_telemetry_file(work_dir=work_dir, telemetry_path=telemetry_path)
     if not path.exists():
         return {

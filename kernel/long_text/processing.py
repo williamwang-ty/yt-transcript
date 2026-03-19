@@ -1,3 +1,5 @@
+"""Main chunk-processing and replan execution loops."""
+
 from __future__ import annotations
 
 _LOCAL_NAMES = {
@@ -9,6 +11,7 @@ _LOCAL_NAMES = {
 
 
 def _bind_utils_globals() -> None:
+    """Bind delegated helper names from `yt_transcript_utils` into module globals."""
     import yt_transcript_utils as utils
 
     for name, value in utils.__dict__.items():
@@ -20,12 +23,8 @@ def _bind_utils_globals() -> None:
 def _process_chunks_impl(work_dir: str, prompt_name: str, extra_instruction: str = "",
                          config_path: str = None, dry_run: bool = False,
                          input_key: str = "raw_path", force: bool = False) -> dict:
+    """Process all active chunks under one plan with retries, repair, and resume support."""
     _bind_utils_globals()
-    """
-    Process each chunk with isolated LLM API calls for context isolation.
-
-    Adds resumability, bounded retries, atomic writes, and chunk-level telemetry.
-    """
     work_path = Path(work_dir)
     manifest_path = work_path / "manifest.json"
     if not manifest_path.exists():
@@ -194,6 +193,8 @@ def _process_chunks_impl(work_dir: str, prompt_name: str, extra_instruction: str
     if resume_report.get("repaired", False) and not dry_run:
         _write_manifest(manifest_path, manifest)
 
+    # Dry-run mode validates configuration, budgets, contracts, and resume state
+    # without mutating chunk outputs or starting LLM requests.
     if dry_run:
         return {
             "success": True,
@@ -256,6 +257,7 @@ def _process_chunks_impl(work_dir: str, prompt_name: str, extra_instruction: str
     active_index = 0
 
     def maybe_abort_for_cancellation() -> bool:
+        """Stop at a safe chunk boundary when a cancel signal is present."""
         nonlocal aborted, aborted_reason, cancellation
         cancellation_snapshot = kernel_state.summarize_runtime_cancel_request(work_dir)
         if not cancellation_snapshot.get("requested", False):
@@ -280,6 +282,7 @@ def _process_chunks_impl(work_dir: str, prompt_name: str, extra_instruction: str
         return True
 
     def maybe_pause_for_request() -> bool:
+        """Pause at a safe chunk boundary when a pause signal is present."""
         nonlocal paused, pause_reason, pause
         pause_snapshot = kernel_state.summarize_runtime_pause_request(work_dir)
         if not pause_snapshot.get("requested", False):
@@ -369,6 +372,8 @@ def _process_chunks_impl(work_dir: str, prompt_name: str, extra_instruction: str
             "pause": pause,
         }
 
+    # Control signals are checked only between chunks so partial chunk outputs
+    # are never merged with partially updated manifest state.
     for chunk_index, chunk_info in enumerate(manifest["chunks"]):
         chunk_id = chunk_info["id"]
         if chunk_info.get("status") == SUPERSEDED_CHUNK_STATUS:
@@ -389,6 +394,8 @@ def _process_chunks_impl(work_dir: str, prompt_name: str, extra_instruction: str
             out_filename = chunk_info["processed_path"]
         out_path = work_path / out_filename
 
+        # A durable output file plus `done` status is a valid checkpoint; skip it
+        # unless the caller explicitly forces regeneration.
         if not force and chunk_info.get("status") == "done" and out_path.exists():
             skipped_count += 1
             print(f"Skipping chunk {active_index}/{total} (chunk_id={chunk_id}, output exists at {out_path.name})", file=sys.stderr)
@@ -536,6 +543,8 @@ def _process_chunks_impl(work_dir: str, prompt_name: str, extra_instruction: str
                 )
                 consecutive_timeouts = 0
 
+                # Verification-triggered repair stays inside the current plan: we
+                # retry the same chunk before escalating to full replanning.
                 if output_health["retry_reasons"] and chunk_info.get("recovery_attempts", 0) < chunk_recovery_attempt_limit:
                     _append_chunk_recovery_log(
                         chunk_info,
@@ -658,6 +667,8 @@ def _process_chunks_impl(work_dir: str, prompt_name: str, extra_instruction: str
                         f"target_tokens={autotune_state['current_target_tokens']} reason={autotune_state['last_reason']}",
                         file=sys.stderr,
                     )
+                # Early timeout instability or an aggressive canary shrink means
+                # the current plan is unhealthy, so stop and regenerate the rest.
                 if had_timeout_retry or (autotune_state["last_event"] == "shrink" and active_index <= canary_limit):
                     _mark_runtime_replan(
                         runtime,
@@ -718,6 +729,8 @@ def _process_chunks_impl(work_dir: str, prompt_name: str, extra_instruction: str
                         file=sys.stderr,
                     )
 
+                # Provider/context failures that point to a bad plan should not be
+                # retried forever at the chunk level; escalate to replan instead.
                 if _should_replan_after_error(error) or (autotune_state["last_event"] == "shrink" and active_index <= canary_limit):
                     _mark_runtime_replan(
                         runtime,
@@ -740,6 +753,8 @@ def _process_chunks_impl(work_dir: str, prompt_name: str, extra_instruction: str
                 else:
                     consecutive_timeouts = 0
 
+                # This acts as a circuit breaker for provider instability: stop the
+                # run once repeated timeout failures indicate the plan is not viable.
                 if stop_after_timeouts > 0 and consecutive_timeouts >= stop_after_timeouts:
                     aborted = True
                     aborted_reason = (
@@ -810,6 +825,7 @@ def _process_chunks_impl(work_dir: str, prompt_name: str, extra_instruction: str
 
 def _replan_remaining_impl(work_dir: str, prompt_name: str = "", config_path: str = None,
                            chunk_size: int = 0, input_key: str = "raw_path") -> dict:
+    """Regenerate chunking for the remaining unprocessed source content."""
     _bind_utils_globals()
     work_path = Path(work_dir)
     manifest_path = work_path / "manifest.json"
@@ -1058,8 +1074,10 @@ def _process_chunks_with_replans_impl(work_dir: str, prompt_name: str, extra_ins
                                       config_path: str = None, input_key: str = "raw_path",
                                       force: bool = False, max_replans: int = 3,
                                       runtime_ownership: dict | None = None) -> dict:
+    """Run chunk processing with bounded automatic replan attempts."""
     _bind_utils_globals()
     def current_superseded_count() -> int:
+        """Return the current superseded count."""
         manifest_path = Path(work_dir) / "manifest.json"
         if not manifest_path.exists():
             return 0

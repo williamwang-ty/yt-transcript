@@ -1,3 +1,5 @@
+"""Persistent runtime-state and control-file helpers."""
+
 import json
 import os
 import time
@@ -16,20 +18,24 @@ RUNTIME_PAUSE_FILENAME = ".runtime_pause.json"
 
 
 def _now_iso() -> str:
+    """Return the current local timestamp in ISO-like wall-clock format."""
     return time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime())
 
 
 def atomic_write_text(path: Path, content: str) -> None:
+    """Atomically replace `path` with the provided text content."""
     tmp_path = path.with_name(f".{path.name}.tmp")
     tmp_path.write_text(content, encoding="utf-8")
     os.replace(tmp_path, path)
 
 
 def write_json_file(path: Path, payload: dict) -> None:
+    """Serialize a JSON object with stable formatting and atomic replacement."""
     atomic_write_text(path, json.dumps(payload, ensure_ascii=False, indent=2))
 
 
 def read_json_file(path: Path) -> tuple[dict | None, str]:
+    """Read a JSON object from disk and return a payload-or-error tuple."""
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
@@ -44,26 +50,31 @@ def read_json_file(path: Path) -> tuple[dict | None, str]:
 
 
 def manifest_path_for(work_dir: str) -> Path:
+    """Return the canonical manifest path for a work directory."""
     return Path(str(work_dir or "")).expanduser().resolve() / MANIFEST_FILENAME
 
 
 def load_manifest(work_dir: str) -> tuple[Path, dict | None, str]:
+    """Load the manifest for a work directory."""
     manifest_path = manifest_path_for(work_dir)
     manifest, error = read_json_file(manifest_path)
     return manifest_path, manifest, error
 
 
 def write_manifest(manifest_path: Path, manifest: dict) -> None:
+    """Persist the manifest atomically."""
     write_json_file(manifest_path, manifest)
 
 
 def _runtime_signal_path(work_dir: str, filename: str) -> Path:
+    """Return the path for a runtime control-file signal."""
     return Path(str(work_dir or "")).expanduser().resolve() / filename
 
 
 def _summarize_runtime_signal(work_dir: str, *, filename: str,
                               schema_version: int, format_name: str,
                               path_field: str, signal_name: str) -> dict:
+    """Summarize the current state of a pause/cancel control file."""
     signal_path = _runtime_signal_path(work_dir, filename)
     payload, error = read_json_file(signal_path)
     if error == "missing":
@@ -104,6 +115,7 @@ def _summarize_runtime_signal(work_dir: str, *, filename: str,
 def _request_runtime_signal(work_dir: str, reason: str = "", *, filename: str,
                             schema_version: int, format_name: str,
                             path_field: str, signal_name: str) -> dict:
+    """Create a durable pause/cancel signal for an active runtime."""
     work_path = Path(str(work_dir or "")).expanduser().resolve()
     signal_path = _runtime_signal_path(str(work_path), filename)
     if not work_path.exists():
@@ -119,6 +131,8 @@ def _request_runtime_signal(work_dir: str, reason: str = "", *, filename: str,
             "success": False,
             "error": f"Work directory not found: {work_path}",
         }
+    # Control signals live in separate files so operators can pause or
+    # cancel a run without rewriting the full manifest.
     payload = {
         "schema_version": schema_version,
         "format": format_name,
@@ -143,6 +157,7 @@ def _request_runtime_signal(work_dir: str, reason: str = "", *, filename: str,
 def _clear_runtime_signal(work_dir: str, *, filename: str,
                           schema_version: int, format_name: str,
                           path_field: str, signal_name: str) -> dict:
+    """Clear a pause/cancel control file and report the outcome."""
     signal_path = _runtime_signal_path(work_dir, filename)
     current = _summarize_runtime_signal(
         work_dir,
@@ -174,10 +189,12 @@ def _clear_runtime_signal(work_dir: str, *, filename: str,
 
 
 def runtime_cancel_path(work_dir: str) -> Path:
+    """Return the cancel-signal path for a work directory."""
     return _runtime_signal_path(work_dir, RUNTIME_CANCEL_FILENAME)
 
 
 def summarize_runtime_cancel_request(work_dir: str) -> dict:
+    """Summarize the current runtime-cancel request, if any."""
     return _summarize_runtime_signal(
         work_dir,
         filename=RUNTIME_CANCEL_FILENAME,
@@ -189,6 +206,7 @@ def summarize_runtime_cancel_request(work_dir: str) -> dict:
 
 
 def request_runtime_cancel(work_dir: str, reason: str = "") -> dict:
+    """Request cancellation for the active run in `work_dir`."""
     return _request_runtime_signal(
         work_dir,
         reason=reason,
@@ -201,6 +219,7 @@ def request_runtime_cancel(work_dir: str, reason: str = "") -> dict:
 
 
 def consume_runtime_cancel(work_dir: str) -> dict:
+    """Consume and clear a runtime-cancel request exactly once."""
     current = summarize_runtime_cancel_request(work_dir)
     if not current.get("requested", False):
         return {
@@ -220,6 +239,7 @@ def consume_runtime_cancel(work_dir: str) -> dict:
 
 
 def clear_runtime_cancel(work_dir: str) -> dict:
+    """Clear the runtime-cancel control file."""
     return _clear_runtime_signal(
         work_dir,
         filename=RUNTIME_CANCEL_FILENAME,
@@ -231,10 +251,12 @@ def clear_runtime_cancel(work_dir: str) -> dict:
 
 
 def runtime_pause_path(work_dir: str) -> Path:
+    """Return the pause-signal path for a work directory."""
     return _runtime_signal_path(work_dir, RUNTIME_PAUSE_FILENAME)
 
 
 def summarize_runtime_pause_request(work_dir: str) -> dict:
+    """Summarize the current runtime-pause request, if any."""
     return _summarize_runtime_signal(
         work_dir,
         filename=RUNTIME_PAUSE_FILENAME,
@@ -246,6 +268,7 @@ def summarize_runtime_pause_request(work_dir: str) -> dict:
 
 
 def request_runtime_pause(work_dir: str, reason: str = "") -> dict:
+    """Request pausing the active run in `work_dir`."""
     return _request_runtime_signal(
         work_dir,
         reason=reason,
@@ -258,6 +281,7 @@ def request_runtime_pause(work_dir: str, reason: str = "") -> dict:
 
 
 def clear_runtime_pause(work_dir: str) -> dict:
+    """Clear the runtime-pause control file."""
     return _clear_runtime_signal(
         work_dir,
         filename=RUNTIME_PAUSE_FILENAME,
@@ -269,6 +293,7 @@ def clear_runtime_pause(work_dir: str) -> dict:
 
 
 def _effective_runtime_status(runtime_status: str, *, pause: dict, cancellation: dict) -> str:
+    """Combine manifest status with out-of-band pause/cancel signals."""
     normalized_status = str(runtime_status or "").strip() or "pending"
     if pause.get("requested", False):
         if normalized_status == "paused":
@@ -281,12 +306,15 @@ def _effective_runtime_status(runtime_status: str, *, pause: dict, cancellation:
 
 
 def summarize_runtime_status(work_dir: str) -> dict:
+    """Build an operator-facing summary of runtime, ownership, and chunk status."""
     work_path = Path(str(work_dir or "")).expanduser().resolve()
     manifest_path, manifest, manifest_error = load_manifest(str(work_path))
     ownership = kernel_runtime.read_runtime_ownership(str(work_path))
     cancellation = summarize_runtime_cancel_request(str(work_path))
     pause = summarize_runtime_pause_request(str(work_path))
 
+    # Read persisted manifest state first, then fold in out-of-band control
+    # files so callers see the current effective status of the local job.
     runtime = manifest.get("runtime", {}) if isinstance(manifest, dict) and isinstance(manifest.get("runtime", {}), dict) else {}
     plan = manifest.get("plan", {}) if isinstance(manifest, dict) and isinstance(manifest.get("plan", {}), dict) else {}
     chunks = manifest.get("chunks", []) if isinstance(manifest, dict) and isinstance(manifest.get("chunks", []), list) else []

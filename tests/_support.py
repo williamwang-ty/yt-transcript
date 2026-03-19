@@ -1,3 +1,5 @@
+"""Shared support helpers for regression tests."""
+
 import http.client
 import io
 import json

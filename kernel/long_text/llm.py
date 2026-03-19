@@ -1,3 +1,5 @@
+"""LLM request orchestration helpers for long-text processing."""
+
 from __future__ import annotations
 
 _LOCAL_NAMES = {
@@ -7,6 +9,7 @@ _LOCAL_NAMES = {
 
 
 def _bind_utils_globals() -> None:
+    """Bind delegated helper names from `yt_transcript_utils` into module globals."""
     import yt_transcript_utils as utils
 
     for name, value in utils.__dict__.items():
@@ -20,19 +23,8 @@ def _call_llm_api(api_key: str, base_url: str, model: str, messages: list,
                   temperature: float = 0.3, timeout_sec: int = 120,
                   max_retries: int = 3, backoff_sec: float = 1.5,
                   stream_mode: str = "auto") -> dict:
+    """Call the configured LLM API with retries and streaming fallback."""
     _bind_utils_globals()
-    """
-    Call LLM API with configurable timeout, bounded retries, and optional streaming.
-
-    Returns:
-        {
-            "text": "...",
-            "latency_ms": 1234,
-            "request_url": "...",
-            "streaming_used": True,
-            "attempts": 2,
-        }
-    """
     stream_mode = _normalize_stream_mode(stream_mode)
     use_stream = stream_mode in {"auto", "true"}
     last_error = None
@@ -64,6 +56,9 @@ def _call_llm_api(api_key: str, base_url: str, model: str, messages: list,
 
             response_hint = (error.response_body or "").lower()
             stream_unsupported = any(token in response_hint for token in ("stream", "sse", "event-stream"))
+            # Some OpenAI-compatible gateways accept normal chat requests but
+            # reject streaming. In auto mode we retry once without stream before
+            # treating it as a real failure.
             if stream_mode == "auto" and use_stream and error.status_code in {400, 422} and stream_unsupported:
                 print(
                     f"ℹ️ Streaming unsupported at {error.request_url or _build_api_url(base_url, api_format)}; retrying once without stream.",
@@ -75,6 +70,8 @@ def _call_llm_api(api_key: str, base_url: str, model: str, messages: list,
             if not error.retryable or attempt > max_retries:
                 raise error
 
+            # Retries are bounded and back off exponentially so transient provider
+            # failures do not immediately abort the whole chunk run.
             sleep_sec = (backoff_sec * (2 ** (attempt - 1))) + random.uniform(0, max(backoff_sec, 0.1))
             print(
                 f"Retrying LLM request after {error.error_type} in {sleep_sec:.1f}s "

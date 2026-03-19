@@ -1,3 +1,5 @@
+"""Semantic-anchor extraction and verification helpers."""
+
 import re
 
 
@@ -11,6 +13,7 @@ ANCHOR_WARNING_PREFIX = "⚠️ Semantic anchors"
 
 
 def _dedupe_keep_order(items: list[str]) -> list[str]:
+    """Deduplicate strings while preserving their first-seen order."""
     seen = set()
     ordered = []
     for item in items:
@@ -23,6 +26,7 @@ def _dedupe_keep_order(items: list[str]) -> list[str]:
 
 
 def _normalize_source_for_anchor_extraction(source_text: str) -> str:
+    """Normalize source for anchor extraction."""
     source = str(source_text or "")
     for _ in range(3):
         updated = re.sub(r'(https?://[^\s]+)\s+([A-Za-z0-9./?=&_%#-]+)', r'\1\2', source)
@@ -33,6 +37,7 @@ def _normalize_source_for_anchor_extraction(source_text: str) -> str:
 
 
 def extract_semantic_anchors(source_text: str, *, max_items: int = 8) -> dict:
+    """Extract URLs, dates, numbers, and other high-signal anchors from source text."""
     source = _normalize_source_for_anchor_extraction(source_text)
     anchors = {
         "urls": _dedupe_keep_order(URL_PATTERN.findall(source)),
@@ -63,6 +68,7 @@ def extract_semantic_anchors(source_text: str, *, max_items: int = 8) -> dict:
 
 
 def build_anchor_prompt_context(source_text: str, *, max_items: int = 8) -> dict:
+    """Build anchor prompt context."""
     anchors = extract_semantic_anchors(source_text, max_items=max_items)
     ordered = anchors["ordered"]
     if not ordered:
@@ -87,10 +93,12 @@ def build_anchor_prompt_context(source_text: str, *, max_items: int = 8) -> dict
 
 
 def _normalized_numeric(anchor: str) -> str:
+    """Normalize numeric anchors so comma formatting does not affect comparison."""
     return str(anchor or "").replace(",", "")
 
 
 def evaluate_semantic_anchors(source_text: str, result_text: str, *, max_items: int = 8) -> dict:
+    """Check whether high-signal anchors survived the transformation output."""
     anchors = extract_semantic_anchors(source_text, max_items=max_items)
     ordered = anchors["ordered"]
     if not ordered:

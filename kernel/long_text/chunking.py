@@ -1,9 +1,12 @@
+"""Public chunking commands for text, segments, and normalized documents."""
+
 import sys
 from pathlib import Path
 
 
 def chunk_text(input_path: str, output_dir: str, chunk_size: int = 0,
                prompt_name: str = "", config_path: str = None) -> dict:
+    """Chunk a plain-text source file into a long-text work directory."""
     import yt_transcript_utils as utils
 
     path = Path(input_path)
@@ -32,6 +35,7 @@ def chunk_text(input_path: str, output_dir: str, chunk_size: int = 0,
 def chunk_segments(segments_path: str, output_dir: str, chunk_size: int = 0,
                    prompt_name: str = "", config_path: str = None,
                    chapters_path: str = "") -> dict:
+    """Chunk a timed-segment document into a long-text work directory."""
     import yt_transcript_utils as utils
 
     metadata, segments = utils._load_segment_document(segments_path)
@@ -53,6 +57,7 @@ def chunk_segments(segments_path: str, output_dir: str, chunk_size: int = 0,
 def chunk_document(normalized_document_path: str, output_dir: str, chunk_size: int = 0,
                    prompt_name: str = "", config_path: str = None,
                    chapters_path: str = "", prefer: str = "auto") -> dict:
+    """Chunk a normalized document, preferring text or segments as configured."""
     import yt_transcript_utils as utils
 
     payload = utils._load_normalized_document(normalized_document_path)

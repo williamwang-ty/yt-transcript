@@ -64,6 +64,7 @@ elif [ -n "$YT_DLP_COOKIES_FROM_BROWSER" ]; then
     YTDLP_ARGS+=(--cookies-from-browser "$YT_DLP_COOKIES_FROM_BROWSER")
 fi
 
+# Detect the common YouTube bot-verification failure strings returned by `yt-dlp`.
 is_not_a_bot_error() {
     local text="$1"
     case "$text" in
@@ -74,6 +75,7 @@ is_not_a_bot_error() {
     return 1
 }
 
+# Explain how to provide browser cookies when automatic retries still fail.
 emit_cookies_import_guidance() {
     local attempts="${1:-}"
     local suffix=""
@@ -100,6 +102,7 @@ emit_cookies_import_guidance() {
 EOF
 }
 
+# Run `yt-dlp` with the currently resolved retry, timeout, and cookie flags.
 run_yt_dlp_command() {
     local stdout_file="$1"
     local stderr_file="$2"
@@ -116,6 +119,7 @@ run_yt_dlp_command() {
     command yt-dlp ${args[@]+"${args[@]}"} "$@" >"$stdout_file" 2>"$stderr_file"
 }
 
+# Wrap `yt-dlp` with bot-check detection and a best-effort Chrome-cookies retry.
 yt_dlp() {
     local stdout_file stderr_file status stderr_text
     stdout_file=$(mktemp)
@@ -183,10 +187,12 @@ yt_dlp() {
     return "$status"
 }
 
+# Extract the normalized YouTube video ID from a URL.
 video_id_for_url() {
     yt_dlp --print "%(id)s" "$VIDEO_URL"
 }
 
+# Fail fast when a URL does not resolve to a plausible video ID.
 require_valid_video_id() {
     local video_id="$1"
     if [ -z "$video_id" ]; then
@@ -201,17 +207,20 @@ require_valid_video_id() {
     esac
 }
 
+# Compute the work directory used for one video download/transcription job.
 download_root_for_video() {
     local video_id="$1"
     printf '/tmp/%s_downloads' "$video_id"
 }
 
+# Reset the download directory so one acquisition mode starts from clean state.
 reset_download_dir() {
     local dir="$1"
     rm -rf "$dir"
     mkdir -p "$dir"
 }
 
+# Derive structured subtitle availability information from `yt-dlp --dump-json` output.
 emit_subtitle_info_from_metadata_json() {
     local video_id="$1"
     local metadata_json
@@ -261,6 +270,7 @@ print(json.dumps({
 PY
 }
 
+# Fallback parser for subtitle listings when full metadata JSON is unavailable.
 emit_subtitle_info_from_list_output() {
     local video_id="$1"
     local list_output
@@ -330,6 +340,7 @@ print(json.dumps({
 PY
 }
 
+# Choose the best available audio-only format from `yt-dlp` metadata JSON.
 select_audio_format_from_metadata_json() {
     local metadata_json
     metadata_json=$(cat)

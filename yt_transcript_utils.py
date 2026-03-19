@@ -82,10 +82,12 @@ from kernel.long_text import processing as kernel_processing
 
 
 def _skill_root() -> Path:
+    """Return the repository root for this skill implementation."""
     return Path(__file__).resolve().parent
 
 
 def _default_config_path() -> Path:
+    """Return the default config path."""
     return _skill_root() / "config.yaml"
 
 
@@ -116,6 +118,7 @@ def _strip_inline_comment(value: str) -> str:
 
 
 def _strip_wrapping_quotes(value: str) -> str:
+    """Strip wrapping quotes."""
     if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
         return value[1:-1]
     return value
@@ -125,10 +128,12 @@ def _yaml_string(value: str) -> str:
     # Intentionally quote every scalar. The frontmatter should favor predictable
     # parsing over pretty YAML, especially for titles/channels that may contain
     # punctuation, quotes, or comment-like characters.
+    """Yaml string."""
     return json.dumps(str(value).replace("\r\n", "\n"), ensure_ascii=False)
 
 
 def _single_line_text(value: str) -> str:
+    """Single line text."""
     return " ".join(str(value).split())
 
 
@@ -149,6 +154,7 @@ def _sanitize_markdown_url(value: str) -> str:
 
 
 def _build_api_url(base_url: str, api_format: str = "openai") -> str:
+    """Build api url."""
     base = base_url.rstrip("/")
 
     if api_format == "anthropic":
@@ -166,6 +172,7 @@ def _build_api_url(base_url: str, api_format: str = "openai") -> str:
 
 
 def _build_token_count_url(base_url: str, api_format: str = "openai") -> str:
+    """Build token count url."""
     base = base_url.rstrip("/")
 
     if api_format != "anthropic":
@@ -180,9 +187,11 @@ def _build_token_count_url(base_url: str, api_format: str = "openai") -> str:
 
 
 class LLMRequestError(Exception):
+    """Structured exception for LLM transport and provider-level request failures."""
     def __init__(self, message: str, *, error_type: str = "unknown",
                  status_code: int = None, retryable: bool = False,
                  request_url: str = "", response_body: str = ""):
+        """Initialize the `LLMRequestError` instance."""
         super().__init__(message)
         self.error_type = error_type
         self.status_code = status_code
@@ -192,6 +201,7 @@ class LLMRequestError(Exception):
 
 
 def _parse_bool(value, default: bool = False) -> bool:
+    """Parse bool."""
     if isinstance(value, bool):
         return value
     if value is None:
@@ -205,6 +215,7 @@ def _parse_bool(value, default: bool = False) -> bool:
 
 
 def _parse_int(value, default: int) -> int:
+    """Parse an integer value and fall back to the provided default."""
     try:
         return int(str(value).strip())
     except (TypeError, ValueError):
@@ -212,6 +223,7 @@ def _parse_int(value, default: int) -> int:
 
 
 def _parse_float(value, default: float) -> float:
+    """Parse float."""
     try:
         return float(str(value).strip())
     except (TypeError, ValueError):
@@ -219,6 +231,7 @@ def _parse_float(value, default: float) -> float:
 
 
 def _parse_int_min(value, default: int, minimum: int) -> int:
+    """Parse an integer and clamp it to a minimum valid value."""
     parsed = _parse_int(value, default)
     if parsed < minimum:
         return default
@@ -226,6 +239,7 @@ def _parse_int_min(value, default: int, minimum: int) -> int:
 
 
 def _parse_float_min(value, default: float, minimum: float) -> float:
+    """Parse float min."""
     parsed = _parse_float(value, default)
     if parsed < minimum:
         return default
@@ -233,6 +247,7 @@ def _parse_float_min(value, default: float, minimum: float) -> float:
 
 
 def _parse_float_range(value, default: float, minimum: float, maximum: float) -> float:
+    """Parse float range."""
     parsed = _parse_float(value, default)
     if parsed < minimum or parsed > maximum:
         return default
@@ -240,6 +255,7 @@ def _parse_float_range(value, default: float, minimum: float, maximum: float) ->
 
 
 def _normalize_stream_mode(value) -> str:
+    """Normalize stream mode."""
     if value is None:
         return "auto"
     text = str(value).strip().lower()
@@ -249,6 +265,7 @@ def _normalize_stream_mode(value) -> str:
 
 
 def _now_iso() -> str:
+    """Return the current local timestamp in ISO-like wall-clock format."""
     return time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime())
 
 
@@ -332,6 +349,7 @@ STRUCTURE_HEADER_WARNING_MIN_CHARS = 2000
 
 
 def _normalize_chunk_mode(value) -> str:
+    """Normalize chunk mode."""
     if value is None:
         return DEFAULT_CHUNK_MODE
     text = str(value).strip().lower()
@@ -341,6 +359,7 @@ def _normalize_chunk_mode(value) -> str:
 
 
 def _default_config_values(config_path: str = "") -> dict:
+    """Return the default config values."""
     return {
         "output_dir": "",
         "deepgram_api_key": "",
@@ -396,6 +415,7 @@ def _default_config_values(config_path: str = "") -> dict:
 
 
 def _legacy_chunk_target_chars(prompt_name: str = "", config: dict | None = None) -> int:
+    """Legacy chunk target chars."""
     config = config or {}
     override = max(0, _parse_int(config.get("chunk_size_override"), 0))
     if override > 0:
@@ -406,6 +426,7 @@ def _legacy_chunk_target_chars(prompt_name: str = "", config: dict | None = None
 
 
 def _get_task_chunk_target(prompt_name: str, config: dict | None = None) -> int:
+    """Return task chunk target."""
     config = config or {}
     override = max(0, _parse_int(config.get("chunk_size_override"), 0))
     if override > 0:
@@ -418,6 +439,7 @@ def _get_task_chunk_target(prompt_name: str, config: dict | None = None) -> int:
 
 
 def _get_task_output_ratio(prompt_name: str, config: dict | None = None) -> float:
+    """Return task output ratio."""
     config = config or {}
     prompt = (prompt_name or "").strip().lower()
     key = f"output_ratio_{prompt}"
@@ -426,6 +448,7 @@ def _get_task_output_ratio(prompt_name: str, config: dict | None = None) -> floa
 
 
 def _get_task_max_output_tokens(prompt_name: str, config: dict | None = None) -> int:
+    """Return task max output tokens."""
     config = config or {}
     prompt = (prompt_name or "").strip().lower()
     key = f"max_output_tokens_{prompt}"
@@ -434,27 +457,33 @@ def _get_task_max_output_tokens(prompt_name: str, config: dict | None = None) ->
 
 
 def _get_task_request_cap(prompt_name: str) -> int:
+    """Return task request cap."""
     prompt = (prompt_name or "").strip().lower()
     return TASK_REQUEST_CAP_DEFAULTS.get(prompt, DEFAULT_UNKNOWN_REQUEST_CAP)
 
 
 def _is_cjk_char(char: str) -> bool:
+    """Return whether cjk char."""
     return "\u3400" <= char <= "\u9fff"
 
 
 def _is_kana_hangul_char(char: str) -> bool:
+    """Return whether kana hangul char."""
     return ("\u3040" <= char <= "\u30ff") or ("\uac00" <= char <= "\ud7af")
 
 
 def _is_latin_word_char(char: str) -> bool:
+    """Return whether latin word char."""
     return ("a" <= char <= "z") or ("A" <= char <= "Z") or char.isdigit()
 
 
 def _new_token_estimate_state() -> dict:
+    """Create token estimate state."""
     return {"tokens": 0, "punct_count": 0, "latin_word_len": 0}
 
 
 def _advance_token_estimate_state(state: dict, char: str, next_char: str = "") -> None:
+    """Advance token estimate state."""
     if _is_cjk_char(char) or _is_kana_hangul_char(char):
         state["latin_word_len"] = 0
         state["tokens"] += 1
@@ -488,6 +517,7 @@ def _advance_token_estimate_state(state: dict, char: str, next_char: str = "") -
 def _estimate_tokens_local(text: str, mode: str = "tokens", config: dict | None = None) -> int:
     # Heuristic estimation only. This intentionally over-approximates common
     # transcript shapes and is not a substitute for provider-side token counting.
+    """Estimate tokens local."""
     del config
     if not text:
         return 0
@@ -505,6 +535,7 @@ def _estimate_tokens_local(text: str, mode: str = "tokens", config: dict | None 
 # token-count round trip per sentence or segment. Provider probing is wired via
 # _count_tokens_via_provider()/test_token_count() and can be promoted later.
 def _estimate_tokens(text: str, mode: str = "tokens", config: dict | None = None) -> int:
+    """Estimate tokens."""
     return _estimate_tokens_local(text, mode, config)
 
 
@@ -521,6 +552,7 @@ def _truncate_tail_text_to_tokens(text: str, max_tokens: int,
 
 def _extract_tail_sentences(text: str, sentence_count: int,
                             config: dict | None = None) -> str:
+    """Extract tail sentences."""
     if not text or sentence_count <= 0:
         return ""
     sentences = _split_sentences(text)
@@ -540,6 +572,7 @@ def _extract_tail_sentences(text: str, sentence_count: int,
 
 
 def _extract_last_section_title(text: str) -> str:
+    """Extract last section title."""
     matches = re.findall(r"^##\s+(.+?)\s*$", text or "", re.MULTILINE)
     if not matches:
         return ""
@@ -549,6 +582,7 @@ def _extract_last_section_title(text: str) -> str:
 def _resolve_previous_section_title(previous_chunk: dict | None,
                                     work_path: Path,
                                     input_key: str = "raw_path") -> str:
+    """Resolve previous section title."""
     previous_chunk = previous_chunk or {}
 
     if input_key == "processed_path":
@@ -576,6 +610,7 @@ def _resolve_previous_section_title(previous_chunk: dict | None,
 
 def _continuity_tail_sentence_count(config: dict | None = None,
                                      continuity_policy: dict | None = None) -> int:
+    """Continuity tail sentence count."""
     policy = continuity_policy if isinstance(continuity_policy, dict) else {}
     if "tail_sentences" in policy:
         return max(0, _parse_int(policy.get("tail_sentences"), 0))
@@ -588,6 +623,7 @@ def _continuity_tail_sentence_count(config: dict | None = None,
 
 def _continuity_summary_token_cap(config: dict | None = None,
                                   continuity_policy: dict | None = None) -> int:
+    """Continuity summary token cap."""
     policy = continuity_policy if isinstance(continuity_policy, dict) else {}
     if "summary_token_cap" in policy:
         return max(0, _parse_int(policy.get("summary_token_cap"), 0))
@@ -694,24 +730,29 @@ def _build_continuity_context(previous_chunk: dict | None, work_path: Path,
 
 
 def _inject_context_block(prompt_template: str, context_text: str) -> str:
+    """Inject context block."""
     return kernel_prompting._inject_context_block(prompt_template, context_text)
 
 
 def _inject_continuity_context(prompt_template: str, continuity_text: str) -> str:
+    """Inject continuity context."""
     return kernel_prompting._inject_continuity_context(prompt_template, continuity_text)
 
 
 def _inject_glossary_context(prompt_template: str, glossary_text: str) -> str:
+    """Inject glossary context."""
     return kernel_prompting._inject_glossary_context(prompt_template, glossary_text)
 
 
 def _inject_semantic_context(prompt_template: str, semantic_text: str) -> str:
+    """Inject semantic context."""
     return kernel_prompting._inject_semantic_context(prompt_template, semantic_text)
 
 
 def _build_chunk_prompt(prompt_template: str, chunk_body: str,
                         continuity_text: str = "", glossary_text: str = "",
                         semantic_text: str = "") -> str:
+    """Build chunk prompt."""
     return kernel_prompting._build_chunk_prompt(
         prompt_template,
         chunk_body,
@@ -723,6 +764,7 @@ def _build_chunk_prompt(prompt_template: str, chunk_body: str,
 
 def _estimate_continuity_reserve_tokens(config: dict | None = None,
                                         continuity_policy: dict | None = None) -> int:
+    """Estimate continuity reserve tokens."""
     config = config or {}
     tail_sentences = _continuity_tail_sentence_count(config, continuity_policy)
     summary_token_cap = _continuity_summary_token_cap(config, continuity_policy)
@@ -749,6 +791,7 @@ def _estimate_continuity_reserve_tokens(config: dict | None = None,
 
 def _calculate_chunk_budget(prompt_name: str, prompt_template: str,
                             config: dict | None = None, model_info: dict = None) -> dict:
+    """Calculate chunk budget."""
     config = config or {}
     prompt_template_tokens = _estimate_tokens(prompt_template or "", "tokens", config)
     continuity_reserve_tokens = _estimate_continuity_reserve_tokens(config)
@@ -806,6 +849,7 @@ def _calculate_chunk_budget(prompt_name: str, prompt_template: str,
 
 
 def _recommended_chunk_size(prompt_name: str = "", config: dict | None = None) -> int:
+    """Recommended chunk size."""
     config = config or {}
     if _normalize_chunk_mode(config.get("chunk_mode", DEFAULT_CHUNK_MODE)) == "chars":
         return _legacy_chunk_target_chars(prompt_name, config)
@@ -813,12 +857,14 @@ def _recommended_chunk_size(prompt_name: str = "", config: dict | None = None) -
 
 
 def _new_plan_id() -> str:
+    """Create plan id."""
     return kernel_contracts.new_plan_id()
 
 
 def _build_manifest_chunk_contract(source_kind: str = "text", *, driver: str = "",
                                    normalized_document_path: str = "", source_adapter: str = "",
                                    has_timing: bool = False, chapters_enabled: bool = False) -> dict:
+    """Build manifest chunk contract."""
     return kernel_contracts.build_manifest_chunk_contract(
         source_kind,
         driver=driver,
@@ -831,6 +877,7 @@ def _build_manifest_chunk_contract(source_kind: str = "text", *, driver: str = "
 
 def _build_manifest_continuity_policy(config: dict | None = None, *, tail_sentences: int | None = None,
                                       summary_token_cap: int | None = None) -> dict:
+    """Build manifest continuity policy."""
     return kernel_contracts.build_manifest_continuity_policy(
         config,
         tail_sentences=tail_sentences,
@@ -843,6 +890,7 @@ def _build_manifest_plan(prompt_name: str, chunk_mode: str, recommended_chunk_si
                          plan_id: str = "", prior_plan_id: str = "",
                          chunk_contract: dict | None = None,
                          continuity_policy: dict | None = None) -> dict:
+    """Build manifest plan."""
     return kernel_contracts.build_manifest_plan(
         prompt_name,
         chunk_mode,
@@ -858,28 +906,34 @@ def _build_manifest_plan(prompt_name: str, chunk_mode: str, recommended_chunk_si
 
 
 def _normalize_operation_input_key(input_key: str = "") -> str:
+    """Normalize operation input key."""
     return kernel_contracts.normalize_operation_input_key(input_key)
 
 
 def _resolve_replan_action(input_key: str = "") -> str:
+    """Resolve replan action."""
     return kernel_contracts.resolve_replan_action(input_key)
 
 
 def _build_quality_gate_contract(*, bilingual: bool = False) -> dict:
+    """Build quality gate contract."""
     return kernel_contracts.build_quality_gate_contract(bilingual=bilingual)
 
 
 def _build_chunk_verification_contract(prompt_name: str, *, applicable: bool = True) -> dict:
+    """Build chunk verification contract."""
     return kernel_contracts.build_chunk_verification_contract(prompt_name, applicable=applicable)
 
 
 def _build_repair_contract(prompt_name: str, config: dict | None = None, *, applicable: bool = True) -> dict:
+    """Build repair contract."""
     return kernel_contracts.build_repair_contract(prompt_name, config, applicable=applicable)
 
 
 def _build_replan_contract(input_key: str = "raw_path", *, applicable: bool = True,
                            canary_chunks: int = DEFAULT_AUTOTUNE_CANARY_CHUNKS,
                            max_auto_replans: int | None = None) -> dict:
+    """Build replan contract."""
     return kernel_contracts.build_replan_contract(
         input_key,
         applicable=applicable,
@@ -893,6 +947,7 @@ def _build_operation_control_contract(kind: str, prompt_name: str, *,
                                       config: dict | None = None,
                                       bilingual: bool = False,
                                       max_auto_replans: int | None = None) -> dict:
+    """Build operation control contract."""
     return kernel_contracts.build_operation_control_contract(
         kind,
         prompt_name,
@@ -904,23 +959,28 @@ def _build_operation_control_contract(kind: str, prompt_name: str, *,
 
 
 def _build_runtime_control_state() -> dict:
+    """Build runtime control state."""
     return kernel_contracts.build_runtime_control_state()
 
 
 def _ensure_runtime_control_state(runtime: dict) -> dict:
+    """Ensure runtime control state."""
     return kernel_contracts.ensure_runtime_control_state(runtime)
 
 
 def _build_chunk_control_state() -> dict:
+    """Build chunk control state."""
     return kernel_contracts.build_chunk_control_state()
 
 
 def _ensure_chunk_control_state(chunk_info: dict) -> dict:
+    """Ensure chunk control state."""
     return kernel_contracts.ensure_chunk_control_state(chunk_info)
 
 
 def _record_chunk_verification(chunk_info: dict, *, status: str, warnings: list[str],
                                retry_reasons: list[str], repair_exhausted: bool = False) -> None:
+    """Record chunk verification."""
     kernel_contracts.record_chunk_verification(
         chunk_info,
         status=status,
@@ -933,6 +993,7 @@ def _record_chunk_verification(chunk_info: dict, *, status: str, warnings: list[
 def _classify_replan_trigger(error: Exception | None = None, *,
                              had_timeout_retry: bool = False,
                              autotune_last_event: str = "") -> str:
+    """Classify replan trigger."""
     return kernel_contracts.classify_replan_trigger(
         error,
         had_timeout_retry=had_timeout_retry,
@@ -942,6 +1003,7 @@ def _classify_replan_trigger(error: Exception | None = None, *,
 
 def _mark_runtime_replan(runtime: dict, *, reason: str, trigger: str,
                          input_key: str, chunk_id: int | None = None) -> None:
+    """Mark runtime replan."""
     kernel_contracts.mark_runtime_replan(
         runtime,
         reason=reason,
@@ -952,10 +1014,12 @@ def _mark_runtime_replan(runtime: dict, *, reason: str, trigger: str,
 
 
 def _build_process_control_summary(runtime: dict, operation_control: dict) -> dict:
+    """Build process control summary."""
     return kernel_contracts.build_process_control_summary(runtime, operation_control)
 
 
 def _build_manifest_runtime(plan_id: str, request_url: str = "") -> dict:
+    """Build manifest runtime."""
     return kernel_contracts.build_manifest_runtime(plan_id, request_url=request_url)
 
 
@@ -965,6 +1029,7 @@ def _new_chunk_manifest_entry(chunk_id: int, chunk_content: str, budget: dict,
                               continuity_prev_chunk_id: int | None = None,
                               chunk_contract: dict | None = None,
                               continuity_policy: dict | None = None) -> dict:
+    """Create chunk manifest entry."""
     return kernel_lifecycle._new_chunk_manifest_entry(
         chunk_id,
         chunk_content,
@@ -980,10 +1045,12 @@ def _new_chunk_manifest_entry(chunk_id: int, chunk_content: str, budget: dict,
 
 
 def _resolve_chunk_output_filename(chunk_info: dict, prompt_name: str = "") -> str:
+    """Resolve chunk output filename."""
     return kernel_lifecycle._resolve_chunk_output_filename(chunk_info, prompt_name)
 
 
 def _resolve_chunk_output_path(work_path: Path, chunk_info: dict, prompt_name: str = "") -> Path:
+    """Resolve chunk output path."""
     return kernel_lifecycle._resolve_chunk_output_path(work_path, chunk_info, prompt_name)
 
 
@@ -991,6 +1058,7 @@ def _ensure_chunk_runtime_defaults(manifest: dict, runtime: dict, plan: dict,
                                    prompt_budget: dict, request_url: str,
                                    planned_max_output_tokens: int,
                                    autotune_state: dict) -> None:
+    """Ensure chunk runtime defaults."""
     kernel_lifecycle._ensure_chunk_runtime_defaults(
         manifest,
         runtime,
@@ -1003,19 +1071,23 @@ def _ensure_chunk_runtime_defaults(manifest: dict, runtime: dict, plan: dict,
 
 
 def _infer_resume_runtime_status(runtime: dict, chunks: list[dict]) -> str:
+    """Infer resume runtime status."""
     return kernel_lifecycle._infer_resume_runtime_status(runtime, chunks)
 
 
 def _prepare_manifest_for_resume(manifest: dict, work_path: Path, prompt_name: str = "") -> dict:
+    """Prepare manifest for resume."""
     return kernel_lifecycle._prepare_manifest_for_resume(manifest, work_path, prompt_name)
 
 
 def _format_resume_report(report: dict) -> str:
+    """Format resume report."""
     return kernel_lifecycle._format_resume_report(report)
 
 
 def _prepare_resume_impl(work_dir: str, prompt_name: str = "", config_path: str = None,
                          input_key: str = "raw_path") -> dict:
+    """Prepare resume impl."""
     return kernel_lifecycle._prepare_resume_impl(
         work_dir,
         prompt_name=prompt_name,
@@ -1025,6 +1097,7 @@ def _prepare_resume_impl(work_dir: str, prompt_name: str = "", config_path: str 
 
 
 def _sync_manifest_legacy_fields(manifest: dict) -> dict:
+    """Synchronize manifest legacy fields."""
     plan = manifest.get("plan", {}) if isinstance(manifest, dict) else {}
     runtime = manifest.get("runtime", {}) if isinstance(manifest, dict) else {}
     autotune = manifest.get("autotune", {}) if isinstance(manifest, dict) else {}
@@ -1073,6 +1146,7 @@ def _sync_manifest_legacy_fields(manifest: dict) -> dict:
 def _ensure_manifest_structure(manifest: dict, *, prompt_name: str = "", prompt_budget: dict | None = None,
                                recommended_chunk_size: int = 0, request_url: str = "",
                                source_file: str = "", config: dict | None = None) -> dict:
+    """Ensure manifest structure."""
     manifest = manifest if isinstance(manifest, dict) else {}
     prompt_budget = prompt_budget or {}
     config = config or {}
@@ -1182,6 +1256,7 @@ def _ensure_manifest_structure(manifest: dict, *, prompt_name: str = "", prompt_
 
 
 def _estimate_p95(values: list[int]) -> int | None:
+    """Estimate p95."""
     cleaned = sorted(
         max(0, _parse_int(value, 0))
         for value in (values or [])
@@ -1195,12 +1270,14 @@ def _estimate_p95(values: list[int]) -> int | None:
 
 def _build_autotune_state(prompt_budget: dict, config: dict | None = None,
                           existing: dict | None = None) -> dict:
+    """Build autotune state."""
     return kernel_autotune.build_autotune_state(prompt_budget, config, existing)
 
 
 def _update_autotune_state(autotune_state: dict | None, *, success: bool,
                            latency_ms: int | None = None, timeout: bool = False,
                            error_type: str = "", chunk_id: int | None = None) -> dict:
+    """Update autotune state."""
     return kernel_autotune.update_autotune_state(
         autotune_state,
         success=success,
@@ -1212,6 +1289,7 @@ def _update_autotune_state(autotune_state: dict | None, *, success: bool,
 
 
 def _build_attempt_log_from_result(result: dict, attempt_index: int | None = None) -> dict:
+    """Build attempt log from result."""
     attempt_number = max(1, _parse_int(attempt_index or result.get("attempts"), 1))
     return {
         "attempt_index": attempt_number,
@@ -1226,6 +1304,7 @@ def _build_attempt_log_from_result(result: dict, attempt_index: int | None = Non
 
 
 def _build_attempt_log_from_error(error: Exception, attempt_index: int | None = None) -> dict:
+    """Build attempt log from error."""
     status_code = getattr(error, "status_code", None)
     error_type = str(getattr(error, "error_type", "unknown") or "unknown")
     return {
@@ -1241,6 +1320,7 @@ def _build_attempt_log_from_error(error: Exception, attempt_index: int | None = 
 
 
 def _collect_attempt_logs(result_or_error) -> list[dict]:
+    """Collect attempt logs."""
     attempt_logs = getattr(result_or_error, "attempt_history", None)
     if attempt_logs is None and isinstance(result_or_error, dict):
         attempt_logs = result_or_error.get("attempt_history")
@@ -1252,6 +1332,7 @@ def _collect_attempt_logs(result_or_error) -> list[dict]:
 
 
 def _has_timeout_attempt(attempt_logs: list[dict]) -> bool:
+    """Return whether timeout attempt."""
     for attempt_log in attempt_logs or []:
         if str(attempt_log.get("error_type", "")).strip() in {"timeout", "socket_timeout", "read_timeout"}:
             return True
@@ -1259,6 +1340,7 @@ def _has_timeout_attempt(attempt_logs: list[dict]) -> bool:
 
 
 def _classify_llm_transport_issue(error_or_reason) -> tuple[str, bool]:
+    """Classify llm transport issue."""
     reason = getattr(error_or_reason, "reason", error_or_reason)
     message = str(reason or error_or_reason or "").strip()
     message_lower = message.lower()
@@ -1299,6 +1381,7 @@ def _classify_llm_transport_issue(error_or_reason) -> tuple[str, bool]:
 
 
 def _should_replan_after_error(error: Exception) -> bool:
+    """Should replan after error."""
     if _is_timeout_error(error):
         return True
     status_code = getattr(error, "status_code", None)
@@ -1312,6 +1395,7 @@ def _should_replan_after_error(error: Exception) -> bool:
 
 
 def _find_previous_active_chunk(chunks: list[dict], current_index: int) -> dict | None:
+    """Find previous active chunk."""
     for index in range(current_index - 1, -1, -1):
         previous_chunk = chunks[index]
         if previous_chunk.get("status") == SUPERSEDED_CHUNK_STATUS:
@@ -1324,6 +1408,7 @@ def _evaluate_chunk_output_health(prompt_name: str, chunk_id: int, chunk_char_co
                                   result_text: str, *, source_text: str = "",
                                   glossary_payload: dict | None = None,
                                   glossary_max_terms: int = 8) -> dict:
+    """Evaluate chunk output health."""
     result_char_count = len(result_text)
     ratio = result_char_count / chunk_char_count if chunk_char_count > 0 else 0
     warnings = []
@@ -1390,6 +1475,7 @@ def _append_chunk_recovery_log(chunk_info: dict, *, action: str, reasons: list[s
                                details: list[str], request_attempts: int,
                                request_url: str = "", latency_ms: int | None = None,
                                sleep_sec: float = 0.0) -> None:
+    """Append chunk recovery log."""
     recovery_logs = list(chunk_info.get("recovery_logs", []))
     recovery_logs.append({
         "attempt_index": len(recovery_logs) + 1,
@@ -1408,10 +1494,12 @@ def _append_chunk_recovery_log(chunk_info: dict, *, action: str, reasons: list[s
 
 
 def _available_prompt_names() -> list[str]:
+    """Available prompt names."""
     return sorted(p.stem for p in (_skill_root() / "prompts").glob("*.md"))
 
 
 def _resolve_prompt_template_path(prompt_name: str) -> Path:
+    """Resolve prompt template path."""
     prompt = (prompt_name or "").strip()
     if not prompt:
         raise ValueError("Prompt name is required")
@@ -1430,12 +1518,14 @@ def _resolve_prompt_template_path(prompt_name: str) -> Path:
 
 
 def _load_optional_config(config_path: str = None) -> dict:
+    """Load optional config."""
     if config_path is None or not str(config_path).strip():
         return load_config(None, allow_missing=True)
     return load_config(config_path, allow_missing=False)
 
 
 def _force_split_text_by_tokens(text: str, max_tokens: int, config: dict | None = None) -> list[str]:
+    """Force split text by tokens."""
     del config
     if max_tokens <= 0:
         return [text]
@@ -1464,6 +1554,7 @@ def _force_split_text_by_tokens(text: str, max_tokens: int, config: dict | None 
 
 def _force_split_text(text: str, max_size: int, chunk_mode: str,
                       config: dict | None = None) -> list[str]:
+    """Force split text."""
     if _normalize_chunk_mode(chunk_mode) == "chars":
         return _hard_split_text(text, max_size)
     return _force_split_text_by_tokens(text, max_size, config)
@@ -1471,6 +1562,7 @@ def _force_split_text(text: str, max_size: int, chunk_mode: str,
 
 def _build_chunk_plan(prompt_name: str, chunk_size: int, config: dict,
                       prompt_template: str) -> dict:
+    """Build chunk plan."""
     requested_chunk_mode = _normalize_chunk_mode(config.get("chunk_mode", DEFAULT_CHUNK_MODE))
     use_legacy_char_override = requested_chunk_mode == "tokens" and chunk_size and chunk_size > 0 and not prompt_name
     chunk_mode = "chars" if use_legacy_char_override else requested_chunk_mode
@@ -1516,6 +1608,7 @@ def _build_chunk_plan(prompt_name: str, chunk_size: int, config: dict,
 def _split_text_into_chunks(sentences: list[str], chunk_mode: str,
                             effective_chunk_size: int, hard_cap_size: int,
                             config: dict) -> tuple[list[str], list[str]]:
+    """Split text into chunks."""
     chunks = []
     current_chunk = []
     current_size = 0
@@ -1553,10 +1646,12 @@ _write_manifest = kernel_state.write_manifest
 
 
 def _is_retryable_status(status_code: int) -> bool:
+    """Return whether retryable status."""
     return status_code in {408, 409, 425, 429} or status_code >= 500
 
 
 def _is_timeout_error(error: Exception) -> bool:
+    """Return whether timeout error."""
     if isinstance(error, LLMRequestError):
         if error.status_code in {408, 504}:
             return True
@@ -1565,6 +1660,7 @@ def _is_timeout_error(error: Exception) -> bool:
 
 
 def _extract_openai_stream_text(payload: dict) -> str:
+    """Extract openai stream text."""
     choices = payload.get("choices") or []
     if not choices:
         return ""
@@ -1576,6 +1672,7 @@ def _extract_openai_stream_text(payload: dict) -> str:
 
 
 def _extract_anthropic_stream_text(payload: dict) -> str:
+    """Extract anthropic stream text."""
     event_type = payload.get("type", "")
     if event_type == "content_block_start":
         block = payload.get("content_block") or {}
@@ -1589,6 +1686,7 @@ def _extract_anthropic_stream_text(payload: dict) -> str:
 
 
 def _extract_llm_text(result: dict, api_format: str) -> str:
+    """Extract llm text."""
     if api_format == "anthropic":
         content = result.get("content") or []
         text_parts = []
@@ -1602,6 +1700,7 @@ def _extract_llm_text(result: dict, api_format: str) -> str:
 
 
 def _read_streaming_response(response, api_format: str) -> str:
+    """Read streaming response."""
     text_parts = []
     for raw_line in response:
         line = raw_line.decode("utf-8", errors="replace").strip()
@@ -1628,6 +1727,7 @@ def _read_streaming_response(response, api_format: str) -> str:
 def _build_llm_request(api_key: str, base_url: str, model: str, messages: list,
                        api_format: str = "openai", max_tokens: int = 8192,
                        temperature: float = 0.3, use_stream: bool = False) -> tuple[str, dict, bytes]:
+    """Build llm request."""
     if api_format == "anthropic":
         url = _build_api_url(base_url, api_format)
         headers = {
@@ -1666,6 +1766,7 @@ def _execute_llm_request(api_key: str, base_url: str, model: str, messages: list
                          api_format: str = "openai", max_tokens: int = 8192,
                          temperature: float = 0.3, timeout_sec: int = 120,
                          use_stream: bool = False) -> dict:
+    """Execute llm request."""
     import urllib.error
     import urllib.request
 
@@ -1761,16 +1862,19 @@ def _split_sentences(text: str) -> list[str]:
     closers = '”"\'’」)]}'
 
     def next_non_space(index: int) -> str:
+        """Next non space."""
         for char in normalized[index + 1:]:
             if not char.isspace():
                 return char
         return ""
 
     def previous_ascii_word(index: int) -> str:
+        """Previous ascii word."""
         match = re.search(r"([A-Za-z]+)$", normalized[:index])
         return match.group(1) if match else ""
 
     def acronym_before_period(index: int) -> bool:
+        """Acronym before period."""
         return bool(re.search(r"(?:\b[A-Za-z]\.){2,}$", normalized[:index + 1]))
 
     sentences = []
@@ -1888,6 +1992,7 @@ def parse_vtt(vtt_path: str) -> str:
 
 
 def _parse_vtt_timestamp(value: str) -> float | None:
+    """Parse vtt timestamp."""
     token = str(value or "").strip().replace(",", ".")
     if not token:
         return None
@@ -1912,6 +2017,7 @@ def _parse_vtt_timestamp(value: str) -> float | None:
 
 
 def _parse_vtt_time_range(line: str) -> tuple[float | None, float | None]:
+    """Parse vtt time range."""
     if "-->" not in line:
         return None, None
 
@@ -1952,6 +2058,7 @@ def parse_vtt_segments(vtt_path: str, *, language: str = "") -> dict:
     cue_lines = []
 
     def flush_cue():
+        """Flush cue."""
         nonlocal cue_start, cue_end, cue_lines
         if cue_start is None or cue_end is None:
             cue_start = None
@@ -2076,6 +2183,7 @@ def process_deepgram(json_path: str) -> dict:
 
 
 def _coerce_float_or_none(value) -> float | None:
+    """Coerce float or none."""
     if value is None or value == "":
         return None
     try:
@@ -2085,6 +2193,7 @@ def _coerce_float_or_none(value) -> float | None:
 
 
 def _normalize_transcript_text(text: str, *, remove_repeated_phrases: bool = True) -> str:
+    """Normalize transcript text."""
     transcript = str(text or "")
 
     # 1. Remove spaces between Chinese characters (multiple passes for thoroughness)
@@ -2102,6 +2211,7 @@ def _normalize_transcript_text(text: str, *, remove_repeated_phrases: bool = Tru
 
 
 def _join_deepgram_words(words: list[dict]) -> str:
+    """Join deepgram words."""
     parts = []
     for word in words:
         token = str(word.get('punctuated_word') or word.get('word') or '').strip()
@@ -2112,6 +2222,7 @@ def _join_deepgram_words(words: list[dict]) -> str:
 
 def extract_deepgram_segments(data: dict, *, time_offset: float = 0.0,
                               source_chunk_index: int = 0, starting_segment_id: int = 0) -> list[dict]:
+    """Extract deepgram segments."""
     alternative = data['results']['channels'][0]['alternatives'][0]
     paragraphs = alternative.get('paragraphs', {}).get('paragraphs', [])
     words = alternative.get('words', []) if isinstance(alternative.get('words', []), list) else []
@@ -2181,6 +2292,7 @@ def extract_deepgram_segments(data: dict, *, time_offset: float = 0.0,
 
 
 def process_deepgram_payload(data: dict) -> dict:
+    """Process deepgram payload."""
     transcript = _normalize_transcript_text(
         data['results']['channels'][0]['alternatives'][0]['transcript']
     )
@@ -2442,6 +2554,7 @@ _runtime_ownership_error_parts = kernel_controller.runtime_ownership_error_parts
 
 def _build_prepare_resume_ownership_conflict_result(manifest_path: Path, prompt_name: str,
                                                     ownership: dict) -> dict:
+    """Build prepare resume ownership conflict result."""
     error, message = _runtime_ownership_error_parts(ownership)
     return _finalize_mutation_result({
         "success": False,
@@ -2455,6 +2568,7 @@ def _build_prepare_resume_ownership_conflict_result(manifest_path: Path, prompt_
 
 
 def _build_process_ownership_conflict_result(ownership: dict) -> dict:
+    """Build process ownership conflict result."""
     error, message = _runtime_ownership_error_parts(ownership)
     return _finalize_mutation_result({
         "success": False,
@@ -2480,6 +2594,7 @@ def _build_process_ownership_conflict_result(ownership: dict) -> dict:
 
 
 def _build_replan_ownership_conflict_result(ownership: dict) -> dict:
+    """Build replan ownership conflict result."""
     error, message = _runtime_ownership_error_parts(ownership)
     return _finalize_mutation_result({
         "success": False,
@@ -2491,6 +2606,7 @@ def _build_replan_ownership_conflict_result(ownership: dict) -> dict:
 
 
 def _build_process_with_replans_ownership_conflict_result(ownership: dict) -> dict:
+    """Build process with replans ownership conflict result."""
     error, message = _runtime_ownership_error_parts(ownership)
     return _finalize_mutation_result({
         "processed_count": 0,
@@ -2516,6 +2632,7 @@ def _build_process_with_replans_ownership_conflict_result(ownership: dict) -> di
 
 def prepare_resume(work_dir: str, prompt_name: str = "", config_path: str = None,
                    input_key: str = "raw_path", runtime_ownership: dict | None = None) -> dict:
+    """Delegate resume preparation to `kernel.long_text.execution`."""
     return kernel_execution.prepare_resume(
         work_dir,
         prompt_name=prompt_name,
@@ -2526,18 +2643,22 @@ def prepare_resume(work_dir: str, prompt_name: str = "", config_path: str = None
 
 
 def runtime_status(work_dir: str) -> dict:
+    """Delegate runtime status inspection to `kernel.long_text.execution`."""
     return kernel_execution.runtime_status(work_dir)
 
 
 def cancel_run(work_dir: str, reason: str = "") -> dict:
+    """Delegate cancellation requests to `kernel.long_text.execution`."""
     return kernel_execution.cancel_run(work_dir, reason=reason)
 
 
 def pause_run(work_dir: str, reason: str = "") -> dict:
+    """Delegate pause requests to `kernel.long_text.execution`."""
     return kernel_execution.pause_run(work_dir, reason=reason)
 
 
 def _build_resume_run_ownership_conflict_result(ownership: dict) -> dict:
+    """Build resume run ownership conflict result."""
     error, message = _runtime_ownership_error_parts(ownership)
     return _finalize_mutation_result({
         "success": False,
@@ -2550,14 +2671,17 @@ def _build_resume_run_ownership_conflict_result(ownership: dict) -> dict:
 
 
 def resume_run(work_dir: str, reason: str = "", runtime_ownership: dict | None = None) -> dict:
+    """Delegate resume requests to `kernel.long_text.execution`."""
     return kernel_execution.resume_run(work_dir, reason=reason, runtime_ownership=runtime_ownership)
 
 
 def _resume_run_impl(work_dir: str, reason: str = "") -> dict:
+    """Resume run impl."""
     return kernel_lifecycle._resume_run_impl(work_dir, reason=reason)
 
 
 def _resolve_telemetry_ref_kwargs(telemetry_ref: str = "", *, telemetry_path: str = "", work_dir: str = "") -> dict:
+    """Resolve telemetry ref kwargs."""
     explicit_telemetry_path = str(telemetry_path or "").strip()
     explicit_work_dir = str(work_dir or "").strip()
     if explicit_telemetry_path or explicit_work_dir:
@@ -2586,6 +2710,7 @@ def _resolve_telemetry_ref_kwargs(telemetry_ref: str = "", *, telemetry_path: st
 
 
 def _parse_optional_success_filter(value) -> bool | None:
+    """Parse optional success filter."""
     if value is None:
         return None
     text = str(value).strip().lower()
@@ -2601,6 +2726,7 @@ def _parse_optional_success_filter(value) -> bool | None:
 def telemetry_summary(telemetry_ref: str = "", *, telemetry_path: str = "", work_dir: str = "",
                       command_filter: str = "", document_id: str = "", success=None,
                       recent_limit: int = 5) -> dict:
+    """Delegate telemetry summarization to `kernel.task_runtime.telemetry`."""
     resolved = _resolve_telemetry_ref_kwargs(telemetry_ref, telemetry_path=telemetry_path, work_dir=work_dir)
     return kernel_telemetry.summarize_telemetry(
         work_dir=resolved["work_dir"],
@@ -2615,6 +2741,7 @@ def telemetry_summary(telemetry_ref: str = "", *, telemetry_path: str = "", work
 def telemetry_events(telemetry_ref: str = "", *, telemetry_path: str = "", work_dir: str = "",
                      limit: int = 20, command_filter: str = "", trace_id: str = "",
                      document_id: str = "", success=None) -> dict:
+    """Delegate telemetry event queries to `kernel.task_runtime.telemetry`."""
     resolved = _resolve_telemetry_ref_kwargs(telemetry_ref, telemetry_path=telemetry_path, work_dir=work_dir)
     return kernel_telemetry.read_telemetry_events(
         work_dir=resolved["work_dir"],
@@ -2629,6 +2756,7 @@ def telemetry_events(telemetry_ref: str = "", *, telemetry_path: str = "", work_
 
 def build_glossary(work_dir: str, max_terms: int = 50,
                   min_occurrences: int = 1) -> dict:
+    """Delegate glossary construction to `kernel.long_text.glossary`."""
     return kernel_glossary.build_glossary(
         work_dir,
         max_terms=max_terms,
@@ -2637,6 +2765,7 @@ def build_glossary(work_dir: str, max_terms: int = 50,
 
 
 def _kernel_command_registry() -> dict[str, object]:
+    """Return the command registry exposed through the top-level CLI façade."""
     return {
         "validate-state": validate_state,
         "normalize-document": normalize_document,
@@ -2663,6 +2792,7 @@ def _dispatch_process_chunks_command(*, work_dir: str, prompt_name: str, extra_i
                                      config_path: str = None, dry_run: bool = False,
                                      input_key: str = "raw_path", force: bool = False,
                                      auto_replan: bool = False, max_replans: int = 3) -> dict:
+    """Dispatch process chunks command."""
     if auto_replan and not dry_run:
         return process_chunks_with_replans(
             work_dir,
@@ -2685,6 +2815,7 @@ def _dispatch_process_chunks_command(*, work_dir: str, prompt_name: str, extra_i
 
 
 def run_kernel_command(command: str, **kwargs) -> dict:
+    """Dispatch a kernel command through the top-level CLI façade."""
     return kernel_runtime.run_registered_kernel_command(
         command,
         kwargs=kwargs,
@@ -2694,6 +2825,7 @@ def run_kernel_command(command: str, **kwargs) -> dict:
 
 def _prepare_chunking_context(prompt_name: str = "", chunk_size: int = 0,
                               config_path: str = None) -> dict:
+    """Prepare chunking context."""
     return kernel_prompting._prepare_chunking_context(
         prompt_name=prompt_name,
         chunk_size=chunk_size,
@@ -2705,6 +2837,7 @@ def _chunk_text_payload(text: str, source_file: str, output_dir: str, chunk_size
                         prompt_name: str = "", config_path: str = None, *, driver: str = "chunk-text",
                         source_kind: str = "text", normalized_document_path: str = "",
                         source_adapter: str = "") -> dict:
+    """Chunk text payload."""
     chunking = _prepare_chunking_context(prompt_name, chunk_size, config_path)
     config = chunking["config"]
     budget = chunking["budget"]
@@ -2828,6 +2961,7 @@ def _chunk_text_payload(text: str, source_file: str, output_dir: str, chunk_size
 
 def chunk_text(input_path: str, output_dir: str, chunk_size: int = 0,
                prompt_name: str = "", config_path: str = None) -> dict:
+    """Delegate text chunking to `kernel.long_text.chunking`."""
     return kernel_chunking.chunk_text(
         input_path,
         output_dir,
@@ -2838,6 +2972,7 @@ def chunk_text(input_path: str, output_dir: str, chunk_size: int = 0,
 
 
 def _load_segment_document(segments_path: str) -> tuple[dict, list[dict]]:
+    """Load segment document."""
     path = Path(segments_path)
     if not path.exists():
         print(f"Error: File does not exist {segments_path}", file=sys.stderr)
@@ -2885,6 +3020,7 @@ def _load_segment_document(segments_path: str) -> tuple[dict, list[dict]]:
 
 
 def _load_chapters_document(chapters_path: str) -> list[dict]:
+    """Load chapters document."""
     path = Path(chapters_path)
     if not path.exists():
         print(f"Error: File does not exist {chapters_path}", file=sys.stderr)
@@ -2911,6 +3047,7 @@ def _load_chapters_document(chapters_path: str) -> list[dict]:
 
 
 def _map_chapter_starts_to_segment_break_ids(chapters: list[dict], segments: list[dict]) -> tuple[set[int], list[str]]:
+    """Map chapter starts to segment break ids."""
     timed_segments = [
         seg for seg in segments
         if seg.get("start_time") is not None and seg.get("end_time") is not None
@@ -2921,6 +3058,7 @@ def _map_chapter_starts_to_segment_break_ids(chapters: list[dict], segments: lis
     warnings = []
 
     def map_time(timestamp: float | None) -> tuple[int, str]:
+        """Map time."""
         if timestamp is None:
             return int(timed_segments[0].get("id", 0)), "missing_time"
 
@@ -2950,6 +3088,7 @@ def _map_chapter_starts_to_segment_break_ids(chapters: list[dict], segments: lis
 
 def _split_timed_segment(segment: dict, max_size: int, chunk_mode: str,
                          config: dict, warning_index: int) -> tuple[list[dict], list[str]]:
+    """Split timed segment."""
     text = segment["text"]
     segment_len = _estimate_tokens(text, chunk_mode, config)
     if segment_len <= max_size:
@@ -2990,6 +3129,7 @@ def _split_timed_segment(segment: dict, max_size: int, chunk_mode: str,
 
 
 def _load_normalized_document(normalized_document_path: str) -> dict:
+    """Load normalized document."""
     path = Path(normalized_document_path)
     if not path.exists():
         print(f"Error: File does not exist {normalized_document_path}", file=sys.stderr)
@@ -3041,6 +3181,7 @@ def _chunk_segments_payload(metadata: dict, segments: list[dict], source_file: s
                             *, chapters_path: str = "", driver: str = "chunk-segments",
                             source_kind: str = "segments", normalized_document_path: str = "",
                             source_adapter: str = "", source_segments_file: str = "") -> dict:
+    """Chunk segments payload."""
     if not segments:
         print("Error: No usable segments found", file=sys.stderr)
         sys.exit(2)
@@ -3076,6 +3217,7 @@ def _chunk_segments_payload(metadata: dict, segments: list[dict], source_file: s
     separator_size = len(CHUNK_SEPARATOR) if chunk_mode == "chars" else _estimate_tokens(CHUNK_SEPARATOR, "tokens", config)
 
     def finalize_chunk(parts: list[dict]):
+        """Finalize chunk."""
         if not parts:
             return
         content = CHUNK_SEPARATOR.join(part["text"] for part in parts if part.get("text"))
@@ -3230,6 +3372,7 @@ def _chunk_segments_payload(metadata: dict, segments: list[dict], source_file: s
 def chunk_segments(segments_path: str, output_dir: str, chunk_size: int = 0,
                    prompt_name: str = "", config_path: str = None,
                    chapters_path: str = "") -> dict:
+    """Delegate segment chunking to `kernel.long_text.chunking`."""
     return kernel_chunking.chunk_segments(
         segments_path,
         output_dir,
@@ -3243,6 +3386,7 @@ def chunk_segments(segments_path: str, output_dir: str, chunk_size: int = 0,
 def chunk_document(normalized_document_path: str, output_dir: str, chunk_size: int = 0,
                    prompt_name: str = "", config_path: str = None,
                    chapters_path: str = "", prefer: str = "auto") -> dict:
+    """Delegate normalized-document chunking to `kernel.long_text.chunking`."""
     return kernel_chunking.chunk_document(
         normalized_document_path,
         output_dir,
@@ -3302,6 +3446,7 @@ def get_chapters(video_url: str, timeout: int = 30) -> dict:
 
 
 def _resolve_manifest_path(manifest_ref: str) -> Path:
+    """Resolve manifest path."""
     path = Path(manifest_ref)
     if path.is_dir():
         return path / "manifest.json"
@@ -3309,10 +3454,12 @@ def _resolve_manifest_path(manifest_ref: str) -> Path:
 
 
 def build_chapter_plan(chapters_path: str, manifest_ref: str, output_path: str = "") -> dict:
+    """Build chapter plan."""
     return kernel_merge.build_chapter_plan(chapters_path, manifest_ref, output_path=output_path)
 
 
 def merge_content(work_dir: str, output_file: str, header_content: str = "") -> dict:
+    """Merge content."""
     return kernel_merge.merge_content(work_dir, output_file, header_content=header_content)
 
 
@@ -3321,6 +3468,7 @@ def _call_llm_api(api_key: str, base_url: str, model: str, messages: list,
                   temperature: float = 0.3, timeout_sec: int = 120,
                   max_retries: int = 3, backoff_sec: float = 1.5,
                   stream_mode: str = "auto") -> dict:
+    """Delegate LLM request orchestration to `kernel.long_text.llm`."""
     return kernel_llm._call_llm_api(
         api_key,
         base_url,
@@ -3339,6 +3487,7 @@ def _call_llm_api(api_key: str, base_url: str, model: str, messages: list,
 def test_llm_api(config_path: str = None, api_key: str = "", base_url: str = "",
                  model: str = "", api_format: str = "", timeout_sec: int = 0,
                  stream_mode: str = "") -> dict:
+    """Probe configured LLM reachability and return a normalized diagnostics payload."""
     config = _load_optional_config(config_path)
     api_key = api_key or config.get("llm_api_key", "")
     base_url = base_url or config.get("llm_base_url", "")
@@ -3397,6 +3546,7 @@ def _count_tokens_via_provider(text: str, config: dict | None = None,
                                api_key: str = "", base_url: str = "",
                                model: str = "", api_format: str = "",
                                timeout_sec: int = 0) -> dict:
+    """Count tokens via provider."""
     import urllib.error
     import urllib.request
 
@@ -3537,6 +3687,7 @@ def _count_tokens_via_provider(text: str, config: dict | None = None,
 def test_token_count(config_path: str = None, api_key: str = "", base_url: str = "",
                      model: str = "", api_format: str = "", timeout_sec: int = 0,
                      sample_text: str = "Reply with OK only.") -> dict:
+    """Test token count."""
     config = _load_optional_config(config_path)
     api_key = api_key or config.get("llm_api_key", "")
     base_url = base_url or config.get("llm_base_url", "")
@@ -3576,10 +3727,12 @@ def test_token_count(config_path: str = None, api_key: str = "", base_url: str =
 
 def _estimate_chunk_input_tokens(chunk_info: dict, input_key: str, text: str,
                                  config: dict | None = None) -> tuple[int, str]:
+    """Estimate chunk input tokens."""
     return kernel_autotune.estimate_chunk_input_tokens(chunk_info, input_key, text, config)
 
 
 def _refresh_manifest_token_source_summary(manifest: dict) -> None:
+    """Refresh manifest token source summary."""
     kernel_autotune.refresh_manifest_token_source_summary(manifest)
 
 
@@ -3587,6 +3740,7 @@ def process_chunks(work_dir: str, prompt_name: str, extra_instruction: str = "",
                    config_path: str = None, dry_run: bool = False,
                    input_key: str = "raw_path", force: bool = False,
                    runtime_ownership: dict | None = None) -> dict:
+    """Delegate chunk execution to `kernel.long_text.execution`."""
     return kernel_execution.process_chunks(
         work_dir,
         prompt_name,
@@ -3602,6 +3756,7 @@ def process_chunks(work_dir: str, prompt_name: str, extra_instruction: str = "",
 def _process_chunks_impl(work_dir: str, prompt_name: str, extra_instruction: str = "",
                          config_path: str = None, dry_run: bool = False,
                          input_key: str = "raw_path", force: bool = False) -> dict:
+    """Delegate chunk processing to `kernel.long_text.processing`."""
     return kernel_processing._process_chunks_impl(
         work_dir,
         prompt_name,
@@ -3616,6 +3771,7 @@ def _process_chunks_impl(work_dir: str, prompt_name: str, extra_instruction: str
 def replan_remaining(work_dir: str, prompt_name: str = "", config_path: str = None,
                      chunk_size: int = 0, input_key: str = "raw_path",
                      runtime_ownership: dict | None = None) -> dict:
+    """Delegate remaining-work replanning to `kernel.long_text.execution`."""
     return kernel_execution.replan_remaining(
         work_dir,
         prompt_name=prompt_name,
@@ -3628,6 +3784,7 @@ def replan_remaining(work_dir: str, prompt_name: str = "", config_path: str = No
 
 def _replan_remaining_impl(work_dir: str, prompt_name: str = "", config_path: str = None,
                            chunk_size: int = 0, input_key: str = "raw_path") -> dict:
+    """Delegate raw replanning logic to `kernel.long_text.processing`."""
     return kernel_processing._replan_remaining_impl(
         work_dir,
         prompt_name=prompt_name,
@@ -3641,6 +3798,7 @@ def process_chunks_with_replans(work_dir: str, prompt_name: str, extra_instructi
                                 config_path: str = None, input_key: str = "raw_path",
                                 force: bool = False, max_replans: int = 3,
                                 runtime_ownership: dict | None = None) -> dict:
+    """Delegate auto-replan chunk execution to `kernel.long_text.execution`."""
     return kernel_execution.process_chunks_with_replans(
         work_dir,
         prompt_name,
@@ -3657,6 +3815,7 @@ def _process_chunks_with_replans_impl(work_dir: str, prompt_name: str, extra_ins
                                       config_path: str = None, input_key: str = "raw_path",
                                       force: bool = False, max_replans: int = 3,
                                       runtime_ownership: dict | None = None) -> dict:
+    """Process chunks with replans impl."""
     return kernel_processing._process_chunks_with_replans_impl(
         work_dir,
         prompt_name,
@@ -3670,6 +3829,7 @@ def _process_chunks_with_replans_impl(work_dir: str, prompt_name: str, extra_ins
 
 
 def detect_audio_content_type(audio_path: str) -> str:
+    """Detect audio content type."""
     ext = Path(audio_path).suffix.lower().lstrip(".")
     return {
         "m4a": "audio/mp4",
@@ -3684,6 +3844,7 @@ def detect_audio_content_type(audio_path: str) -> str:
 
 def _call_deepgram_api(audio_path: str, api_key: str, language: str,
                        timeout: int = 300) -> dict:
+    """Call deepgram api."""
     import urllib.request
     import urllib.error
 
@@ -4128,6 +4289,7 @@ LEGACY_STATE_MACHINE_SUFFIX = "_machine_state.json"
 
 
 def _derive_machine_state_path(state_path: str | Path) -> Path:
+    """Derive machine state path."""
     path = Path(state_path)
     if path.suffix.lower() == ".json":
         return path
@@ -4140,6 +4302,7 @@ def _derive_machine_state_path(state_path: str | Path) -> Path:
 
 
 def _derive_legacy_state_path(machine_state_path: str | Path) -> Path:
+    """Derive legacy state path."""
     path = Path(machine_state_path)
     if path.suffix.lower() == ".md":
         return path
@@ -4149,11 +4312,13 @@ def _derive_legacy_state_path(machine_state_path: str | Path) -> Path:
 
 
 def _default_normalized_document_path(document_id: str) -> str:
+    """Return the default normalized document path."""
     token = str(document_id or "").strip() or "unknown"
     return f"/tmp/{token}_normalized_document.json"
 
 
 def _parse_legacy_state_content(content: str) -> dict:
+    """Parse legacy state content."""
     state = {}
     for raw_line in content.splitlines():
         line = raw_line.strip()
@@ -4167,6 +4332,7 @@ def _parse_legacy_state_content(content: str) -> dict:
 
 
 def _read_legacy_state_file(state_path: str | Path) -> tuple[dict, str]:
+    """Read legacy state file."""
     path = Path(state_path)
     try:
         content = path.read_text(encoding="utf-8")
@@ -4178,6 +4344,7 @@ def _read_legacy_state_file(state_path: str | Path) -> tuple[dict, str]:
 
 def _compat_fields_to_machine_state(compat_fields: dict, legacy_state_path: Path,
                                  machine_state_path: Path, existing_payload: dict | None = None) -> dict:
+    """Compat fields to machine state."""
     compat = {str(key).strip(): str(value).strip() for key, value in (compat_fields or {}).items() if str(key).strip()}
     content = "\n".join(f"{key}: {value}" for key, value in sorted(compat.items()))
     content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
@@ -4231,6 +4398,7 @@ def _compat_fields_to_machine_state(compat_fields: dict, legacy_state_path: Path
 
 
 def _read_machine_state(machine_state_path: str | Path) -> dict:
+    """Read machine state."""
     path = Path(machine_state_path)
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
@@ -4244,12 +4412,14 @@ def _read_machine_state(machine_state_path: str | Path) -> dict:
 
 
 def _write_machine_state(machine_state_path: str | Path, payload: dict) -> None:
+    """Write machine state."""
     path = Path(machine_state_path)
     path.parent.mkdir(parents=True, exist_ok=True)
     _atomic_write_text(path, json.dumps(payload, ensure_ascii=False, indent=2))
 
 
 def _machine_state_to_compat_fields(payload: dict) -> dict:
+    """Machine state to compat fields."""
     compat = payload.get("compat_projection", {}).get("fields", {}) if isinstance(payload, dict) else {}
     if not isinstance(compat, dict):
         return {}
@@ -4257,6 +4427,7 @@ def _machine_state_to_compat_fields(payload: dict) -> dict:
 
 
 def sync_machine_state(state_ref: str, write_legacy: bool = False) -> dict:
+    """Synchronize machine state."""
     path = Path(state_ref)
     if path.suffix.lower() == ".json":
         if not path.exists():
@@ -4329,6 +4500,7 @@ def load_state(state_path: str) -> dict:
 
 
 def _normalize_text_body(text: str) -> str:
+    """Normalize text body."""
     normalized = str(text or "").replace("\r\n", "\n").replace("\r", "\n")
     normalized = "\n".join(line.rstrip() for line in normalized.split("\n"))
     normalized = re.sub(r"\n{3,}", "\n\n", normalized)
@@ -4339,6 +4511,7 @@ def _update_machine_state_normalization(machine_state_path: str | Path, *, norma
                                         source_adapter: str, preferred_chunk_source: str,
                                         segment_count: int, char_count: int,
                                         raw_text_path: str = "", segments_path: str = "") -> None:
+    """Update machine state normalization."""
     payload = _read_machine_state(machine_state_path)
     artifacts = payload.get("artifacts", {}) if isinstance(payload.get("artifacts", {}), dict) else {}
     if raw_text_path:
@@ -4361,6 +4534,7 @@ def _update_machine_state_normalization(machine_state_path: str | Path, *, norma
 
 def normalize_document(state_ref: str, output_path: str = "", prefer: str = "auto",
                        allow_missing: bool = False) -> dict:
+    """Materialize `normalized_document.json` from synced workflow state artifacts."""
     sync_result = sync_machine_state(state_ref)
     compat = sync_result["compat_fields"]
     machine_state_path = sync_result["machine_state_path"]
@@ -4674,6 +4848,7 @@ def plan_optimization(state_path: str) -> dict:
     }
 
     def build_execution_contract(kind: str, input_key: str = "") -> dict:
+        """Build execution contract."""
         if kind != "chunk":
             return {
                 "mode": "single_pass",
@@ -4699,6 +4874,7 @@ def plan_optimization(state_path: str) -> dict:
         }
 
     def build_control_contract(kind: str, prompt: str, input_key: str = "", *, bilingual_output: bool = False) -> dict:
+        """Build control contract."""
         return _build_operation_control_contract(
             kind,
             prompt,
@@ -4859,6 +5035,7 @@ def load_config(config_path: str = None, allow_missing: bool = False) -> dict:
     config_warnings = []
 
     def parse_int_field(key: str, default: int, minimum: int | None = None, maximum: int | None = None) -> int:
+        """Parse an integer config field with warnings and range enforcement."""
         raw = config.get(key)
         if raw is None or raw == '':
             return default
@@ -4879,6 +5056,7 @@ def load_config(config_path: str = None, allow_missing: bool = False) -> dict:
         return parsed
 
     def parse_float_field(key: str, default: float, minimum: float | None = None, maximum: float | None = None) -> float:
+        """Parse float field."""
         raw = config.get(key)
         if raw is None or raw == '':
             return default
@@ -4995,6 +5173,7 @@ def load_config(config_path: str = None, allow_missing: bool = False) -> dict:
 
 
 def main():
+    """Main."""
     parser = argparse.ArgumentParser(
         description='yt-transcript utility script',
         formatter_class=argparse.RawDescriptionHelpFormatter,

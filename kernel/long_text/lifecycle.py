@@ -1,3 +1,5 @@
+"""Manifest lifecycle and resume-repair helpers for long-text runs."""
+
 from __future__ import annotations
 
 _LOCAL_NAMES = {
@@ -15,6 +17,7 @@ _LOCAL_NAMES = {
 
 
 def _bind_utils_globals() -> None:
+    """Bind delegated helper names from `yt_transcript_utils` into module globals."""
     import yt_transcript_utils as utils
 
     for name, value in utils.__dict__.items():
@@ -29,10 +32,13 @@ def _new_chunk_manifest_entry(chunk_id: int, chunk_content: str, budget: dict,
                               continuity_prev_chunk_id: int | None = None,
                               chunk_contract: dict | None = None,
                               continuity_policy: dict | None = None) -> dict:
+    """Create the persisted manifest record for a single planned chunk."""
     _bind_utils_globals()
     config = config or {}
     chunk_contract = chunk_contract if isinstance(chunk_contract, dict) else _build_manifest_chunk_contract()
     continuity_policy = continuity_policy if isinstance(continuity_policy, dict) else _build_manifest_continuity_policy(config)
+    # The chunk entry is the durable checkpoint for one unit of work. It keeps
+    # both execution bookkeeping and the continuity metadata needed for retries.
     return {
         "id": chunk_id,
         "chunk_id": chunk_id,
@@ -93,6 +99,7 @@ def _new_chunk_manifest_entry(chunk_id: int, chunk_content: str, budget: dict,
     }
 
 def _resolve_chunk_output_filename(chunk_info: dict, prompt_name: str = "") -> str:
+    """Resolve the output filename for a chunk under the current prompt."""
     _bind_utils_globals()
     chunk_id = _parse_int(chunk_info.get("id", chunk_info.get("chunk_id", 0)), 0)
     if prompt_name == "summarize":
@@ -101,6 +108,7 @@ def _resolve_chunk_output_filename(chunk_info: dict, prompt_name: str = "") -> s
     return filename or f"processed_{chunk_id:03d}.md"
 
 def _resolve_chunk_output_path(work_path: Path, chunk_info: dict, prompt_name: str = "") -> Path:
+    """Resolve the absolute output path for a chunk result file."""
     _bind_utils_globals()
     return work_path / _resolve_chunk_output_filename(chunk_info, prompt_name)
 
@@ -108,6 +116,7 @@ def _ensure_chunk_runtime_defaults(manifest: dict, runtime: dict, plan: dict,
                                    prompt_budget: dict, request_url: str,
                                    planned_max_output_tokens: int,
                                    autotune_state: dict) -> None:
+    """Backfill chunk/runtime fields needed by resume and processing loops."""
     _bind_utils_globals()
     for chunk_info in manifest.get("chunks", []):
         chunk_info.setdefault("chunk_id", chunk_info.get("id", 0))
@@ -157,6 +166,7 @@ def _ensure_chunk_runtime_defaults(manifest: dict, runtime: dict, plan: dict,
         _ensure_chunk_control_state(chunk_info)
 
 def _infer_resume_runtime_status(runtime: dict, chunks: list[dict]) -> str:
+    """Infer the safest runtime status to expose after loading a prior run."""
     _bind_utils_globals()
     active_chunks = [chunk for chunk in (chunks or []) if chunk.get("status") != SUPERSEDED_CHUNK_STATUS]
     active_statuses = {str(chunk.get("status", "pending")).strip() or "pending" for chunk in active_chunks}
@@ -183,6 +193,7 @@ def _infer_resume_runtime_status(runtime: dict, chunks: list[dict]) -> str:
     return previous_status
 
 def _prepare_manifest_for_resume(manifest: dict, work_path: Path, prompt_name: str = "") -> dict:
+    """Repair stale chunk/runtime state so an interrupted run can resume safely."""
     _bind_utils_globals()
     runtime = manifest.get("runtime", {}) if isinstance(manifest.get("runtime", {}), dict) else {}
     now = _now_iso()
@@ -199,6 +210,7 @@ def _prepare_manifest_for_resume(manifest: dict, work_path: Path, prompt_name: s
     }
 
     def mark_promoted_done(chunk_info: dict, output_path: Path, reason: str) -> None:
+        """Promote a chunk to done when its durable output already exists."""
         try:
             output_text = output_path.read_text(encoding="utf-8")
         except OSError:
@@ -218,6 +230,7 @@ def _prepare_manifest_for_resume(manifest: dict, work_path: Path, prompt_name: s
         report["warnings"].append(reason)
 
     def mark_interrupted(chunk_info: dict, reason: str, bucket: str) -> None:
+        """Mark a chunk as interrupted when its recorded state is no longer trustworthy."""
         chunk_info["status"] = INTERRUPTED_CHUNK_STATUS
         chunk_info["last_error"] = reason
         chunk_info["last_error_type"] = "resume_interrupted"
@@ -235,6 +248,9 @@ def _prepare_manifest_for_resume(manifest: dict, work_path: Path, prompt_name: s
         status = str(chunk_info.get("status", "pending")).strip() or "pending"
 
         if status == "running":
+            # A stale `running` chunk means the previous process exited mid-run.
+            # If the output file exists we can safely promote it to done; if not,
+            # we downgrade it to interrupted for an explicit retry.
             if output_exists:
                 mark_promoted_done(
                     chunk_info,
@@ -248,12 +264,16 @@ def _prepare_manifest_for_resume(manifest: dict, work_path: Path, prompt_name: s
                     "interrupted_chunk_ids",
                 )
         elif status == "done" and not output_exists:
+            # A missing checkpoint file means the manifest claimed success before
+            # the durable output was actually present on disk.
             mark_interrupted(
                 chunk_info,
                 f"Resume repair: demoted done chunk {_parse_int(chunk_info.get('id'), 0)} because checkpoint file {output_path.name} is missing",
                 "demoted_missing_output_chunk_ids",
             )
         elif status == INTERRUPTED_CHUNK_STATUS and output_exists:
+            # If a prior run wrote the output before failing to update manifest
+            # state, prefer the durable file over the stale interrupted marker.
             mark_promoted_done(
                 chunk_info,
                 output_path,
@@ -280,6 +300,7 @@ def _prepare_manifest_for_resume(manifest: dict, work_path: Path, prompt_name: s
     return report
 
 def _format_resume_report(report: dict) -> str:
+    """Format a compact human-readable summary of resume repairs."""
     _bind_utils_globals()
     if not isinstance(report, dict) or not report.get("repaired", False):
         return ""
@@ -295,6 +316,7 @@ def _format_resume_report(report: dict) -> str:
 
 def _prepare_resume_impl(work_dir: str, prompt_name: str = "", config_path: str = None,
                          input_key: str = "raw_path") -> dict:
+    """Load, repair, and persist manifest state before a resume attempt."""
     _bind_utils_globals()
     del input_key
     work_path = Path(work_dir)
@@ -344,6 +366,7 @@ def _prepare_resume_impl(work_dir: str, prompt_name: str = "", config_path: str 
     }
 
 def _resume_run_impl(work_dir: str, reason: str = "") -> dict:
+    """Clear pause state and mark the runtime as resumable again."""
     _bind_utils_globals()
     work_path = Path(work_dir)
     manifest_path = work_path / "manifest.json"

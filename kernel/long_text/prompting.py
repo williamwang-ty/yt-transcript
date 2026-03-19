@@ -1,3 +1,5 @@
+"""Prompt assembly and chunking-context preparation helpers."""
+
 from __future__ import annotations
 
 _LOCAL_NAMES = {
@@ -12,6 +14,7 @@ _LOCAL_NAMES = {
 
 
 def _bind_utils_globals() -> None:
+    """Bind delegated helper names from `yt_transcript_utils` into module globals."""
     import yt_transcript_utils as utils
 
     for name, value in utils.__dict__.items():
@@ -21,6 +24,7 @@ def _bind_utils_globals() -> None:
 
 
 def _inject_context_block(prompt_template: str, context_text: str) -> str:
+    """Inject a reference-only context block before the prompt input section."""
     _bind_utils_globals()
     if not context_text:
         return prompt_template
@@ -31,20 +35,24 @@ def _inject_context_block(prompt_template: str, context_text: str) -> str:
     return prompt_template.rstrip() + "\n\n" + context_text + "\n"
 
 def _inject_continuity_context(prompt_template: str, continuity_text: str) -> str:
+    """Inject continuity context into a chunk prompt template."""
     _bind_utils_globals()
     return _inject_context_block(prompt_template, continuity_text)
 
 def _inject_glossary_context(prompt_template: str, glossary_text: str) -> str:
+    """Inject glossary context into a chunk prompt template."""
     _bind_utils_globals()
     return _inject_context_block(prompt_template, glossary_text)
 
 def _inject_semantic_context(prompt_template: str, semantic_text: str) -> str:
+    """Inject semantic-anchor context into a chunk prompt template."""
     _bind_utils_globals()
     return _inject_context_block(prompt_template, semantic_text)
 
 def _build_chunk_prompt(prompt_template: str, chunk_body: str,
                         continuity_text: str = "", glossary_text: str = "",
                         semantic_text: str = "") -> str:
+    """Assemble the final chunk prompt with continuity and consistency context."""
     _bind_utils_globals()
     template = _inject_semantic_context(prompt_template, semantic_text)
     template = _inject_glossary_context(template, glossary_text)
@@ -57,6 +65,7 @@ def _build_chunk_prompt(prompt_template: str, chunk_body: str,
 
 def _prepare_chunking_context(prompt_name: str = "", chunk_size: int = 0,
                               config_path: str = None) -> dict:
+    """Prepare prompt and budget context used before chunk generation starts."""
     _bind_utils_globals()
     config = _load_optional_config(config_path)
     prompt_template = ""

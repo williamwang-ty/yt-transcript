@@ -1,8 +1,12 @@
+"""Regression tests for workflow-level state and planning behavior."""
+
 from tests._support import *
 
 
 class WorkflowRegressionTests(unittest.TestCase):
+    """Regression coverage for workflow state, normalization, and planning paths."""
     def test_cleanup_script_removes_state_by_default(self):
+        """Test cleanup script removes state by default."""
         video_id = "cleanup_state_test"
         state_file = Path(f"/tmp/{video_id}_state.md")
         machine_state_file = Path(f"/tmp/{video_id}_machine_state.json")
@@ -23,6 +27,7 @@ class WorkflowRegressionTests(unittest.TestCase):
             machine_state_file.unlink(missing_ok=True)
 
     def test_cleanup_script_can_keep_state(self):
+        """Test cleanup script can keep state."""
         video_id = "cleanup_keep_state_test"
         state_file = Path(f"/tmp/{video_id}_state.md")
         machine_state_file = Path(f"/tmp/{video_id}_machine_state.json")
@@ -43,6 +48,7 @@ class WorkflowRegressionTests(unittest.TestCase):
             machine_state_file.unlink(missing_ok=True)
 
     def test_cleanup_script_rejects_unsafe_video_id(self):
+        """Test cleanup script rejects unsafe video id."""
         result = subprocess.run(
             ["bash", str(PROJECT_ROOT / "scripts/cleanup.sh"), "../bad-id"],
             cwd=PROJECT_ROOT,
@@ -53,6 +59,7 @@ class WorkflowRegressionTests(unittest.TestCase):
         self.assertIn("unsafe characters", result.stderr)
 
     def test_download_metadata_returns_valid_json(self):
+        """Test download metadata returns valid json."""
         with tempfile.TemporaryDirectory() as tmpdir:
             fake_bin = Path(tmpdir) / "yt-dlp"
             fake_bin.write_text(
@@ -88,6 +95,7 @@ class WorkflowRegressionTests(unittest.TestCase):
             self.assertEqual(payload["channel"], 'A "B"')
 
     def test_download_metadata_fails_when_video_id_is_missing(self):
+        """Test download metadata fails when video id is missing."""
         with tempfile.TemporaryDirectory() as tmpdir:
             fake_bin = Path(tmpdir) / "yt-dlp"
             fake_bin.write_text(
@@ -113,6 +121,7 @@ class WorkflowRegressionTests(unittest.TestCase):
             self.assertIn("Could not resolve a video ID", result.stderr)
 
     def test_download_metadata_retries_with_chrome_after_not_a_bot(self):
+        """Test download metadata retries with chrome after not a bot."""
         with tempfile.TemporaryDirectory() as tmpdir:
             fake_bin = Path(tmpdir) / "yt-dlp"
             fake_bin.write_text(
@@ -170,6 +179,7 @@ esac
             self.assertIn("attempt 1/3", result.stderr)
 
     def test_download_metadata_guides_cookie_file_when_chrome_retry_fails(self):
+        """Test download metadata guides cookie file when chrome retry fails."""
         with tempfile.TemporaryDirectory() as tmpdir:
             fake_bin = Path(tmpdir) / "yt-dlp"
             fake_bin.write_text(
@@ -214,6 +224,7 @@ exit 1
             self.assertIn("Netscape-format cookies.txt", result.stderr)
 
     def test_subtitle_info_prefers_english_for_bilingual(self):
+        """Test subtitle info prefers english for bilingual."""
         with tempfile.TemporaryDirectory() as tmpdir:
             fake_bin = Path(tmpdir) / "yt-dlp"
             fake_bin.write_text(
@@ -258,6 +269,7 @@ exit 1
             self.assertEqual(payload["mode"], "bilingual")
 
     def test_subtitle_info_stops_routing_unsupported_languages_as_chinese(self):
+        """Test subtitle info stops routing unsupported languages as chinese."""
         with tempfile.TemporaryDirectory() as tmpdir:
             fake_bin = Path(tmpdir) / "yt-dlp"
             fake_bin.write_text(
@@ -297,6 +309,7 @@ exit 1
             self.assertEqual(payload["mode"], "")
 
     def test_subtitle_info_propagates_yt_dlp_failure(self):
+        """Test subtitle info propagates yt dlp failure."""
         with tempfile.TemporaryDirectory() as tmpdir:
             fake_bin = Path(tmpdir) / "yt-dlp"
             fake_bin.write_text(
@@ -327,6 +340,7 @@ exit 1
             self.assertIn("network failed", result.stderr)
 
     def test_subtitle_info_reads_structured_metadata_when_json_available(self):
+        """Test subtitle info reads structured metadata when json available."""
         with tempfile.TemporaryDirectory() as tmpdir:
             fake_bin = Path(tmpdir) / "yt-dlp"
             fake_bin.write_text(
@@ -370,6 +384,7 @@ exit 1
             self.assertEqual(payload["mode"], "bilingual")
 
     def test_subtitles_selects_manual_english_source_file(self):
+        """Test subtitles selects manual english source file."""
         with tempfile.TemporaryDirectory() as tmpdir:
             fake_bin = Path(tmpdir) / "yt-dlp"
             fake_bin.write_text(
@@ -429,6 +444,7 @@ exit 1
             shutil.rmtree("/tmp/vid001_downloads", ignore_errors=True)
 
     def test_subtitles_selects_manual_english_source_file_from_isolated_dir(self):
+        """Test subtitles selects manual english source file from isolated dir."""
         with tempfile.TemporaryDirectory() as tmpdir:
             fake_bin = Path(tmpdir) / "yt-dlp"
             fake_bin.write_text(
@@ -487,6 +503,7 @@ exit 1
                 shutil.rmtree("/tmp/vid001_downloads", ignore_errors=True)
 
     def test_subtitles_downloads_supported_english_variant(self):
+        """Test subtitles downloads supported english variant."""
         with tempfile.TemporaryDirectory() as tmpdir:
             fake_bin = Path(tmpdir) / "yt-dlp"
             fake_bin.write_text(
@@ -546,6 +563,7 @@ exit 1
             shutil.rmtree("/tmp/vidgb_downloads", ignore_errors=True)
 
     def test_subtitles_rejects_unsupported_languages_before_download(self):
+        """Test subtitles rejects unsupported languages before download."""
         with tempfile.TemporaryDirectory() as tmpdir:
             fake_bin = Path(tmpdir) / "yt-dlp"
             fake_bin.write_text(
@@ -584,6 +602,7 @@ exit 1
             self.assertNotIn("unexpected subtitle download", result.stderr)
 
     def test_preflight_treats_update_check_as_best_effort(self):
+        """Test preflight treats update check as best effort."""
         with tempfile.TemporaryDirectory() as tmpdir:
             fake_yt_dlp = Path(tmpdir) / "yt-dlp"
             fake_yt_dlp.write_text(
@@ -635,6 +654,7 @@ exit 0
             self.assertIn("All pre-flight checks passed", result.stdout)
 
     def test_preflight_supports_gnu_stat_for_cache_age(self):
+        """Test preflight supports gnu stat for cache age."""
         with tempfile.TemporaryDirectory() as tmpdir:
             fake_yt_dlp = Path(tmpdir) / "yt-dlp"
             fake_yt_dlp.write_text(
@@ -708,6 +728,7 @@ exit 1
             self.assertIn("All pre-flight checks passed", result.stdout)
 
     def test_audio_download_uses_isolated_dir(self):
+        """Test audio download uses isolated dir."""
         with tempfile.TemporaryDirectory() as tmpdir:
             fake_bin = Path(tmpdir) / "yt-dlp"
             fake_bin.write_text(

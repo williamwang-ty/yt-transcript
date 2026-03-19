@@ -1,7 +1,10 @@
+"""Autotune helpers for adaptive chunk sizing and token-source summaries."""
+
 import math
 
 
 def _utils():
+    """Import and return the main utility module for delegated helpers."""
     import yt_transcript_utils as utils
 
     return utils
@@ -9,6 +12,7 @@ def _utils():
 
 def build_autotune_state(prompt_budget: dict, config: dict | None = None,
                          existing: dict | None = None) -> dict:
+    """Build persistent autotune state from budget defaults and prior history."""
     utils = _utils()
     config = config or {}
     existing = existing if isinstance(existing, dict) else {}
@@ -84,6 +88,7 @@ def build_autotune_state(prompt_budget: dict, config: dict | None = None,
 def update_autotune_state(autotune_state: dict | None, *, success: bool,
                           latency_ms: int | None = None, timeout: bool = False,
                           error_type: str = "", chunk_id: int | None = None) -> dict:
+    """Update autotune state after one chunk succeeds, times out, or fails."""
     utils = _utils()
     state = dict(autotune_state or {})
     state.setdefault("enabled", False)
@@ -213,6 +218,7 @@ def estimate_chunk_input_tokens(chunk_info: dict, input_key: str, text: str,
 
 
 def refresh_manifest_token_source_summary(manifest: dict) -> None:
+    """Refresh manifest token source summary."""
     chunks = manifest.get("chunks", []) if isinstance(manifest, dict) else []
     sources = sorted({
         str(chunk.get("token_count_source", "")).strip()

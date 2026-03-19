@@ -16,6 +16,7 @@ CONFIG_FILE="$ROOT_DIR/config.yaml"
 REQUIRE_DEEPGRAM=false
 REQUIRE_LLM=false
 
+# Return a file modification time in epoch seconds across macOS and Linux `stat`.
 file_mtime_epoch() {
     local path="$1"
     if stat -f %m "$path" >/dev/null 2>&1; then

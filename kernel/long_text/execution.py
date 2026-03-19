@@ -1,3 +1,5 @@
+"""Execution command surfaces for processing, resume, and replan flows."""
+
 import sys
 from pathlib import Path
 
@@ -6,18 +8,22 @@ from ..task_runtime import state as kernel_state
 
 
 def runtime_status(work_dir: str) -> dict:
+    """Return the current runtime summary for a long-text work directory."""
     return kernel_state.summarize_runtime_status(work_dir)
 
 
 def cancel_run(work_dir: str, reason: str = "") -> dict:
+    """Request cancellation for the active long-text run."""
     return kernel_state.request_runtime_cancel(work_dir, reason=reason)
 
 
 def pause_run(work_dir: str, reason: str = "") -> dict:
+    """Request pausing the active long-text run."""
     return kernel_state.request_runtime_pause(work_dir, reason=reason)
 
 
 def resume_run(work_dir: str, reason: str = "", runtime_ownership: dict | None = None) -> dict:
+    """Resume a paused long-text run under runtime ownership protection."""
     import yt_transcript_utils as utils
 
     manifest_path = Path(work_dir) / "manifest.json"
@@ -36,6 +42,7 @@ def resume_run(work_dir: str, reason: str = "", runtime_ownership: dict | None =
 
 def prepare_resume(work_dir: str, prompt_name: str = "", config_path: str = None,
                    input_key: str = "raw_path", runtime_ownership: dict | None = None) -> dict:
+    """Repair manifest state so an interrupted long-text run can resume safely."""
     import yt_transcript_utils as utils
 
     manifest_path = Path(work_dir) / "manifest.json"
@@ -63,6 +70,7 @@ def process_chunks(work_dir: str, prompt_name: str, extra_instruction: str = "",
                    config_path: str = None, dry_run: bool = False,
                    input_key: str = "raw_path", force: bool = False,
                    runtime_ownership: dict | None = None) -> dict:
+    """Run the main chunk-processing mutation under runtime ownership protection."""
     import yt_transcript_utils as utils
 
     manifest_path = Path(work_dir) / "manifest.json"
@@ -90,6 +98,7 @@ def process_chunks(work_dir: str, prompt_name: str, extra_instruction: str = "",
 def replan_remaining(work_dir: str, prompt_name: str = "", config_path: str = None,
                      chunk_size: int = 0, input_key: str = "raw_path",
                      runtime_ownership: dict | None = None) -> dict:
+    """Replan the remaining unprocessed source content under runtime ownership protection."""
     import yt_transcript_utils as utils
 
     manifest_path = Path(work_dir) / "manifest.json"
@@ -116,6 +125,7 @@ def process_chunks_with_replans(work_dir: str, prompt_name: str, extra_instructi
                                 config_path: str = None, input_key: str = "raw_path",
                                 force: bool = False, max_replans: int = 3,
                                 runtime_ownership: dict | None = None) -> dict:
+    """Run chunk processing with bounded automatic replanning support."""
     import yt_transcript_utils as utils
 
     manifest_path = Path(work_dir) / "manifest.json"

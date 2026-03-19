@@ -330,6 +330,84 @@ This is especially important for long-video chunk execution, but the design prin
 - resuming becomes practical
 - the project behaves like a local job system instead of a disposable script
 
+#### Implementation anchors
+
+- `kernel/task_runtime/runtime.py`
+  - runtime ownership, command envelopes, and append-only command telemetry
+- `kernel/task_runtime/state.py`
+  - manifest persistence plus pause / cancel control files and runtime status summaries
+- `kernel/task_runtime/controller.py`
+  - owned mutation wrappers and bounded auto-replan control loops
+- `kernel/task_runtime/telemetry.py`
+  - telemetry query and summarization surfaces for operators
+
+### 6.9 Kernel Layering: Generic Runtime vs Long-Text Transformation
+
+The project-level pipeline above explains execution order, but the codebase has another equally important split: the internal kernel is organized into two different layers with different responsibilities.
+
+#### A. Generic task-runtime layer
+
+This layer is not specific to transcript rewriting. It exists because any long-running local job needs common operating semantics:
+
+- exclusive ownership for mutations
+- persisted manifest and control signals
+- pause / resume / cancel semantics
+- telemetry and result envelopes
+
+In the current repository, that generic runtime layer lives in:
+
+- `kernel/task_runtime/runtime.py`
+- `kernel/task_runtime/state.py`
+- `kernel/task_runtime/controller.py`
+- `kernel/task_runtime/telemetry.py`
+
+This layer answers the question:
+
+> How does the system behave like a controllable local job, regardless of what the job is doing?
+
+#### B. Long-text transformation layer
+
+This layer is specific to the hardest content problem in the project: safely transforming long transcript-like input into coherent article-style output.
+
+Its responsibilities include:
+
+- chunk contracts and control policies
+- chunking and prompt assembly
+- glossary and semantic-anchor consistency controls
+- LLM request orchestration
+- chunk processing, repair, replan, and merge behavior
+
+In the current repository, that layer lives in:
+
+- `kernel/long_text/contracts.py`
+- `kernel/long_text/lifecycle.py`
+- `kernel/long_text/prompting.py`
+- `kernel/long_text/llm.py`
+- `kernel/long_text/processing.py`
+- `kernel/long_text/chunking.py`
+- `kernel/long_text/merge.py`
+- `kernel/long_text/execution.py`
+- `kernel/long_text/glossary.py`
+- `kernel/long_text/semantic.py`
+- `kernel/long_text/autotune.py`
+
+This layer answers the question:
+
+> Given a long document and a transformation goal, how do we split, guide, verify, recover, and reassemble the work?
+
+#### C. Relationship to `yt_transcript_utils.py`
+
+`yt_transcript_utils.py` is still the main command surface and compatibility façade, but after the refactor it is no longer the only place where core behavior lives.
+
+Its role is now to:
+
+- expose CLI and repository-level commands
+- bridge shell workflows and Python code
+- delegate generic runtime concerns to `kernel/task_runtime/*`
+- delegate long-text transformation concerns to `kernel/long_text/*`
+
+This separation improves readability because readers can distinguish project orchestration from reusable runtime control and from long-text transformation mechanics.
+
 ---
 
 ## 7. Core Subsystem Design: Long-Text Transformation
@@ -369,6 +447,29 @@ The long-text subsystem is designed to be:
 - **consistency-aware**: preserve terminology and high-signal details across chunks
 
 ### 7.4 Long-text subsystem architecture
+
+Before describing the logic, it helps to state the layered implementation view explicitly.
+
+#### Layered implementation view
+
+- **Contract and control layer**: `kernel/long_text/contracts.py`
+  - defines chunk contract, continuity policy, verification contract, repair policy, and replan policy
+- **Lifecycle and resumability layer**: `kernel/long_text/lifecycle.py`
+  - defines per-chunk manifest entries, runtime defaults, and resume-repair behavior
+- **Prompt and context assembly layer**: `kernel/long_text/prompting.py`, `kernel/long_text/glossary.py`, `kernel/long_text/semantic.py`
+  - prepares continuity, terminology, and semantic-anchor context before each LLM call
+- **LLM request layer**: `kernel/long_text/llm.py`
+  - owns retries, timeout behavior, and streaming fallback
+- **Processing-control layer**: `kernel/long_text/processing.py`
+  - owns the main chunk loop, repair decisions, autotune, abort / pause / replan behavior, and manifest updates
+- **Boundary surface layer**: `kernel/long_text/chunking.py`, `kernel/long_text/merge.py`, `kernel/long_text/execution.py`
+  - exposes chunking, merge, resume, and replan command surfaces to the rest of the project
+
+This subsystem also depends on the generic runtime layer rather than reimplementing job control locally:
+
+- `kernel/task_runtime/runtime.py`
+- `kernel/task_runtime/state.py`
+- `kernel/task_runtime/controller.py`
 
 #### A. Plan and chunk contract
 
@@ -911,6 +1012,84 @@ YouTube URL
 - resume 变得可操作
 - 项目行为更像一个本地作业系统，而不是一次性脚本
 
+#### 实现锚点
+
+- `kernel/task_runtime/runtime.py`
+  - runtime ownership、command envelope，以及 append-only 的命令 telemetry
+- `kernel/task_runtime/state.py`
+  - manifest 持久化，以及 pause / cancel 控制文件和 runtime 状态汇总
+- `kernel/task_runtime/controller.py`
+  - owned mutation 包装器，以及有边界的 auto-replan 控制循环
+- `kernel/task_runtime/telemetry.py`
+  - 面向操作者的 telemetry 查询与汇总接口
+
+### 6.9 Kernel 分层：通用 Runtime 与长文本变换
+
+上面的项目分层描述的是执行顺序，但代码内部还有另一条同样重要的分层线：当前 kernel 被拆成两个职责不同的层。
+
+#### A. 通用 task-runtime 层
+
+这一层并不专属于 transcript 重写。它存在的原因是：任何长时间运行的本地作业，都需要一套共同的“运行语义”：
+
+- mutation 的独占 ownership
+- 持久化 manifest 与控制信号
+- pause / resume / cancel 语义
+- telemetry 与结果 envelope
+
+在当前仓库里，这个通用 runtime 层主要落在：
+
+- `kernel/task_runtime/runtime.py`
+- `kernel/task_runtime/state.py`
+- `kernel/task_runtime/controller.py`
+- `kernel/task_runtime/telemetry.py`
+
+这一层回答的问题是：
+
+> 不管具体在做什么任务，系统怎样表现得像一个可控制的本地作业系统？
+
+#### B. 长文本变换层
+
+这一层专门服务于项目里最难的内容问题：如何把很长、带 transcript 特征的输入，安全地变成连贯的文章式输出。
+
+它的职责包括：
+
+- chunk contract 与 control policy
+- chunking 与 prompt 组装
+- glossary 与 semantic-anchor 一致性控制
+- LLM 请求编排
+- chunk 处理、repair、replan 与 merge 行为
+
+在当前仓库里，这一层主要落在：
+
+- `kernel/long_text/contracts.py`
+- `kernel/long_text/lifecycle.py`
+- `kernel/long_text/prompting.py`
+- `kernel/long_text/llm.py`
+- `kernel/long_text/processing.py`
+- `kernel/long_text/chunking.py`
+- `kernel/long_text/merge.py`
+- `kernel/long_text/execution.py`
+- `kernel/long_text/glossary.py`
+- `kernel/long_text/semantic.py`
+- `kernel/long_text/autotune.py`
+
+这一层回答的问题是：
+
+> 给定一份长文档和一个变换目标，系统如何切分、引导、校验、恢复并重新装配整项工作？
+
+#### C. 它与 `yt_transcript_utils.py` 的关系
+
+`yt_transcript_utils.py` 仍然是主命令入口和兼容 façade，但在重构之后，它已经不再是所有核心行为的唯一承载点。
+
+它现在的角色更像：
+
+- 暴露 CLI 与仓库级命令入口
+- 连接 shell workflow 和 Python 代码
+- 把通用 runtime 相关职责委托给 `kernel/task_runtime/*`
+- 把长文本变换相关职责委托给 `kernel/long_text/*`
+
+这种拆分提升了可读性，因为阅读者可以把“项目编排”“通用运行控制”“长文本变换机制”三类问题清楚区分开。
+
 ---
 
 ## 7. 核心子系统设计：长文本变换
@@ -950,6 +1129,29 @@ YouTube URL
 - **有一致性感知**：能保护跨 chunk 的术语和高信号细节
 
 ### 7.4 长文本子系统的架构设计
+
+在讲具体逻辑之前，先把实现层次直接说清楚。
+
+#### 分层实现视图
+
+- **Contract 与 control 层**：`kernel/long_text/contracts.py`
+  - 定义 chunk contract、continuity policy、verification contract、repair policy 与 replan policy
+- **Lifecycle 与 resumability 层**：`kernel/long_text/lifecycle.py`
+  - 定义每个 chunk 的 manifest 记录、runtime 默认值，以及 resume repair 行为
+- **Prompt 与上下文组装层**：`kernel/long_text/prompting.py`、`kernel/long_text/glossary.py`、`kernel/long_text/semantic.py`
+  - 在每次 LLM 调用前准备 continuity、terminology、semantic anchor 相关上下文
+- **LLM request 层**：`kernel/long_text/llm.py`
+  - 管理 retries、timeout 行为，以及 streaming fallback
+- **Processing control 层**：`kernel/long_text/processing.py`
+  - 管理主 chunk 循环、repair 决策、autotune、abort / pause / replan 行为，以及 manifest 更新
+- **边界命令层**：`kernel/long_text/chunking.py`、`kernel/long_text/merge.py`、`kernel/long_text/execution.py`
+  - 向项目其它部分暴露 chunking、merge、resume、replan 这些命令接口
+
+同时，这个子系统不会自己重复实现一套作业控制逻辑，而是直接依赖通用 runtime 层：
+
+- `kernel/task_runtime/runtime.py`
+- `kernel/task_runtime/state.py`
+- `kernel/task_runtime/controller.py`
 
 #### A. plan 与 chunk contract
 

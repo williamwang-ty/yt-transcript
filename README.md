@@ -188,6 +188,8 @@ At a high level, `yt-transcript` is a local-first, script-first system that turn
 - short-path direct transformation or the long-text transformation subsystem
 - final assembly and quality gates
 
+The codebase mirrors that design through a two-layer kernel split: `kernel/task_runtime/*` owns generic long-running job control, while `kernel/long_text/*` owns long-text transformation behavior. `yt_transcript_utils.py` remains the main CLI and workflow façade, but it now delegates into those two layers directly.
+
 The hardest internal subsystem is long-text transformation. It activates only when the planning layer determines that the input is long enough to require chunking, continuity control, consistency protection, verification, repair / replan, and deterministic merge.
 
 [Read separate System Design Document](SYSTEM_DESIGN.md)
@@ -482,6 +484,8 @@ yt-transcript/
 - 优化计划制定
 - 短路径直接变换或进入长文本变换子系统
 - 最终装配与质量门禁
+
+代码结构也按照这套设计拆成两层 kernel：`kernel/task_runtime/*` 负责通用长程任务控制，`kernel/long_text/*` 负责长文本变换行为。`yt_transcript_utils.py` 仍然是主 CLI 和 workflow façade，但现在会直接把职责委托给这两层。
 
 其中最难的内部子系统是长文本变换。它只会在 planning 层判断输入足够长、必须进入 chunk 处理时激活，并负责 chunking、continuity、一致性保护、verification、repair / replan 与确定性 merge。
 

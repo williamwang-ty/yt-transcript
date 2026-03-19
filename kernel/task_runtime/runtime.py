@@ -1,3 +1,5 @@
+"""Generic task-runtime ownership, command envelope, and telemetry helpers."""
+
 import hashlib
 import json
 import os
@@ -16,6 +18,7 @@ RUNTIME_OWNER_FILENAME = ".runtime_owner.json"
 
 
 def _parse_int(value, default: int = 0) -> int:
+    """Parse an integer value and fall back to `default` on invalid input."""
     try:
         return int(value)
     except (TypeError, ValueError):
@@ -23,15 +26,18 @@ def _parse_int(value, default: int = 0) -> int:
 
 
 def _now_iso() -> str:
+    """Return the current local timestamp in ISO-like wall-clock format."""
     return time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime())
 
 
 def new_trace_id(command: str = "") -> str:
+    """Create a short trace ID for telemetry, ownership, and resumable runs."""
     payload = f"{command}:{time.time_ns()}:{os.getpid()}:{random.random()}"
     return hashlib.sha1(payload.encode("utf-8")).hexdigest()[:16]
 
 
 def _command_warning_count(result) -> int:
+    """Count warnings from heterogeneous command result payloads."""
     if not isinstance(result, dict):
         return 0
     if "warning_count" in result:
@@ -41,6 +47,7 @@ def _command_warning_count(result) -> int:
 
 
 def _infer_command_success(result) -> bool:
+    """Infer a normalized success flag from different command result schemas."""
     if isinstance(result, dict):
         if "success" in result:
             return bool(result.get("success"))
@@ -55,6 +62,7 @@ def _infer_command_success(result) -> bool:
 
 
 def _infer_command_document_id(command: str, result, context: dict | None = None) -> str:
+    """Infer the most stable document identifier available for telemetry."""
     context = context or {}
     if isinstance(result, dict):
         outputs = result.get("outputs", {}) if isinstance(result.get("outputs", {}), dict) else {}
@@ -80,6 +88,7 @@ def _infer_command_document_id(command: str, result, context: dict | None = None
 
 
 def resolve_command_telemetry_path(command: str, result, context: dict | None = None) -> str:
+    """Resolve the telemetry file path closest to the current command outputs."""
     del command
     context = context or {}
     candidates = []
@@ -125,9 +134,12 @@ def resolve_command_telemetry_path(command: str, result, context: dict | None = 
 def build_command_telemetry_event(command: str, result, *, trace_id: str,
                                   started_at: float, context: dict | None = None,
                                   telemetry_path: str = "") -> dict:
+    """Build the append-only telemetry event recorded for one command invocation."""
     context = context or {}
     duration_ms = max(0, int((time.monotonic() - started_at) * 1000))
     warning_count = _command_warning_count(result)
+    # Keep the base envelope stable so operators can query command history even
+    # when individual commands return slightly different result payloads.
     event = {
         "schema_version": TELEMETRY_EVENT_SCHEMA_VERSION,
         "format": TELEMETRY_EVENT_FORMAT,
@@ -160,6 +172,7 @@ def build_command_telemetry_event(command: str, result, *, trace_id: str,
 
 
 def append_command_telemetry_event(telemetry_path: str, event: dict) -> str:
+    """Append a command telemetry event to the JSONL telemetry log."""
     path_text = str(telemetry_path or "").strip()
     if not path_text:
         return ""
@@ -177,6 +190,7 @@ def build_command_result_envelope(command: str, result, *, trace_id: str = "",
                                   started_at: float | None = None,
                                   telemetry_path: str = "",
                                   context: dict | None = None) -> dict:
+    """Wrap a raw command result with trace metadata and persisted telemetry."""
     context = context or {}
     resolved_trace_id = str(trace_id or new_trace_id(command)).strip()
     started = started_at if started_at is not None else time.monotonic()
@@ -212,6 +226,7 @@ def build_command_result_envelope(command: str, result, *, trace_id: str = "",
 def run_registered_kernel_command(command: str, *, kwargs: dict,
                                   registry: dict[str, object],
                                   process_chunks_handler) -> dict:
+    """Dispatch a kernel command and normalize its telemetry envelope."""
     normalized_command = str(command or "").strip()
     started_at = time.monotonic()
     trace_id = new_trace_id(normalized_command)
@@ -239,10 +254,12 @@ def run_registered_kernel_command(command: str, *, kwargs: dict,
 
 
 def _runtime_owner_path(work_dir: str) -> Path:
+    """Return the runtime-owner marker path for a work directory."""
     return Path(str(work_dir or "")).expanduser().resolve() / RUNTIME_OWNER_FILENAME
 
 
 def _is_process_alive(pid: int) -> bool:
+    """Return whether process alive."""
     if pid <= 0:
         return False
     if pid == os.getpid():
@@ -259,6 +276,7 @@ def _is_process_alive(pid: int) -> bool:
 
 
 def _load_runtime_owner(owner_path: Path) -> tuple[dict | None, str]:
+    """Load and validate the runtime-owner record from disk."""
     try:
         payload = json.loads(owner_path.read_text(encoding="utf-8"))
     except FileNotFoundError:
@@ -274,6 +292,7 @@ def _load_runtime_owner(owner_path: Path) -> tuple[dict | None, str]:
 
 def summarize_runtime_ownership(record: dict | None, owner_path: str | Path = "",
                                 status: str = "") -> dict:
+    """Normalize an ownership record into an operator-friendly summary payload."""
     payload = record if isinstance(record, dict) else {}
     owner_file = str(owner_path or payload.get("owner_path", "")).strip()
     summary = {
@@ -297,6 +316,7 @@ def summarize_runtime_ownership(record: dict | None, owner_path: str | Path = ""
 
 
 def _classify_stale_owner(record: dict | None, read_error: str = "") -> str:
+    """Classify whether an owner record is stale and safe to recover."""
     if read_error:
         return "invalid_owner_file"
     payload = record if isinstance(record, dict) else {}
@@ -309,6 +329,7 @@ def _classify_stale_owner(record: dict | None, read_error: str = "") -> str:
 
 
 def read_runtime_ownership(work_dir: str) -> dict:
+    """Read the current ownership state for a work directory."""
     owner_path = _runtime_owner_path(work_dir)
     existing_record, read_error = _load_runtime_owner(owner_path)
     if not owner_path.exists():
@@ -349,6 +370,7 @@ def read_runtime_ownership(work_dir: str) -> dict:
 
 
 def acquire_runtime_ownership(work_dir: str, operation: str, owner_id: str = "") -> dict:
+    """Acquire exclusive ownership for a runtime mutation in `work_dir`."""
     work_path = Path(str(work_dir or "")).expanduser()
     resolved_work_dir = str(work_path.resolve())
     owner_path = Path(resolved_work_dir) / RUNTIME_OWNER_FILENAME
@@ -374,6 +396,8 @@ def acquire_runtime_ownership(work_dir: str, operation: str, owner_id: str = "")
 
     recovered_stale_owner = None
     for _ in range(3):
+        # The owner file is the durable lock record shared by all processes that
+        # may mutate the same work directory.
         owner_record = {
             "schema_version": RUNTIME_OWNERSHIP_SCHEMA_VERSION,
             "format": RUNTIME_OWNERSHIP_FORMAT,
@@ -384,6 +408,8 @@ def acquire_runtime_ownership(work_dir: str, operation: str, owner_id: str = "")
             "acquired_at": _now_iso(),
         }
         try:
+            # `O_EXCL` keeps acquisition deterministic: either we created the
+            # lock record, or another active owner already holds it.
             fd = os.open(str(owner_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
         except FileExistsError:
             existing_record, read_error = _load_runtime_owner(owner_path)
@@ -402,6 +428,8 @@ def acquire_runtime_ownership(work_dir: str, operation: str, owner_id: str = "")
 
             stale_reason = _classify_stale_owner(existing_record, read_error)
             if stale_reason:
+                # Recover only obviously stale owners so interrupted local runs
+                # do not permanently wedge the work directory.
                 stale_payload = dict(existing_record or {})
                 stale_payload["stale_reason"] = stale_reason
                 if read_error:
@@ -516,6 +544,7 @@ def acquire_runtime_ownership(work_dir: str, operation: str, owner_id: str = "")
 
 
 def release_runtime_ownership(work_dir: str, owner_id: str = "") -> dict:
+    """Release a previously acquired runtime-owner marker."""
     owner_path = _runtime_owner_path(work_dir)
     resolved_work_dir = str(owner_path.parent)
     existing_record, read_error = _load_runtime_owner(owner_path)
@@ -592,6 +621,7 @@ def release_runtime_ownership(work_dir: str, owner_id: str = "") -> dict:
 
 
 def finalize_runtime_ownership(ownership: dict | None, release_result: dict | None = None) -> dict:
+    """Attach release outcome details to an ownership summary payload."""
     if not isinstance(ownership, dict):
         return {}
     summary = dict(ownership)

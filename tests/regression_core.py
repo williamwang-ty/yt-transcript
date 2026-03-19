@@ -1,8 +1,12 @@
+"""Regression tests for core utility and text-processing behavior."""
+
 from tests._support import *
 
 
 class CoreRegressionTests(unittest.TestCase):
+    """Regression coverage for core utility and chunk-processing behavior."""
     def test_build_api_url_accepts_root_and_v1(self):
+        """Test build api url accepts root and v1."""
         self.assertEqual(
             utils._build_api_url("https://api.openai.com", "openai"),
             "https://api.openai.com/v1/chat/completions",
@@ -37,6 +41,7 @@ class CoreRegressionTests(unittest.TestCase):
         )
 
     def test_build_token_count_url_accepts_root_v1_and_messages(self):
+        """Test build token count url accepts root v1 and messages."""
         self.assertEqual(
             utils._build_token_count_url("https://api.anthropic.com", "anthropic"),
             "https://api.anthropic.com/v1/messages/count_tokens",
@@ -55,6 +60,7 @@ class CoreRegressionTests(unittest.TestCase):
         )
 
     def test_load_config_preserves_hash_inside_quotes(self):
+        """Test load config preserves hash inside quotes."""
         with tempfile.TemporaryDirectory() as tmpdir:
             config_path = Path(tmpdir) / "config.yaml"
             config_path.write_text(
@@ -69,6 +75,7 @@ class CoreRegressionTests(unittest.TestCase):
             self.assertEqual(config["llm_base_url"], "https://api.openai.com/v1")
 
     def test_chunk_text_splits_chinese_without_spaces(self):
+        """Test chunk text splits chinese without spaces."""
         with tempfile.TemporaryDirectory() as tmpdir:
             source = Path(tmpdir) / "raw.txt"
             out_dir = Path(tmpdir) / "chunks"
@@ -82,10 +89,12 @@ class CoreRegressionTests(unittest.TestCase):
             self.assertTrue(any("第四句。" in chunk for chunk in chunks))
 
     def test_split_sentences_handles_chinese_quotes(self):
+        """Test split sentences handles chinese quotes."""
         sentences = utils._split_sentences('他说："没问题。"然后离开了。下一句。')
         self.assertEqual(sentences, ['他说："没问题。"', '然后离开了。', '下一句。'])
 
     def test_split_sentences_handles_mixed_language_text(self):
+        """Test split sentences handles mixed language text."""
         sentences = utils._split_sentences("First sentence. 第二句。Third sentence! 最后一句？")
         self.assertEqual(
             sentences,
@@ -93,24 +102,29 @@ class CoreRegressionTests(unittest.TestCase):
         )
 
     def test_split_sentences_preserves_decimals(self):
+        """Test split sentences preserves decimals."""
         sentences = utils._split_sentences("Version 2.0 is live. Then we ship.")
         self.assertEqual(sentences, ["Version 2.0 is live.", "Then we ship."])
 
     def test_split_sentences_preserves_acronyms(self):
+        """Test split sentences preserves acronyms."""
         sentences = utils._split_sentences("U.S.A. is big. Next sentence.")
         self.assertEqual(sentences, ["U.S.A. is big.", "Next sentence."])
 
     def test_split_sentences_preserves_honorifics(self):
+        """Test split sentences preserves honorifics."""
         sentences = utils._split_sentences("Mr. Smith arrived. He spoke.")
         self.assertEqual(sentences, ["Mr. Smith arrived.", "He spoke."])
 
     def test_estimate_tokens_heuristic_for_common_text_shapes(self):
+        """Test estimate tokens heuristic for common text shapes."""
         self.assertAlmostEqual(utils._estimate_tokens("hello world"), 3, delta=1)
         self.assertAlmostEqual(utils._estimate_tokens("你好世界"), 4, delta=1)
         self.assertAlmostEqual(utils._estimate_tokens("Hello 世界"), 4, delta=1)
         self.assertEqual(utils._estimate_tokens("abc", mode="chars"), 3)
 
     def test_chunk_text_hard_splits_overlong_sentence(self):
+        """Test chunk text hard splits overlong sentence."""
         with tempfile.TemporaryDirectory() as tmpdir:
             source = Path(tmpdir) / "raw.txt"
             out_dir = Path(tmpdir) / "chunks"
@@ -131,6 +145,7 @@ class CoreRegressionTests(unittest.TestCase):
             self.assertEqual("".join(chunks), "甲" * 25)
 
     def test_chunk_text_preserves_content_for_deepgram_style_unpunctuated_text(self):
+        """Test chunk text preserves content for deepgram style unpunctuated text."""
         with tempfile.TemporaryDirectory() as tmpdir:
             source = Path(tmpdir) / "raw.txt"
             out_dir = Path(tmpdir) / "chunks"
@@ -151,6 +166,7 @@ class CoreRegressionTests(unittest.TestCase):
             self.assertEqual("".join(chunk.replace("\n\n", "") for chunk in chunks), text)
 
     def test_chunk_text_with_realistic_chinese_transcript_fixture(self):
+        """Test chunk text with realistic chinese transcript fixture."""
         with tempfile.TemporaryDirectory() as tmpdir:
             source = Path(tmpdir) / "raw.txt"
             out_dir = Path(tmpdir) / "chunks"
@@ -172,6 +188,7 @@ class CoreRegressionTests(unittest.TestCase):
             self.assertTrue(any("API 设计" in chunk or "OpenAI SDK" in chunk for chunk in chunks))
 
     def test_assemble_final_escapes_metadata(self):
+        """Test assemble final escapes metadata."""
         with tempfile.TemporaryDirectory() as tmpdir:
             optimized = Path(tmpdir) / "opt.txt"
             output = Path(tmpdir) / "out.md"
@@ -193,6 +210,7 @@ class CoreRegressionTests(unittest.TestCase):
             self.assertIn("# He said \"hi\"", content)
 
     def test_process_deepgram_payload_normalizes_chinese_spacing(self):
+        """Test process deepgram payload normalizes chinese spacing."""
         payload = {"results": {"channels": [{"alternatives": [{"transcript": "你 好 ！"}]}]}}
         result = utils.process_deepgram_payload(payload)
         self.assertEqual(result["transcript"], "你好！")
@@ -202,6 +220,7 @@ class CoreRegressionTests(unittest.TestCase):
         self.assertEqual(repeated_result["transcript"], "哈哈哈")
 
     def test_transcribe_deepgram_merges_chunk_outputs_and_writes_artifacts(self):
+        """Test transcribe deepgram merges chunk outputs and writes artifacts."""
         with tempfile.TemporaryDirectory() as tmpdir:
             audio_path = Path(tmpdir) / "source.mp3"
             chunk_a = Path(tmpdir) / "chunk_a.mp3"
@@ -260,6 +279,7 @@ class CoreRegressionTests(unittest.TestCase):
             self.assertEqual(result["segments_output"], str(output_segments))
 
     def test_chunk_segments_writes_timed_manifest(self):
+        """Test chunk segments writes timed manifest."""
         with tempfile.TemporaryDirectory() as tmpdir:
             segments_path = Path(tmpdir) / "segments.json"
             work_dir = Path(tmpdir) / "chunks"
@@ -304,6 +324,7 @@ class CoreRegressionTests(unittest.TestCase):
             self.assertEqual(manifest["chunks"][1]["source_segment_start"], 1)
 
     def test_parse_vtt_segments_extracts_timing_and_dedupes(self):
+        """Test parse vtt segments extracts timing and dedupes."""
         with tempfile.TemporaryDirectory() as tmpdir:
             vtt_path = Path(tmpdir) / "sub.vtt"
             vtt_path.write_text(
@@ -338,6 +359,7 @@ class CoreRegressionTests(unittest.TestCase):
             self.assertEqual(segments[1]["end_time"], 6.5)
 
     def test_cli_parse_vtt_segments_command_is_registered(self):
+        """Test cli parse vtt segments command is registered."""
         with tempfile.TemporaryDirectory() as tmpdir:
             vtt_path = Path(tmpdir) / "sub.vtt"
             vtt_path.write_text(
@@ -376,6 +398,7 @@ class CoreRegressionTests(unittest.TestCase):
             self.assertEqual(payload["segments"][0]["end_time"], 4.0)
 
     def test_chunk_segments_can_force_chapter_boundaries(self):
+        """Test chunk segments can force chapter boundaries."""
         with tempfile.TemporaryDirectory() as tmpdir:
             segments_path = Path(tmpdir) / "segments.json"
             chapters_path = Path(tmpdir) / "chapters.json"
@@ -438,6 +461,7 @@ class CoreRegressionTests(unittest.TestCase):
             self.assertEqual(manifest["chunks"][1]["end_time"], 30.0)
 
     def test_chunk_document_prefers_segments_and_writes_formal_contract(self):
+        """Test chunk document prefers segments and writes formal contract."""
         with tempfile.TemporaryDirectory() as tmpdir:
             normalized_document = Path(tmpdir) / "normalized_document.json"
             work_dir = Path(tmpdir) / "chunks"
@@ -484,6 +508,7 @@ class CoreRegressionTests(unittest.TestCase):
             self.assertEqual(manifest["chunks"][0]["start_time"], 0.0)
 
     def test_chunk_document_can_force_text_mode(self):
+        """Test chunk document can force text mode."""
         with tempfile.TemporaryDirectory() as tmpdir:
             normalized_document = Path(tmpdir) / "normalized_document.json"
             work_dir = Path(tmpdir) / "chunks"
@@ -515,6 +540,7 @@ class CoreRegressionTests(unittest.TestCase):
             self.assertNotIn("start_time", manifest["chunks"][0])
 
     def test_chunk_text_manifest_initializes_control_state(self):
+        """Test chunk text manifest initializes control state."""
         with tempfile.TemporaryDirectory() as tmpdir:
             source = Path(tmpdir) / "raw.txt"
             work_dir = Path(tmpdir) / "chunks"
@@ -530,6 +556,7 @@ class CoreRegressionTests(unittest.TestCase):
             self.assertFalse(manifest["chunks"][0]["control"]["repair_exhausted"])
 
     def test_build_chapter_plan_maps_chapters_to_timed_chunks(self):
+        """Test build chapter plan maps chapters to timed chunks."""
         with tempfile.TemporaryDirectory() as tmpdir:
             segments_path = Path(tmpdir) / "segments.json"
             work_dir = Path(tmpdir) / "chunks"
@@ -586,6 +613,7 @@ class CoreRegressionTests(unittest.TestCase):
             self.assertEqual(plan[1]["anchor_segment_id"], 1)
 
     def test_assemble_final_escapes_markdown_header_text(self):
+        """Test assemble final escapes markdown header text."""
         with tempfile.TemporaryDirectory() as tmpdir:
             optimized = Path(tmpdir) / "opt.txt"
             output = Path(tmpdir) / "out.md"
@@ -606,6 +634,7 @@ class CoreRegressionTests(unittest.TestCase):
             self.assertIn(r"[YouTube - Chan \[A\]\(B\) \#1](https://example.com/a%20path%281%29?q=%5Bx%5D#frag)", content)
 
     def test_validate_state_is_stage_aware(self):
+        """Test validate state is stage aware."""
         with tempfile.TemporaryDirectory() as tmpdir:
             state = Path(tmpdir) / "state.md"
             state.write_text(
@@ -632,6 +661,7 @@ class CoreRegressionTests(unittest.TestCase):
             self.assertTrue(any("output_file" in failure for failure in final_result["hard_failures"]))
 
     def test_validate_state_accepts_final_stage_when_output_file_present(self):
+        """Test validate state accepts final stage when output file present."""
         with tempfile.TemporaryDirectory() as tmpdir:
             state = Path(tmpdir) / "state.md"
             state.write_text(
@@ -656,6 +686,7 @@ class CoreRegressionTests(unittest.TestCase):
             self.assertTrue(result["passed"], result)
 
     def test_validate_state_materializes_machine_state_from_legacy_markdown(self):
+        """Test validate state materializes machine state from legacy markdown."""
         with tempfile.TemporaryDirectory() as tmpdir:
             state = Path(tmpdir) / "vid001_state.md"
             state.write_text(
@@ -684,6 +715,7 @@ class CoreRegressionTests(unittest.TestCase):
             self.assertEqual(payload["compat_projection"]["fields"]["title"], "Sample")
 
     def test_plan_optimization_accepts_machine_state_json_input(self):
+        """Test plan optimization accepts machine state json input."""
         with tempfile.TemporaryDirectory() as tmpdir:
             state = Path(tmpdir) / "vid001_state.md"
             state.write_text(
@@ -711,6 +743,7 @@ class CoreRegressionTests(unittest.TestCase):
             self.assertEqual(result["machine_state_path"], sync_result["machine_state_path"])
 
     def test_sync_machine_state_can_write_legacy_projection_from_json(self):
+        """Test sync machine state can write legacy projection from json."""
         with tempfile.TemporaryDirectory() as tmpdir:
             state = Path(tmpdir) / "vid001_state.md"
             state.write_text(
@@ -734,6 +767,7 @@ class CoreRegressionTests(unittest.TestCase):
             self.assertIn("vid: vid001", content)
 
     def test_normalize_document_materializes_from_raw_text_artifact(self):
+        """Test normalize document materializes from raw text artifact."""
         with tempfile.TemporaryDirectory() as tmpdir:
             state = Path(tmpdir) / "vid001_state.md"
             raw_text = Path(tmpdir) / "vid001_raw.txt"
@@ -760,6 +794,7 @@ class CoreRegressionTests(unittest.TestCase):
             self.assertEqual(payload["content"]["text"], "Line one.\n\nLine two.")
 
     def test_normalize_document_prefers_segments_artifact_when_available(self):
+        """Test normalize document prefers segments artifact when available."""
         with tempfile.TemporaryDirectory() as tmpdir:
             state = Path(tmpdir) / "vid001_state.md"
             raw_text = Path(tmpdir) / "vid001_raw.txt"
@@ -802,6 +837,7 @@ class CoreRegressionTests(unittest.TestCase):
             self.assertEqual(machine_payload["normalization"]["source_adapter"], "segments_json")
 
     def test_plan_optimization_materializes_normalized_document_when_artifact_exists(self):
+        """Test plan optimization materializes normalized document when artifact exists."""
         with tempfile.TemporaryDirectory() as tmpdir:
             state = Path(tmpdir) / "vid001_state.md"
             raw_text = Path(tmpdir) / "vid001_raw.txt"
@@ -832,6 +868,7 @@ class CoreRegressionTests(unittest.TestCase):
             self.assertEqual(result["outputs"]["normalized_document"], result["normalization"]["normalized_document_path"])
 
     def test_plan_optimization_reports_chunk_document_contract(self):
+        """Test plan optimization reports chunk document contract."""
         with tempfile.TemporaryDirectory() as tmpdir:
             state = Path(tmpdir) / "vid001_state.md"
             raw_text = Path(tmpdir) / "vid001_raw.txt"
@@ -864,6 +901,7 @@ work_dir: /tmp/vid001_chunks
             self.assertEqual(result["chunking"]["continuity_mode"], "reference_only")
 
     def test_plan_optimization_returns_short_bilingual_operations(self):
+        """Test plan optimization returns short bilingual operations."""
         with tempfile.TemporaryDirectory() as tmpdir:
             state = Path(tmpdir) / "state.md"
             state.write_text(
@@ -893,6 +931,7 @@ work_dir: /tmp/vid001_chunks
             self.assertTrue(all(not op["execution"]["supports_auto_replan"] for op in result["operations"]))
 
     def test_plan_optimization_returns_long_deepgram_operations(self):
+        """Test plan optimization returns long deepgram operations."""
         with tempfile.TemporaryDirectory() as tmpdir:
             state = Path(tmpdir) / "state.md"
             state.write_text(
@@ -928,6 +967,7 @@ work_dir: /tmp/vid001_chunks
             self.assertEqual(result["quality_contract"]["stop_rule"], "hard_failures_stop")
 
     def test_plan_optimization_marks_processed_path_chunk_stage_for_manual_review(self):
+        """Test plan optimization marks processed path chunk stage for manual review."""
         with tempfile.TemporaryDirectory() as tmpdir:
             state = Path(tmpdir) / "state.md"
             state.write_text(
@@ -959,6 +999,7 @@ work_dir: /tmp/vid001_chunks
             self.assertEqual(result["operations"][1]["control"]["quality_gate"]["hard_failure_checks"][-1]["id"], "bilingual_pairs")
 
     def test_cli_api_envelope_wraps_plan_optimization(self):
+        """Test cli api envelope wraps plan optimization."""
         with tempfile.TemporaryDirectory() as tmpdir:
             state = Path(tmpdir) / "state.md"
             work_dir = Path(tmpdir) / "vid001_chunks"
@@ -1005,6 +1046,7 @@ work_dir: /tmp/vid001_chunks
             self.assertEqual(event["trace_id"], payload["trace_id"])
 
     def test_load_config_parses_llm_tuning_fields(self):
+        """Test load config parses llm tuning fields."""
         with tempfile.TemporaryDirectory() as tmpdir:
             config_path = Path(tmpdir) / "config.yaml"
             config_path.write_text(
@@ -1028,6 +1070,7 @@ work_dir: /tmp/vid001_chunks
             self.assertEqual(config["llm_stop_after_consecutive_timeouts"], 4)
 
     def test_load_config_parses_chunk_tuning_fields(self):
+        """Test load config parses chunk tuning fields."""
         with tempfile.TemporaryDirectory() as tmpdir:
             config_path = Path(tmpdir) / "config.yaml"
             config_path.write_text(
@@ -1090,6 +1133,7 @@ work_dir: /tmp/vid001_chunks
             self.assertEqual(config["autotune_canary_chunks"], 4)
 
     def test_load_config_invalid_chunk_values_fall_back(self):
+        """Test load config invalid chunk values fall back."""
         with tempfile.TemporaryDirectory() as tmpdir:
             config_path = Path(tmpdir) / "config.yaml"
             config_path.write_text(
@@ -1141,6 +1185,7 @@ work_dir: /tmp/vid001_chunks
             self.assertIn("autotune_reduce_percent='1.2'", warning_output)
 
     def test_chunk_text_uses_token_aware_default_budget(self):
+        """Test chunk text uses token aware default budget."""
         with tempfile.TemporaryDirectory() as tmpdir:
             source = Path(tmpdir) / "raw.txt"
             out_dir = Path(tmpdir) / "chunks"
@@ -1156,6 +1201,7 @@ work_dir: /tmp/vid001_chunks
             self.assertGreater(result["total_chunks"], 1)
 
     def test_chunk_text_chars_mode_preserves_legacy_prompt_default(self):
+        """Test chunk text chars mode preserves legacy prompt default."""
         with tempfile.TemporaryDirectory() as tmpdir:
             source = Path(tmpdir) / "raw.txt"
             out_dir = Path(tmpdir) / "chunks"
@@ -1175,6 +1221,7 @@ work_dir: /tmp/vid001_chunks
             self.assertEqual(manifest["recommended_chunk_size"], 4000)
 
     def test_chunk_text_varies_by_prompt_in_token_mode(self):
+        """Test chunk text varies by prompt in token mode."""
         with tempfile.TemporaryDirectory() as tmpdir:
             source = Path(tmpdir) / "raw.txt"
             structure_dir = Path(tmpdir) / "structure"
@@ -1190,6 +1237,7 @@ work_dir: /tmp/vid001_chunks
             self.assertGreater(structure_result["total_chunks"], summary_result["total_chunks"])
 
     def test_chunk_text_explicit_size_without_prompt_uses_legacy_char_sizing(self):
+        """Test chunk text explicit size without prompt uses legacy char sizing."""
         with tempfile.TemporaryDirectory() as tmpdir:
             source = Path(tmpdir) / "raw.txt"
             out_dir = Path(tmpdir) / "chunks"
@@ -1205,6 +1253,7 @@ work_dir: /tmp/vid001_chunks
             self.assertEqual([len(chunk) for chunk in chunks], [10, 10, 5])
 
     def test_chunk_text_missing_explicit_config_path_fails_fast(self):
+        """Test chunk text missing explicit config path fails fast."""
         with tempfile.TemporaryDirectory() as tmpdir:
             source = Path(tmpdir) / "raw.txt"
             out_dir = Path(tmpdir) / "chunks"
@@ -1214,6 +1263,7 @@ work_dir: /tmp/vid001_chunks
                 utils.chunk_text(str(source), str(out_dir), 0, "structure_only", "/no/such/config.yaml")
 
     def test_chunk_text_unknown_prompt_fails_fast(self):
+        """Test chunk text unknown prompt fails fast."""
         with tempfile.TemporaryDirectory() as tmpdir:
             source = Path(tmpdir) / "raw.txt"
             out_dir = Path(tmpdir) / "chunks"
@@ -1223,6 +1273,7 @@ work_dir: /tmp/vid001_chunks
                 utils.chunk_text(str(source), str(out_dir), 0, "not_a_prompt")
 
     def test_chunk_text_rejects_prompt_path_traversal(self):
+        """Test chunk text rejects prompt path traversal."""
         with tempfile.TemporaryDirectory() as tmpdir:
             source = Path(tmpdir) / "raw.txt"
             out_dir = Path(tmpdir) / "chunks"
@@ -1232,6 +1283,7 @@ work_dir: /tmp/vid001_chunks
                 utils.chunk_text(str(source), str(out_dir), 0, "../CODE_REVIEW")
 
     def test_calculate_chunk_budget_varies_by_prompt_and_override(self):
+        """Test calculate chunk budget varies by prompt and override."""
         default_config = utils._default_config_values()
         structure_prompt = (PROJECT_ROOT / "prompts" / "structure_only.md").read_text(encoding="utf-8")
         summary_prompt = (PROJECT_ROOT / "prompts" / "summarize.md").read_text(encoding="utf-8")
@@ -1256,6 +1308,7 @@ work_dir: /tmp/vid001_chunks
         self.assertEqual(utils._get_task_chunk_target("structure_only", override_config), 777)
 
     def test_calculate_chunk_budget_reserves_continuity_context(self):
+        """Test calculate chunk budget reserves continuity context."""
         structure_prompt = (PROJECT_ROOT / "prompts" / "structure_only.md").read_text(encoding="utf-8")
         with_continuity = utils._default_config_values()
         without_continuity = utils._default_config_values()
@@ -1270,15 +1323,18 @@ work_dir: /tmp/vid001_chunks
         self.assertLess(budget_with["target_tokens"], budget_without["target_tokens"])
 
     def test_inject_continuity_context_appends_when_no_anchor(self):
+        """Test inject continuity context appends when no anchor."""
         result = utils._inject_continuity_context("Prompt header", "## Continuity Context\ncontext")
         self.assertEqual(result, "Prompt header\n\n## Continuity Context\ncontext\n")
 
     def test_truncate_tail_text_to_tokens_handles_boundary_cases(self):
+        """Test truncate tail text to tokens handles boundary cases."""
         self.assertEqual(utils._truncate_tail_text_to_tokens("", 10), "")
         self.assertEqual(utils._truncate_tail_text_to_tokens(" 甲乙 ", 0), "甲乙")
         self.assertEqual(utils._truncate_tail_text_to_tokens("甲乙丙丁", 2), "丙丁")
 
     def test_call_llm_api_retries_timeout_then_succeeds(self):
+        """Test call llm api retries timeout then succeeds."""
         with mock.patch.object(utils, "_execute_llm_request") as mocked_request, mock.patch("time.sleep"):
             mocked_request.side_effect = [
                 utils.LLMRequestError("timeout", error_type="timeout", retryable=True, request_url="https://api.example.com/v1/chat/completions"),
@@ -1300,6 +1356,7 @@ work_dir: /tmp/vid001_chunks
             self.assertEqual(mocked_request.call_count, 2)
 
     def test_execute_llm_request_marks_remote_disconnect_retryable(self):
+        """Test execute llm request marks remote disconnect retryable."""
         remote_error = urllib.error.URLError(
             http.client.RemoteDisconnected("Remote end closed connection without response")
         )
@@ -1317,6 +1374,7 @@ work_dir: /tmp/vid001_chunks
         self.assertTrue(ctx.exception.retryable)
 
     def test_call_llm_api_fails_fast_on_http_400(self):
+        """Test call llm api fails fast on http 400."""
         with mock.patch.object(utils, "_execute_llm_request") as mocked_request, mock.patch("time.sleep"):
             mocked_request.side_effect = utils.LLMRequestError(
                 "bad request",
@@ -1337,6 +1395,7 @@ work_dir: /tmp/vid001_chunks
             self.assertEqual(mocked_request.call_count, 1)
 
     def test_merge_content_supports_multiple_chapters_per_chunk(self):
+        """Test merge content supports multiple chapters per chunk."""
         with tempfile.TemporaryDirectory() as tmpdir:
             work_dir = Path(tmpdir) / "chunks"
             output_file = Path(tmpdir) / "merged.md"
@@ -1378,6 +1437,7 @@ work_dir: /tmp/vid001_chunks
             self.assertIn("## 乙", merged_text)
 
     def test_test_llm_api_returns_probe_metadata(self):
+        """Test test llm api returns probe metadata."""
         with mock.patch.object(utils, "load_config", return_value={
             "llm_api_key": "key",
             "llm_base_url": "https://api.example.com",
@@ -1401,6 +1461,7 @@ work_dir: /tmp/vid001_chunks
         self.assertTrue(result["streaming_used"])
 
     def test_test_llm_api_can_run_from_explicit_overrides_without_config(self):
+        """Test test llm api can run from explicit overrides without config."""
         with mock.patch.object(utils, "load_config", side_effect=AssertionError("explicit overrides should not require load_config")), mock.patch.object(
             utils,
             "_load_optional_config",
@@ -1423,6 +1484,7 @@ work_dir: /tmp/vid001_chunks
         self.assertEqual(result["request_url"], "https://api.example.com/v1/chat/completions")
 
     def test_count_tokens_via_provider_uses_anthropic_endpoint(self):
+        """Test count tokens via provider uses anthropic endpoint."""
         config = utils._default_config_values()
         config.update({
             "enable_token_count_probe": True,
@@ -1435,16 +1497,21 @@ work_dir: /tmp/vid001_chunks
         requests = []
 
         class FakeResponse:
+            """Minimal fake HTTP response used by regression tests."""
             def __enter__(self):
+                """Enter."""
                 return self
 
             def __exit__(self, exc_type, exc, tb):
+                """Exit."""
                 return False
 
             def read(self):
+                """Read."""
                 return b'{"input_tokens": 7}'
 
         def fake_urlopen(req, timeout=0):
+            """Fake urlopen."""
             requests.append((req.full_url, timeout, req.data.decode("utf-8")))
             return FakeResponse()
 
@@ -1459,6 +1526,7 @@ work_dir: /tmp/vid001_chunks
         self.assertIn('"model": "claude-demo"', requests[0][2])
 
     def test_count_tokens_via_provider_http_error_falls_back_cleanly(self):
+        """Test count tokens via provider http error falls back cleanly."""
         import urllib.error
 
         config = utils._default_config_values()
@@ -1488,6 +1556,7 @@ work_dir: /tmp/vid001_chunks
         self.assertGreater(result["token_count"], 0)
 
     def test_count_tokens_via_provider_network_error_falls_back_cleanly(self):
+        """Test count tokens via provider network error falls back cleanly."""
         import urllib.error
 
         config = utils._default_config_values()
@@ -1509,6 +1578,7 @@ work_dir: /tmp/vid001_chunks
         self.assertIn("dns failed", result["error"])
 
     def test_count_tokens_via_provider_timeout_falls_back_cleanly(self):
+        """Test count tokens via provider timeout falls back cleanly."""
         import socket
 
         config = utils._default_config_values()
@@ -1530,6 +1600,7 @@ work_dir: /tmp/vid001_chunks
         self.assertIn("probe timed out", result["error"])
 
     def test_test_token_count_falls_back_to_local_estimate(self):
+        """Test test token count falls back to local estimate."""
         with mock.patch.object(utils, "load_config", return_value={
             "enable_token_count_probe": True,
             "llm_api_key": "key",
@@ -1547,6 +1618,7 @@ work_dir: /tmp/vid001_chunks
         self.assertGreater(result["token_count"], 0)
 
     def test_test_token_count_can_run_from_explicit_overrides_without_config(self):
+        """Test test token count can run from explicit overrides without config."""
         with mock.patch.object(utils, "load_config", side_effect=AssertionError("explicit overrides should not require load_config")), mock.patch.object(
             utils,
             "_load_optional_config",

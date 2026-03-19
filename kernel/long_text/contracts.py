@@ -1,23 +1,30 @@
+"""Machine-readable contracts and control-state builders for long-text runs."""
+
 import random
 import time
 
 
 def _utils():
+    """Import and return the main utility module for delegated helpers."""
     import yt_transcript_utils as utils
 
     return utils
 
 
 def new_plan_id() -> str:
+    """Create a stable plan ID for one planning or replanning pass."""
     return f"plan_{time.strftime('%Y%m%d%H%M%S', time.localtime())}_{random.randint(1000, 9999)}"
 
 
 def build_manifest_chunk_contract(source_kind: str = "text", *, driver: str = "",
                                   normalized_document_path: str = "", source_adapter: str = "",
                                   has_timing: bool = False, chapters_enabled: bool = False) -> dict:
+    """Build the chunk-boundary contract that later processing must obey."""
     utils = _utils()
     normalized_source_kind = "segments" if str(source_kind).strip() == "segments" else "text"
     default_driver = "chunk-segments" if normalized_source_kind == "segments" else "chunk-text"
+    # This contract makes merge predictable: context may be shown to the model,
+    # but only the current chunk body may appear in the output.
     return {
         "version": utils.CHUNK_CONTRACT_SCHEMA_VERSION,
         "driver": str(driver or default_driver).strip(),
@@ -36,6 +43,7 @@ def build_manifest_chunk_contract(source_kind: str = "text", *, driver: str = ""
 
 def build_manifest_continuity_policy(config: dict | None = None, *, tail_sentences: int | None = None,
                                      summary_token_cap: int | None = None) -> dict:
+    """Build the reference-only continuity policy carried across chunk boundaries."""
     utils = _utils()
     config = config or {}
     resolved_tail_sentences = max(
@@ -76,7 +84,10 @@ def build_manifest_plan(prompt_name: str, chunk_mode: str, recommended_chunk_siz
                         plan_id: str = "", prior_plan_id: str = "",
                         chunk_contract: dict | None = None,
                         continuity_policy: dict | None = None) -> dict:
+    """Build the normalized manifest plan shared by chunking and execution."""
     utils = _utils()
+    # The plan records the budget and boundary assumptions that all later retry,
+    # repair, merge, and resume behavior must continue to respect.
     return {
         "plan_id": plan_id or new_plan_id(),
         "prior_plan_id": prior_plan_id,
@@ -103,15 +114,18 @@ def build_manifest_plan(prompt_name: str, chunk_mode: str, recommended_chunk_siz
 
 
 def normalize_operation_input_key(input_key: str = "") -> str:
+    """Normalize operation input key."""
     normalized = str(input_key or "").strip()
     return normalized or "raw_path"
 
 
 def resolve_replan_action(input_key: str = "") -> str:
+    """Resolve the default action when the current plan becomes invalid."""
     return "auto_replan_remaining" if normalize_operation_input_key(input_key) == "raw_path" else "stop_and_review"
 
 
 def build_quality_gate_contract(*, bilingual: bool = False) -> dict:
+    """Build deterministic quality checks for the final assembled output."""
     utils = _utils()
     hard_failure_checks = [
         {"id": "file_exists", "severity": "hard_failure"},
@@ -161,6 +175,7 @@ def build_quality_gate_contract(*, bilingual: bool = False) -> dict:
 
 
 def build_chunk_verification_contract(prompt_name: str, *, applicable: bool = True) -> dict:
+    """Build retryable chunk-level verification checks for one prompt family."""
     utils = _utils()
     if not applicable:
         return {
@@ -202,6 +217,7 @@ def build_chunk_verification_contract(prompt_name: str, *, applicable: bool = Tr
 
 
 def build_repair_contract(prompt_name: str, config: dict | None = None, *, applicable: bool = True) -> dict:
+    """Build the bounded retry policy used after chunk-level verification warnings."""
     utils = _utils()
     config = config or {}
     if not applicable:
@@ -237,6 +253,7 @@ def build_repair_contract(prompt_name: str, config: dict | None = None, *, appli
 def build_replan_contract(input_key: str = "raw_path", *, applicable: bool = True,
                           canary_chunks: int = 0,
                           max_auto_replans: int | None = None) -> dict:
+    """Build the policy that decides when a whole plan must be regenerated."""
     utils = _utils()
     if not applicable:
         return {
@@ -290,6 +307,7 @@ def build_operation_control_contract(kind: str, prompt_name: str, *,
                                      config: dict | None = None,
                                      bilingual: bool = False,
                                      max_auto_replans: int | None = None) -> dict:
+    """Bundle verification, repair, replan, and quality-gate policy for an operation."""
     utils = _utils()
     config = config or {}
     is_chunk = kind == "chunk"
@@ -315,6 +333,9 @@ def build_operation_control_contract(kind: str, prompt_name: str, *,
 
 
 def build_runtime_control_state() -> dict:
+    """Build mutable runtime-control counters shared across chunk execution."""
+    # Runtime control fields summarize cross-chunk control flow rather than any
+    # one chunk's local output quality.
     return {
         "verification_warning_count": 0,
         "repair_attempted_count": 0,
@@ -330,6 +351,7 @@ def build_runtime_control_state() -> dict:
 
 
 def ensure_runtime_control_state(runtime: dict) -> dict:
+    """Ensure the runtime payload contains the expected control-state fields."""
     control = runtime.get("control")
     if not isinstance(control, dict):
         control = build_runtime_control_state()
@@ -348,6 +370,9 @@ def ensure_runtime_control_state(runtime: dict) -> dict:
 
 
 def build_chunk_control_state() -> dict:
+    """Build per-chunk control fields used by verification and repair logic."""
+    # Chunk control fields stay local to one chunk so resume and verification
+    # can reason about that chunk without scanning the full attempt history.
     return {
         "verification_status": "pending",
         "warning_count": 0,
@@ -359,6 +384,7 @@ def build_chunk_control_state() -> dict:
 
 
 def ensure_chunk_control_state(chunk_info: dict) -> dict:
+    """Ensure a chunk manifest entry contains the expected control-state fields."""
     control = chunk_info.get("control")
     if not isinstance(control, dict):
         control = build_chunk_control_state()
@@ -374,6 +400,7 @@ def ensure_chunk_control_state(chunk_info: dict) -> dict:
 
 def record_chunk_verification(chunk_info: dict, *, status: str, warnings: list[str],
                               retry_reasons: list[str], repair_exhausted: bool = False) -> None:
+    """Record chunk-level verification outcomes back into the manifest entry."""
     utils = _utils()
     control = ensure_chunk_control_state(chunk_info)
     control["verification_status"] = str(status or "pending")
@@ -387,6 +414,7 @@ def record_chunk_verification(chunk_info: dict, *, status: str, warnings: list[s
 def classify_replan_trigger(error: Exception | None = None, *,
                             had_timeout_retry: bool = False,
                             autotune_last_event: str = "") -> str:
+    """Classify why the current plan should stop and be regenerated."""
     utils = _utils()
     if had_timeout_retry:
         return "timeout_retry_instability"
@@ -411,6 +439,7 @@ def classify_replan_trigger(error: Exception | None = None, *,
 
 def mark_runtime_replan(runtime: dict, *, reason: str, trigger: str,
                         input_key: str, chunk_id: int | None = None) -> None:
+    """Mark the runtime as requiring replanning before further chunk execution."""
     runtime["replan_required"] = True
     runtime["replan_reason"] = str(reason or "").strip()
     control = ensure_runtime_control_state(runtime)
@@ -420,6 +449,7 @@ def mark_runtime_replan(runtime: dict, *, reason: str, trigger: str,
 
 
 def build_process_control_summary(runtime: dict, operation_control: dict) -> dict:
+    """Build an operator-facing summary of control-state outcomes for a run."""
     runtime_control = ensure_runtime_control_state(runtime)
     replan_contract = operation_control.get("replan", {}) if isinstance(operation_control.get("replan", {}), dict) else {}
     repair_contract = operation_control.get("repair", {}) if isinstance(operation_control.get("repair", {}), dict) else {}
@@ -459,7 +489,10 @@ def build_process_control_summary(runtime: dict, operation_control: dict) -> dic
 
 
 def build_manifest_runtime(plan_id: str, request_url: str = "") -> dict:
+    """Build the top-level runtime payload stored in `manifest.json`."""
     utils = _utils()
+    # This runtime payload is the durable document-level status record. It lets
+    # resume, pause, cancellation, and replan logic cooperate on disk.
     return {
         "status": "pending",
         "active_plan_id": plan_id,

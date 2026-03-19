@@ -1,8 +1,12 @@
+"""Regression tests for runtime control and long-text execution behavior."""
+
 from tests._support import *
 
 
 class RuntimeRegressionTests(unittest.TestCase):
+    """Regression coverage for runtime ownership, pause, resume, and replan behavior."""
     def test_run_kernel_command_returns_envelope_and_writes_telemetry(self):
+        """Test run kernel command returns envelope and writes telemetry."""
         with tempfile.TemporaryDirectory() as tmpdir:
             source = Path(tmpdir) / "raw.txt"
             work_dir = Path(tmpdir) / "chunks"
@@ -31,6 +35,7 @@ class RuntimeRegressionTests(unittest.TestCase):
             self.assertEqual(envelope["result"]["driver"], "chunk-text")
 
     def test_telemetry_summary_reads_local_journal(self):
+        """Test telemetry summary reads local journal."""
         with tempfile.TemporaryDirectory() as tmpdir:
             source = Path(tmpdir) / "raw.txt"
             work_dir = Path(tmpdir) / "chunks"
@@ -58,6 +63,7 @@ class RuntimeRegressionTests(unittest.TestCase):
             self.assertEqual(len(result["recent_events"]), 2)
 
     def test_telemetry_events_filter_by_command_and_limit(self):
+        """Test telemetry events filter by command and limit."""
         with tempfile.TemporaryDirectory() as tmpdir:
             source = Path(tmpdir) / "raw.txt"
             work_dir = Path(tmpdir) / "chunks"
@@ -94,6 +100,7 @@ class RuntimeRegressionTests(unittest.TestCase):
             self.assertEqual(result["events"][0]["command"], "pause-run")
 
     def test_cli_api_envelope_wraps_telemetry_summary(self):
+        """Test cli api envelope wraps telemetry summary."""
         with tempfile.TemporaryDirectory() as tmpdir:
             source = Path(tmpdir) / "raw.txt"
             work_dir = Path(tmpdir) / "chunks"
@@ -129,6 +136,7 @@ class RuntimeRegressionTests(unittest.TestCase):
             self.assertGreaterEqual(payload["result"]["summary"]["matching_event_count"], 1)
 
     def test_build_glossary_extracts_terms_from_work_dir(self):
+        """Test build glossary extracts terms from work dir."""
         with tempfile.TemporaryDirectory() as tmpdir:
             source = Path(tmpdir) / "raw.txt"
             work_dir = Path(tmpdir) / "chunks"
@@ -146,6 +154,7 @@ class RuntimeRegressionTests(unittest.TestCase):
             self.assertIn("Deepgram", terms)
 
     def test_process_chunks_injects_glossary_terms_into_prompt(self):
+        """Test process chunks injects glossary terms into prompt."""
         with tempfile.TemporaryDirectory() as tmpdir:
             source = Path(tmpdir) / "raw.txt"
             work_dir = Path(tmpdir) / "chunks"
@@ -164,6 +173,7 @@ class RuntimeRegressionTests(unittest.TestCase):
             captured = {}
 
             def fake_llm(*args, **kwargs):
+                """Fake llm."""
                 captured["prompt"] = kwargs["messages"][0]["content"]
                 return {
                     "text": "## 结果\n\nOpenAI API 设计。",
@@ -187,6 +197,7 @@ class RuntimeRegressionTests(unittest.TestCase):
             self.assertEqual(result["glossary"]["mode"], "local_file")
 
     def test_process_chunks_retries_when_glossary_terms_are_missing(self):
+        """Test process chunks retries when glossary terms are missing."""
         with tempfile.TemporaryDirectory() as tmpdir:
             source = Path(tmpdir) / "raw.txt"
             work_dir = Path(tmpdir) / "chunks"
@@ -235,6 +246,7 @@ class RuntimeRegressionTests(unittest.TestCase):
             self.assertIn("OpenAI API", output)
 
     def test_process_chunks_injects_semantic_anchor_guardrails(self):
+        """Test process chunks injects semantic anchor guardrails."""
         with tempfile.TemporaryDirectory() as tmpdir:
             source = Path(tmpdir) / "raw.txt"
             work_dir = Path(tmpdir) / "chunks"
@@ -252,6 +264,7 @@ class RuntimeRegressionTests(unittest.TestCase):
             captured = {}
 
             def fake_llm(*args, **kwargs):
+                """Fake llm."""
                 captured["prompt"] = kwargs["messages"][0]["content"]
                 return {
                     "text": "## 结果\n\n访问 https://example.com 于 2026-03-08 完成 32% 进度。",
@@ -276,6 +289,7 @@ class RuntimeRegressionTests(unittest.TestCase):
             self.assertEqual(result["semantic_verification"]["mode"], "anchor_checks")
 
     def test_process_chunks_retries_when_semantic_anchor_missing(self):
+        """Test process chunks retries when semantic anchor missing."""
         with tempfile.TemporaryDirectory() as tmpdir:
             source = Path(tmpdir) / "raw.txt"
             work_dir = Path(tmpdir) / "chunks"
@@ -322,6 +336,7 @@ class RuntimeRegressionTests(unittest.TestCase):
             self.assertIn("32%", (work_dir / manifest["chunks"][0]["processed_path"]).read_text(encoding="utf-8"))
 
     def test_verify_quality_reports_missing_semantic_anchors(self):
+        """Test verify quality reports missing semantic anchors."""
         with tempfile.TemporaryDirectory() as tmpdir:
             raw = Path(tmpdir) / "raw.txt"
             optimized = Path(tmpdir) / "optimized.txt"
@@ -335,6 +350,7 @@ class RuntimeRegressionTests(unittest.TestCase):
             self.assertTrue(any("Semantic anchors" in warning for warning in result["warnings"]))
 
     def test_verify_quality_rejects_missing_structure(self):
+        """Test verify quality rejects missing structure."""
         with tempfile.TemporaryDirectory() as tmpdir:
             optimized = Path(tmpdir) / "opt.md"
             raw = Path(tmpdir) / "raw.txt"
@@ -347,6 +363,7 @@ class RuntimeRegressionTests(unittest.TestCase):
             self.assertTrue(any("section headers" in failure for failure in result["hard_failures"]))
 
     def test_verify_quality_checks_bilingual_pairs(self):
+        """Test verify quality checks bilingual pairs."""
         with tempfile.TemporaryDirectory() as tmpdir:
             optimized = Path(tmpdir) / "opt.md"
             raw = Path(tmpdir) / "raw.txt"
@@ -366,6 +383,7 @@ class RuntimeRegressionTests(unittest.TestCase):
             self.assertGreaterEqual(result["checks"]["bilingual_pairs"], 1)
 
     def test_verify_quality_rejects_bilingual_without_pairs(self):
+        """Test verify quality rejects bilingual without pairs."""
         with tempfile.TemporaryDirectory() as tmpdir:
             optimized = Path(tmpdir) / "opt.md"
             raw = Path(tmpdir) / "raw.txt"
@@ -383,6 +401,7 @@ class RuntimeRegressionTests(unittest.TestCase):
             self.assertTrue(any("paragraph pairs" in failure for failure in result["hard_failures"]))
 
     def test_verify_quality_passes_when_only_warnings_exist(self):
+        """Test verify quality passes when only warnings exist."""
         with tempfile.TemporaryDirectory() as tmpdir:
             optimized = Path(tmpdir) / "opt.md"
             raw = Path(tmpdir) / "raw.txt"
@@ -401,6 +420,7 @@ class RuntimeRegressionTests(unittest.TestCase):
             self.assertTrue(result["warnings"])
 
     def test_process_chunks_dry_run_does_not_require_llm_credentials(self):
+        """Test process chunks dry run does not require llm credentials."""
         with tempfile.TemporaryDirectory() as tmpdir:
             source = Path(tmpdir) / "raw.txt"
             work_dir = Path(tmpdir) / "chunks"
@@ -427,6 +447,7 @@ class RuntimeRegressionTests(unittest.TestCase):
             self.assertEqual(result["request_url"], "")
 
     def test_runtime_status_reports_manifest_runtime_ownership_and_counts(self):
+        """Test runtime status reports manifest runtime ownership and counts."""
         with tempfile.TemporaryDirectory() as tmpdir:
             source = Path(tmpdir) / "raw.txt"
             work_dir = Path(tmpdir) / "chunks"
@@ -457,6 +478,7 @@ class RuntimeRegressionTests(unittest.TestCase):
             self.assertFalse(result["cancellation"]["requested"])
 
     def test_cancel_run_marks_runtime_cancel_request(self):
+        """Test cancel run marks runtime cancel request."""
         with tempfile.TemporaryDirectory() as tmpdir:
             source = Path(tmpdir) / "raw.txt"
             work_dir = Path(tmpdir) / "chunks"
@@ -473,6 +495,7 @@ class RuntimeRegressionTests(unittest.TestCase):
             self.assertEqual(status["cancellation"]["reason"], "user requested stop")
 
     def test_process_chunks_aborts_when_cancel_requested(self):
+        """Test process chunks aborts when cancel requested."""
         with tempfile.TemporaryDirectory() as tmpdir:
             source = Path(tmpdir) / "raw.txt"
             work_dir = Path(tmpdir) / "chunks"
@@ -506,6 +529,7 @@ class RuntimeRegressionTests(unittest.TestCase):
             self.assertEqual(manifest["runtime"]["last_cancel_reason"], "operator stop")
 
     def test_pause_run_marks_runtime_pause_request(self):
+        """Test pause run marks runtime pause request."""
         with tempfile.TemporaryDirectory() as tmpdir:
             source = Path(tmpdir) / "raw.txt"
             work_dir = Path(tmpdir) / "chunks"
@@ -522,6 +546,7 @@ class RuntimeRegressionTests(unittest.TestCase):
             self.assertEqual(status["pause"]["reason"], "operator requested pause")
 
     def test_process_chunks_pauses_when_pause_requested(self):
+        """Test process chunks pauses when pause requested."""
         with tempfile.TemporaryDirectory() as tmpdir:
             source = Path(tmpdir) / "raw.txt"
             work_dir = Path(tmpdir) / "chunks"
@@ -555,6 +580,7 @@ class RuntimeRegressionTests(unittest.TestCase):
             self.assertEqual(manifest["runtime"]["last_pause_reason"], "operator pause")
 
     def test_process_chunks_pauses_at_safe_boundary_between_chunks(self):
+        """Test process chunks pauses at safe boundary between chunks."""
         with tempfile.TemporaryDirectory() as tmpdir:
             source = Path(tmpdir) / "raw.txt"
             work_dir = Path(tmpdir) / "chunks"
@@ -572,6 +598,7 @@ class RuntimeRegressionTests(unittest.TestCase):
             seen_calls = 0
 
             def fake_llm(*args, **kwargs):
+                """Fake llm."""
                 nonlocal seen_calls
                 seen_calls += 1
                 if seen_calls == 1:
@@ -601,6 +628,7 @@ class RuntimeRegressionTests(unittest.TestCase):
             self.assertTrue(any(chunk["status"] == "pending" for chunk in manifest["chunks"][1:]))
 
     def test_resume_run_clears_pause_and_marks_runtime_resumable(self):
+        """Test resume run clears pause and marks runtime resumable."""
         with tempfile.TemporaryDirectory() as tmpdir:
             source = Path(tmpdir) / "raw.txt"
             work_dir = Path(tmpdir) / "chunks"
@@ -625,6 +653,7 @@ class RuntimeRegressionTests(unittest.TestCase):
             self.assertEqual(manifest_after["runtime"]["last_resume_reason"], "continue")
 
     def test_cli_api_envelope_wraps_pause_and_resume_run(self):
+        """Test cli api envelope wraps pause and resume run."""
         with tempfile.TemporaryDirectory() as tmpdir:
             source = Path(tmpdir) / "raw.txt"
             work_dir = Path(tmpdir) / "chunks"
@@ -654,6 +683,7 @@ class RuntimeRegressionTests(unittest.TestCase):
             self.assertTrue(resume_envelope["result"]["resumed"])
 
     def test_cli_api_envelope_wraps_cancel_run(self):
+        """Test cli api envelope wraps cancel run."""
         with tempfile.TemporaryDirectory() as tmpdir:
             source = Path(tmpdir) / "raw.txt"
             work_dir = Path(tmpdir) / "chunks"
@@ -686,6 +716,7 @@ class RuntimeRegressionTests(unittest.TestCase):
             self.assertTrue(telemetry_path.exists())
 
     def test_cli_api_envelope_wraps_runtime_status(self):
+        """Test cli api envelope wraps runtime status."""
         with tempfile.TemporaryDirectory() as tmpdir:
             source = Path(tmpdir) / "raw.txt"
             work_dir = Path(tmpdir) / "chunks"
@@ -715,6 +746,7 @@ class RuntimeRegressionTests(unittest.TestCase):
             self.assertTrue(telemetry_path.exists())
 
     def test_process_chunks_skips_done_chunks_by_default(self):
+        """Test process chunks skips done chunks by default."""
         with tempfile.TemporaryDirectory() as tmpdir:
             source = Path(tmpdir) / "raw.txt"
             work_dir = Path(tmpdir) / "chunks"
@@ -745,6 +777,7 @@ class RuntimeRegressionTests(unittest.TestCase):
             mocked_call.assert_not_called()
 
     def test_process_chunks_rejects_active_runtime_owner(self):
+        """Test process chunks rejects active runtime owner."""
         with tempfile.TemporaryDirectory() as tmpdir:
             source = Path(tmpdir) / "raw.txt"
             work_dir = Path(tmpdir) / "chunks"
@@ -778,6 +811,7 @@ class RuntimeRegressionTests(unittest.TestCase):
             self.assertTrue(owner_path.exists())
 
     def test_prepare_resume_recovers_stale_runtime_owner(self):
+        """Test prepare resume recovers stale runtime owner."""
         with tempfile.TemporaryDirectory() as tmpdir:
             source = Path(tmpdir) / "raw.txt"
             work_dir = Path(tmpdir) / "chunks"
@@ -812,6 +846,7 @@ class RuntimeRegressionTests(unittest.TestCase):
             self.assertFalse(owner_path.exists())
 
     def test_process_chunks_with_replans_shares_runtime_owner_across_steps(self):
+        """Test process chunks with replans shares runtime owner across steps."""
         with tempfile.TemporaryDirectory() as tmpdir:
             source = Path(tmpdir) / "raw.txt"
             work_dir = Path(tmpdir) / "chunks"
@@ -822,6 +857,7 @@ class RuntimeRegressionTests(unittest.TestCase):
             process_call_count = {"count": 0}
 
             def fake_process_chunks(*args, **kwargs):
+                """Fake process chunks."""
                 ownership = kwargs.get("runtime_ownership") or {}
                 seen_calls.append(("process", ownership.get("owner_id", ""), bool(ownership.get("delegated", False))))
                 if process_call_count["count"] == 0:
@@ -860,6 +896,7 @@ class RuntimeRegressionTests(unittest.TestCase):
                 }
 
             def fake_replan_remaining(*args, **kwargs):
+                """Fake replan remaining."""
                 ownership = kwargs.get("runtime_ownership") or {}
                 seen_calls.append(("replan", ownership.get("owner_id", ""), bool(ownership.get("delegated", False))))
                 return {
@@ -884,6 +921,7 @@ class RuntimeRegressionTests(unittest.TestCase):
             self.assertTrue(result["ownership"]["released"])
 
     def test_prepare_resume_marks_stale_running_chunk_interrupted(self):
+        """Test prepare resume marks stale running chunk interrupted."""
         with tempfile.TemporaryDirectory() as tmpdir:
             source = Path(tmpdir) / "raw.txt"
             work_dir = Path(tmpdir) / "chunks"
@@ -907,6 +945,7 @@ class RuntimeRegressionTests(unittest.TestCase):
             self.assertEqual(result["resume"]["interrupted_chunk_ids"], [0])
 
     def test_prepare_resume_promotes_running_chunk_with_output_to_done(self):
+        """Test prepare resume promotes running chunk with output to done."""
         with tempfile.TemporaryDirectory() as tmpdir:
             source = Path(tmpdir) / "raw.txt"
             work_dir = Path(tmpdir) / "chunks"
@@ -929,6 +968,7 @@ class RuntimeRegressionTests(unittest.TestCase):
             self.assertEqual(result["resume"]["promoted_done_chunk_ids"], [0])
 
     def test_prepare_resume_demotes_done_chunk_missing_output_to_interrupted(self):
+        """Test prepare resume demotes done chunk missing output to interrupted."""
         with tempfile.TemporaryDirectory() as tmpdir:
             source = Path(tmpdir) / "raw.txt"
             work_dir = Path(tmpdir) / "chunks"
@@ -950,6 +990,7 @@ class RuntimeRegressionTests(unittest.TestCase):
             self.assertEqual(manifest_after["runtime"]["status"], utils.RESUMABLE_RUNTIME_STATUS)
 
     def test_process_chunks_auto_repairs_resume_state_before_execution(self):
+        """Test process chunks auto repairs resume state before execution."""
         with tempfile.TemporaryDirectory() as tmpdir:
             source = Path(tmpdir) / "raw.txt"
             work_dir = Path(tmpdir) / "chunks"
@@ -994,6 +1035,7 @@ class RuntimeRegressionTests(unittest.TestCase):
             self.assertEqual(manifest_after["runtime"]["status"], "completed")
 
     def test_process_chunks_uses_prompt_specific_max_output_tokens(self):
+        """Test process chunks uses prompt specific max output tokens."""
         with tempfile.TemporaryDirectory() as tmpdir:
             source = Path(tmpdir) / "raw.txt"
             work_dir = Path(tmpdir) / "chunks"
@@ -1033,6 +1075,7 @@ class RuntimeRegressionTests(unittest.TestCase):
             self.assertEqual(manifest["chunks"][0]["planned_max_output_tokens"], 384)
 
     def test_process_chunks_injects_continuity_context(self):
+        """Test process chunks injects continuity context."""
         with tempfile.TemporaryDirectory() as tmpdir:
             source = Path(tmpdir) / "raw.txt"
             work_dir = Path(tmpdir) / "chunks"
@@ -1057,6 +1100,7 @@ class RuntimeRegressionTests(unittest.TestCase):
             ])
 
             def fake_call(**kwargs):
+                """Fake call."""
                 recorded_prompts.append(kwargs["messages"][0]["content"])
                 return {
                     "text": next(fake_outputs),
@@ -1092,6 +1136,7 @@ class RuntimeRegressionTests(unittest.TestCase):
             self.assertEqual(manifest["chunks"][0]["last_section_title"], "## Intro")
 
     def test_process_chunks_uses_manifest_continuity_policy_even_if_runtime_config_disables_it(self):
+        """Test process chunks uses manifest continuity policy even if runtime config disables it."""
         with tempfile.TemporaryDirectory() as tmpdir:
             source = Path(tmpdir) / "raw.txt"
             work_dir = Path(tmpdir) / "chunks"
@@ -1144,6 +1189,7 @@ chunk_context_summary_tokens: 20
             self.assertIn("Do not repeat or rewrite this context in the output.", recorded_prompts[1])
 
     def test_process_chunks_reuses_manifest_token_estimates_without_remote_probe(self):
+        """Test process chunks reuses manifest token estimates without remote probe."""
         with tempfile.TemporaryDirectory() as tmpdir:
             source = Path(tmpdir) / "raw.txt"
             work_dir = Path(tmpdir) / "chunks"
@@ -1178,6 +1224,7 @@ chunk_context_summary_tokens: 20
             self.assertIn("est_source=manifest_cached_input", stderr.getvalue())
 
     def test_process_chunks_uses_processed_tail_for_chained_continuity(self):
+        """Test process chunks uses processed tail for chained continuity."""
         with tempfile.TemporaryDirectory() as tmpdir:
             source = Path(tmpdir) / "raw.txt"
             work_dir = Path(tmpdir) / "chunks"
@@ -1249,6 +1296,7 @@ chunk_context_summary_tokens: 20
             self.assertIn("est_source=manifest_cached_output", stderr.getvalue())
 
     def test_process_chunks_dry_run_preserves_char_manifest_units(self):
+        """Test process chunks dry run preserves char manifest units."""
         with tempfile.TemporaryDirectory() as tmpdir:
             source = Path(tmpdir) / "raw.txt"
             work_dir = Path(tmpdir) / "chunks"
@@ -1276,6 +1324,7 @@ chunk_context_summary_tokens: 20
             self.assertFalse(any("1200" in warning for warning in result["warnings"]))
 
     def test_process_chunks_rejects_prompt_path_traversal(self):
+        """Test process chunks rejects prompt path traversal."""
         with tempfile.TemporaryDirectory() as tmpdir:
             source = Path(tmpdir) / "raw.txt"
             work_dir = Path(tmpdir) / "chunks"
@@ -1294,6 +1343,7 @@ chunk_context_summary_tokens: 20
                 utils.process_chunks(str(work_dir), "../CODE_REVIEW", dry_run=True)
 
     def test_process_chunks_aborts_after_consecutive_timeouts(self):
+        """Test process chunks aborts after consecutive timeouts."""
         with tempfile.TemporaryDirectory() as tmpdir:
             source = Path(tmpdir) / "raw.txt"
             work_dir = Path(tmpdir) / "chunks"
@@ -1332,6 +1382,7 @@ chunk_context_summary_tokens: 20
             self.assertEqual(manifest["runtime"]["status"], "aborted")
 
     def test_process_chunks_autotune_shrinks_after_timeout(self):
+        """Test process chunks autotune shrinks after timeout."""
         with tempfile.TemporaryDirectory() as tmpdir:
             source = Path(tmpdir) / "raw.txt"
             work_dir = Path(tmpdir) / "chunks"
@@ -1348,6 +1399,7 @@ chunk_context_summary_tokens: 20
             call_counter = {"count": 0}
 
             def fake_call(**kwargs):
+                """Fake call."""
                 if call_counter["count"] == 0:
                     call_counter["count"] += 1
                     raise timeout_error
@@ -1390,6 +1442,7 @@ chunk_context_summary_tokens: 20
             self.assertIn("Autotune chunk_id=0 event=shrink", stderr.getvalue())
 
     def test_process_chunks_autotune_increases_after_success_window(self):
+        """Test process chunks autotune increases after success window."""
         with tempfile.TemporaryDirectory() as tmpdir:
             source = Path(tmpdir) / "raw.txt"
             work_dir = Path(tmpdir) / "chunks"
@@ -1437,6 +1490,7 @@ chunk_context_summary_tokens: 20
             )
 
     def test_process_chunks_records_attempt_logs_and_aborts_for_retry_timeout(self):
+        """Test process chunks records attempt logs and aborts for retry timeout."""
         with tempfile.TemporaryDirectory() as tmpdir:
             source = Path(tmpdir) / "raw.txt"
             work_dir = Path(tmpdir) / "chunks"
@@ -1488,6 +1542,7 @@ chunk_context_summary_tokens: 20
             self.assertEqual(manifest["runtime"]["control"]["last_replan_chunk_id"], first_chunk["id"])
 
     def test_process_chunks_auto_recovers_suspicious_short_output(self):
+        """Test process chunks auto recovers suspicious short output."""
         with tempfile.TemporaryDirectory() as tmpdir:
             source = Path(tmpdir) / "raw.txt"
             work_dir = Path(tmpdir) / "chunks"
@@ -1541,6 +1596,7 @@ chunk_context_summary_tokens: 20
             self.assertIn("## Done", output_path.read_text(encoding="utf-8"))
 
     def test_process_chunks_marks_repair_exhausted_when_retries_disabled(self):
+        """Test process chunks marks repair exhausted when retries disabled."""
         with tempfile.TemporaryDirectory() as tmpdir:
             source = Path(tmpdir) / "raw.txt"
             work_dir = Path(tmpdir) / "chunks"
@@ -1579,6 +1635,7 @@ chunk_context_summary_tokens: 20
             self.assertEqual(first_chunk["control"]["retry_reasons"], ["short_output"])
 
     def test_replan_remaining_supersedes_pending_chunks_and_appends_new_plan(self):
+        """Test replan remaining supersedes pending chunks and appends new plan."""
         with tempfile.TemporaryDirectory() as tmpdir:
             source = Path(tmpdir) / "raw.txt"
             work_dir = Path(tmpdir) / "chunks"
@@ -1613,6 +1670,7 @@ chunk_context_summary_tokens: 20
             self.assertEqual(result["chunk_size"], 3)
 
     def test_process_chunks_clears_stale_replan_flags_after_success(self):
+        """Test process chunks clears stale replan flags after success."""
         with tempfile.TemporaryDirectory() as tmpdir:
             source = Path(tmpdir) / "raw.txt"
             work_dir = Path(tmpdir) / "chunks"
@@ -1655,6 +1713,7 @@ chunk_context_summary_tokens: 20
             self.assertEqual(manifest_after["runtime"]["status"], "completed")
 
     def test_process_chunks_marks_completed_with_errors_for_nonfatal_failures(self):
+        """Test process chunks marks completed with errors for nonfatal failures."""
         with tempfile.TemporaryDirectory() as tmpdir:
             source = Path(tmpdir) / "raw.txt"
             work_dir = Path(tmpdir) / "chunks"
@@ -1696,6 +1755,7 @@ chunk_context_summary_tokens: 20
             self.assertFalse(manifest_after["runtime"]["replan_required"])
 
     def test_process_chunks_with_replans_auto_recovers_after_canary_abort(self):
+        """Test process chunks with replans auto recovers after canary abort."""
         with tempfile.TemporaryDirectory() as tmpdir:
             source = Path(tmpdir) / "raw.txt"
             work_dir = Path(tmpdir) / "chunks"
@@ -1712,6 +1772,7 @@ chunk_context_summary_tokens: 20
             call_counter = {"count": 0}
 
             def fake_call(**kwargs):
+                """Fake call."""
                 if call_counter["count"] == 0:
                     call_counter["count"] += 1
                     raise timeout_error
@@ -1757,6 +1818,7 @@ chunk_context_summary_tokens: 20
             self.assertEqual(result["control"]["replan"]["max_auto_replans"], 1)
 
     def test_process_chunks_with_replans_stops_when_replan_step_fails(self):
+        """Test process chunks with replans stops when replan step fails."""
         with tempfile.TemporaryDirectory() as tmpdir:
             source = Path(tmpdir) / "raw.txt"
             work_dir = Path(tmpdir) / "chunks"
@@ -1794,6 +1856,7 @@ chunk_context_summary_tokens: 20
         self.assertEqual(result["warning_count"], 1)
 
     def test_merge_content_keeps_chapter_headers_after_replan_remaining(self):
+        """Test merge content keeps chapter headers after replan remaining."""
         with tempfile.TemporaryDirectory() as tmpdir:
             source = Path(tmpdir) / "raw.txt"
             work_dir = Path(tmpdir) / "chunks"

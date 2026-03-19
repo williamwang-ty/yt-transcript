@@ -1,3 +1,5 @@
+"""Glossary extraction and terminology-consistency helpers for long-text jobs."""
+
 import json
 import re
 import time
@@ -23,14 +25,17 @@ TERM_PATTERNS = [
 
 
 def _now_iso() -> str:
+    """Return the current local timestamp in ISO-like wall-clock format."""
     return time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime())
 
 
 def glossary_path_for(work_dir: str) -> Path:
+    """Return the glossary file path for a work directory."""
     return Path(str(work_dir or "")).expanduser().resolve() / GLOSSARY_FILENAME
 
 
 def load_glossary(work_dir: str) -> dict:
+    """Load the persisted glossary payload, or return an empty default shell."""
     glossary_path = glossary_path_for(work_dir)
     try:
         payload = json.loads(glossary_path.read_text(encoding="utf-8"))
@@ -40,6 +45,7 @@ def load_glossary(work_dir: str) -> dict:
 
 
 def _extract_candidate_terms(text: str) -> list[str]:
+    """Extract candidate glossary terms from chunk text using simple heuristics."""
     candidates = []
     for pattern in TERM_PATTERNS:
         for match in pattern.findall(text or ""):
@@ -55,6 +61,7 @@ def _extract_candidate_terms(text: str) -> list[str]:
 
 
 def _iter_manifest_source_chunks(work_dir: str) -> list[tuple[int, str]]:
+    """Iter manifest source chunks."""
     work_path = Path(str(work_dir or "")).expanduser().resolve()
     manifest_path = work_path / "manifest.json"
     try:
@@ -82,6 +89,7 @@ def _iter_manifest_source_chunks(work_dir: str) -> list[tuple[int, str]]:
 
 def build_glossary(work_dir: str, *, max_terms: int = 50,
                    min_occurrences: int = 1) -> dict:
+    """Build and persist a document-level glossary from source chunks."""
     work_path = Path(str(work_dir or "")).expanduser().resolve()
     if not work_path.exists():
         glossary_path = glossary_path_for(str(work_path))
@@ -136,6 +144,7 @@ def build_glossary(work_dir: str, *, max_terms: int = 50,
 
 
 def select_glossary_terms(glossary_payload: dict, source_text: str, *, max_terms: int = 8) -> list[dict]:
+    """Select the glossary terms most relevant to the current source chunk."""
     source = str(source_text or "")
     terms = glossary_payload.get("terms", []) if isinstance(glossary_payload.get("terms", []), list) else []
     matched = []
@@ -153,6 +162,7 @@ def select_glossary_terms(glossary_payload: dict, source_text: str, *, max_terms
 
 
 def build_glossary_prompt_context(glossary_payload: dict, source_text: str, *, max_terms: int = 8) -> dict:
+    """Build glossary prompt context."""
     selected_terms = select_glossary_terms(glossary_payload, source_text, max_terms=max_terms)
     if not selected_terms:
         return {
@@ -182,6 +192,7 @@ def build_glossary_prompt_context(glossary_payload: dict, source_text: str, *, m
 
 def evaluate_glossary_terms(glossary_payload: dict, source_text: str, result_text: str, *,
                             max_terms: int = 8) -> dict:
+    """Check whether required glossary terms were preserved in the result text."""
     selected_terms = select_glossary_terms(glossary_payload, source_text, max_terms=max_terms)
     if not selected_terms:
         return {
