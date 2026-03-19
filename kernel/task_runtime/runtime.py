@@ -7,6 +7,8 @@ import random
 import time
 from pathlib import Path
 
+from . import contracts as kernel_contracts
+
 
 COMMAND_RESULT_SCHEMA_VERSION = 1
 COMMAND_RESULT_FORMAT = "yt_transcript.command_result/v1"
@@ -133,7 +135,7 @@ def resolve_command_telemetry_path(command: str, result, context: dict | None = 
 
 def build_command_telemetry_event(command: str, result, *, trace_id: str,
                                   started_at: float, context: dict | None = None,
-                                  telemetry_path: str = "") -> dict:
+                                  telemetry_path: str = "", contract_summary: dict | None = None) -> dict:
     """Build the append-only telemetry event recorded for one command invocation."""
     context = context or {}
     duration_ms = max(0, int((time.monotonic() - started_at) * 1000))
@@ -168,6 +170,8 @@ def build_command_telemetry_event(command: str, result, *, trace_id: str,
         prompt_name = str(result.get("prompt_name", result.get("plan", {}).get("prompt_name", "")) or "").strip()
     if prompt_name:
         event["prompt_name"] = prompt_name
+    if isinstance(contract_summary, dict) and contract_summary:
+        event["contracts"] = contract_summary
     return event
 
 
@@ -195,6 +199,13 @@ def build_command_result_envelope(command: str, result, *, trace_id: str = "",
     resolved_trace_id = str(trace_id or new_trace_id(command)).strip()
     started = started_at if started_at is not None else time.monotonic()
     resolved_telemetry_path = telemetry_path or resolve_command_telemetry_path(command, result, context)
+    contract_bundle = kernel_contracts.build_command_contract_bundle(
+        command,
+        result,
+        context=context,
+        trace_id=resolved_trace_id,
+    )
+    contract_summary = kernel_contracts.summarize_contract_bundle(contract_bundle)
     event = build_command_telemetry_event(
         command,
         result,
@@ -202,6 +213,7 @@ def build_command_result_envelope(command: str, result, *, trace_id: str = "",
         started_at=started,
         context=context,
         telemetry_path=resolved_telemetry_path,
+        contract_summary=contract_summary,
     )
     persisted_telemetry_path = append_command_telemetry_event(resolved_telemetry_path, event)
     event["telemetry_path"] = persisted_telemetry_path
@@ -218,7 +230,9 @@ def build_command_result_envelope(command: str, result, *, trace_id: str = "",
             "warning_count": event["warning_count"],
             "document_id": event.get("document_id", ""),
             "telemetry_path": persisted_telemetry_path,
+            "contracts": contract_summary,
         },
+        "contracts": contract_bundle,
         "result": result,
     }
 

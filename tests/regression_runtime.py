@@ -34,6 +34,63 @@ class RuntimeRegressionTests(unittest.TestCase):
             self.assertTrue(event["success"])
             self.assertEqual(envelope["result"]["driver"], "chunk-text")
 
+    def test_run_kernel_command_includes_contract_bundle_and_telemetry_summary(self):
+        """Test run kernel command includes contract bundle and telemetry contract summary."""
+        from kernel.task_runtime import contracts as runtime_contracts
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source = Path(tmpdir) / "raw.txt"
+            work_dir = Path(tmpdir) / "chunks"
+            source.write_text("第一句。第二句。第三句。第四句。", encoding="utf-8")
+
+            envelope = utils.run_kernel_command(
+                "chunk-text",
+                input_path=str(source),
+                output_dir=str(work_dir),
+                chunk_size=4,
+                prompt_name="structure_only",
+                config_path=None,
+            )
+
+            contracts = envelope["contracts"]
+            self.assertEqual(contracts["format"], runtime_contracts.CONTRACT_BUNDLE_FORMAT)
+            self.assertEqual(contracts["task_spec"]["format"], runtime_contracts.TASK_SPEC_FORMAT)
+            self.assertEqual(contracts["run_state"]["format"], runtime_contracts.RUN_STATE_FORMAT)
+            self.assertEqual(contracts["action_result"]["format"], runtime_contracts.ACTION_RESULT_FORMAT)
+            self.assertEqual(contracts["run_state"]["active_stage"], "planning")
+            self.assertEqual(contracts["action_result"]["tool_name"], "chunk-text")
+            self.assertGreaterEqual(len(contracts["artifacts"]), 1)
+            self.assertEqual(envelope["telemetry"]["contracts"]["action_type"], "chunk_text")
+            self.assertEqual(envelope["telemetry"]["contracts"]["active_stage"], "planning")
+
+            telemetry_path = Path(envelope["telemetry"]["telemetry_path"])
+            event = json.loads(telemetry_path.read_text(encoding="utf-8").splitlines()[-1])
+            self.assertEqual(event["contracts"]["active_stage"], "planning")
+            self.assertEqual(event["contracts"]["action_type"], "chunk_text")
+
+    def test_contract_bundle_derives_quality_report_from_verify_quality(self):
+        """Test runtime contract bundle derives a quality report from verify quality output."""
+        from kernel.task_runtime import contracts as runtime_contracts
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            raw = Path(tmpdir) / "raw.txt"
+            optimized = Path(tmpdir) / "optimized.md"
+            raw.write_text("这是一大段没有章节标题的文本。" * 100, encoding="utf-8")
+            optimized.write_text("这是一大段没有章节标题的文本。" * 120, encoding="utf-8")
+
+            result = utils.verify_quality(str(optimized), str(raw), bilingual=False)
+            bundle = runtime_contracts.build_command_contract_bundle(
+                "verify-quality",
+                result,
+                context={"optimized_text_path": str(optimized)},
+                trace_id="trace_verify_contract",
+            )
+
+            self.assertIn("quality_report", bundle)
+            self.assertEqual(bundle["quality_report"]["format"], runtime_contracts.QUALITY_REPORT_FORMAT)
+            self.assertFalse(bundle["quality_report"]["passed"])
+            self.assertEqual(bundle["quality_report"]["recommended_action"], "repair_or_replan")
+
     def test_telemetry_summary_reads_local_journal(self):
         """Test telemetry summary reads local journal."""
         with tempfile.TemporaryDirectory() as tmpdir:
