@@ -533,6 +533,36 @@ class RuntimeRegressionTests(unittest.TestCase):
             self.assertEqual(result["ownership"]["status"], "held")
             self.assertTrue(result["ownership"]["held"])
             self.assertFalse(result["cancellation"]["requested"])
+            self.assertIn("lifecycle", result)
+            self.assertEqual(result["lifecycle"]["command"], "runtime-status")
+            self.assertEqual(result["lifecycle"]["active_stage"], "processing")
+
+    def test_pause_run_includes_lifecycle_transition_and_telemetry_summary(self):
+        """Test pause run exposes lifecycle transition data directly and via telemetry."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source = Path(tmpdir) / "raw.txt"
+            work_dir = Path(tmpdir) / "chunks"
+            source.write_text("第一句。第二句。第三句。第四句。", encoding="utf-8")
+            utils.chunk_text(str(source), str(work_dir), 4, "structure_only")
+
+            result = utils.pause_run(str(work_dir), reason="operator pause")
+            self.assertTrue(result["success"])
+            self.assertIn("lifecycle", result)
+            self.assertEqual(result["lifecycle"]["command"], "pause-run")
+            self.assertEqual(result["lifecycle"]["active_stage"], "processing")
+            self.assertEqual(result["lifecycle"]["state_after"], "processing")
+            self.assertEqual(result["lifecycle"]["control_signal"], "pause_requested")
+
+            envelope = utils.run_kernel_command(
+                "pause-run",
+                work_dir=str(work_dir),
+                reason="operator pause again",
+            )
+            telemetry_path = Path(envelope["telemetry"]["telemetry_path"])
+            event = json.loads(telemetry_path.read_text(encoding="utf-8").splitlines()[-1])
+            self.assertEqual(event["lifecycle"]["active_stage"], "processing")
+            self.assertEqual(event["lifecycle"]["state_after"], "processing")
+            self.assertEqual(event["lifecycle"]["control_signal"], "pause_requested")
 
     def test_cancel_run_marks_runtime_cancel_request(self):
         """Test cancel run marks runtime cancel request."""

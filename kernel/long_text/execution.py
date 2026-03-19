@@ -4,22 +4,35 @@ import sys
 from pathlib import Path
 
 from ..task_runtime import controller as kernel_controller
+from ..task_runtime import lifecycle as runtime_lifecycle
 from ..task_runtime import state as kernel_state
 
 
 def runtime_status(work_dir: str) -> dict:
     """Return the current runtime summary for a long-text work directory."""
-    return kernel_state.summarize_runtime_status(work_dir)
+    return runtime_lifecycle.execute_lifecycle_command(
+        "runtime-status",
+        lambda: kernel_state.summarize_runtime_status(work_dir),
+        context={"work_dir": work_dir},
+    )
 
 
 def cancel_run(work_dir: str, reason: str = "") -> dict:
     """Request cancellation for the active long-text run."""
-    return kernel_state.request_runtime_cancel(work_dir, reason=reason)
+    return runtime_lifecycle.execute_lifecycle_command(
+        "cancel-run",
+        lambda: kernel_state.request_runtime_cancel(work_dir, reason=reason),
+        context={"work_dir": work_dir, "reason": reason},
+    )
 
 
 def pause_run(work_dir: str, reason: str = "") -> dict:
     """Request pausing the active long-text run."""
-    return kernel_state.request_runtime_pause(work_dir, reason=reason)
+    return runtime_lifecycle.execute_lifecycle_command(
+        "pause-run",
+        lambda: kernel_state.request_runtime_pause(work_dir, reason=reason),
+        context={"work_dir": work_dir, "reason": reason},
+    )
 
 
 def resume_run(work_dir: str, reason: str = "", runtime_ownership: dict | None = None) -> dict:
@@ -31,12 +44,16 @@ def resume_run(work_dir: str, reason: str = "", runtime_ownership: dict | None =
         print(f"Error: manifest.json not found in {work_dir}", file=sys.stderr)
         sys.exit(1)
 
-    return kernel_controller.run_owned_mutation(
-        work_dir,
+    return runtime_lifecycle.execute_lifecycle_command(
         "resume-run",
-        runtime_ownership=runtime_ownership,
-        conflict_result_builder=utils._build_resume_run_ownership_conflict_result,
-        mutation_fn=lambda ownership: utils._resume_run_impl(work_dir, reason=reason),
+        lambda: kernel_controller.run_owned_mutation(
+            work_dir,
+            "resume-run",
+            runtime_ownership=runtime_ownership,
+            conflict_result_builder=utils._build_resume_run_ownership_conflict_result,
+            mutation_fn=lambda ownership: utils._resume_run_impl(work_dir, reason=reason),
+        ),
+        context={"work_dir": work_dir, "reason": reason},
     )
 
 
@@ -50,19 +67,23 @@ def prepare_resume(work_dir: str, prompt_name: str = "", config_path: str = None
         print(f"Error: manifest.json not found in {work_dir}", file=sys.stderr)
         sys.exit(1)
 
-    return kernel_controller.run_owned_mutation(
-        work_dir,
+    return runtime_lifecycle.execute_lifecycle_command(
         "prepare-resume",
-        runtime_ownership=runtime_ownership,
-        conflict_result_builder=lambda ownership: utils._build_prepare_resume_ownership_conflict_result(
-            manifest_path, prompt_name, ownership
-        ),
-        mutation_fn=lambda ownership: utils._prepare_resume_impl(
+        lambda: kernel_controller.run_owned_mutation(
             work_dir,
-            prompt_name=prompt_name,
-            config_path=config_path,
-            input_key=input_key,
+            "prepare-resume",
+            runtime_ownership=runtime_ownership,
+            conflict_result_builder=lambda ownership: utils._build_prepare_resume_ownership_conflict_result(
+                manifest_path, prompt_name, ownership
+            ),
+            mutation_fn=lambda ownership: utils._prepare_resume_impl(
+                work_dir,
+                prompt_name=prompt_name,
+                config_path=config_path,
+                input_key=input_key,
+            ),
         ),
+        context={"work_dir": work_dir, "prompt_name": prompt_name, "input_key": input_key},
     )
 
 
@@ -78,20 +99,30 @@ def process_chunks(work_dir: str, prompt_name: str, extra_instruction: str = "",
         print(f"Error: manifest.json not found in {work_dir}", file=sys.stderr)
         sys.exit(1)
 
-    return kernel_controller.run_owned_mutation(
-        work_dir,
+    return runtime_lifecycle.execute_lifecycle_command(
         "process-chunks",
-        runtime_ownership=runtime_ownership,
-        conflict_result_builder=utils._build_process_ownership_conflict_result,
-        mutation_fn=lambda ownership: utils._process_chunks_impl(
+        lambda: kernel_controller.run_owned_mutation(
             work_dir,
-            prompt_name,
-            extra_instruction=extra_instruction,
-            config_path=config_path,
-            dry_run=dry_run,
-            input_key=input_key,
-            force=force,
+            "process-chunks",
+            runtime_ownership=runtime_ownership,
+            conflict_result_builder=utils._build_process_ownership_conflict_result,
+            mutation_fn=lambda ownership: utils._process_chunks_impl(
+                work_dir,
+                prompt_name,
+                extra_instruction=extra_instruction,
+                config_path=config_path,
+                dry_run=dry_run,
+                input_key=input_key,
+                force=force,
+            ),
         ),
+        context={
+            "work_dir": work_dir,
+            "prompt_name": prompt_name,
+            "input_key": input_key,
+            "extra_instruction": extra_instruction,
+            "force": force,
+        },
     )
 
 
@@ -106,18 +137,22 @@ def replan_remaining(work_dir: str, prompt_name: str = "", config_path: str = No
         print(f"Error: manifest.json not found in {work_dir}", file=sys.stderr)
         sys.exit(1)
 
-    return kernel_controller.run_owned_mutation(
-        work_dir,
+    return runtime_lifecycle.execute_lifecycle_command(
         "replan-remaining",
-        runtime_ownership=runtime_ownership,
-        conflict_result_builder=utils._build_replan_ownership_conflict_result,
-        mutation_fn=lambda ownership: utils._replan_remaining_impl(
+        lambda: kernel_controller.run_owned_mutation(
             work_dir,
-            prompt_name=prompt_name,
-            config_path=config_path,
-            chunk_size=chunk_size,
-            input_key=input_key,
+            "replan-remaining",
+            runtime_ownership=runtime_ownership,
+            conflict_result_builder=utils._build_replan_ownership_conflict_result,
+            mutation_fn=lambda ownership: utils._replan_remaining_impl(
+                work_dir,
+                prompt_name=prompt_name,
+                config_path=config_path,
+                chunk_size=chunk_size,
+                input_key=input_key,
+            ),
         ),
+        context={"work_dir": work_dir, "prompt_name": prompt_name, "input_key": input_key},
     )
 
 
@@ -133,19 +168,30 @@ def process_chunks_with_replans(work_dir: str, prompt_name: str, extra_instructi
         print(f"Error: manifest.json not found in {work_dir}", file=sys.stderr)
         sys.exit(1)
 
-    return kernel_controller.run_owned_mutation(
-        work_dir,
+    return runtime_lifecycle.execute_lifecycle_command(
         "process-chunks-with-replans",
-        runtime_ownership=runtime_ownership,
-        conflict_result_builder=utils._build_process_with_replans_ownership_conflict_result,
-        mutation_fn=lambda ownership: utils._process_chunks_with_replans_impl(
+        lambda: kernel_controller.run_owned_mutation(
             work_dir,
-            prompt_name,
-            extra_instruction=extra_instruction,
-            config_path=config_path,
-            input_key=input_key,
-            force=force,
-            max_replans=max_replans,
-            runtime_ownership=ownership,
+            "process-chunks-with-replans",
+            runtime_ownership=runtime_ownership,
+            conflict_result_builder=utils._build_process_with_replans_ownership_conflict_result,
+            mutation_fn=lambda ownership: utils._process_chunks_with_replans_impl(
+                work_dir,
+                prompt_name,
+                extra_instruction=extra_instruction,
+                config_path=config_path,
+                input_key=input_key,
+                force=force,
+                max_replans=max_replans,
+                runtime_ownership=ownership,
+            ),
         ),
+        context={
+            "work_dir": work_dir,
+            "prompt_name": prompt_name,
+            "input_key": input_key,
+            "extra_instruction": extra_instruction,
+            "force": force,
+            "max_replans": max_replans,
+        },
     )

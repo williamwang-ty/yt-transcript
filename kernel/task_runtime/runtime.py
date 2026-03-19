@@ -165,6 +165,15 @@ def build_command_telemetry_event(command: str, result, *, trace_id: str,
             event["replan_required"] = bool(result.get("replan_required", False))
         if "dry_run" in result:
             event["dry_run"] = bool(result.get("dry_run", False))
+        lifecycle_summary = result.get("lifecycle", {}) if isinstance(result.get("lifecycle", {}), dict) else {}
+        if lifecycle_summary:
+            event["lifecycle"] = {
+                "state_before": str(lifecycle_summary.get("state_before", "")).strip(),
+                "state_after": str(lifecycle_summary.get("state_after", "")).strip(),
+                "active_stage": str(lifecycle_summary.get("active_stage", "")).strip(),
+                "transition_kind": str(lifecycle_summary.get("transition_kind", "")).strip(),
+                "control_signal": str(lifecycle_summary.get("control_signal", "")).strip(),
+            }
     prompt_name = str(context.get("prompt_name", context.get("prompt", "")) or "").strip()
     if not prompt_name and isinstance(result, dict):
         prompt_name = str(result.get("prompt_name", result.get("plan", {}).get("prompt_name", "")) or "").strip()

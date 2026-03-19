@@ -154,6 +154,7 @@ yt-transcript/
 │   ├── task_runtime/       # Generic task runtime layer
 │   │   ├── runtime.py      # Ownership, command envelopes, telemetry append
 │   │   ├── contracts.py    # Runtime contracts for task/run/action/artifact envelopes
+│   │   ├── lifecycle.py    # Lifecycle shell and transition summaries for runtime stages
 │   │   ├── state.py        # Manifest/runtime persistence and control files
 │   │   ├── controller.py   # Owned mutation and bounded control-loop helpers
 │   │   └── telemetry.py    # Telemetry query and summary helpers
@@ -192,6 +193,7 @@ At a high level, `yt-transcript` is a local-first, script-first system that turn
 The codebase mirrors that design through a two-layer kernel split: `kernel/task_runtime/*` owns generic long-running job control, while `kernel/long_text/*` owns long-text transformation behavior. `yt_transcript_utils.py` remains the main CLI and workflow façade, but it now delegates into those two layers directly.
 
 Phase 1 of the runtime-upgrade path also introduces `kernel/task_runtime/contracts.py`, which normalizes task, run-state, action, artifact, and quality-report envelopes without changing the nominal workflow behavior.
+Phase 2 adds `kernel/task_runtime/lifecycle.py`, which wraps runtime-sensitive commands in an explicit lifecycle shell so state transitions become observable before richer policy logic is introduced.
 
 The hardest internal subsystem is long-text transformation. It activates only when the planning layer determines that the input is long enough to require chunking, continuity control, consistency protection, verification, repair / replan, and deterministic merge.
 
