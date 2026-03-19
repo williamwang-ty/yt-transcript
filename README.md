@@ -145,16 +145,38 @@ After completion, a summary table will be provided with status and output paths 
 ```
 yt-transcript/
 ├── SKILL.md                 # Claude Skill workflow guide (main entry point)
+├── SYSTEM_DESIGN.md         # Single authoritative system design document
 ├── workflows/               # Modular workflow files
 ├── prompts/                 # Single-task prompt templates
 ├── scripts/                 # Helper shell scripts
-├── yt_transcript_utils.py   # Python utilities
+├── yt_transcript_utils.py   # Main Python entry + orchestration utilities
+├── kernel_state.py          # Persisted state and runtime control helpers
+├── kernel_runtime.py        # Runtime ownership and command telemetry helpers
+├── kernel_controller.py     # Owned mutation and bounded control-loop helpers
+├── kernel_telemetry.py      # Telemetry query and summary helpers
+├── kernel_glossary.py       # Glossary extraction and terminology checks
+├── kernel_semantic.py       # Semantic anchor extraction and checks
+├── tests/                   # Regression test suite
 ├── config.yaml              # Local config (gitignored)
 ├── config.example.yaml      # Config template
 └── README.md                # This document
 ```
 
-### 🏗️ Architecture & Design Philosophy (v4.0)
+### 🏗️ Architecture & Design Overview
+
+`README.md` is the operator-facing quickstart and command guide. `SYSTEM_DESIGN.md` is the single authoritative design document for the system architecture.
+
+At a high level, `yt-transcript` is a local-first, script-first system that turns a YouTube URL into a Markdown article through:
+
+- preflight and configuration checks
+- metadata and subtitle availability detection
+- subtitle download or Deepgram fallback transcription
+- state synchronization and normalized document creation
+- optimization planning
+- short-path direct transformation or the long-text transformation subsystem
+- final assembly and quality gates
+
+The hardest internal subsystem is long-text transformation. It activates only when the planning layer determines that the input is long enough to require chunking, continuity control, consistency protection, verification, repair / replan, and deterministic merge.
 
 [Read separate System Design Document](SYSTEM_DESIGN.md)
 
@@ -173,7 +195,7 @@ bash scripts/preflight.sh --require-llm
 
 ### 🧩 Structured Script Outputs
 
-The helper scripts now emit machine-readable JSON on stdout:
+This project is script-first: helper commands emit machine-readable JSON on stdout so routing, validation, and execution decisions stay in code instead of drifting inside prompt prose:
 
 - `scripts/download.sh "$URL" metadata`
 - `scripts/download.sh "$URL" subtitle-info`
@@ -191,7 +213,9 @@ The helper scripts now emit machine-readable JSON on stdout:
 
 This keeps workflow logic in scripts instead of ad-hoc shell parsing inside the prompt instructions.
 
-`plan-optimization` also emits the canonical chunk execution contract:
+`plan-optimization` also emits the canonical chunk execution contract.
+
+At the whole-project level, it is the routing boundary between source acquisition and text transformation. At the long-text subsystem level, it defines the execution contract that downstream chunk processing must follow:
 
 - `operations[*].execution.supports_auto_replan`
 - `operations[*].execution.recommended_cli_flags`
@@ -201,7 +225,7 @@ This keeps workflow logic in scripts instead of ad-hoc shell parsing inside the 
 
 For long-video chunking, `plan-optimization` now also emits a canonical `chunking` block; when normalization exists, `chunk-document` is the preferred driver and it keeps chunk boundary / continuity assumptions explicit in `manifest.json`.
 
-Stage 4 also adds explicit resume semantics: `prepare-resume` repairs stale manifest state manually, while `process-chunks` runs the same repair step automatically before execution continues.
+The current design also has explicit resume semantics: `prepare-resume` repairs stale manifest state manually, while `process-chunks` runs the same repair step automatically before execution continues.
 
 Current policy is intentional and explicit:
 
@@ -404,16 +428,38 @@ pip install yt-dlp
 ```
 yt-transcript/
 ├── SKILL.md                 # Claude Skill 工作流程指南（主入口）
+├── SYSTEM_DESIGN.md         # 系统设计唯一权威文档
 ├── workflows/               # 模块化工作流文件
 ├── prompts/                 # 单任务 Prompt 模板
 ├── scripts/                 # Shell 辅助脚本
-├── yt_transcript_utils.py   # Python 工具脚本
+├── yt_transcript_utils.py   # 主 Python 入口与编排工具
+├── kernel_state.py          # 状态持久化与 runtime control 辅助
+├── kernel_runtime.py        # runtime ownership 与 command telemetry 辅助
+├── kernel_controller.py     # owned mutation 与 bounded control-loop 辅助
+├── kernel_telemetry.py      # telemetry 查询与汇总辅助
+├── kernel_glossary.py       # glossary 提取与术语检查
+├── kernel_semantic.py       # semantic anchor 提取与检查
+├── tests/                   # 回归测试集
 ├── config.yaml              # 本地配置（已 gitignore）
 ├── config.example.yaml      # 配置模板
 └── README.md                # 本文档
 ```
 
-### 🏗️ 架构设计与设计哲学 (v4.0)
+### 🏗️ 架构设计总览
+
+`README.md` 是面向操作者的快速上手与命令指南，`SYSTEM_DESIGN.md` 是系统架构唯一的权威设计文档。
+
+从整体上看，`yt-transcript` 是一个 local-first、script-first 的系统：它把 YouTube URL 通过以下阶段转换成 Markdown 文章：
+
+- preflight 与配置检查
+- metadata 与字幕可用性探测
+- 字幕下载或 Deepgram 兜底转录
+- 状态同步与标准化文档生成
+- 优化计划制定
+- 短路径直接变换或进入长文本变换子系统
+- 最终装配与质量门禁
+
+其中最难的内部子系统是长文本变换。它只会在 planning 层判断输入足够长、必须进入 chunk 处理时激活，并负责 chunking、continuity、一致性保护、verification、repair / replan 与确定性 merge。
 
 [阅读详细系统设计文档](SYSTEM_DESIGN.md)
 
@@ -432,7 +478,7 @@ bash scripts/preflight.sh --require-llm
 
 ### 🧩 结构化脚本输出
 
-辅助脚本现在会在 stdout 输出可解析 JSON：
+这个项目是 script-first 的：辅助命令会在 stdout 输出可解析 JSON，让路由、校验与执行决策尽量留在代码里，而不是漂移到 prompt 文案中：
 
 - `scripts/download.sh "$URL" metadata`
 - `scripts/download.sh "$URL" subtitle-info`
@@ -450,7 +496,9 @@ bash scripts/preflight.sh --require-llm
 
 这样 workflow 文档只保留调用顺序，具体判断逻辑下沉到脚本中。
 
-`plan-optimization` 现在还会输出标准化的 chunk 执行契约：
+`plan-optimization` 现在还会输出标准化的 chunk 执行契约。
+
+在整个项目层面，它是 source acquisition 和 text transformation 之间的路由边界；在长文本子系统层面，它定义了后续 chunk 执行必须遵循的 execution contract：
 
 - `operations[*].execution.supports_auto_replan`
 - `operations[*].execution.recommended_cli_flags`
@@ -460,7 +508,7 @@ bash scripts/preflight.sh --require-llm
 
 对于长视频分块，`plan-optimization` 现在还会输出显式的 `chunking` 契约；一旦 normalization 已存在，优先使用 `chunk-document`，并把 chunk 边界 / continuity 假设显式记录到 `manifest.json`。
 
-Stage 4 还加入了显式 resume 语义：`prepare-resume` 用于手动修复 stale manifest，而 `process-chunks` 在继续执行前会自动做同样的修复。
+当前设计还包含显式的 resume 语义：`prepare-resume` 用于手动修复 stale manifest，而 `process-chunks` 在继续执行前会自动做同样的修复。
 
 当前约定是明确固定的：
 

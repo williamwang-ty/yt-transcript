@@ -95,7 +95,7 @@ python3 <skill-root>/yt_transcript_utils.py get-chapters "$VIDEO_URL" > /tmp/${V
 
 ### Step 2: Build Chunk Work Dir
 
-Canonical Stage 3 path: if `PLAN_JSON.normalization.materialized=true`, chunk from the normalized document directly:
+Canonical long-path rule: if `PLAN_JSON.normalization.materialized=true`, chunk from the normalized document directly:
 
 ```bash
 python3 <skill-root>/yt_transcript_utils.py chunk-document \
