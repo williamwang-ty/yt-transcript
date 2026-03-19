@@ -164,6 +164,11 @@ def execute_lifecycle_command(command: str, action_fn, *, context: dict | None =
         return result
     after = observe_runtime_snapshot(resolved_work_dir)
     enriched = dict(result)
+    from . import recovery as runtime_recovery
+
+    if resolved_work_dir:
+        enriched["processing_state"] = runtime_recovery.build_processing_state(resolved_work_dir, result=enriched)
+        enriched["recovery"] = runtime_recovery.build_recovery_summary(resolved_work_dir, result=enriched)
     enriched["lifecycle"] = build_lifecycle_transition(
         command,
         enriched,

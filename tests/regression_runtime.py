@@ -539,6 +539,38 @@ class RuntimeRegressionTests(unittest.TestCase):
             self.assertTrue(result["dry_run"])
             self.assertEqual(result["request_url"], "")
 
+    def test_process_chunks_dry_run_exposes_processing_state_recovery_and_artifact_graph(self):
+        """Test process-chunks dry run exposes processing state, recovery summary, and artifact graph."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source = Path(tmpdir) / "raw.txt"
+            work_dir = Path(tmpdir) / "chunks"
+            source.write_text("第一句。第二句。第三句。第四句。", encoding="utf-8")
+            utils.chunk_text(str(source), str(work_dir), 4, "structure_only")
+
+            config = utils._default_config_values()
+            with mock.patch.object(utils, "load_config", return_value=config):
+                envelope = utils.run_kernel_command(
+                    "process-chunks",
+                    work_dir=str(work_dir),
+                    prompt_name="structure_only",
+                    config_path=None,
+                    dry_run=True,
+                    input_key="raw_path",
+                    force=False,
+                    auto_replan=False,
+                    max_replans=3,
+                )
+
+            contracts = envelope["contracts"]
+            self.assertIn("processing_state", contracts)
+            self.assertIn("recovery_summary", contracts)
+            self.assertIn("artifact_graph", contracts)
+            self.assertEqual(contracts["processing_state"]["format"], "yt_transcript.processing_state/v1")
+            self.assertEqual(contracts["processing_state"]["substate"], "chunk_queue_ready")
+            self.assertEqual(contracts["recovery_summary"]["recommended_action"], "continue_stage")
+            self.assertGreaterEqual(contracts["artifact_graph"]["node_count"], 1)
+            self.assertEqual(envelope["telemetry"]["contracts"]["processing_substate"], "chunk_queue_ready")
+
     def test_runtime_status_reports_manifest_runtime_ownership_and_counts(self):
         """Test runtime status reports manifest runtime ownership and counts."""
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -588,6 +620,8 @@ class RuntimeRegressionTests(unittest.TestCase):
             self.assertEqual(result["lifecycle"]["active_stage"], "processing")
             self.assertEqual(result["lifecycle"]["state_after"], "processing")
             self.assertEqual(result["lifecycle"]["control_signal"], "pause_requested")
+            self.assertIn("processing_state", result)
+            self.assertIn("recovery", result)
 
             envelope = utils.run_kernel_command(
                 "pause-run",

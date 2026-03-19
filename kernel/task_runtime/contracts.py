@@ -505,8 +505,10 @@ def build_command_contract_bundle(command: str, result=None, *, context: dict | 
             "artifact_count": len(artifacts),
         },
     )
+    from . import artifacts as kernel_artifacts
     from . import decision as kernel_decision
     from . import policy as kernel_policy
+    from . import recovery as kernel_recovery
 
     policy_evaluation = kernel_policy.evaluate_policy(
         run_state=run_state,
@@ -521,6 +523,12 @@ def build_command_contract_bundle(command: str, result=None, *, context: dict | 
         policy_evaluation=policy_evaluation,
         quality_report=quality_report,
     )
+    processing_state = None
+    recovery_summary = None
+    if str(run_state.get("active_stage", "")).strip() == "processing":
+        processing_state = kernel_recovery.build_processing_state(str(run_state.get("work_dir", "")).strip(), result=result)
+        recovery_summary = kernel_recovery.build_recovery_summary(str(run_state.get("work_dir", "")).strip(), result=result)
+    artifact_graph = kernel_artifacts.build_artifact_graph(run_id=str(run_state.get("run_id", "")).strip(), artifacts=artifacts)
     bundle = {
         "schema_version": CONTRACT_SCHEMA_VERSION,
         "format": CONTRACT_BUNDLE_FORMAT,
@@ -531,7 +539,12 @@ def build_command_contract_bundle(command: str, result=None, *, context: dict | 
         "decision_record": decision_record,
         "action_result": action_result,
         "artifacts": artifacts,
+        "artifact_graph": artifact_graph,
     }
+    if processing_state is not None:
+        bundle["processing_state"] = processing_state
+    if recovery_summary is not None:
+        bundle["recovery_summary"] = recovery_summary
     if quality_report is not None:
         bundle["quality_report"] = quality_report
     return bundle
@@ -545,6 +558,8 @@ def summarize_contract_bundle(bundle: dict | None = None) -> dict:
     action_result = payload.get("action_result", {}) if isinstance(payload.get("action_result", {}), dict) else {}
     policy_evaluation = payload.get("policy", {}) if isinstance(payload.get("policy", {}), dict) else {}
     decision_record = payload.get("decision_record", {}) if isinstance(payload.get("decision_record", {}), dict) else {}
+    processing_state = payload.get("processing_state", {}) if isinstance(payload.get("processing_state", {}), dict) else {}
+    recovery_summary = payload.get("recovery_summary", {}) if isinstance(payload.get("recovery_summary", {}), dict) else {}
     quality_report = payload.get("quality_report", {}) if isinstance(payload.get("quality_report", {}), dict) else {}
     artifacts = payload.get("artifacts", []) if isinstance(payload.get("artifacts", []), list) else []
     return {
@@ -555,6 +570,8 @@ def summarize_contract_bundle(bundle: dict | None = None) -> dict:
         "action_type": str(action_result.get("action_type", "")).strip(),
         "selected_action": str(decision_record.get("selected_action", "")).strip(),
         "budget_pressure_level": str(policy_evaluation.get("budget_pressure_level", "")).strip(),
+        "processing_substate": str(processing_state.get("substate", "")).strip(),
+        "recovery_action": str(recovery_summary.get("recommended_action", "")).strip(),
         "artifact_count": len(artifacts),
         "quality_recommended_action": str(quality_report.get("recommended_action", "")).strip(),
     }

@@ -158,6 +158,8 @@ yt-transcript/
 │   │   ├── policy.py       # Allowed-action derivation and budget-pressure policy checks
 │   │   ├── decision.py     # Rule-first action selection and decision records
 │   │   ├── ledger.py       # Runtime budget and action accounting summaries
+│   │   ├── recovery.py     # Resume-safe recovery summaries and processing sub-states
+│   │   ├── artifacts.py    # Artifact-graph helpers for persisted runtime outputs
 │   │   ├── state.py        # Manifest/runtime persistence and control files
 │   │   ├── controller.py   # Owned mutation and bounded control-loop helpers
 │   │   └── telemetry.py    # Telemetry query and summary helpers
@@ -198,6 +200,7 @@ The codebase mirrors that design through a two-layer kernel split: `kernel/task_
 Phase 1 of the runtime-upgrade path also introduces `kernel/task_runtime/contracts.py`, which normalizes task, run-state, action, artifact, and quality-report envelopes without changing the nominal workflow behavior.
 Phase 2 adds `kernel/task_runtime/lifecycle.py`, which wraps runtime-sensitive commands in an explicit lifecycle shell so state transitions become observable before richer policy logic is introduced.
 Phase 3 adds `kernel/task_runtime/policy.py`, `decision.py`, and `ledger.py` so command envelopes can expose allowed actions, budget-pressure summaries, and rule-first decision records in a uniform way.
+Phase 4 adds `kernel/task_runtime/recovery.py` and `artifacts.py` so long-text runs expose processing sub-states, recovery recommendations, and artifact-graph views without changing the core chunk-processing algorithms.
 
 The hardest internal subsystem is long-text transformation. It activates only when the planning layer determines that the input is long enough to require chunking, continuity control, consistency protection, verification, repair / replan, and deterministic merge.
 
