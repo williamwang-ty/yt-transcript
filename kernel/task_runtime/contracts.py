@@ -353,15 +353,9 @@ def derive_run_state(command: str, result=None, *, context: dict | None = None,
     effective_runtime_status = (
         str(result.get("effective_runtime_status", "") or runtime.get("status", "") or lifecycle_state).strip()
     )
-    budget_ledger = {}
-    if "warning_count" in result:
-        budget_ledger["warning_count"] = _parse_int(result.get("warning_count"), 0)
-    if "replan_count" in result:
-        budget_ledger["replan_count"] = _parse_int(result.get("replan_count"), 0)
-    if "processed_count" in result:
-        budget_ledger["processed_count"] = _parse_int(result.get("processed_count"), 0)
-    if "failed_count" in result:
-        budget_ledger["failed_count"] = _parse_int(result.get("failed_count"), 0)
+    from . import ledger as kernel_ledger
+
+    budget_ledger = kernel_ledger.derive_budget_ledger(result, context=context)
 
     return build_run_state(
         run_id=run_id,
@@ -511,12 +505,30 @@ def build_command_contract_bundle(command: str, result=None, *, context: dict | 
             "artifact_count": len(artifacts),
         },
     )
+    from . import decision as kernel_decision
+    from . import policy as kernel_policy
+
+    policy_evaluation = kernel_policy.evaluate_policy(
+        run_state=run_state,
+        result=result,
+        context=context,
+        quality_report=quality_report,
+    )
+    decision_record = kernel_decision.build_decision_record_for_command(
+        command,
+        run_state=run_state,
+        result=result,
+        policy_evaluation=policy_evaluation,
+        quality_report=quality_report,
+    )
     bundle = {
         "schema_version": CONTRACT_SCHEMA_VERSION,
         "format": CONTRACT_BUNDLE_FORMAT,
         "task_spec": task_spec,
         "run_state": run_state,
         "observation": observation,
+        "policy": policy_evaluation,
+        "decision_record": decision_record,
         "action_result": action_result,
         "artifacts": artifacts,
     }
@@ -531,6 +543,8 @@ def summarize_contract_bundle(bundle: dict | None = None) -> dict:
     task_spec = payload.get("task_spec", {}) if isinstance(payload.get("task_spec", {}), dict) else {}
     run_state = payload.get("run_state", {}) if isinstance(payload.get("run_state", {}), dict) else {}
     action_result = payload.get("action_result", {}) if isinstance(payload.get("action_result", {}), dict) else {}
+    policy_evaluation = payload.get("policy", {}) if isinstance(payload.get("policy", {}), dict) else {}
+    decision_record = payload.get("decision_record", {}) if isinstance(payload.get("decision_record", {}), dict) else {}
     quality_report = payload.get("quality_report", {}) if isinstance(payload.get("quality_report", {}), dict) else {}
     artifacts = payload.get("artifacts", []) if isinstance(payload.get("artifacts", []), list) else []
     return {
@@ -539,6 +553,8 @@ def summarize_contract_bundle(bundle: dict | None = None) -> dict:
         "lifecycle_state": str(run_state.get("lifecycle_state", "")).strip(),
         "active_stage": str(run_state.get("active_stage", "")).strip(),
         "action_type": str(action_result.get("action_type", "")).strip(),
+        "selected_action": str(decision_record.get("selected_action", "")).strip(),
+        "budget_pressure_level": str(policy_evaluation.get("budget_pressure_level", "")).strip(),
         "artifact_count": len(artifacts),
         "quality_recommended_action": str(quality_report.get("recommended_action", "")).strip(),
     }

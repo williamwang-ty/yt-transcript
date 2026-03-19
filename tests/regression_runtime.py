@@ -62,6 +62,9 @@ class RuntimeRegressionTests(unittest.TestCase):
             self.assertGreaterEqual(len(contracts["artifacts"]), 1)
             self.assertEqual(envelope["telemetry"]["contracts"]["action_type"], "chunk_text")
             self.assertEqual(envelope["telemetry"]["contracts"]["active_stage"], "planning")
+            self.assertEqual(envelope["telemetry"]["contracts"]["selected_action"], "continue_stage")
+            self.assertEqual(contracts["policy"]["budget_pressure_level"], "normal")
+            self.assertEqual(contracts["decision_record"]["selected_action"], "continue_stage")
 
             telemetry_path = Path(envelope["telemetry"]["telemetry_path"])
             event = json.loads(telemetry_path.read_text(encoding="utf-8").splitlines()[-1])
@@ -90,6 +93,39 @@ class RuntimeRegressionTests(unittest.TestCase):
             self.assertEqual(bundle["quality_report"]["format"], runtime_contracts.QUALITY_REPORT_FORMAT)
             self.assertFalse(bundle["quality_report"]["passed"])
             self.assertEqual(bundle["quality_report"]["recommended_action"], "repair_or_replan")
+            self.assertIn("repair_chunk", bundle["policy"]["allowed_actions"])
+            self.assertEqual(bundle["decision_record"]["selected_action"], "repair_chunk")
+
+    def test_policy_prefers_replan_for_timeout_driven_processing_failure(self):
+        """Test policy and decision select replan for timeout-driven processing failures."""
+        from kernel.task_runtime import decision as runtime_decision
+        from kernel.task_runtime import policy as runtime_policy
+
+        run_state = {
+            "active_stage": "processing",
+            "lifecycle_state": "processing",
+            "effective_runtime_status": "processing",
+        }
+        result = {
+            "success": False,
+            "aborted": True,
+            "aborted_reason": "timeout on chunk 0; reduce target for future requests",
+            "replan_required": True,
+            "replan_reason": "timeout on chunk 0; reduce target for future requests",
+            "warning_count": 1,
+        }
+        policy_evaluation = runtime_policy.evaluate_policy(run_state=run_state, result=result, context={"work_dir": "/tmp/demo"})
+        decision_record = runtime_decision.build_decision_record_for_command(
+            "process-chunks",
+            run_state=run_state,
+            result=result,
+            policy_evaluation=policy_evaluation,
+        )
+
+        self.assertIn("replan_remaining", policy_evaluation["allowed_actions"])
+        self.assertIn("shrink_chunk_size", policy_evaluation["allowed_actions"])
+        self.assertEqual(policy_evaluation["budget_pressure_level"], "high")
+        self.assertEqual(decision_record["selected_action"], "replan_remaining")
 
     def test_telemetry_summary_reads_local_journal(self):
         """Test telemetry summary reads local journal."""
