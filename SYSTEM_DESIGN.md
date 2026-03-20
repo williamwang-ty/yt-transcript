@@ -312,108 +312,277 @@ This makes output packaging and output judgment explicit final stages rather tha
 - quality gates are auditable
 - the user gets both a document and a reasoned stop/go signal
 
-### 6.8 Runtime Control and Observability Layer
+### 6.8 Runtime Design: Bounded Adaptive Control
 
-#### Problem to solve
+#### Why the runtime exists
 
-A long-running local workflow is hard to operate if its internal state is invisible.
+The project already has a clear business workflow, but workflow structure alone is not enough once execution becomes long-running, interruptible, and recoverable.
 
-#### Solution
+A purely path-oriented implementation tends to accumulate:
 
-The project keeps runtime behavior inspectable through persisted state, manifests, ownership records, control signals, telemetry, and intermediate artifacts.
+- implicit branching hidden in `if/else` conditions
+- recovery logic expressed as one-off exceptions
+- pause / resume / cancel semantics scattered across commands
+- difficulty explaining what the system believes, what it can do next, and why
 
-This is especially important for long-video chunk execution, but the design principle applies to the whole project.
+The runtime exists to solve that problem.
 
-#### Design value
+It is the layer that turns execution from “a chain of commands with conditions” into “a bounded job with explicit state, allowed actions, and durable control semantics.”
 
-- failures become diagnosable
-- resuming becomes practical
-- the project behaves like a local job system instead of a disposable script
+#### What the runtime is — and is not
+
+In this project, the runtime is:
+
+- a **bounded adaptive control layer** between workflow routing and tool execution
+- **state-oriented** rather than path-oriented
+- **rule-first**, with LLM participation limited to constrained decision support
+- **local-first**, with important truth persisted on disk
+- **operable**, meaning a run can be inspected, paused, resumed, cancelled, and explained
+
+It is not:
+
+- a second free-form planner agent embedded inside the skill
+- a replacement for the business workflow itself
+- an excuse to let the model invent arbitrary next actions
+- a generic multi-agent platform
+
+So the runtime should be read as **adaptive control**, not as **autonomous agency**.
+
+#### Runtime responsibilities
+
+The runtime owns six core responsibilities:
+
+1. **Normalize runtime contracts**
+   - represent task intent, run state, observations, decisions, actions, quality signals, and artifacts in explicit schemas
+
+2. **Drive lifecycle state explicitly**
+   - make lifecycle state and stage transitions visible instead of leaving them implicit in branch structure
+
+3. **Derive allowed actions**
+   - decide what is legal at a given moment based on policy, budget pressure, recovery signals, and quality outcomes
+
+4. **Select and dispatch bounded actions**
+   - choose from an allowed set, invoke the compatible implementation, and record why that action was selected
+
+5. **Persist operational truth**
+   - keep state, control signals, ownership markers, and telemetry on disk so runs remain inspectable and resumable
+
+6. **Expose a stable outer contract**
+   - give external callers a small runtime-facing API instead of forcing them to understand internal helper commands
+
+#### The runtime lifecycle loop
+
+The runtime control model is best understood as this loop:
+
+`Observe -> Evaluate -> Derive Allowed Actions -> Decide -> Validate -> Act -> Commit -> Transition`
+
+Each step has a distinct purpose:
+
+- **Observe**
+  - read persisted state such as manifests, control files, ownership markers, and prior results
+- **Evaluate**
+  - summarize execution health, budget pressure, processing substate, and quality signals
+- **Derive Allowed Actions**
+  - produce an explicit set of legal next actions under current policy
+- **Decide**
+  - select one action from the allowed set; rules lead, and model-assisted ranking is optional and constrained
+- **Validate**
+  - confirm preconditions before mutation or external calls
+- **Act**
+  - execute the chosen bounded command
+- **Commit**
+  - persist resulting state, control changes, artifacts, and telemetry
+- **Transition**
+  - emit the new lifecycle state and transition summary
+
+This is the conceptual upgrade from workflow control to runtime control:
+
+- workflow still defines the nominal business path
+- runtime defines the current operational state and legal next moves
+
+#### Core runtime objects
+
+The runtime is organized around a small set of persistent or derivable objects:
+
+- **`TaskSpec`**
+  - stable description of task intent from the outer caller’s perspective
+- **`RunState`**
+  - current lifecycle state, active stage, ownership, effective runtime status, and budget context
+- **`Observation`**
+  - normalized facts collected from command results and persisted runtime state
+- **`PolicyEvaluation`**
+  - allowed actions, pressure signals, and policy profile outputs
+- **`DecisionRecord`**
+  - the selected action, confidence, rationale, and policy checks behind it
+- **`ActionResult`**
+  - normalized report of what command ran and what happened
+- **`ProcessingState` / `RecoverySummary`**
+  - resumability and fine-grained processing posture for long-text work
+- **`ArtifactRef` / `ArtifactGraph`**
+  - output lineage and inspectable run products
+- **`QualityReport` / `EvaluatorReport`**
+  - structured quality and recommendation signals, separate from nominal processing
+
+These objects matter because the runtime should be explainable without relying on prompt memory or caller intuition.
+
+#### Persisted truth and control surfaces
+
+The runtime is intentionally local-first. Its important truth lives in files, not only in process memory.
+
+The main persisted surfaces are:
+
+- **`.runtime_task.json`**
+  - stable outer-facing task record used by the runtime API
+- **`manifest.json`**
+  - domain execution truth for long-text processing plans, chunks, and runtime status
+- **`.runtime_owner.json`**
+  - mutation ownership marker for exclusive local control
+- **`.runtime_pause.json`** and **`.runtime_cancel.json`**
+  - out-of-band operator control signals
+- **`telemetry.jsonl`**
+  - append-only operational journal for command history and runtime inspection
+
+The design intent is:
+
+- `manifest.json` and control files express operational execution truth
+- `.runtime_task.json` expresses stable integration-facing run identity and intent
+- telemetry provides append-only observability rather than replacing state
+
+#### Decision model: rule-first, LLM-optional, never unconstrained
+
+A key runtime design principle is that the model does not own orchestration.
+
+Instead:
+
+- workflow code still defines the nominal business skeleton
+- policy derives the allowed action set
+- the decision layer must choose from that allowed set
+- an optional LLM ranker may help rank or select **within** the allowed set only
+- recovery actions such as `pause`, `resume`, `cancel`, `prepare_resume`, and `replan_remaining` are first-class runtime semantics rather than one-off exceptions
+
+This keeps adaptation without giving up control boundaries.
+
+#### Stable external runtime API
+
+For external callers, the preferred runtime surface is:
+
+- `create-run`
+- `inspect-run`
+- `advance-run`
+- `apply-control`
+- `resume-run`
+- `finalize-run`
+
+This API does three things:
+
+- hides internal helper-command detail behind a stable contract
+- lets an outer agent treat the skill as a bounded runtime capability
+- preserves backward compatibility because older commands still exist as implementation-level helpers
+
+So the migration direction is:
+
+- **preferred path**: runtime-facing API
+- **compatibility path**: legacy helper commands and CLI shims
 
 #### Implementation anchors
 
-- `kernel/task_runtime/runtime.py`
-  - runtime ownership, command envelopes, and append-only command telemetry
+The runtime design maps onto the current repository like this:
+
+- `kernel/task_runtime/contracts.py`
+  - runtime object schemas and command contract bundles
+- `kernel/task_runtime/lifecycle.py`
+  - lifecycle shell and transition summaries
+- `kernel/task_runtime/policy.py`
+  - allowed-action derivation and budget-pressure evaluation
+- `kernel/task_runtime/decision.py`
+  - rule-first action selection with optional constrained model assistance
+- `kernel/task_runtime/ledger.py`
+  - budget and action-accounting summaries
+- `kernel/task_runtime/recovery.py`
+  - processing substates and recovery recommendations
+- `kernel/task_runtime/artifacts.py`
+  - artifact references and artifact-graph summaries
+- `kernel/task_runtime/evaluator.py`
+  - structured quality-driven recommendation signals
 - `kernel/task_runtime/api.py`
   - stable outer-agent runtime API for `create-run / inspect-run / advance-run / apply-control / resume-run / finalize-run`
-- `kernel/task_runtime/state.py`
-  - manifest persistence plus pause / cancel control files and runtime status summaries
-- `kernel/task_runtime/controller.py`
-  - owned mutation wrappers and bounded auto-replan control loops
-- `kernel/task_runtime/telemetry.py`
-  - telemetry query and summarization surfaces for operators
-
-### 6.9 Kernel Layering: Generic Runtime vs Long-Text Transformation
-
-The project-level pipeline above explains execution order, but the codebase has another equally important split: the internal kernel is organized into two different layers with different responsibilities.
-
-#### A. Generic task-runtime layer
-
-This layer is not specific to transcript rewriting. It exists because any long-running local job needs common operating semantics:
-
-- exclusive ownership for mutations
-- persisted manifest and control signals
-- pause / resume / cancel semantics
-- telemetry and result envelopes
-
-In the current repository, that generic runtime layer lives in:
-
 - `kernel/task_runtime/runtime.py`
-- `kernel/task_runtime/api.py`
+  - command envelopes, telemetry append, and ownership helpers
 - `kernel/task_runtime/state.py`
+  - persisted manifest, runtime state, and control-file helpers
 - `kernel/task_runtime/controller.py`
+  - owned mutations and bounded control-loop wrappers
 - `kernel/task_runtime/telemetry.py`
+  - operator-facing telemetry query and summary surfaces
 
-Phase 6 also adds a runtime-facing convergence layer in `kernel/task_runtime/api.py`. It keeps `work_dir` as the durable local run reference, returns a stable `run_id` contract, and makes `create-run / inspect-run / advance-run / apply-control / resume-run / finalize-run` the preferred outer integration surface while older helpers remain compatibility wrappers.
+### 6.9 Layering: Workflow Façade, Generic Runtime, and Long-Text Transformation
 
-This layer answers the question:
+The whole system becomes easier to understand if it is read as three stacked concerns rather than one large script.
 
-> How does the system behave like a controllable local job, regardless of what the job is doing?
+#### A. Workflow façade layer
 
-#### B. Long-text transformation layer
+This layer lives mainly in `scripts/*` and `yt_transcript_utils.py`.
 
-This layer is specific to the hardest content problem in the project: safely transforming long transcript-like input into coherent article-style output.
+Its job is to define the nominal business path:
 
-Its responsibilities include:
+- source discovery and routing
+- subtitle path vs Deepgram fallback
+- short-path vs long-path planning
+- normalization, assembly, and verification entrypoints
+- compatibility CLI and repository command surfaces
 
-- chunk contracts and control policies
+This layer answers:
+
+> What business path should the job take under normal conditions?
+
+#### B. Generic task-runtime layer
+
+This layer lives in `kernel/task_runtime/*`.
+
+Its job is to make the job controllable as a runtime:
+
+- explicit contracts
+- lifecycle state and transitions
+- allowed actions and decisions
+- ownership and control signals
+- recovery semantics
+- telemetry and outer runtime API
+
+This layer answers:
+
+> Given the current persisted state, what is the run, what can it legally do next, and how do we control it safely?
+
+#### C. Long-text transformation layer
+
+This layer lives in `kernel/long_text/*`.
+
+Its job is to perform domain-specific text work:
+
 - chunking and prompt assembly
-- glossary and semantic-anchor consistency controls
-- LLM request orchestration
-- chunk processing, repair, replan, and merge behavior
+- glossary and semantic-anchor consistency
+- LLM request execution
+- repair, replan, merge, and resume behavior
 
-In the current repository, that layer lives in:
+This layer answers:
 
-- `kernel/long_text/contracts.py`
-- `kernel/long_text/lifecycle.py`
-- `kernel/long_text/prompting.py`
-- `kernel/long_text/llm.py`
-- `kernel/long_text/processing.py`
-- `kernel/long_text/chunking.py`
-- `kernel/long_text/merge.py`
-- `kernel/long_text/execution.py`
-- `kernel/long_text/glossary.py`
-- `kernel/long_text/semantic.py`
-- `kernel/long_text/autotune.py`
+> Given an allowed bounded action, how is the long-text transformation actually carried out?
 
-This layer answers the question:
+#### D. Why this split matters
 
-> Given a long document and a transformation goal, how do we split, guide, verify, recover, and reassemble the work?
+This split is important because it prevents three different concerns from collapsing into one place:
 
-#### C. Relationship to `yt_transcript_utils.py`
+- **workflow concern**: business routing
+- **runtime concern**: state-oriented control and recovery
+- **domain concern**: transcript-to-article transformation mechanics
 
-`yt_transcript_utils.py` is still the main command surface and compatibility façade, but after the refactor it is no longer the only place where core behavior lives.
+That separation is the key architectural move behind the current upgrade.
 
-Its role is now to:
+The result is not “an agent all the way down.”
+The result is:
 
-- expose CLI and repository-level commands
-- bridge shell workflows and Python code
-- delegate generic runtime concerns to `kernel/task_runtime/*`
-- delegate long-text transformation concerns to `kernel/long_text/*`
-
-This separation improves readability because readers can distinguish project orchestration from reusable runtime control and from long-text transformation mechanics.
-
----
+- a workflow-native system
+- upgraded by an explicit runtime control layer
+- while keeping LLM usage bounded inside the right places
 
 ## 7. Core Subsystem Design: Long-Text Transformation
 
@@ -628,7 +797,7 @@ Those may be future directions, but they are not the current system design goal.
 
 This section is not a spec. It helps relate design concepts to the current repository surfaces.
 
-The internal implementation is organized into two layers: `task_runtime` for generic long-running task control, and `long_text` for long-text transformation behavior.
+The internal implementation is best read as a workflow façade above two kernel layers: `task_runtime` for generic long-running task control, and `long_text` for long-text transformation behavior.
 
 - `SKILL.md`
   - top-level human/agent workflow entry
@@ -642,6 +811,24 @@ The internal implementation is organized into two layers: `task_runtime` for gen
   - metadata, subtitle, and audio acquisition surface
 - `yt_transcript_utils.py`
   - main Python entry, CLI façade, workflow orchestration, planning, verification, and adapter commands; it imports the two kernel layers directly
+- `kernel/task_runtime/contracts.py`
+  - runtime object schemas and command contract bundles
+- `kernel/task_runtime/lifecycle.py`
+  - lifecycle shell and transition summaries
+- `kernel/task_runtime/policy.py`
+  - allowed-action derivation and budget-pressure evaluation
+- `kernel/task_runtime/decision.py`
+  - rule-first action selection and bounded decision records
+- `kernel/task_runtime/ledger.py`
+  - budget and action-accounting summaries
+- `kernel/task_runtime/recovery.py`
+  - processing substates and recovery recommendations
+- `kernel/task_runtime/artifacts.py`
+  - artifact references and artifact-graph summaries
+- `kernel/task_runtime/evaluator.py`
+  - structured quality and recommendation outputs
+- `kernel/task_runtime/api.py`
+  - stable external runtime API for create / inspect / advance / control / resume / finalize
 - `kernel/task_runtime/runtime.py`
   - task ownership, command envelopes, and telemetry append helpers
 - `kernel/task_runtime/state.py`
@@ -999,108 +1186,277 @@ YouTube URL
 - 质量门禁可审计
 - 用户拿到的不只是文档，还有一个可解释的 stop/go 判断
 
-### 6.8 运行控制与可观察性层
+### 6.8 运行时设计：有边界的自适应控制层
 
-#### 要解决的问题
+#### 为什么需要 runtime
 
-一个长时间运行的本地工作流，如果内部状态不可见，就很难被稳定操作。
+这个项目本来就有清晰的业务 workflow，但当执行过程变成长时间运行、可中断、可恢复的作业时，仅靠 workflow 结构本身是不够的。
 
-#### 解决方案
+如果只有 path-oriented 的流程控制，系统很容易逐渐堆积出：
 
-项目通过持久化 state、manifest、ownership、control signals、telemetry 和中间产物，让运行行为保持可检查。
+- 藏在 `if/else` 里的隐式分支
+- 以 special case 形式出现的恢复逻辑
+- 分散在不同命令里的 pause / resume / cancel 语义
+- 很难回答“系统现在相信什么、下一步能做什么、为什么这样做”
 
-这一点在长视频 chunk 执行里尤其重要，但这套设计原则其实适用于整个项目。
+runtime 的存在，就是为了解决这个问题。
 
-#### 设计价值
+它把执行从“带条件的命令串”提升为“一个有明确状态、允许动作集合和持久控制语义的有边界作业”。
 
-- 失败更可诊断
-- resume 变得可操作
-- 项目行为更像一个本地作业系统，而不是一次性脚本
+#### runtime 是什么，不是什么
+
+在这个项目里，runtime 是：
+
+- 位于 workflow 路由和工具执行之间的 **有边界自适应控制层**
+- **state-oriented** 而不是 path-oriented
+- **rule-first** 的；LLM 只在受限决策中做可选辅助
+- **local-first** 的；重要真相必须落盘
+- **可操作** 的；run 必须可 inspect、pause、resume、cancel、解释
+
+它不是：
+
+- skill 内再嵌一个自由规划的第二 agent
+- 对业务 workflow 的替代
+- 允许模型随意发明下一步动作的理由
+- 一个通用 multi-agent 平台
+
+所以这里的 runtime，本质上应理解为 **adaptive control**，而不是 **autonomous agency**。
+
+#### runtime 的核心职责
+
+runtime 主要承担六类职责：
+
+1. **统一 runtime contracts**
+   - 用显式 schema 表示 task intent、run state、observation、decision、action、quality signal 与 artifacts
+
+2. **显式驱动 lifecycle**
+   - 让 lifecycle state 与 stage transition 变成可见的一等语义，而不是隐藏在分支结构里
+
+3. **推导 allowed actions**
+   - 基于 policy、预算压力、恢复信号与质量结果，明确当前时刻哪些动作合法
+
+4. **选择并派发受限动作**
+   - 从 allowed set 中选一个动作，调用兼容实现，并记录为什么选它
+
+5. **持久化运行真相**
+   - 把状态、控制信号、ownership marker 与 telemetry 写到磁盘上，让 run 可检查、可恢复
+
+6. **对外暴露稳定 contract**
+   - 给外层调用者一个小而稳的 runtime-facing API，而不是逼它理解内部 helper command
+
+#### runtime 的 lifecycle loop
+
+runtime 的控制模型，最好理解成下面这个循环：
+
+`Observe -> Evaluate -> Derive Allowed Actions -> Decide -> Validate -> Act -> Commit -> Transition`
+
+每一步的职责都不同：
+
+- **Observe**
+  - 读取 manifest、control files、ownership marker、已有结果等持久化状态
+- **Evaluate**
+  - 汇总执行健康度、预算压力、processing substate 与质量信号
+- **Derive Allowed Actions**
+  - 在当前 policy 下生成明确的合法下一步动作集合
+- **Decide**
+  - 从 allowed set 中选一个动作；规则优先，模型辅助是可选且受限的
+- **Validate**
+  - 在真正 mutation 或外部调用前确认前置条件
+- **Act**
+  - 执行被选中的受限命令
+- **Commit**
+  - 持久化新的状态、控制变化、产物与 telemetry
+- **Transition**
+  - 产出新的 lifecycle state 与 transition summary
+
+这也是从 workflow control 升级到 runtime control 的关键：
+
+- workflow 仍然负责名义业务路径
+- runtime 负责当前运行状态以及合法的下一步控制动作
+
+#### runtime 的核心对象模型
+
+runtime 围绕一组小而明确的对象来组织：
+
+- **`TaskSpec`**
+  - 从外层调用者视角描述任务意图的稳定对象
+- **`RunState`**
+  - 当前 lifecycle state、active stage、ownership、effective runtime status 与预算上下文
+- **`Observation`**
+  - 从命令结果与持久化状态中抽取出来的标准化事实
+- **`PolicyEvaluation`**
+  - allowed actions、压力信号与 policy profile 输出
+- **`DecisionRecord`**
+  - 被选动作、置信度、原因和 policy checks
+- **`ActionResult`**
+  - 标准化描述“执行了什么命令，结果如何”
+- **`ProcessingState` / `RecoverySummary`**
+  - 长文本执行的细粒度处理姿态与可恢复性摘要
+- **`ArtifactRef` / `ArtifactGraph`**
+  - 产物引用与产物血缘关系
+- **`QualityReport` / `EvaluatorReport`**
+  - 与 nominal processing 分离的结构化质量信号和建议动作
+
+这些对象重要，是因为 runtime 必须能在不依赖 prompt memory、不依赖调用者脑补的情况下，被清晰解释。
+
+#### 持久化真相与控制面
+
+runtime 明确坚持 local-first。重要真相应该存在文件里，而不是只存在进程内存里。
+
+主要的持久化载体包括：
+
+- **`.runtime_task.json`**
+  - 面向外部稳定 contract 的 task record
+- **`manifest.json`**
+  - 长文本 processing 计划、chunk 状态与 runtime status 的领域执行真相
+- **`.runtime_owner.json`**
+  - 保证本地 mutation 独占控制的 ownership marker
+- **`.runtime_pause.json`** 与 **`.runtime_cancel.json`**
+  - 带外操作控制信号
+- **`telemetry.jsonl`**
+  - append-only 的运行日志与命令历史
+
+设计意图是：
+
+- `manifest.json` 与 control files 表达运行中的执行真相
+- `.runtime_task.json` 表达面向集成的稳定 run identity 与 task intent
+- telemetry 提供 append-only 的可观察性，但不替代状态本身
+
+#### 决策模型：规则优先，LLM 可选，但绝不越权
+
+runtime 的关键设计原则之一，是模型不能接管 orchestration。
+
+因此：
+
+- workflow code 仍然定义名义业务骨架
+- policy 先推导 allowed action set
+- decision layer 只能在这个 allowed set 里做选择
+- 可选的 LLM ranker 只能在 allowed set **内部** 排序或选择
+- `pause`、`resume`、`cancel`、`prepare_resume`、`replan_remaining` 等恢复动作必须是 first-class runtime semantics，而不是 special case
+
+这样系统才能在保留自适应能力的同时，不失去控制边界。
+
+#### 对外稳定 runtime API
+
+面向外部调用者，当前首选的 runtime surface 是：
+
+- `create-run`
+- `inspect-run`
+- `advance-run`
+- `apply-control`
+- `resume-run`
+- `finalize-run`
+
+这组 API 的作用有三点：
+
+- 用稳定 contract 隐藏内部 helper-command 细节
+- 让外层 agent 可以把 skill 当成一个 bounded runtime capability 调用
+- 保留向后兼容，因为旧命令仍然存在，但退居实现级 helper 的位置
+
+所以迁移方向是：
+
+- **preferred path**：runtime-facing API
+- **compatibility path**：legacy helper commands 与 CLI shim
 
 #### 实现锚点
 
-- `kernel/task_runtime/runtime.py`
-  - runtime ownership、command envelope，以及 append-only 的命令 telemetry
+runtime 设计在当前仓库里的落点如下：
+
+- `kernel/task_runtime/contracts.py`
+  - runtime 对象 schema 与 command contract bundle
+- `kernel/task_runtime/lifecycle.py`
+  - lifecycle shell 与 transition summary
+- `kernel/task_runtime/policy.py`
+  - allowed-action derivation 与 budget-pressure evaluation
+- `kernel/task_runtime/decision.py`
+  - rule-first action selection，以及受限的模型辅助决策
+- `kernel/task_runtime/ledger.py`
+  - budget 与 action accounting 摘要
+- `kernel/task_runtime/recovery.py`
+  - processing substate 与 recovery recommendation
+- `kernel/task_runtime/artifacts.py`
+  - artifact 引用与 artifact-graph 摘要
+- `kernel/task_runtime/evaluator.py`
+  - 结构化的质量建议信号
 - `kernel/task_runtime/api.py`
   - 面向外层 agent 的稳定 runtime API：`create-run / inspect-run / advance-run / apply-control / resume-run / finalize-run`
+- `kernel/task_runtime/runtime.py`
+  - command envelope、telemetry append 与 ownership 辅助
 - `kernel/task_runtime/state.py`
-  - manifest 持久化，以及 pause / cancel 控制文件和 runtime 状态汇总
+  - manifest、runtime state 与 control-file 持久化辅助
 - `kernel/task_runtime/controller.py`
-  - owned mutation 包装器，以及有边界的 auto-replan 控制循环
+  - owned mutation 与 bounded control-loop 包装器
 - `kernel/task_runtime/telemetry.py`
   - 面向操作者的 telemetry 查询与汇总接口
 
-### 6.9 Kernel 分层：通用 Runtime 与长文本变换
+### 6.9 分层：Workflow Façade、Generic Runtime 与 Long-Text Transformation
 
-上面的项目分层描述的是执行顺序，但代码内部还有另一条同样重要的分层线：当前 kernel 被拆成两个职责不同的层。
+如果把整个系统理解成三层叠放的职责，而不是一大段脚本，runtime 的位置会更清晰。
 
-#### A. 通用 task-runtime 层
+#### A. Workflow façade 层
 
-这一层并不专属于 transcript 重写。它存在的原因是：任何长时间运行的本地作业，都需要一套共同的“运行语义”：
+这一层主要落在 `scripts/*` 和 `yt_transcript_utils.py`。
 
-- mutation 的独占 ownership
-- 持久化 manifest 与控制信号
-- pause / resume / cancel 语义
-- telemetry 与结果 envelope
+它负责定义名义业务路径：
 
-在当前仓库里，这个通用 runtime 层主要落在：
-
-- `kernel/task_runtime/runtime.py`
-- `kernel/task_runtime/api.py`
-- `kernel/task_runtime/state.py`
-- `kernel/task_runtime/controller.py`
-- `kernel/task_runtime/telemetry.py`
-
-Phase 6 还增加了 `kernel/task_runtime/api.py` 这一层 runtime-facing convergence layer：它以 `work_dir` 作为本地持久 run 引用，返回稳定的 `run_id` contract，并把 `create-run / inspect-run / advance-run / apply-control / resume-run / finalize-run` 设为首选外部集成面，而旧 helper 保留为兼容包装。
+- source discovery 与 routing
+- 字幕路径还是 Deepgram fallback
+- short-path 还是 long-path planning
+- normalization、assembly、verification 的入口
+- 兼容 CLI 与仓库级命令表面
 
 这一层回答的问题是：
 
-> 不管具体在做什么任务，系统怎样表现得像一个可控制的本地作业系统？
+> 在正常业务语义下，这个任务应该走哪条路径？
 
-#### B. 长文本变换层
+#### B. Generic task-runtime 层
 
-这一层专门服务于项目里最难的内容问题：如何把很长、带 transcript 特征的输入，安全地变成连贯的文章式输出。
+这一层落在 `kernel/task_runtime/*`。
 
-它的职责包括：
+它负责把任务变成一个可控制的 runtime：
 
-- chunk contract 与 control policy
+- 显式 contracts
+- lifecycle state 与 transition
+- allowed actions 与 decisions
+- ownership 与 control signals
+- recovery semantics
+- telemetry 与外部 runtime API
+
+这一层回答的问题是：
+
+> 给定当前持久化状态，这个 run 现在是什么状态、合法下一步是什么、怎样才能安全控制它？
+
+#### C. Long-text transformation 层
+
+这一层落在 `kernel/long_text/*`。
+
+它负责真正的领域执行：
+
 - chunking 与 prompt 组装
 - glossary 与 semantic-anchor 一致性控制
-- LLM 请求编排
-- chunk 处理、repair、replan 与 merge 行为
-
-在当前仓库里，这一层主要落在：
-
-- `kernel/long_text/contracts.py`
-- `kernel/long_text/lifecycle.py`
-- `kernel/long_text/prompting.py`
-- `kernel/long_text/llm.py`
-- `kernel/long_text/processing.py`
-- `kernel/long_text/chunking.py`
-- `kernel/long_text/merge.py`
-- `kernel/long_text/execution.py`
-- `kernel/long_text/glossary.py`
-- `kernel/long_text/semantic.py`
-- `kernel/long_text/autotune.py`
+- LLM 请求执行
+- repair、replan、merge、resume 行为
 
 这一层回答的问题是：
 
-> 给定一份长文档和一个变换目标，系统如何切分、引导、校验、恢复并重新装配整项工作？
+> 在一个被允许的受限动作已经确定之后，长文本变换到底怎样被执行？
 
-#### C. 它与 `yt_transcript_utils.py` 的关系
+#### D. 为什么这种拆分重要
 
-`yt_transcript_utils.py` 仍然是主命令入口和兼容 façade，但在重构之后，它已经不再是所有核心行为的唯一承载点。
+这种拆分很重要，因为它避免了三类问题坍缩在一起：
 
-它现在的角色更像：
+- **workflow concern**：业务路由
+- **runtime concern**：面向状态的控制与恢复
+- **domain concern**：transcript-to-article 的变换机制
 
-- 暴露 CLI 与仓库级命令入口
-- 连接 shell workflow 和 Python 代码
-- 把通用 runtime 相关职责委托给 `kernel/task_runtime/*`
-- 把长文本变换相关职责委托给 `kernel/long_text/*`
+这正是当前升级里最关键的架构动作。
 
-这种拆分提升了可读性，因为阅读者可以把“项目编排”“通用运行控制”“长文本变换机制”三类问题清楚区分开。
+升级后的结果不是“把整个系统都做成 agent”。
+而是：
 
----
+- 仍然是一个 workflow-native 系统
+- 但升级出了显式的 runtime control layer
+- 同时把 LLM 严格限制在合适的位置使用
 
 ## 7. 核心子系统设计：长文本变换
 
@@ -1315,7 +1671,7 @@ merge 被刻意设计得尽量简单。
 
 这一节不是 spec，只是帮助把设计概念映射到当前仓库表面。
 
-当前内部实现分成两层：`task_runtime` 负责通用长程任务控制，`long_text` 负责长文本变换行为。
+当前内部实现最好理解为：一个 workflow façade 位于两层 kernel 之上；其中 `task_runtime` 负责通用长程任务控制，`long_text` 负责长文本变换行为。
 
 - `SKILL.md`
   - 顶层的人类/agent 工作流入口
@@ -1329,6 +1685,24 @@ merge 被刻意设计得尽量简单。
   - metadata、字幕、音频的获取接口
 - `yt_transcript_utils.py`
   - 主 Python 入口、CLI façade、workflow 编排、planning、verification 与适配命令；现直接依赖两层 kernel 子包
+- `kernel/task_runtime/contracts.py`
+  - runtime 对象 schema 与 command contract bundle
+- `kernel/task_runtime/lifecycle.py`
+  - lifecycle shell 与 transition summary
+- `kernel/task_runtime/policy.py`
+  - allowed-action derivation 与 budget-pressure evaluation
+- `kernel/task_runtime/decision.py`
+  - rule-first action selection 与受限决策记录
+- `kernel/task_runtime/ledger.py`
+  - budget 与 action accounting 摘要
+- `kernel/task_runtime/recovery.py`
+  - processing substate 与 recovery recommendation
+- `kernel/task_runtime/artifacts.py`
+  - artifact 引用与 artifact-graph 摘要
+- `kernel/task_runtime/evaluator.py`
+  - 结构化质量与建议动作输出
+- `kernel/task_runtime/api.py`
+  - 稳定的外部 runtime API：create / inspect / advance / control / resume / finalize
 - `kernel/task_runtime/runtime.py`
   - 任务 ownership、command envelope 与 telemetry append 辅助
 - `kernel/task_runtime/state.py`
