@@ -480,6 +480,14 @@ yt-transcript/
 │   ├── task_runtime/       # 通用任务运行时层
 │   │   ├── runtime.py      # ownership、command envelope、telemetry append
 │   │   ├── api.py          # 对外稳定 runtime API：create/inspect/advance/control/finalize
+│   │   ├── contracts.py    # runtime contracts：task/run/action/artifact envelope
+│   │   ├── lifecycle.py    # runtime lifecycle shell 与 transition summary
+│   │   ├── policy.py       # allowed-action derivation 与 budget-pressure policy
+│   │   ├── evaluator.py    # quality-gated evaluator report 与建议动作
+│   │   ├── decision.py     # rule-first action selection 与 decision record
+│   │   ├── ledger.py       # runtime budget 与 action accounting 摘要
+│   │   ├── recovery.py     # processing substate 与 recovery summary
+│   │   ├── artifacts.py    # artifact graph 与持久化产物引用
 │   │   ├── state.py        # manifest/runtime 持久化与控制文件
 │   │   ├── controller.py   # owned mutation 与 bounded control-loop 辅助
 │   │   └── telemetry.py    # telemetry 查询与汇总辅助
