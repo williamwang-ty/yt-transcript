@@ -28,7 +28,12 @@ YT_DLP_EXTRACTOR_RETRIES="${YT_DLP_EXTRACTOR_RETRIES:-}"
 YT_DLP_COOKIES_FROM_BROWSER="${YT_DLP_COOKIES_FROM_BROWSER:-}"
 YT_DLP_COOKIES_FILE="${YT_DLP_COOKIES_FILE:-}"
 YTDLP_SESSION_BROWSER_COOKIES=""
+YTDLP_SESSION_STATE_FILE="/tmp/yt_transcript_${$}_browser_session"
+trap 'rm -f "$YTDLP_SESSION_STATE_FILE"' EXIT
 YTDLP_CHROME_COOKIES_RETRY_MAX=3
+YTDLP_DEFAULT_SOCKET_TIMEOUT_SEC=15
+YTDLP_DEFAULT_RETRIES=1
+YTDLP_DEFAULT_EXTRACTOR_RETRIES=1
 
 if [ -n "$CONFIG_JSON" ]; then
     if [ -z "$YT_DLP_SOCKET_TIMEOUT_SEC" ]; then
@@ -48,21 +53,117 @@ if [ -n "$CONFIG_JSON" ]; then
     fi
 fi
 
-YTDLP_ARGS=()
-if [[ "$YT_DLP_SOCKET_TIMEOUT_SEC" =~ ^-?[0-9]+$ ]] && [ "$YT_DLP_SOCKET_TIMEOUT_SEC" -gt 0 ]; then
-    YTDLP_ARGS+=(--socket-timeout "$YT_DLP_SOCKET_TIMEOUT_SEC")
-fi
-if [[ "$YT_DLP_RETRIES" =~ ^-?[0-9]+$ ]] && [ "$YT_DLP_RETRIES" -ge 0 ]; then
-    YTDLP_ARGS+=(--retries "$YT_DLP_RETRIES")
-fi
-if [[ "$YT_DLP_EXTRACTOR_RETRIES" =~ ^-?[0-9]+$ ]] && [ "$YT_DLP_EXTRACTOR_RETRIES" -ge 0 ]; then
-    YTDLP_ARGS+=(--extractor-retries "$YT_DLP_EXTRACTOR_RETRIES")
-fi
+resolve_positive_int() {
+    local raw_value="$1"
+    local fallback="$2"
+    if [[ "$raw_value" =~ ^[0-9]+$ ]] && [ "$raw_value" -gt 0 ]; then
+        printf '%s' "$raw_value"
+    else
+        printf '%s' "$fallback"
+    fi
+}
+
+resolve_nonnegative_int() {
+    local raw_value="$1"
+    local fallback="$2"
+    if [[ "$raw_value" =~ ^[0-9]+$ ]] && [ "$raw_value" -ge 0 ]; then
+        printf '%s' "$raw_value"
+    else
+        printf '%s' "$fallback"
+    fi
+}
+
+YT_DLP_SOCKET_TIMEOUT_SEC=$(resolve_positive_int "$YT_DLP_SOCKET_TIMEOUT_SEC" "$YTDLP_DEFAULT_SOCKET_TIMEOUT_SEC")
+YT_DLP_RETRIES=$(resolve_nonnegative_int "$YT_DLP_RETRIES" "$YTDLP_DEFAULT_RETRIES")
+YT_DLP_EXTRACTOR_RETRIES=$(resolve_nonnegative_int "$YT_DLP_EXTRACTOR_RETRIES" "$YTDLP_DEFAULT_EXTRACTOR_RETRIES")
+
+declare -a YTDLP_ARGS=(
+    --socket-timeout "$YT_DLP_SOCKET_TIMEOUT_SEC"
+    --retries "$YT_DLP_RETRIES"
+    --extractor-retries "$YT_DLP_EXTRACTOR_RETRIES"
+)
+
 if [ -n "$YT_DLP_COOKIES_FILE" ]; then
     YTDLP_ARGS+=(--cookies "$YT_DLP_COOKIES_FILE")
 elif [ -n "$YT_DLP_COOKIES_FROM_BROWSER" ]; then
     YTDLP_ARGS+=(--cookies-from-browser "$YT_DLP_COOKIES_FROM_BROWSER")
 fi
+
+current_session_browser() {
+    if [ -s "$YTDLP_SESSION_STATE_FILE" ]; then
+        cat "$YTDLP_SESSION_STATE_FILE" 2>/dev/null || true
+    elif [ -n "$YTDLP_SESSION_BROWSER_COOKIES" ]; then
+        printf '%s' "$YTDLP_SESSION_BROWSER_COOKIES"
+    fi
+}
+
+current_auth_strategy() {
+    if [ -n "$YT_DLP_COOKIES_FILE" ]; then
+        printf 'cookies_file'
+    elif [ -n "$YT_DLP_COOKIES_FROM_BROWSER" ]; then
+        printf 'configured_browser'
+    elif [ -n "$(current_session_browser)" ]; then
+        printf 'chrome_retry_session'
+    else
+        printf 'anonymous'
+    fi
+}
+
+current_ytdlp_runtime_json() {
+    local session_browser=""
+    session_browser=$(current_session_browser)
+
+    env \
+        YT_DLP_SOCKET_TIMEOUT_SEC="$YT_DLP_SOCKET_TIMEOUT_SEC" \
+        YT_DLP_RETRIES="$YT_DLP_RETRIES" \
+        YT_DLP_EXTRACTOR_RETRIES="$YT_DLP_EXTRACTOR_RETRIES" \
+        YT_DLP_COOKIES_FROM_BROWSER="$YT_DLP_COOKIES_FROM_BROWSER" \
+        YT_DLP_COOKIES_FILE="$YT_DLP_COOKIES_FILE" \
+        YTDLP_SESSION_BROWSER_COOKIES="$session_browser" \
+        YTDLP_CHROME_COOKIES_RETRY_MAX="$YTDLP_CHROME_COOKIES_RETRY_MAX" \
+        YTDLP_AUTH_STRATEGY="$(current_auth_strategy)" \
+        python3 - <<'PY'
+import json
+import os
+
+print(json.dumps({
+    'socket_timeout_sec': int(os.environ.get('YT_DLP_SOCKET_TIMEOUT_SEC', '0') or 0),
+    'retries': int(os.environ.get('YT_DLP_RETRIES', '0') or 0),
+    'extractor_retries': int(os.environ.get('YT_DLP_EXTRACTOR_RETRIES', '0') or 0),
+    'auth_strategy': os.environ.get('YTDLP_AUTH_STRATEGY', 'anonymous'),
+    'cookies_from_browser': os.environ.get('YT_DLP_COOKIES_FROM_BROWSER', ''),
+    'cookies_file': os.environ.get('YT_DLP_COOKIES_FILE', ''),
+    'session_browser_cookies': os.environ.get('YTDLP_SESSION_BROWSER_COOKIES', ''),
+    'chrome_retry_max': int(os.environ.get('YTDLP_CHROME_COOKIES_RETRY_MAX', '3') or 3),
+}, ensure_ascii=False))
+PY
+}
+
+is_impersonation_warning_line() {
+    local text="$1"
+    case "$text" in
+        *"extractor specified to use impersonation for this download, but no impersonate target is available"*)
+            return 0
+            ;;
+    esac
+    return 1
+}
+
+emit_filtered_stderr() {
+    local stderr_text="$1"
+    local saw_impersonation=false
+    [ -z "$stderr_text" ] && return 0
+    while IFS= read -r line; do
+        if is_impersonation_warning_line "$line"; then
+            saw_impersonation=true
+            continue
+        fi
+        printf '%s\n' "$line" >&2
+    done <<< "$stderr_text"
+    if [ "$saw_impersonation" = true ]; then
+        echo "ℹ️  yt-dlp extractor impersonation is unavailable in this build; continuing without it." >&2
+    fi
+}
 
 # Detect the common YouTube bot-verification failure strings returned by `yt-dlp`.
 is_not_a_bot_error() {
@@ -112,11 +213,19 @@ run_yt_dlp_command() {
     if (( ${#YTDLP_ARGS[@]} )); then
         args+=("${YTDLP_ARGS[@]}")
     fi
-    if [ -n "$YTDLP_SESSION_BROWSER_COOKIES" ] && [ -z "$YT_DLP_COOKIES_FILE" ] && [ -z "$YT_DLP_COOKIES_FROM_BROWSER" ]; then
-        args+=(--cookies-from-browser "$YTDLP_SESSION_BROWSER_COOKIES")
+
+    local session_browser=""
+    session_browser=$(current_session_browser)
+    if [ -n "$session_browser" ] && [ -z "$YT_DLP_COOKIES_FILE" ] && [ -z "$YT_DLP_COOKIES_FROM_BROWSER" ]; then
+        args+=(--cookies-from-browser "$session_browser")
     fi
 
-    command yt-dlp ${args[@]+"${args[@]}"} "$@" >"$stdout_file" 2>"$stderr_file"
+    local -a passthrough=("$@")
+    local passthrough_count=${#passthrough[@]}
+    local url="${passthrough[$((passthrough_count - 1))]}"
+    unset 'passthrough[$((passthrough_count - 1))]'
+
+    command yt-dlp ${passthrough[@]+"${passthrough[@]}"} ${args[@]+"${args[@]}"} "$url" >"$stdout_file" 2>"$stderr_file"
 }
 
 # Wrap `yt-dlp` with bot-check detection and a best-effort Chrome-cookies retry.
@@ -128,7 +237,7 @@ yt_dlp() {
     if run_yt_dlp_command "$stdout_file" "$stderr_file" "$@"; then
         cat "$stdout_file"
         if [ -s "$stderr_file" ]; then
-            cat "$stderr_file" >&2
+            emit_filtered_stderr "$(cat "$stderr_file")"
         fi
         rm -f "$stdout_file" "$stderr_file"
         return 0
@@ -139,10 +248,10 @@ yt_dlp() {
     stderr_text=$(cat "$stderr_file")
     rm -f "$stdout_file" "$stderr_file"
 
-    if [ -z "$YT_DLP_COOKIES_FILE" ] && [ -z "$YT_DLP_COOKIES_FROM_BROWSER" ] && [ -z "$YTDLP_SESSION_BROWSER_COOKIES" ] && is_not_a_bot_error "$stderr_text"; then
+    if [ -z "$YT_DLP_COOKIES_FILE" ] && [ -z "$YT_DLP_COOKIES_FROM_BROWSER" ] && [ -z "$YTDLP_SESSION_BROWSER_COOKIES" ] && [ ! -s "$YTDLP_SESSION_STATE_FILE" ] && is_not_a_bot_error "$stderr_text"; then
         local attempt retry_stdout retry_stderr retry_status retry_stderr_text
 
-        printf '%s\n' "$stderr_text" >&2
+        emit_filtered_stderr "$stderr_text"
 
         attempt=0
         retry_status="$status"
@@ -153,11 +262,17 @@ yt_dlp() {
             retry_stdout=$(mktemp)
             retry_stderr=$(mktemp)
 
-            if command yt-dlp ${YTDLP_ARGS[@]+"${YTDLP_ARGS[@]}"} --cookies-from-browser chrome "$@" >"$retry_stdout" 2>"$retry_stderr"; then
+            local -a retry_passthrough=("$@")
+            local retry_count=${#retry_passthrough[@]}
+            local retry_url="${retry_passthrough[$((retry_count - 1))]}"
+            unset 'retry_passthrough[$((retry_count - 1))]'
+
+            if command yt-dlp ${retry_passthrough[@]+"${retry_passthrough[@]}"} ${YTDLP_ARGS[@]+"${YTDLP_ARGS[@]}"} --cookies-from-browser chrome "$retry_url" >"$retry_stdout" 2>"$retry_stderr"; then
                 YTDLP_SESSION_BROWSER_COOKIES="chrome"
+                printf '%s' "$YTDLP_SESSION_BROWSER_COOKIES" > "$YTDLP_SESSION_STATE_FILE"
                 cat "$retry_stdout"
                 if [ -s "$retry_stderr" ]; then
-                    cat "$retry_stderr" >&2
+                    emit_filtered_stderr "$(cat "$retry_stderr")"
                 fi
                 rm -f "$retry_stdout" "$retry_stderr"
                 return 0
@@ -169,7 +284,7 @@ yt_dlp() {
             rm -f "$retry_stdout" "$retry_stderr"
 
             if [ -n "$retry_stderr_text" ]; then
-                printf '%s\n' "$retry_stderr_text" >&2
+                emit_filtered_stderr "$retry_stderr_text"
             fi
 
             if ! is_not_a_bot_error "$retry_stderr_text"; then
@@ -182,7 +297,7 @@ yt_dlp() {
     fi
 
     if [ -n "$stderr_text" ]; then
-        printf '%s\n' "$stderr_text" >&2
+        emit_filtered_stderr "$stderr_text"
     fi
     return "$status"
 }
@@ -223,9 +338,10 @@ reset_download_dir() {
 # Derive structured subtitle availability information from `yt-dlp --dump-json` output.
 emit_subtitle_info_from_metadata_json() {
     local video_id="$1"
-    local metadata_json
+    local metadata_json ytdlp_runtime_json
     metadata_json=$(cat)
-    VIDEO_ID="$video_id" METADATA_JSON="$metadata_json" python3 - <<'PY'
+    ytdlp_runtime_json=$(current_ytdlp_runtime_json)
+    VIDEO_ID="$video_id" METADATA_JSON="$metadata_json" YTDLP_RUNTIME_JSON="$ytdlp_runtime_json" python3 - <<'PY'
 import json
 import os
 
@@ -266,6 +382,7 @@ print(json.dumps({
     'preferred_source_language': preferred_source_language,
     'preferred_source_kind': preferred_source_kind,
     'mode': mode,
+    'yt_dlp_runtime': json.loads(os.environ.get('YTDLP_RUNTIME_JSON', '{}') or '{}'),
 }, ensure_ascii=False))
 PY
 }
@@ -273,9 +390,10 @@ PY
 # Fallback parser for subtitle listings when full metadata JSON is unavailable.
 emit_subtitle_info_from_list_output() {
     local video_id="$1"
-    local list_output
+    local list_output ytdlp_runtime_json
     list_output=$(cat)
-    VIDEO_ID="$video_id" LIST_OUTPUT="$list_output" python3 - <<'PY'
+    ytdlp_runtime_json=$(current_ytdlp_runtime_json)
+    VIDEO_ID="$video_id" LIST_OUTPUT="$list_output" YTDLP_RUNTIME_JSON="$ytdlp_runtime_json" python3 - <<'PY'
 import json
 import os
 import re
@@ -336,6 +454,7 @@ print(json.dumps({
     'preferred_source_language': preferred_source_language,
     'preferred_source_kind': preferred_source_kind,
     'mode': mode,
+    'yt_dlp_runtime': json.loads(os.environ.get('YTDLP_RUNTIME_JSON', '{}') or '{}'),
 }, ensure_ascii=False))
 PY
 }
@@ -402,7 +521,8 @@ case "$MODE" in
             exit 1
         fi
 
-        VIDEO_ID="$VIDEO_ID" TITLE="$TITLE" DURATION="$DURATION" UPLOAD_DATE="$UPLOAD_DATE" CHANNEL="$CHANNEL" \
+        YTDLP_RUNTIME_JSON=$(current_ytdlp_runtime_json)
+        VIDEO_ID="$VIDEO_ID" TITLE="$TITLE" DURATION="$DURATION" UPLOAD_DATE="$UPLOAD_DATE" CHANNEL="$CHANNEL" YTDLP_RUNTIME_JSON="$YTDLP_RUNTIME_JSON" \
             python3 - <<'PY'
 import json
 import os
@@ -413,6 +533,7 @@ print(json.dumps({
     'duration': int(os.environ.get('DURATION', '0') or 0),
     'upload_date': os.environ.get('UPLOAD_DATE', ''),
     'channel': os.environ.get('CHANNEL', ''),
+    'yt_dlp_runtime': json.loads(os.environ.get('YTDLP_RUNTIME_JSON', '{}') or '{}'),
 }, ensure_ascii=False))
 PY
         ;;
@@ -492,7 +613,8 @@ PY
                -o "$SUBTITLE_DIR/${VIDEO_ID}" \
                "$VIDEO_URL" >&2
 
-        VIDEO_ID="$VIDEO_ID" SUB_INFO_JSON="$SUB_INFO_JSON" SUBTITLE_DIR="$SUBTITLE_DIR" python3 - <<'PY'
+        YTDLP_RUNTIME_JSON=$(current_ytdlp_runtime_json)
+        VIDEO_ID="$VIDEO_ID" SUB_INFO_JSON="$SUB_INFO_JSON" SUBTITLE_DIR="$SUBTITLE_DIR" YTDLP_RUNTIME_JSON="$YTDLP_RUNTIME_JSON" python3 - <<'PY'
 import json
 import os
 from pathlib import Path
@@ -578,6 +700,7 @@ print(json.dumps({
     'selected_source_vtt': selected_source_vtt,
     'selected_source_language': selected_source_language,
     'selected_source_kind': selected_source_kind,
+    'yt_dlp_runtime': json.loads(os.environ.get('YTDLP_RUNTIME_JSON', '{}') or '{}'),
 }, ensure_ascii=False))
 PY
         ;;
@@ -614,7 +737,8 @@ PY
             exit 1
         fi
 
-        AUDIO_FILE="$AUDIO_FILE" VIDEO_ID="$VIDEO_ID" AUDIO_FORMAT="$AUDIO_FORMAT" AUDIO_DIR="$AUDIO_DIR" python3 - <<'PY'
+        YTDLP_RUNTIME_JSON=$(current_ytdlp_runtime_json)
+        AUDIO_FILE="$AUDIO_FILE" VIDEO_ID="$VIDEO_ID" AUDIO_FORMAT="$AUDIO_FORMAT" AUDIO_DIR="$AUDIO_DIR" YTDLP_RUNTIME_JSON="$YTDLP_RUNTIME_JSON" python3 - <<'PY'
 import json
 import os
 from pathlib import Path
@@ -627,6 +751,7 @@ print(json.dumps({
     'audio_format': os.environ['AUDIO_FORMAT'],
     'extension': audio_file.suffix.lstrip('.'),
     'size_bytes': audio_file.stat().st_size,
+    'yt_dlp_runtime': json.loads(os.environ.get('YTDLP_RUNTIME_JSON', '{}') or '{}'),
 }, ensure_ascii=False))
 PY
         ;;

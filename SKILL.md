@@ -72,7 +72,7 @@ Use this streamlined path only when all conditions are true:
 - `subtitle-info` reports `has_any=true`
 - No chapter planning or multi-speaker output is required
 
-Quick Mode is an optional fast path inside the broader `video_path=short` bucket from `plan-optimization`. The canonical short/long routing remains `< 1800s = short`, `>= 1800s = long`.
+Quick Mode is an optional fast path inside the broader short-duration bucket. `plan-optimization` still records `< 1800s` as `duration_bucket=short`, but it may escalate oversized short transcripts to chunked execution (`video_path=long`, `routing_reason=oversized_short_input`) when single-pass prompting would be too large or too slow.
 
 ### Quick Mode Steps
 

@@ -1646,6 +1646,198 @@ work_dir: /tmp/vid001_chunks
         self.assertFalse(result["provider_supported"])
         self.assertEqual(result["token_count"], 5)
 
+    def test_load_config_coerces_unsafe_yt_dlp_values_to_sane_defaults(self):
+        """Test load config coerces unsafe yt dlp values to sane defaults."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "config.yaml"
+            config_path.write_text(
+                f'output_dir: "{tmpdir}"\n'
+                'yt_dlp_socket_timeout_sec: "-1"\n'
+                'yt_dlp_retries: "-1"\n'
+                'yt_dlp_extractor_retries: "-1"\n',
+                encoding="utf-8",
+            )
+
+            config = utils.load_config(str(config_path))
+
+            self.assertEqual(config["yt_dlp_socket_timeout_sec"], utils.DEFAULT_YT_DLP_SOCKET_TIMEOUT_SEC)
+            self.assertEqual(config["yt_dlp_retries"], utils.DEFAULT_YT_DLP_RETRIES)
+            self.assertEqual(config["yt_dlp_extractor_retries"], utils.DEFAULT_YT_DLP_EXTRACTOR_RETRIES)
+            self.assertTrue(any("yt_dlp_socket_timeout_sec" in warning for warning in config["config_warnings"]))
+
+    def test_call_deepgram_api_retries_transient_timeout_then_succeeds(self):
+        """Test call deepgram api retries transient timeout then succeeds."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            audio_path = Path(tmpdir) / "sample.mp3"
+            audio_path.write_bytes(b"audio")
+            payload = {"results": {"channels": [{"alternatives": [{"transcript": "ok"}]}]}}
+
+            with mock.patch.object(
+                utils,
+                "_call_deepgram_api_once",
+                side_effect=[TimeoutError("timed out"), payload],
+            ) as mocked_call, mock.patch("time.sleep", return_value=None):
+                result = utils._call_deepgram_api(
+                    str(audio_path),
+                    api_key="key",
+                    language="en",
+                    timeout=3,
+                    request_retries=2,
+                    retry_backoff_sec=0.01,
+                )
+
+            self.assertEqual(result, payload)
+            self.assertEqual(mocked_call.call_count, 2)
+
+    def test_chunk_segments_merges_tiny_chapter_boundary_fragment_forward(self):
+        """Test chunk segments merges tiny chapter boundary fragment forward."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            segments_path = Path(tmpdir) / "segments.json"
+            chapters_path = Path(tmpdir) / "chapters.json"
+            work_dir = Path(tmpdir) / "chunks"
+            config_path = Path(tmpdir) / "config.yaml"
+
+            segments_path.write_text(
+                json.dumps(
+                    {
+                        "source": "vtt",
+                        "segments": [
+                            {"id": 0, "text": "A" * 10, "start_time": 0.0, "end_time": 10.0},
+                            {"id": 1, "text": "B" * 10, "start_time": 10.0, "end_time": 20.0},
+                            {"id": 2, "text": "C" * 3, "start_time": 20.0, "end_time": 23.0},
+                            {"id": 3, "text": "D" * 24, "start_time": 23.0, "end_time": 40.0},
+                        ],
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            chapters_path.write_text(
+                json.dumps(
+                    {"chapters": [{"title": "Part Two", "start_time": 20.0, "end_time": 40.0}]},
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            config_path.write_text(
+                f'output_dir: "{tmpdir}"\n'
+                'chunk_mode: "chars"\n',
+                encoding="utf-8",
+            )
+
+            result = utils.chunk_segments(
+                str(segments_path),
+                str(work_dir),
+                chunk_size=25,
+                prompt_name="",
+                config_path=str(config_path),
+                chapters_path=str(chapters_path),
+            )
+
+            self.assertEqual(result["total_chunks"], 2)
+            self.assertTrue(any("Merged 1 undersized chunk fragment" in warning for warning in result["warnings"]))
+            chunk1 = (work_dir / "chunk_001.txt").read_text(encoding="utf-8")
+            self.assertIn("C" * 3, chunk1)
+            self.assertIn("D" * 24, chunk1)
+            manifest = json.loads((work_dir / "manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest["chunks"][1]["start_time"], 20.0)
+            self.assertEqual(manifest["chunks"][1]["source_segment_start"], 2)
+
+    def test_build_chapter_plan_tolerates_near_boundary_start_without_warning(self):
+        """Test build chapter plan tolerates near boundary start without warning."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            segments_path = Path(tmpdir) / "segments.json"
+            work_dir = Path(tmpdir) / "chunks"
+            chapters_path = Path(tmpdir) / "chapters.json"
+            output_path = Path(tmpdir) / "chapter_plan.json"
+            config_path = Path(tmpdir) / "config.yaml"
+
+            segments_path.write_text(
+                json.dumps(
+                    {
+                        "source": "deepgram",
+                        "segments": [
+                            {"id": 0, "text": "A" * 30, "start_time": 0.0, "end_time": 10.0},
+                            {"id": 1, "text": "B" * 30, "start_time": 10.0, "end_time": 20.0},
+                        ],
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            config_path.write_text(
+                f'output_dir: "{tmpdir}"\n'
+                'chunk_mode: "chars"\n',
+                encoding="utf-8",
+            )
+            utils.chunk_segments(
+                str(segments_path),
+                str(work_dir),
+                chunk_size=35,
+                prompt_name="",
+                config_path=str(config_path),
+            )
+            chapters_path.write_text(
+                json.dumps(
+                    {
+                        "chapters": [
+                            {"title": "Intro", "start_time": 0.0, "end_time": 9.95},
+                            {"title": "Topic", "start_time": 9.95, "end_time": 20.0},
+                        ]
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+
+            result = utils.build_chapter_plan(str(chapters_path), str(work_dir), str(output_path))
+            plan = json.loads(output_path.read_text(encoding="utf-8"))
+
+            self.assertTrue(result["success"])
+            self.assertFalse(any("fallback strategy" in warning for warning in result["warnings"]))
+            self.assertEqual(plan[1]["start_chunk"], 1)
+            self.assertEqual(plan[1]["match_strategy"], "near_next_start")
+            self.assertIn("boundary_tolerance_sec", plan[1]["mapping_diagnostics"])
+
+    def test_plan_optimization_escalates_oversized_short_input_to_chunked_path(self):
+        """Test plan optimization escalates oversized short input to chunked path."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            raw_path = Path(tmpdir) / "raw.txt"
+            state = Path(tmpdir) / "state.md"
+            raw_path.write_text(("word " * 5000).strip(), encoding="utf-8")
+            state.write_text(
+                "# State\n"
+                "vid: vid001\n"
+                "url: https://example.com/watch?v=1\n"
+                "title: Sample\n"
+                "channel: Channel\n"
+                "upload_date: 20260308\n"
+                "duration: 1200\n"
+                f"output_dir: {tmpdir}\n"
+                "mode: bilingual\n"
+                "src: youtube\n"
+                "source_language: en\n"
+                "subtitle_source: YouTube Subtitles\n"
+                f"raw_text: {raw_path}\n"
+                f"work_dir: {tmpdir}/vid001_chunks\n",
+                encoding="utf-8",
+            )
+
+            result = utils.plan_optimization(str(state))
+
+            self.assertTrue(result["passed"], result)
+            self.assertEqual(result["duration_bucket"], "short")
+            self.assertEqual(result["video_path"], "long")
+            self.assertEqual(result["routing_reason"], "oversized_short_input")
+            self.assertTrue(result["requires_llm_preflight"])
+            self.assertTrue(all(op["kind"] == "chunk" for op in result["operations"]))
+            self.assertGreater(result["estimated_input_tokens"], result["single_pass_token_limit"])
+
+    def test_normalize_transcript_text_repairs_conservative_confusable_ascii_tokens(self):
+        """Test normalize transcript text repairs conservative confusable ascii tokens."""
+        self.assertEqual(utils._normalize_transcript_text("c0ntext 5tack"), "context stack")
+        self.assertEqual(utils._normalize_transcript_text("gpt-4o"), "gpt-4o")
+
 
 if __name__ == "__main__":
     unittest.main()

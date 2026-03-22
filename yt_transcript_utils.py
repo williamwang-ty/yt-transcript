@@ -329,6 +329,12 @@ DEFAULT_AUTOTUNE_MIN_TARGET_RATIO = 0.5
 DEFAULT_AUTOTUNE_CANARY_CHUNKS = 3
 DEFAULT_LLM_CHUNK_RECOVERY_ATTEMPTS = 1
 DEFAULT_LLM_CHUNK_RECOVERY_BACKOFF_SEC = 1.0
+DEFAULT_YT_DLP_SOCKET_TIMEOUT_SEC = 15
+DEFAULT_YT_DLP_RETRIES = 1
+DEFAULT_YT_DLP_EXTRACTOR_RETRIES = 1
+DEFAULT_DEEPGRAM_REQUEST_RETRIES = 2
+DEFAULT_DEEPGRAM_RETRY_BACKOFF_SEC = 1.0
+DEFAULT_CHAPTER_BOUNDARY_TOLERANCE_SEC = 0.35
 MANIFEST_SCHEMA_VERSION = 5
 CHUNK_CONTRACT_SCHEMA_VERSION = 1
 CONTROL_CONTRACT_SCHEMA_VERSION = 1
@@ -373,9 +379,9 @@ def _default_config_values(config_path: str = "") -> dict:
         "llm_base_url": "",
         "llm_model": "",
         "llm_api_format": "openai",
-        "yt_dlp_socket_timeout_sec": -1,
-        "yt_dlp_retries": -1,
-        "yt_dlp_extractor_retries": -1,
+        "yt_dlp_socket_timeout_sec": DEFAULT_YT_DLP_SOCKET_TIMEOUT_SEC,
+        "yt_dlp_retries": DEFAULT_YT_DLP_RETRIES,
+        "yt_dlp_extractor_retries": DEFAULT_YT_DLP_EXTRACTOR_RETRIES,
         "yt_dlp_cookies_from_browser": "",
         "yt_dlp_cookies_file": "",
         "llm_timeout_sec": 120,
@@ -2198,6 +2204,27 @@ def _coerce_float_or_none(value) -> float | None:
         return None
 
 
+def _normalize_confusable_ascii_token(token: str) -> str:
+    """Normalize conservative digit/letter confusions in mostly alphabetic tokens."""
+    text = str(token or "")
+    if len(text) < 5:
+        return text
+    if not re.search(r'[A-Za-z]', text) or not re.search(r'[0-9]', text):
+        return text
+
+    digit_count = sum(ch.isdigit() for ch in text)
+    alpha_count = sum(ch.isalpha() for ch in text)
+    if digit_count > 2 or alpha_count < 3:
+        return text
+
+    normalized = re.sub(r'(?<=[A-Za-z])0(?=[A-Za-z])', 'o', text)
+    normalized = re.sub(r'(?<=[a-z])1(?=[a-z])', 'l', normalized)
+    normalized = re.sub(r'(?<=[A-Za-z])5(?=[A-Za-z])', 's', normalized)
+    normalized = re.sub(r'^5(?=[A-Za-z]{3,})', 's', normalized)
+    normalized = re.sub(r'^0(?=[A-Za-z]{4,})', 'o', normalized)
+    return normalized
+
+
 def _normalize_transcript_text(text: str, *, remove_repeated_phrases: bool = True) -> str:
     """Normalize transcript text."""
     transcript = str(text or "")
@@ -2209,12 +2236,14 @@ def _normalize_transcript_text(text: str, *, remove_repeated_phrases: bool = Tru
     # 2. Fix spaces around punctuation
     transcript = re.sub(r'\s+([。，！？、：；])', r'\1', transcript)
 
-    # 3. Remove consecutive repeated phrases (3-20 characters)
+    # 3. Normalize conservative mixed alnum OCR-like tokens without touching model/version IDs.
+    transcript = re.sub(r'\b[A-Za-z0-9]{5,}\b', lambda match: _normalize_confusable_ascii_token(match.group(0)), transcript)
+
+    # 4. Remove consecutive repeated phrases (3-20 characters)
     if remove_repeated_phrases:
         transcript = re.sub(r'([一-鿿]{3,20})\1{1,5}', r'\1', transcript)
 
     return transcript.strip()
-
 
 def _join_deepgram_words(words: list[dict]) -> str:
     """Join deepgram words."""
@@ -3158,6 +3187,77 @@ def _load_chapters_document(chapters_path: str) -> list[dict]:
     return [chapter for chapter in chapters if isinstance(chapter, dict)]
 
 
+def _chapter_boundary_tolerance_sec(timed_items: list[dict]) -> float:
+    """Return a small boundary tolerance for chapter-to-timing alignment."""
+    durations = []
+    for item in timed_items:
+        start_time = _coerce_float_or_none(item.get("start_time"))
+        end_time = _coerce_float_or_none(item.get("end_time"))
+        if start_time is None or end_time is None or end_time <= start_time:
+            continue
+        durations.append(end_time - start_time)
+    shortest_duration = min(durations, default=DEFAULT_CHAPTER_BOUNDARY_TOLERANCE_SEC)
+    return max(0.05, min(DEFAULT_CHAPTER_BOUNDARY_TOLERANCE_SEC, shortest_duration * 0.2))
+
+
+def _map_timestamp_to_timed_item(timestamp: float | None, timed_items: list[dict], *,
+                                 next_strategy: str = "next_segment",
+                                 after_last_strategy: str = "after_last_segment") -> tuple[dict, str, str, dict]:
+    """Map a timestamp onto the best matching timed segment/chunk with boundary tolerance."""
+    if not timed_items:
+        return {}, after_last_strategy, "low", {"boundary_tolerance_sec": 0.0}
+
+    tolerance = _chapter_boundary_tolerance_sec(timed_items)
+    if timestamp is None:
+        first_item = timed_items[0]
+        return first_item, "missing_time", "low", {
+            "boundary_tolerance_sec": round(tolerance, 3),
+            "matched_id": first_item.get("id"),
+        }
+
+    for index, item in enumerate(timed_items):
+        start_time = float(item["start_time"])
+        end_time = float(item["end_time"])
+        next_item = timed_items[index + 1] if index + 1 < len(timed_items) else None
+        if next_item is not None:
+            next_start = float(next_item["start_time"])
+            delta_to_next_start = next_start - timestamp
+            if 0.0 <= delta_to_next_start <= tolerance:
+                return next_item, "near_next_start", "high", {
+                    "boundary_tolerance_sec": round(tolerance, 3),
+                    "matched_id": next_item.get("id"),
+                    "delta_to_next_start_sec": round(delta_to_next_start, 3),
+                }
+        if start_time <= timestamp < end_time or math.isclose(timestamp, start_time, abs_tol=tolerance / 4):
+            return item, "time_contains", "high", {
+                "boundary_tolerance_sec": round(tolerance, 3),
+                "matched_id": item.get("id"),
+                "delta_to_start_sec": round(timestamp - start_time, 3),
+                "delta_to_end_sec": round(end_time - timestamp, 3),
+            }
+        if timestamp < start_time:
+            return item, next_strategy, "medium", {
+                "boundary_tolerance_sec": round(tolerance, 3),
+                "matched_id": item.get("id"),
+                "delta_to_start_sec": round(start_time - timestamp, 3),
+            }
+
+    last_item = timed_items[-1]
+    last_end = float(last_item["end_time"])
+    delta_after_last_end = timestamp - last_end
+    if 0.0 <= delta_after_last_end <= tolerance:
+        return last_item, "near_last_end", "medium", {
+            "boundary_tolerance_sec": round(tolerance, 3),
+            "matched_id": last_item.get("id"),
+            "delta_after_last_end_sec": round(delta_after_last_end, 3),
+        }
+    return last_item, after_last_strategy, "low", {
+        "boundary_tolerance_sec": round(tolerance, 3),
+        "matched_id": last_item.get("id"),
+        "delta_after_last_end_sec": round(delta_after_last_end, 3),
+    }
+
+
 def _map_chapter_starts_to_segment_break_ids(chapters: list[dict], segments: list[dict]) -> tuple[set[int], list[str]]:
     """Map chapter starts to segment break ids."""
     timed_segments = [
@@ -3168,35 +3268,25 @@ def _map_chapter_starts_to_segment_break_ids(chapters: list[dict], segments: lis
         return set(), ["No timed segments found; cannot apply chapter-aware chunking"]
 
     warnings = []
-
-    def map_time(timestamp: float | None) -> tuple[int, str]:
-        """Map time."""
-        if timestamp is None:
-            return int(timed_segments[0].get("id", 0)), "missing_time"
-
-        for seg in timed_segments:
-            start_time = float(seg["start_time"])
-            end_time = float(seg["end_time"])
-            if start_time <= timestamp < end_time or math.isclose(timestamp, start_time):
-                return int(seg.get("id", 0)), "time_contains"
-            if timestamp < start_time:
-                return int(seg.get("id", 0)), "next_segment"
-
-        return int(timed_segments[-1].get("id", 0)), "after_last_segment"
-
+    tolerated_strategies = {"time_contains", "near_next_start"}
     break_ids = set()
     for index, chapter in enumerate(chapters):
         start_time = _coerce_float_or_none(chapter.get("start_time"))
         if start_time is None:
             continue
 
-        segment_id, match_strategy = map_time(start_time)
+        segment, match_strategy, _, _ = _map_timestamp_to_timed_item(
+            start_time,
+            timed_segments,
+            next_strategy="next_segment",
+            after_last_strategy="after_last_segment",
+        )
+        segment_id = int(segment.get("id", 0))
         break_ids.add(segment_id)
-        if match_strategy != "time_contains":
+        if match_strategy not in tolerated_strategies:
             warnings.append(f"Chapter {index} used fallback strategy '{match_strategy}'")
 
     return break_ids, warnings
-
 
 def _split_timed_segment(segment: dict, max_size: int, chunk_mode: str,
                          config: dict, warning_index: int) -> tuple[list[dict], list[str]]:
@@ -3288,6 +3378,119 @@ def _load_normalized_document(normalized_document_path: str) -> dict:
     return payload
 
 
+def _minimum_viable_chunk_size(target_size: int, chunk_mode: str) -> int:
+    """Return the smallest chunk size worth keeping as a standalone unit."""
+    if target_size <= 0:
+        return 0
+    baseline = max(1, target_size // 6)
+    if chunk_mode == "tokens":
+        return max(60, min(120, baseline))
+    return max(40, min(80, baseline))
+
+
+def _merge_chunk_specs(left: dict, right: dict) -> dict:
+    """Merge two adjacent chunk specs while preserving timing and boundary metadata."""
+    content_parts = [part for part in (left.get("content", ""), right.get("content", "")) if part]
+    content = CHUNK_SEPARATOR.join(content_parts)
+    segment_ids = [seg_id for seg_id in left.get("segment_ids", []) + right.get("segment_ids", []) if seg_id is not None]
+    start_time = left.get("start_time") if left.get("start_time") is not None else right.get("start_time")
+    end_time = right.get("end_time") if right.get("end_time") is not None else left.get("end_time")
+    return {
+        "content": content,
+        "start_time": start_time,
+        "end_time": end_time,
+        "duration_sec": None if start_time is None or end_time is None else round(max(0.0, end_time - start_time), 3),
+        "segment_ids": segment_ids,
+        "source_segment_start": segment_ids[0] if segment_ids else None,
+        "source_segment_end": segment_ids[-1] if segment_ids else None,
+        "source_segments_count": len({seg_id for seg_id in segment_ids}),
+        "starts_with_chapter_break": bool(left.get("starts_with_chapter_break")),
+    }
+
+
+def _coalesce_undersized_chunk_specs(chunk_specs: list[dict], chunk_mode: str, config: dict,
+                                     effective_chunk_size: int, hard_cap_size: int) -> tuple[list[dict], list[str]]:
+    """Merge tiny boundary fragments into neighbors when doing so is still budget-safe."""
+    if len(chunk_specs) < 3:
+        return chunk_specs, []
+
+    minimum_size = _minimum_viable_chunk_size(effective_chunk_size, chunk_mode)
+    if minimum_size <= 0:
+        return chunk_specs, []
+
+    merged_specs = list(chunk_specs)
+    warnings: list[str] = []
+    merged_count = 0
+    merge_slack = max(10, minimum_size // 2)
+    index = 0
+    while index < len(merged_specs):
+        if len(merged_specs) < 2:
+            break
+        current = merged_specs[index]
+        current_size = _estimate_tokens(current.get("content", ""), chunk_mode, config)
+        if current_size >= minimum_size:
+            index += 1
+            continue
+
+        source_segments_count = max(0, _parse_int(current.get("source_segments_count"), 0))
+        if source_segments_count > 1 and current_size > max(20, minimum_size // 2):
+            index += 1
+            continue
+
+        starts_with_chapter_break = bool(current.get("starts_with_chapter_break"))
+        candidates = []
+        if index + 1 < len(merged_specs):
+            next_total = _estimate_tokens(
+                CHUNK_SEPARATOR.join(part for part in (current.get("content", ""), merged_specs[index + 1].get("content", "")) if part),
+                chunk_mode,
+                config,
+            )
+            candidates.append(("next", next_total, next_total <= hard_cap_size, 0 if starts_with_chapter_break else 1))
+        if index > 0 and not starts_with_chapter_break:
+            prev_total = _estimate_tokens(
+                CHUNK_SEPARATOR.join(part for part in (merged_specs[index - 1].get("content", ""), current.get("content", "")) if part),
+                chunk_mode,
+                config,
+            )
+            candidates.append(("prev", prev_total, prev_total <= hard_cap_size, 0))
+
+        if not candidates:
+            index += 1
+            continue
+
+        candidates.sort(key=lambda item: (0 if item[2] else 1, item[3], item[1]))
+        direction, combined_size, within_cap, _ = candidates[0]
+        if not within_cap and combined_size > hard_cap_size + merge_slack:
+            warnings.append(
+                f"Chunk {index} remains below the preferred floor ({current_size} {chunk_mode}); neighbor merge would exceed hard cap"
+            )
+            index += 1
+            continue
+
+        if direction == "prev":
+            merged_specs[index - 1] = _merge_chunk_specs(merged_specs[index - 1], current)
+            del merged_specs[index]
+            index = max(0, index - 1)
+        else:
+            merged_specs[index] = _merge_chunk_specs(current, merged_specs[index + 1])
+            del merged_specs[index + 1]
+        merged_count += 1
+
+    if merged_count:
+        warnings.append(
+            f"Merged {merged_count} undersized chunk fragment(s) below the preferred floor of {minimum_size} {chunk_mode}"
+        )
+    remaining_small = sum(
+        1 for spec in merged_specs
+        if _estimate_tokens(spec.get("content", ""), chunk_mode, config) < minimum_size
+    )
+    if remaining_small:
+        warnings.append(
+            f"{remaining_small} chunk(s) remain below the preferred floor of {minimum_size} {chunk_mode}"
+        )
+    return merged_specs, warnings
+
+
 def _chunk_segments_payload(metadata: dict, segments: list[dict], source_file: str, output_dir: str,
                             chunk_size: int = 0, prompt_name: str = "", config_path: str = None,
                             *, chapters_path: str = "", driver: str = "chunk-segments",
@@ -3336,14 +3539,24 @@ def _chunk_segments_payload(metadata: dict, segments: list[dict], source_file: s
         start_time = next((part.get("start_time") for part in parts if part.get("start_time") is not None), None)
         end_time = next((part.get("end_time") for part in reversed(parts) if part.get("end_time") is not None), None)
         segment_ids = [part.get("id") for part in parts if part.get("id") is not None]
+        first_part = parts[0]
+        first_part_id = first_part.get("id")
+        first_part_index = first_part.get("segment_part_index")
+        starts_with_chapter_break = (
+            first_part_id is not None
+            and (first_part_index is None or int(first_part_index) == 0)
+            and int(first_part_id) in chapter_break_ids
+        )
         chunk_specs.append({
             "content": content,
             "start_time": start_time,
             "end_time": end_time,
             "duration_sec": None if start_time is None or end_time is None else round(max(0.0, end_time - start_time), 3),
+            "segment_ids": segment_ids,
             "source_segment_start": segment_ids[0] if segment_ids else None,
             "source_segment_end": segment_ids[-1] if segment_ids else None,
             "source_segments_count": len({seg_id for seg_id in segment_ids}),
+            "starts_with_chapter_break": starts_with_chapter_break,
         })
 
     for part in prepared_segments:
@@ -3369,6 +3582,15 @@ def _chunk_segments_payload(metadata: dict, segments: list[dict], source_file: s
 
     if current_parts:
         finalize_chunk(current_parts)
+
+    chunk_specs, merge_warnings = _coalesce_undersized_chunk_specs(
+        chunk_specs,
+        chunk_mode,
+        config,
+        effective_chunk_size,
+        hard_cap_size,
+    )
+    warnings.extend(merge_warnings)
 
     out_dir = Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -3954,11 +4176,10 @@ def detect_audio_content_type(audio_path: str) -> str:
     }.get(ext, "application/octet-stream")
 
 
-def _call_deepgram_api(audio_path: str, api_key: str, language: str,
-                       timeout: int = 300) -> dict:
-    """Call deepgram api."""
+def _call_deepgram_api_once(audio_path: str, api_key: str, language: str,
+                            timeout: int = 300) -> dict:
+    """Perform one Deepgram API request."""
     import urllib.request
-    import urllib.error
 
     audio_file = Path(audio_path)
     if not audio_file.exists():
@@ -3978,21 +4199,89 @@ def _call_deepgram_api(audio_path: str, api_key: str, language: str,
 
     data = audio_file.read_bytes()
     req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+    with urllib.request.urlopen(req, timeout=timeout) as response:
+        return json.loads(response.read().decode("utf-8"))
 
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as response:
-            return json.loads(response.read().decode("utf-8"))
-    except urllib.error.HTTPError as e:
-        error_body = e.read().decode("utf-8", errors="replace")
-        print(f"Error: Deepgram API returned HTTP {e.code}: {error_body}", file=sys.stderr)
-        sys.exit(1)
-    except urllib.error.URLError as e:
-        print(f"Error: Cannot reach Deepgram API: {e.reason}", file=sys.stderr)
-        sys.exit(1)
-    except Exception as e:
-        print(f"Error: Deepgram API call failed: {e}", file=sys.stderr)
-        sys.exit(1)
 
+def _is_retryable_deepgram_error(error: Exception) -> bool:
+    """Return whether a Deepgram request error is worth retrying once or twice."""
+    import urllib.error
+
+    if isinstance(error, (socket.timeout, TimeoutError)):
+        return True
+    if isinstance(error, urllib.error.HTTPError):
+        return error.code in {408, 409, 425, 429, 500, 502, 503, 504}
+    if isinstance(error, urllib.error.URLError):
+        reason = getattr(error, 'reason', '')
+        if isinstance(reason, (socket.timeout, TimeoutError)):
+            return True
+        reason_text = str(reason).lower()
+        return any(fragment in reason_text for fragment in (
+            'timed out',
+            'timeout',
+            'temporarily unavailable',
+            'connection reset',
+            'connection aborted',
+            'connection refused',
+        ))
+    error_text = str(error).lower()
+    return any(fragment in error_text for fragment in (
+        'timed out',
+        'timeout',
+        'temporarily unavailable',
+        'connection reset',
+        'connection aborted',
+    ))
+
+
+def _call_deepgram_api(audio_path: str, api_key: str, language: str,
+                       timeout: int = 300, request_retries: int = DEFAULT_DEEPGRAM_REQUEST_RETRIES,
+                       retry_backoff_sec: float = DEFAULT_DEEPGRAM_RETRY_BACKOFF_SEC) -> dict:
+    """Call Deepgram with bounded retries for transient timeout/network failures."""
+    import urllib.error
+
+    attempts = max(1, request_retries + 1)
+    last_error = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return _call_deepgram_api_once(audio_path, api_key=api_key, language=language, timeout=timeout)
+        except urllib.error.HTTPError as error:
+            last_error = error
+            if attempt < attempts and _is_retryable_deepgram_error(error):
+                print(
+                    f"Warning: Deepgram API returned HTTP {error.code} on attempt {attempt}/{attempts}; retrying in {retry_backoff_sec:.1f}s",
+                    file=sys.stderr,
+                )
+                time.sleep(max(0.0, retry_backoff_sec))
+                continue
+            error_body = error.read().decode("utf-8", errors="replace")
+            print(f"Error: Deepgram API returned HTTP {error.code}: {error_body}", file=sys.stderr)
+            sys.exit(1)
+        except urllib.error.URLError as error:
+            last_error = error
+            if attempt < attempts and _is_retryable_deepgram_error(error):
+                print(
+                    f"Warning: Deepgram API network error on attempt {attempt}/{attempts}: {error.reason}. Retrying in {retry_backoff_sec:.1f}s",
+                    file=sys.stderr,
+                )
+                time.sleep(max(0.0, retry_backoff_sec))
+                continue
+            print(f"Error: Cannot reach Deepgram API: {error.reason}", file=sys.stderr)
+            sys.exit(1)
+        except Exception as error:
+            last_error = error
+            if attempt < attempts and _is_retryable_deepgram_error(error):
+                print(
+                    f"Warning: Deepgram API call failed on attempt {attempt}/{attempts}: {error}. Retrying in {retry_backoff_sec:.1f}s",
+                    file=sys.stderr,
+                )
+                time.sleep(max(0.0, retry_backoff_sec))
+                continue
+            print(f"Error: Deepgram API call failed: {error}", file=sys.stderr)
+            sys.exit(1)
+
+    print(f"Error: Deepgram API call failed: {last_error}", file=sys.stderr)
+    sys.exit(1)
 
 def transcribe_deepgram(audio_path: str, language: str, config_path: str = None,
                         api_key: str = "", max_size_mb: float = 10.0,
@@ -4215,6 +4504,42 @@ def assemble_final(optimized_text_path: str, output_file: str,
     }
 
 
+def _has_unbalanced_terminal_markers(text: str) -> bool:
+    """Return whether the trailing line has obvious unclosed quotes or brackets."""
+    sample = str(text or "")
+    pairs = [("(", ")"), ("（", "）"), ("[", "]"), ("{", "}"), ('"', '"'), ("“", "”"), ("‘", "’")]
+    for opener, closer in pairs:
+        if opener == closer:
+            if sample.count(opener) % 2 == 1:
+                return True
+            continue
+        if sample.count(opener) > sample.count(closer):
+            return True
+    return False
+
+
+def _line_looks_truncated(last_line: str) -> bool:
+    """Return whether the final visible line has strong cut-off signals."""
+    text = str(last_line or "").strip()
+    if not text:
+        return True
+
+    proper_endings = ('.', '!', '?', '。', '！', '？', '*', '`', '"', ')', '）', '」', '>', '-', ':', '：')
+    if text.endswith(proper_endings) or text.startswith('#') or len(text) < 10:
+        return False
+
+    unfinished_tail_patterns = [
+        r'[，,、；;—-]$',
+        r'(?:and|or|but|because|so|to|with|for|of|in|on|at|by|the|a|an)$',
+        r'(?:的|了|和|与|并|但|而|及|在|把|将|对|让|给|从|向|为|等)$',
+    ]
+    if any(re.search(pattern, text, re.IGNORECASE) for pattern in unfinished_tail_patterns):
+        return True
+    if _has_unbalanced_terminal_markers(text):
+        return True
+    return len(text) > 120 and text[-1].isalnum()
+
+
 def verify_quality(optimized_text_path: str, raw_text_path: str = None,
                    bilingual: bool = False) -> dict:
     """
@@ -4292,24 +4617,16 @@ def verify_quality(optimized_text_path: str, raw_text_path: str = None,
         warnings.append(f"Only {len(body_paragraphs)} body paragraph found in {total_chars} chars of text")
     
     # Check 3: No abrupt truncation
-    # Check if last non-empty line ends with proper punctuation or closing marker
-    lines = [l for l in text.strip().split('\n') if l.strip()]
+    lines = [l for l in text.strip().split("\n") if l.strip()]
     if lines:
         last_line = lines[-1].strip()
-        # Consider proper endings: punctuation, markdown markers, closing quotes
-        proper_endings = ('.', '!', '?', '。', '！', '？', '*', '`', '"', '"', 
-                         ')', '）', '」', '>', '-', ':', '：')
-        checks["no_truncation"] = (
-            last_line.endswith(proper_endings) or 
-            last_line.startswith('#') or
-            len(last_line) < 10  # very short last lines are likely intentional
-        )
+        checks["no_truncation"] = not _line_looks_truncated(last_line)
         if not checks["no_truncation"]:
-            warnings.append(f"Possible truncation: last line does not end with punctuation: \"{last_line[-50:]}\"")
+            warnings.append(f'Possible truncation: last line looks incomplete: "{last_line[-50:]}"')
     else:
         checks["no_truncation"] = False
         warnings.append("No non-empty lines found")
-    
+
     # Check 4: Bilingual balance
     if bilingual:
         cn_chars = sum(1 for c in text if '\u4e00' <= c <= '\u9fff')
@@ -4907,6 +5224,46 @@ def validate_state(state_path: str, stage: str = "", require: list[str] | None =
     }
 
 
+def _estimate_single_pass_input_tokens(normalized_document_path: str, raw_text_path: str,
+                                       config: dict | None = None) -> tuple[int, int]:
+    """Estimate normalized input size for short-video single-pass routing."""
+    config = config or {}
+    candidates = []
+    normalized_path = Path(str(normalized_document_path or "").strip())
+    if normalized_path.exists():
+        candidates.append((normalized_path, 'normalized_document'))
+    raw_path = Path(str(raw_text_path or "").strip())
+    if raw_path.exists():
+        candidates.append((raw_path, 'raw_text'))
+
+    for candidate_path, source_kind in candidates:
+        try:
+            if source_kind == 'normalized_document':
+                payload = json.loads(candidate_path.read_text(encoding='utf-8'))
+                text = str(payload.get('content', {}).get('text', '') or '')
+            else:
+                text = candidate_path.read_text(encoding='utf-8')
+        except Exception:
+            continue
+        normalized_text = _normalize_text_body(text)
+        if normalized_text:
+            return _estimate_tokens(normalized_text, 'tokens', config), len(normalized_text)
+    return 0, 0
+
+
+def _single_pass_token_limit(mode: str, source: str, config: dict | None = None) -> int:
+    """Return the largest input we should still send through one non-chunked prompt."""
+    config = config or {}
+    structure_limit = _get_task_request_cap('structure_only') + _get_task_max_output_tokens('structure_only', config)
+    translate_limit = _get_task_request_cap('translate_only') + _get_task_max_output_tokens('translate_only', config)
+    limit = structure_limit
+    if str(mode or '').strip() == 'bilingual':
+        limit = min(limit, translate_limit)
+    if str(source or '').strip() == 'deepgram':
+        limit = min(limit, structure_limit - 300)
+    return max(3200, limit)
+
+
 def plan_optimization(state_path: str) -> dict:
     """
     Build a structured optimization plan from validated workflow state.
@@ -4949,10 +5306,31 @@ def plan_optimization(state_path: str) -> dict:
     video_id = state.get("vid", "")
     planner_config = load_config(None, allow_missing=True)
     bilingual_quality_gate = mode == "bilingual"
+    duration_bucket = "long" if duration >= 1800 else "short"
+    raw_text_output = str(state.get("raw_text", "") or f"/tmp/{video_id}_raw_text.txt")
+    estimated_input_tokens, estimated_input_chars = _estimate_single_pass_input_tokens(
+        normalization.get("normalized_document_path", ""),
+        raw_text_output,
+        planner_config,
+    )
+    single_pass_token_limit = _single_pass_token_limit(mode, source, planner_config)
+    oversized_short_input = duration_bucket == "short" and estimated_input_tokens > single_pass_token_limit
+    routing_reason = "duration_threshold" if duration_bucket == "long" else (
+        "oversized_short_input" if oversized_short_input else "duration_short_single_pass"
+    )
+    video_path = "long" if duration_bucket == "long" or oversized_short_input else "short"
+    plan_warnings = list(normalization.get("warnings", []))
+    if oversized_short_input:
+        plan_warnings.append(
+            f"Short-duration input is oversized for single-pass optimization ({estimated_input_tokens} estimated tokens > {single_pass_token_limit}); using chunked processing."
+        )
+    if source == "deepgram":
+        plan_warnings.append(
+            "Deepgram fallback is active; review proper nouns and mixed-language terms carefully in the final output."
+        )
 
-    video_path = "long" if duration >= 1800 else "short"
     outputs = {
-        "raw_text": str(state.get("raw_text", "") or f"/tmp/{video_id}_raw_text.txt"),
+        "raw_text": raw_text_output,
         "structured_text": str(state.get("structured_text", "") or f"/tmp/{video_id}_structured.txt"),
         "optimized_text": str(state.get("optimized_text", "") or f"/tmp/{video_id}_optimized.txt"),
         "normalized_document": normalization.get("normalized_document_path", ""),
@@ -5076,13 +5454,20 @@ def plan_optimization(state_path: str) -> dict:
         "checks": {
             "state_stage": "post-source",
             "duration": duration,
+            "duration_bucket": duration_bucket,
             "mode": mode,
             "source": source,
             "video_path": video_path,
+            "routing_reason": routing_reason,
+            "estimated_input_tokens": estimated_input_tokens,
+            "estimated_input_chars": estimated_input_chars,
+            "single_pass_token_limit": single_pass_token_limit,
         },
-        "warnings": normalization.get("warnings", []),
+        "warnings": plan_warnings,
         "hard_failures": [],
         "video_path": video_path,
+        "duration_bucket": duration_bucket,
+        "routing_reason": routing_reason,
         "normalization": {
             "materialized": normalization.get("materialized", False),
             "source_adapter": normalization.get("source_adapter", ""),
@@ -5092,6 +5477,8 @@ def plan_optimization(state_path: str) -> dict:
         },
         "chunking": chunking,
         "requires_llm_preflight": video_path == "long",
+        "estimated_input_tokens": estimated_input_tokens,
+        "single_pass_token_limit": single_pass_token_limit,
         "requires_quality_check": True,
         "quality_contract": _build_quality_gate_contract(bilingual=bilingual_quality_gate),
         "replan_contract": {
@@ -5194,9 +5581,21 @@ def load_config(config_path: str = None, allow_missing: bool = False) -> dict:
         if not os.path.isdir(output_dir):
             print(f"Warning: output_dir does not exist: {output_dir}", file=sys.stderr)
 
-    yt_dlp_socket_timeout_sec = parse_int_field('yt_dlp_socket_timeout_sec', -1, minimum=-1)
-    yt_dlp_retries = parse_int_field('yt_dlp_retries', -1, minimum=-1)
-    yt_dlp_extractor_retries = parse_int_field('yt_dlp_extractor_retries', -1, minimum=-1)
+    yt_dlp_socket_timeout_sec = parse_int_field(
+        'yt_dlp_socket_timeout_sec',
+        DEFAULT_YT_DLP_SOCKET_TIMEOUT_SEC,
+        minimum=1,
+    )
+    yt_dlp_retries = parse_int_field(
+        'yt_dlp_retries',
+        DEFAULT_YT_DLP_RETRIES,
+        minimum=0,
+    )
+    yt_dlp_extractor_retries = parse_int_field(
+        'yt_dlp_extractor_retries',
+        DEFAULT_YT_DLP_EXTRACTOR_RETRIES,
+        minimum=0,
+    )
     yt_dlp_cookies_from_browser = str(config.get('yt_dlp_cookies_from_browser', '') or '').strip()
     yt_dlp_cookies_file = str(config.get('yt_dlp_cookies_file', '') or '').strip()
     if yt_dlp_cookies_file:

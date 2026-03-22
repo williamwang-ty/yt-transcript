@@ -2235,3 +2235,57 @@ chunk_context_summary_tokens: 20
             self.assertEqual(payload["result"]["run_id"], created["run_id"])
             self.assertEqual(payload["contracts"]["run_state"]["run_id"], created["run_id"])
             self.assertEqual(payload["contracts"]["task_spec"]["source_ref"], "youtube:cli-inspect")
+
+
+    def test_verify_quality_does_not_flag_complete_chinese_tail_without_punctuation(self):
+        """Test verify quality does not flag complete chinese tail without punctuation."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            optimized = Path(tmpdir) / "opt.md"
+            raw = Path(tmpdir) / "raw.txt"
+            optimized.write_text(
+                "## Section\n\n"
+                "第一段内容，结构完整。\n\n"
+                "这是最后一段没有句号但语义完整",
+                encoding="utf-8",
+            )
+            raw.write_text(
+                "第一段内容，结构完整。\n这是最后一段没有句号但语义完整",
+                encoding="utf-8",
+            )
+
+            result = utils.verify_quality(str(optimized), str(raw), bilingual=False)
+
+            self.assertTrue(result["passed"], result)
+            self.assertTrue(result["checks"]["no_truncation"])
+            self.assertFalse(any("Possible truncation" in warning for warning in result["warnings"]))
+
+    def test_process_chunks_dry_run_ignores_stale_manifest_target_tokens_when_plan_is_current(self):
+        """Test process chunks dry run ignores stale manifest target tokens when plan is current."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source = Path(tmpdir) / "raw.txt"
+            work_dir = Path(tmpdir) / "chunks"
+            source.write_text(("第一句。第二句。第三句。第四句。" * 200), encoding="utf-8")
+            utils.chunk_text(str(source), str(work_dir), 0, "structure_only")
+
+            manifest_path = work_dir / "manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["target_tokens"] = 9999
+            manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+
+            config = utils._default_config_values()
+            config.update({
+                "llm_api_key": "key",
+                "llm_base_url": "https://api.example.com",
+                "llm_model": "demo",
+                "llm_api_format": "openai",
+            })
+
+            with mock.patch.object(utils, "load_config", side_effect=AssertionError("dry-run should not require load_config")), mock.patch.object(
+                utils,
+                "_load_optional_config",
+                return_value=config,
+            ):
+                result = utils.process_chunks(str(work_dir), "structure_only", dry_run=True)
+
+            self.assertTrue(result["success"])
+            self.assertFalse(any("Planned chunk target" in warning for warning in result["warnings"]))

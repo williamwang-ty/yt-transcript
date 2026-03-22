@@ -50,11 +50,13 @@ If `requires_llm_preflight=true`, ensure:
 bash <skill-root>/scripts/preflight.sh --require-llm
 ```
 
-`plan-optimization` is the canonical router here: `video_path=short` means duration `< 1800` seconds, while `video_path=long` means `>= 1800` seconds. The separate Quick Mode from `SKILL.md` is a narrower `< 900` second shortcut inside the short-video bucket.
+`plan-optimization` is the canonical router here. It still reports the raw `duration_bucket` (`short` for `< 1800s`, `long` for `>= 1800s`), but `video_path` may escalate a short-duration transcript to chunked execution when the normalized input is too large for reliable single-pass prompting. The separate Quick Mode from `SKILL.md` is a narrower `< 900` second shortcut inside the short-duration bucket.
 
 ---
 
 ## Short Video Path (`video_path=short`)
+
+Use this path only when `PLAN_JSON.video_path=short`. Do not infer it from duration alone.
 
 ### Step 1: Read Raw Text
 
@@ -86,6 +88,8 @@ Write to state:
 ---
 
 ## Long Video Path (`video_path=long`)
+
+This path now covers both true long videos and oversized short-duration transcripts that were escalated by the planner.
 
 ### Step 1: Detect Existing Chapters
 

@@ -128,10 +128,9 @@ def _process_chunks_impl(work_dir: str, prompt_name: str, extra_instruction: str
     setup_warnings = []
 
     if manifest_chunk_mode == "tokens":
-        manifest_target_tokens = max(0, _parse_int(manifest.get("target_tokens"), 0))
-        if manifest_target_tokens and manifest_target_tokens > prompt_budget["target_tokens"]:
+        if plan_target_tokens > prompt_budget["target_tokens"]:
             setup_warning = (
-                f"⚠️ Chunk target {manifest_target_tokens} tokens is larger than the recommended "
+                f"⚠️ Planned chunk target {plan_target_tokens} tokens exceeds the current recommended "
                 f"{prompt_budget['target_tokens']} for prompt '{prompt_name}'. Long outputs may time out."
             )
             setup_warnings.append(setup_warning)

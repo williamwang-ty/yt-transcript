@@ -63,6 +63,11 @@ pip install yt-dlp
    llm_stream: "auto"
    llm_chunk_recovery_attempts: 1
    llm_chunk_recovery_backoff_sec: 1.0
+
+   # yt-dlp network hardening (safe defaults)
+   yt_dlp_socket_timeout_sec: 15
+   yt_dlp_retries: 1
+   yt_dlp_extractor_retries: 1
    ```
 
    #### YouTube "Sign in to confirm you're not a bot"
@@ -75,6 +80,7 @@ pip install yt-dlp
    3. If that Chrome retry also fails, surface a clear error and tell you how to provide a `cookies.txt` file
 
    This means local desktop setups may recover automatically, while remote/container setups remain explicit and safe.
+   The JSON returned by `scripts/download.sh` now also includes a `yt_dlp_runtime` object so callers can see which timeout, retry, and auth strategy actually ran.
 
    If the automatic Chrome retry fails, the most portable fix is an exported Netscape-format `cookies.txt`:
 
@@ -106,6 +112,7 @@ pip install yt-dlp
 
    > **Note**:
    > - `deepgram_api_key` is only required when the video has no usable subtitles and audio transcription is needed.
+   > - Deepgram requests now use bounded automatic retries for transient timeout/network failures before surfacing an error.
    > - LLM API config is only needed for long video chunk processing, or when bilingual translation is required.
    > - `llm_base_url` can be either a provider root URL or a `/v1` URL. The tool normalizes both.
    > - `llm_stream: "auto"` prefers SSE streaming when the provider supports it.
@@ -139,6 +146,13 @@ Please transcribe these videos:
 ```
 
 After completion, a summary table will be provided with status and output paths for each video.
+
+
+### Routing Notes
+
+- `plan-optimization` still records the raw `duration_bucket` (`short` vs `long`).
+- If a short-duration transcript is too large for reliable single-pass prompting, the planner now escalates it to chunked processing and returns `video_path=long` with `routing_reason=oversized_short_input`.
+- Workflow callers should follow `video_path`, `operations`, and `routing_reason` from the planner rather than duration alone.
 
 ### 📁 Project Structure
 

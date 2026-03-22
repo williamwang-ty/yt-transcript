@@ -65,18 +65,14 @@ def build_chapter_plan(chapters_path: str, manifest_ref: str, output_path: str =
 
     timed_chunks.sort(key=lambda item: int(item.get("id", 0)))
 
-    def map_time(timestamp: float | None) -> tuple[dict, str, str]:
+    def map_time(timestamp: float | None) -> tuple[dict, str, str, dict]:
         """Map a timestamp onto the chunk that first covers that source position."""
-        if timestamp is None:
-            return timed_chunks[0], "missing_time", "low"
-        for chunk in timed_chunks:
-            start_time = chunk["start_time"]
-            end_time = chunk["end_time"]
-            if start_time <= timestamp < end_time or math.isclose(timestamp, start_time):
-                return chunk, "time_contains", "high"
-            if timestamp < start_time:
-                return chunk, "next_chunk", "medium"
-        return timed_chunks[-1], "after_last_chunk", "low"
+        return utils._map_timestamp_to_timed_item(
+            timestamp,
+            timed_chunks,
+            next_strategy="next_chunk",
+            after_last_strategy="after_last_chunk",
+        )
 
     def is_untitled(title: str) -> bool:
         """Return whether a chapter title should be treated as effectively empty."""
@@ -97,11 +93,12 @@ def build_chapter_plan(chapters_path: str, manifest_ref: str, output_path: str =
 
         start_time = utils._coerce_float_or_none(chapter.get("start_time"))
         end_time = utils._coerce_float_or_none(chapter.get("end_time"))
-        start_chunk, match_strategy, confidence = map_time(start_time)
+        start_chunk, match_strategy, confidence, diagnostics = map_time(start_time)
         end_chunk = start_chunk
+        end_diagnostics = diagnostics
         if end_time is not None:
             end_probe = max(start_time or end_time, end_time - 1e-6)
-            end_chunk, _, _ = map_time(end_probe)
+            end_chunk, _, _, end_diagnostics = map_time(end_probe)
 
         title = str(chapter.get("title", "")).strip()
         if title and is_untitled(title):
@@ -112,7 +109,7 @@ def build_chapter_plan(chapters_path: str, manifest_ref: str, output_path: str =
         if not title_zh and not title_en and title and not is_untitled(title):
             title_zh = title
 
-        if match_strategy != "time_contains":
+        if match_strategy not in {"time_contains", "near_next_start"}:
             warnings.append(f"Chapter {index} used fallback strategy '{match_strategy}'")
 
         plan_entries.append({
@@ -127,6 +124,8 @@ def build_chapter_plan(chapters_path: str, manifest_ref: str, output_path: str =
             "anchor_segment_id": start_chunk.get("source_segment_start"),
             "match_strategy": match_strategy,
             "confidence": confidence,
+            "mapping_diagnostics": diagnostics,
+            "end_mapping_diagnostics": end_diagnostics,
         })
 
     output_file = str(output_path or (manifest_path.parent / "chapter_plan.json"))

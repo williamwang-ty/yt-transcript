@@ -175,6 +175,8 @@ esac
             self.assertEqual(payload["video_id"], "abc123")
             self.assertEqual(payload["title"], "Recovered title")
             self.assertEqual(payload["channel"], "Recovered channel")
+            self.assertEqual(payload["yt_dlp_runtime"]["auth_strategy"], "chrome_retry_session")
+            self.assertEqual(payload["yt_dlp_runtime"]["session_browser_cookies"], "chrome")
             self.assertIn("retrying with Chrome cookies", result.stderr)
             self.assertIn("attempt 1/3", result.stderr)
 
@@ -784,3 +786,101 @@ exit 1
             finally:
                 stale.unlink(missing_ok=True)
                 shutil.rmtree("/tmp/vidaudio_downloads", ignore_errors=True)
+
+
+    def test_download_metadata_applies_safe_ytdlp_defaults_and_reports_runtime(self):
+        """Test download metadata applies safe ytdlp defaults and reports runtime."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            log_path = Path(tmpdir) / "yt-dlp.log"
+            fake_bin = Path(tmpdir) / "yt-dlp"
+            fake_bin.write_text(
+                f"""#!/usr/bin/env bash
+printf '%s
+' "$*" >> '{log_path}'
+print_field=''
+while [ $# -gt 0 ]; do
+  if [ "$1" = "--print" ] && [ $# -ge 2 ]; then
+    print_field="$2"
+    shift 2
+    continue
+  fi
+  shift
+done
+case "$print_field" in
+  '%(id)s') echo 'safe123' ;;
+  '%(title)s') echo 'Safe title' ;;
+  '%(duration)s') echo '42' ;;
+  '%(upload_date)s') echo '20260316' ;;
+  '%(channel)s') echo 'Safe channel' ;;
+  *) exit 1 ;;
+esac
+""",
+                encoding="utf-8",
+            )
+            fake_bin.chmod(0o755)
+
+            env = os.environ.copy()
+            env["PATH"] = f"{tmpdir}:{env['PATH']}"
+            env["YT_DLP_SOCKET_TIMEOUT_SEC"] = "-1"
+            env["YT_DLP_RETRIES"] = "-1"
+            env["YT_DLP_EXTRACTOR_RETRIES"] = "-1"
+            result = subprocess.run(
+                ["bash", str(PROJECT_ROOT / "scripts/download.sh"), "https://example.com/video", "metadata"],
+                cwd=PROJECT_ROOT,
+                env=env,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+            payload = json.loads(result.stdout)
+            log_text = log_path.read_text(encoding="utf-8")
+            self.assertEqual(payload["yt_dlp_runtime"]["socket_timeout_sec"], 15)
+            self.assertEqual(payload["yt_dlp_runtime"]["retries"], 1)
+            self.assertEqual(payload["yt_dlp_runtime"]["extractor_retries"], 1)
+            self.assertIn("--socket-timeout 15", log_text)
+            self.assertIn("--retries 1", log_text)
+            self.assertIn("--extractor-retries 1", log_text)
+
+    def test_download_metadata_filters_impersonation_warning(self):
+        """Test download metadata filters impersonation warning."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fake_bin = Path(tmpdir) / "yt-dlp"
+            fake_bin.write_text(
+                """#!/usr/bin/env bash
+print_field=''
+while [ $# -gt 0 ]; do
+  if [ "$1" = "--print" ] && [ $# -ge 2 ]; then
+    print_field="$2"
+    shift 2
+    continue
+  fi
+  shift
+done
+echo 'WARNING: [youtube] The extractor specified to use impersonation for this download, but no impersonate target is available' >&2
+case "$print_field" in
+  '%(id)s') echo 'imp123' ;;
+  '%(title)s') echo 'Impersonation title' ;;
+  '%(duration)s') echo '12' ;;
+  '%(upload_date)s') echo '20260316' ;;
+  '%(channel)s') echo 'Channel' ;;
+  *) exit 1 ;;
+esac
+""",
+                encoding="utf-8",
+            )
+            fake_bin.chmod(0o755)
+
+            env = os.environ.copy()
+            env["PATH"] = f"{tmpdir}:{env['PATH']}"
+            result = subprocess.run(
+                ["bash", str(PROJECT_ROOT / "scripts/download.sh"), "https://example.com/video", "metadata"],
+                cwd=PROJECT_ROOT,
+                env=env,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+            self.assertNotIn("no impersonate target is available", result.stderr)
+            self.assertIn("impersonation is unavailable in this build", result.stderr)

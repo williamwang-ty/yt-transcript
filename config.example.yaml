@@ -11,11 +11,11 @@ deepgram_api_key: "your_deepgram_api_key_here"
 output_dir: "~/Downloads"
 
 # yt-dlp tuning (optional)
-# These default to conservative values to avoid long hangs.
-# Set to a positive integer to enable. Use -1 to keep yt-dlp defaults.
-yt_dlp_socket_timeout_sec: -1
-yt_dlp_retries: -1
-yt_dlp_extractor_retries: -1
+# These default to conservative bounded values to avoid long hangs.
+# Invalid, empty, or negative values automatically fall back to these defaults.
+yt_dlp_socket_timeout_sec: 15
+yt_dlp_retries: 1
+yt_dlp_extractor_retries: 1
 
 # YouTube anti-bot / login handling (optional)
 # Default behavior: yt-transcript does NOT read browser cookies up front.

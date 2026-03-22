@@ -81,9 +81,9 @@ No separate split-path workflow is needed.
 
 **Error Handling**
 
-- If the command fails, STOP
-- Do not auto-retry
-- Ask the user whether to retry only after surfacing the error
+- `transcribe-deepgram` now performs bounded automatic retries for transient Deepgram timeout/network failures
+- If the command still fails after those retries, STOP
+- Ask the user whether to retry only after surfacing the final error
 
 ---
 
