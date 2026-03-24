@@ -222,6 +222,16 @@ Both paths are designed to produce normalized downstream artifacts such as raw t
 - later stages do not need to know whether text came from subtitles or audio transcription
 - timed information remains available for chapter-aware chunking when possible
 
+#### Alternative considered: direct YouTube InnerTube subtitle fetching
+
+Direct InnerTube subtitle fetching was evaluated as an alternative acquisition strategy to `yt-dlp`. It is lighter for subtitle-only flows and can reduce setup cost for simple local runs. The architecture does not adopt it as the default acquisition layer because it remains an unofficial, interface-sensitive surface, does not remove the no-subtitle fallback requirement, and would shift more extraction-maintenance burden into this project.
+
+So the design choice is:
+
+- `yt-dlp` remains the primary subtitle-acquisition dependency
+- Deepgram remains the fallback when usable subtitles do not exist
+- InnerTube is acknowledged as a possible future fast path, not the canonical default
+
 ### 6.4 Canonical State and Normalization Layer
 
 #### Problem to solve
@@ -1343,6 +1353,16 @@ YouTube URL
 - 多种获取策略仍能汇聚到同一套下游架构
 - 后续层不需要关心文本来自字幕还是音频转录
 - 如果有时间信息，后续仍可做 chapter-aware chunking
+
+#### 备选方案评估：直接走 YouTube InnerTube 字幕获取
+
+项目评估过直接通过 YouTube InnerTube 获取字幕，作为 `yt-dlp` 的替代获取策略。该方案对纯字幕路径更轻量，并可降低简单本地运行的依赖成本。当前架构不将其设为默认获取层，因为它仍属于非官方、对接口变化敏感的获取面，不能消除“无字幕时仍需音频转录兜底”的要求，也会将更多提取维护成本转移到项目内部。
+
+因此，这里的设计结论是：
+
+- `yt-dlp` 仍然是主字幕获取依赖
+- 当可用字幕不存在时，Deepgram 仍然承担兜底路径
+- InnerTube 只被视为未来可选的 fast path，而不是规范默认方案
 
 ### 6.4 规范状态与标准化层
 
