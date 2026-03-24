@@ -302,6 +302,7 @@ Current policy is intentional and explicit:
 - Markdown header text is escaped and link destinations are encoded so edge-case titles/channels do not break output structure
 - `chunk-document` is now the canonical long-video chunking entrypoint when `normalized_document.json` exists; it auto-selects `segments` vs `text` but keeps `chunk-text` / `chunk-segments` available as compatible lower-level drivers
 - `chunk-text` force-splits very long unpunctuated passages to stay within downstream LLM chunk budgets
+- `download.sh metadata` now prefers a single `yt-dlp -J` fetch when available, and subtitle/audio modes reuse metadata-derived video IDs before falling back to extra probes
 - `transcribe-deepgram --output-segments` can emit time-aligned segments for downstream timed chunking + YouTube chapter mapping
 - `transcribe-deepgram --enable-utterances --prefer-structured-output` is the current staged opt-in path for utterance-first transcript assembly before the default flips in a later cleanup pass
 - `transcribe-deepgram` now also reports lightweight observability fields such as paragraph/sentence/word counts, per-chunk transcript metadata, and fallback warnings in its result JSON
@@ -632,6 +633,7 @@ bash scripts/preflight.sh --require-llm
 - Markdown 头部里的标题/频道文本会做转义，链接目标会做编码，避免边界字符破坏结构
 - `chunk-document` 现在是 `normalized_document.json` 已存在时的规范长视频分块入口；它会自动选择 `segments` 或 `text`，但仍保留 `chunk-text` / `chunk-segments` 作为兼容的低层驱动
 - `chunk-text` 会对超长且缺少标点的段落做强制切分，并在提供 `--prompt` 时默认启用 token-aware 规划
+- `download.sh metadata` 现在会优先走单次 `yt-dlp -J` 获取；字幕/音频模式也会先复用 metadata 里的 video id，再回退到额外探测
 - `transcribe-deepgram --output-segments` 可选输出带时间戳的对齐 segments，用于后续 timed chunk 与 YouTube 章节映射
 - `transcribe-deepgram --enable-utterances --prefer-structured-output` 是当前分阶段引入的 utterance-first 组装路径；默认值会在后续清理 PR 中再切换
 - `transcribe-deepgram` 现在还会在结果 JSON 中输出轻量可观测字段，例如 paragraph/sentence/word 计数、逐 chunk 的 transcript 元数据，以及 structured-output 回退 warning

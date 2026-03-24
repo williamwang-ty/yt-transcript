@@ -34,6 +34,8 @@ YTDLP_CHROME_COOKIES_RETRY_MAX=3
 YTDLP_DEFAULT_SOCKET_TIMEOUT_SEC=15
 YTDLP_DEFAULT_RETRIES=1
 YTDLP_DEFAULT_EXTRACTOR_RETRIES=1
+METADATA_JSON_CACHE=""
+METADATA_JSON_LOADED=false
 
 if [ -n "$CONFIG_JSON" ]; then
     if [ -z "$YT_DLP_SOCKET_TIMEOUT_SEC" ]; then
@@ -307,6 +309,65 @@ video_id_for_url() {
     yt_dlp --print "%(id)s" "$VIDEO_URL"
 }
 
+# Fetch `yt-dlp -J` metadata once per invocation and reuse it inside the script.
+metadata_json_for_url() {
+    if [ "$METADATA_JSON_LOADED" != true ]; then
+        METADATA_JSON_CACHE=$(yt_dlp -J "$VIDEO_URL" 2>/dev/null || true)
+        METADATA_JSON_LOADED=true
+    fi
+    printf '%s' "$METADATA_JSON_CACHE"
+}
+
+# Extract the normalized video ID from a metadata JSON document.
+video_id_from_metadata_json() {
+    local metadata_json
+    metadata_json=$(cat)
+    METADATA_JSON="$metadata_json" python3 - <<'PY'
+import json
+import os
+
+payload = json.loads(os.environ['METADATA_JSON'])
+video_id = str(payload.get('id') or '').strip()
+if not video_id:
+    raise SystemExit(1)
+print(video_id)
+PY
+}
+
+# Emit metadata payload from `yt-dlp -J` output.
+emit_metadata_from_metadata_json() {
+    local metadata_json ytdlp_runtime_json
+    metadata_json=$(cat)
+    ytdlp_runtime_json=$(current_ytdlp_runtime_json)
+    METADATA_JSON="$metadata_json" YTDLP_RUNTIME_JSON="$ytdlp_runtime_json" python3 - <<'PY'
+import json
+import os
+
+payload = json.loads(os.environ['METADATA_JSON'])
+video_id = str(payload.get('id') or '').strip()
+if not video_id:
+    raise SystemExit(1)
+
+duration = payload.get('duration')
+if duration in (None, '', 'NA'):
+    duration = 0
+else:
+    try:
+        duration = int(float(duration))
+    except (TypeError, ValueError):
+        duration = 0
+
+print(json.dumps({
+    'video_id': video_id,
+    'title': str(payload.get('title') or ''),
+    'duration': duration,
+    'upload_date': str(payload.get('upload_date') or ''),
+    'channel': str(payload.get('channel') or ''),
+    'yt_dlp_runtime': json.loads(os.environ.get('YTDLP_RUNTIME_JSON', '{}') or '{}'),
+}, ensure_ascii=False))
+PY
+}
+
 # Fail fast when a URL does not resolve to a plausible video ID.
 require_valid_video_id() {
     local video_id="$1"
@@ -507,6 +568,18 @@ PY
 case "$MODE" in
     metadata)
         echo "📋 Fetching video metadata..." >&2
+        METADATA_JSON=$(metadata_json_for_url)
+        if [ -n "$METADATA_JSON" ]; then
+            VIDEO_ID=$(printf '%s' "$METADATA_JSON" | video_id_from_metadata_json 2>/dev/null || true)
+            if [ -n "$VIDEO_ID" ]; then
+                require_valid_video_id "$VIDEO_ID"
+                if METADATA_PAYLOAD=$(printf '%s' "$METADATA_JSON" | emit_metadata_from_metadata_json 2>/dev/null); then
+                    printf '%s\n' "$METADATA_PAYLOAD"
+                    exit 0
+                fi
+            fi
+        fi
+
         VIDEO_ID=$(video_id_for_url)
         require_valid_video_id "$VIDEO_ID"
         if ! TITLE=$(yt_dlp --print "%(title)s" "$VIDEO_URL"); then
@@ -540,16 +613,20 @@ PY
 
     subtitle-info)
         echo "🔎 Inspecting subtitle availability..." >&2
-        VIDEO_ID=$(video_id_for_url)
-        require_valid_video_id "$VIDEO_ID"
-        METADATA_JSON=$(yt_dlp -J "$VIDEO_URL" 2>/dev/null || true)
+        METADATA_JSON=$(metadata_json_for_url)
         if [ -n "$METADATA_JSON" ]; then
-            if SUB_INFO_JSON=$(printf '%s' "$METADATA_JSON" | emit_subtitle_info_from_metadata_json "$VIDEO_ID" 2>/dev/null); then
-                printf '%s\n' "$SUB_INFO_JSON"
-                exit 0
+            VIDEO_ID=$(printf '%s' "$METADATA_JSON" | video_id_from_metadata_json 2>/dev/null || true)
+            if [ -n "$VIDEO_ID" ]; then
+                require_valid_video_id "$VIDEO_ID"
+                if SUB_INFO_JSON=$(printf '%s' "$METADATA_JSON" | emit_subtitle_info_from_metadata_json "$VIDEO_ID" 2>/dev/null); then
+                    printf '%s\n' "$SUB_INFO_JSON"
+                    exit 0
+                fi
             fi
         fi
 
+        VIDEO_ID=$(video_id_for_url)
+        require_valid_video_id "$VIDEO_ID"
         if ! LIST_OUTPUT=$(yt_dlp --list-subs "$VIDEO_URL" 2>&1); then
             printf '%s\n' "$LIST_OUTPUT" >&2
             exit 1
@@ -560,12 +637,33 @@ PY
 
     subtitles)
         echo "📥 Downloading subtitles..." >&2
-        VIDEO_ID=$(video_id_for_url)
-        require_valid_video_id "$VIDEO_ID"
+        SUB_INFO_JSON=""
+        METADATA_JSON=$(metadata_json_for_url)
+        if [ -n "$METADATA_JSON" ]; then
+            VIDEO_ID=$(printf '%s' "$METADATA_JSON" | video_id_from_metadata_json 2>/dev/null || true)
+            if [ -n "$VIDEO_ID" ]; then
+                require_valid_video_id "$VIDEO_ID"
+                SUB_INFO_JSON=$(printf '%s' "$METADATA_JSON" | emit_subtitle_info_from_metadata_json "$VIDEO_ID" 2>/dev/null || true)
+            fi
+        fi
+        if [ -z "$SUB_INFO_JSON" ]; then
+            SUB_INFO_JSON=$(bash "$SCRIPT_DIR/download.sh" "$VIDEO_URL" subtitle-info)
+            VIDEO_ID=$(SUB_INFO_JSON="$SUB_INFO_JSON" python3 - <<'PY'
+import json
+import os
+
+payload = json.loads(os.environ['SUB_INFO_JSON'])
+video_id = str(payload.get('video_id') or '').strip()
+if not video_id:
+    raise SystemExit(1)
+print(video_id)
+PY
+)
+            require_valid_video_id "$VIDEO_ID"
+        fi
         SUBTITLE_DIR="$(download_root_for_video "$VIDEO_ID")/subtitles"
         reset_download_dir "$SUBTITLE_DIR"
 
-        SUB_INFO_JSON=$(bash "$SCRIPT_DIR/download.sh" "$VIDEO_URL" subtitle-info)
         if ! SUB_LANGS=$(SUB_INFO_JSON="$SUB_INFO_JSON" python3 - <<'PY'
 import json
 import os
@@ -707,23 +805,23 @@ PY
 
     audio)
         echo "🎵 Downloading audio..." >&2
-        VIDEO_ID=$(video_id_for_url)
+        VIDEO_ID=""
+        METADATA_JSON=$(metadata_json_for_url)
+        if [ -n "$METADATA_JSON" ]; then
+            VIDEO_ID=$(printf '%s' "$METADATA_JSON" | video_id_from_metadata_json 2>/dev/null || true)
+        fi
+        if [ -z "$VIDEO_ID" ]; then
+            VIDEO_ID=$(video_id_for_url)
+        fi
         require_valid_video_id "$VIDEO_ID"
         AUDIO_DIR="$(download_root_for_video "$VIDEO_ID")/audio"
         reset_download_dir "$AUDIO_DIR"
 
         AUDIO_FORMAT=""
-        METADATA_JSON=$(yt_dlp -J "$VIDEO_URL" 2>/dev/null || true)
         if [ -n "$METADATA_JSON" ]; then
             AUDIO_FORMAT=$(printf '%s' "$METADATA_JSON" | select_audio_format_from_metadata_json 2>/dev/null || true)
         fi
 
-        if [ -z "$AUDIO_FORMAT" ]; then
-            AUDIO_FORMAT=$(yt_dlp --list-formats "$VIDEO_URL" 2>&1 | grep -E "audio.*zh" | head -1 | awk '{print $1}' || true)
-        fi
-        if [ -z "$AUDIO_FORMAT" ]; then
-            AUDIO_FORMAT=$(yt_dlp --list-formats "$VIDEO_URL" 2>&1 | grep -E "^140-0|^140 " | head -1 | awk '{print $1}' || true)
-        fi
         if [ -z "$AUDIO_FORMAT" ]; then
             AUDIO_FORMAT="bestaudio"
         fi

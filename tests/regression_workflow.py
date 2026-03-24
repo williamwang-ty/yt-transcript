@@ -120,6 +120,48 @@ class WorkflowRegressionTests(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("Could not resolve a video ID", result.stderr)
 
+    def test_download_metadata_prefers_single_json_fetch_when_available(self):
+        """Test download metadata prefers a single -J fetch when available."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            log_path = Path(tmpdir) / "yt-dlp.log"
+            fake_bin = Path(tmpdir) / "yt-dlp"
+            fake_bin.write_text(
+                f"""#!/usr/bin/env bash
+printf '%s\n' "$*" >> '{log_path}'
+for arg in "$@"; do
+  if [ "$arg" = "-J" ]; then
+    cat <<'EOF'
+{{"id":"json123","title":"JSON title","duration":42,"upload_date":"20260324","channel":"JSON channel"}}
+EOF
+    exit 0
+  fi
+done
+exit 1
+""",
+                encoding="utf-8",
+            )
+            fake_bin.chmod(0o755)
+
+            env = os.environ.copy()
+            env["PATH"] = f"{tmpdir}:{env['PATH']}"
+            result = subprocess.run(
+                ["bash", str(PROJECT_ROOT / "scripts/download.sh"), "https://example.com/video", "metadata"],
+                cwd=PROJECT_ROOT,
+                env=env,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+            payload = json.loads(result.stdout)
+            log_text = log_path.read_text(encoding="utf-8")
+            self.assertEqual(payload["video_id"], "json123")
+            self.assertEqual(payload["title"], "JSON title")
+            self.assertEqual(payload["channel"], "JSON channel")
+            self.assertIn("-J", log_text)
+            self.assertIn("https://example.com/video", log_text)
+            self.assertNotIn("%(title)s", log_text)
+
     def test_download_metadata_retries_with_chrome_after_not_a_bot(self):
         """Test download metadata retries with chrome after not a bot."""
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -786,6 +828,56 @@ exit 1
             finally:
                 stale.unlink(missing_ok=True)
                 shutil.rmtree("/tmp/vidaudio_downloads", ignore_errors=True)
+
+    def test_audio_download_can_resolve_video_id_from_metadata_json_only(self):
+        """Test audio download can resolve video id from metadata json without --print."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fake_bin = Path(tmpdir) / "yt-dlp"
+            fake_bin.write_text(
+                """#!/usr/bin/env bash
+if [ "$1" = "-J" ]; then
+  cat <<'EOF'
+{"id":"vidjsononly","formats":[{"format_id":"251","language":"zh","vcodec":"none","acodec":"opus"}]}
+EOF
+  exit 0
+fi
+if [ "$1" = "-f" ]; then
+  out=''
+  while [ $# -gt 0 ]; do
+    if [ "$1" = "-o" ]; then
+      out="$2"
+      shift 2
+      continue
+    fi
+    shift
+  done
+  mkdir -p "$(dirname "$out")"
+  : > "${out//%(ext)s/mp3}"
+  exit 0
+fi
+exit 1
+""",
+                encoding="utf-8",
+            )
+            fake_bin.chmod(0o755)
+
+            env = os.environ.copy()
+            env["PATH"] = f"{tmpdir}:{env['PATH']}"
+            try:
+                result = subprocess.run(
+                    ["bash", str(PROJECT_ROOT / "scripts/download.sh"), "https://example.com/video", "audio"],
+                    cwd=PROJECT_ROOT,
+                    env=env,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+                payload = json.loads(result.stdout)
+                self.assertEqual(payload["video_id"], "vidjsononly")
+                self.assertEqual(payload["audio_format"], "251")
+                self.assertEqual(payload["audio_file"], "/tmp/vidjsononly_downloads/audio/vidjsononly.mp3")
+            finally:
+                shutil.rmtree("/tmp/vidjsononly_downloads", ignore_errors=True)
 
 
     def test_download_metadata_applies_safe_ytdlp_defaults_and_reports_runtime(self):
