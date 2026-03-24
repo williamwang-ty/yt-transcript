@@ -6,11 +6,12 @@
 # Deepgram API Key (get from https://console.deepgram.com/)
 # Required only when a video has no usable subtitles and audio transcription is needed.
 deepgram_api_key: "your_deepgram_api_key_here"
-# Optional Deepgram model override. Keep nova-2 for the current stable fallback path.
+# Optional Deepgram model override. Keep nova-2 for the current stable path.
 deepgram_model: "nova-2"
-# PR2 staged flags: keep these false to preserve legacy flat-transcript behavior.
-deepgram_enable_utterances: false
-deepgram_prefer_structured_output: false
+# Structured transcript assembly now defaults on.
+# Set either flag to false only when debugging parity with the legacy flat path.
+deepgram_enable_utterances: true
+deepgram_prefer_structured_output: true
 
 # Output directory for transcribed files. This is the only always-required field.
 output_dir: "~/Downloads"

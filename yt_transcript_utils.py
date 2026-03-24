@@ -333,8 +333,8 @@ DEFAULT_YT_DLP_SOCKET_TIMEOUT_SEC = 15
 DEFAULT_YT_DLP_RETRIES = 1
 DEFAULT_YT_DLP_EXTRACTOR_RETRIES = 1
 DEFAULT_DEEPGRAM_MODEL = "nova-2"
-DEFAULT_DEEPGRAM_ENABLE_UTTERANCES = False
-DEFAULT_DEEPGRAM_PREFER_STRUCTURED_OUTPUT = False
+DEFAULT_DEEPGRAM_ENABLE_UTTERANCES = True
+DEFAULT_DEEPGRAM_PREFER_STRUCTURED_OUTPUT = True
 DEFAULT_DEEPGRAM_REQUEST_RETRIES = 2
 DEFAULT_DEEPGRAM_RETRY_BACKOFF_SEC = 1.0
 DEFAULT_CHAPTER_BOUNDARY_TOLERANCE_SEC = 0.35
@@ -2165,7 +2165,7 @@ def parse_vtt_segments(vtt_path: str, *, language: str = "") -> dict:
     }
 
 
-def process_deepgram(json_path: str) -> dict:
+def process_deepgram(json_path: str, *, prefer_structured_output: bool = DEFAULT_DEEPGRAM_PREFER_STRUCTURED_OUTPUT) -> dict:
     """
     Process Deepgram API JSON result
 
@@ -2195,7 +2195,7 @@ def process_deepgram(json_path: str) -> dict:
         sys.exit(2)
 
     try:
-        return process_deepgram_payload(data)
+        return process_deepgram_payload(data, prefer_structured_output=prefer_structured_output)
     except (KeyError, IndexError) as e:
         print(f"Error: Deepgram JSON structure unexpected {e}", file=sys.stderr)
         sys.exit(2)
@@ -2346,7 +2346,7 @@ def _extract_utterance_text(utterance: dict) -> str:
     return str(utterance.get('transcript') or utterance.get('text') or '').strip()
 
 
-def _build_deepgram_transcript(data: dict, *, prefer_structured_output: bool = False) -> dict:
+def _build_deepgram_transcript(data: dict, *, prefer_structured_output: bool = DEFAULT_DEEPGRAM_PREFER_STRUCTURED_OUTPUT) -> dict:
     """Build transcript text from a Deepgram payload with optional structured-field priority."""
     inspection = _inspect_deepgram_payload(data)
     if not prefer_structured_output:
@@ -2425,7 +2425,7 @@ def _build_deepgram_transcript(data: dict, *, prefer_structured_output: bool = F
 def _extract_deepgram_segments_with_report(data: dict, *, time_offset: float = 0.0,
                                            source_chunk_index: int = 0,
                                            starting_segment_id: int = 0,
-                                           prefer_structured_output: bool = False) -> tuple[list[dict], dict]:
+                                           prefer_structured_output: bool = DEFAULT_DEEPGRAM_PREFER_STRUCTURED_OUTPUT) -> tuple[list[dict], dict]:
     """Extract Deepgram segments plus observability metadata."""
     alternative = _deepgram_primary_alternative(data)
     paragraphs = _deepgram_paragraphs(alternative)
@@ -2653,7 +2653,7 @@ def _extract_deepgram_segments_with_report(data: dict, *, time_offset: float = 0
 
 def extract_deepgram_segments(data: dict, *, time_offset: float = 0.0,
                               source_chunk_index: int = 0, starting_segment_id: int = 0,
-                              prefer_structured_output: bool = False) -> list[dict]:
+                              prefer_structured_output: bool = DEFAULT_DEEPGRAM_PREFER_STRUCTURED_OUTPUT) -> list[dict]:
     """Extract deepgram segments."""
     segments, _ = _extract_deepgram_segments_with_report(
         data,
@@ -2665,7 +2665,7 @@ def extract_deepgram_segments(data: dict, *, time_offset: float = 0.0,
     return segments
 
 
-def process_deepgram_payload(data: dict, *, prefer_structured_output: bool = False) -> dict:
+def process_deepgram_payload(data: dict, *, prefer_structured_output: bool = DEFAULT_DEEPGRAM_PREFER_STRUCTURED_OUTPUT) -> dict:
     """Process deepgram payload."""
     inspection = _inspect_deepgram_payload(data)
     transcript_result = _build_deepgram_transcript(data, prefer_structured_output=prefer_structured_output)
@@ -6203,6 +6203,12 @@ def main():
         help='Process Deepgram JSON, output cleaned text and speaker count'
     )
     dg_parser.add_argument('json_path', help='Deepgram JSON file path')
+    dg_parser.set_defaults(prefer_structured_output=DEFAULT_DEEPGRAM_PREFER_STRUCTURED_OUTPUT)
+    dg_output_group = dg_parser.add_mutually_exclusive_group()
+    dg_output_group.add_argument('--prefer-structured-output', dest='prefer_structured_output', action='store_true',
+                                 help='Prefer utterances/sentence text when processing Deepgram JSON (default)')
+    dg_output_group.add_argument('--legacy-flat-output', dest='prefer_structured_output', action='store_false',
+                                 help='Force legacy flat transcript assembly when processing Deepgram JSON')
 
     # sanitize-filename command
     fn_parser = subparsers.add_parser(
@@ -6229,8 +6235,17 @@ def main():
     tdg_parser.add_argument('--output-text', default='', help='Optional path to write merged transcript text')
     tdg_parser.add_argument('--output-segments', default='', help='Optional path to write aligned source segments JSON')
     tdg_parser.add_argument('--model', default='', help='Optional Deepgram model override')
-    tdg_parser.add_argument('--enable-utterances', action='store_true', help='Request Deepgram utterances=true for structured speaker-aware output')
-    tdg_parser.add_argument('--prefer-structured-output', action='store_true', help='Prefer utterances/sentence text over the legacy flat transcript when building output text and segments')
+    tdg_parser.set_defaults(enable_utterances_override=None, prefer_structured_output_override=None)
+    tdg_utterance_group = tdg_parser.add_mutually_exclusive_group()
+    tdg_utterance_group.add_argument('--enable-utterances', dest='enable_utterances_override', action='store_true',
+                                     help='Force Deepgram utterances=true speaker-aware output (default)')
+    tdg_utterance_group.add_argument('--disable-utterances', dest='enable_utterances_override', action='store_false',
+                                     help='Disable Deepgram utterances when comparing against the flatter legacy response shape')
+    tdg_output_group = tdg_parser.add_mutually_exclusive_group()
+    tdg_output_group.add_argument('--prefer-structured-output', dest='prefer_structured_output_override', action='store_true',
+                                  help='Prefer utterances/sentence text over the legacy flat transcript when building output text and segments (default)')
+    tdg_output_group.add_argument('--legacy-flat-output', dest='prefer_structured_output_override', action='store_false',
+                                  help='Force legacy flat transcript assembly for compatibility/debugging checks')
 
     # test-deepgram-api command
     api_parser = subparsers.add_parser(
@@ -6626,7 +6641,10 @@ def main():
         print(json.dumps(result, ensure_ascii=False))
 
     elif args.command == 'process-deepgram':
-        result = process_deepgram(args.json_path)
+        result = process_deepgram(
+            args.json_path,
+            prefer_structured_output=args.prefer_structured_output,
+        )
         print(json.dumps(result, ensure_ascii=False))
 
     elif args.command == 'sanitize-filename':
@@ -6646,8 +6664,8 @@ def main():
             output_text=args.output_text,
             output_segments=args.output_segments,
             deepgram_model=args.model,
-            enable_utterances=True if args.enable_utterances else None,
-            prefer_structured_output=True if args.prefer_structured_output else None,
+            enable_utterances=args.enable_utterances_override,
+            prefer_structured_output=args.prefer_structured_output_override,
         )
         print(json.dumps(result, ensure_ascii=False))
 
