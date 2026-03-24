@@ -1,0 +1,83 @@
+{
+  "results": {
+    "channels": [
+      {
+        "alternatives": [
+          {
+            "transcript": "Hello world. We are testing Deepgram observability.",
+            "words": [
+              {
+                "word": "Hello",
+                "punctuated_word": "Hello",
+                "start": 0.0,
+                "end": 0.4
+              },
+              {
+                "word": "world",
+                "punctuated_word": "world.",
+                "start": 0.4,
+                "end": 0.8
+              },
+              {
+                "word": "We",
+                "punctuated_word": "We",
+                "start": 1.1,
+                "end": 1.3
+              },
+              {
+                "word": "are",
+                "punctuated_word": "are",
+                "start": 1.3,
+                "end": 1.5
+              },
+              {
+                "word": "testing",
+                "punctuated_word": "testing",
+                "start": 1.5,
+                "end": 1.9
+              },
+              {
+                "word": "Deepgram",
+                "punctuated_word": "Deepgram",
+                "start": 1.9,
+                "end": 2.3
+              },
+              {
+                "word": "observability",
+                "punctuated_word": "observability.",
+                "start": 2.3,
+                "end": 2.9
+              }
+            ],
+            "paragraphs": {
+              "paragraphs": [
+                {
+                  "speaker": 0,
+                  "sentences": [
+                    {
+                      "text": "Hello world.",
+                      "start": 0.0,
+                      "end": 0.8,
+                      "speaker": 0
+                    }
+                  ]
+                },
+                {
+                  "speaker": 1,
+                  "sentences": [
+                    {
+                      "text": "We are testing Deepgram observability.",
+                      "start": 1.1,
+                      "end": 2.9,
+                      "speaker": 1
+                    }
+                  ]
+                }
+              ]
+            }
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -76,6 +76,7 @@ This command automatically:
 - Merges all chunk transcripts into `/tmp/${VIDEO_ID}_raw_text.txt`
 - When `--output-json` is set, always writes the requested aggregate JSON path; split mode also writes sibling `*_chunk_XXX.json` payload files
 - When `--output-segments` is set, writes aligned sentence-level segments (with `start_time` / `end_time`) for timed chunking + chapter mapping
+- Emits lightweight observability fields in `/tmp/${VIDEO_ID}_deepgram_result.json`, including per-chunk transcript metadata and fallback warnings
 
 No separate split-path workflow is needed.
 
@@ -94,8 +95,12 @@ Read `/tmp/${VIDEO_ID}_deepgram_result.json` and record:
 - `speaker_count`
 - `chunk_count`
 - `used_split_mode`
+- `paragraph_count`
+- `sentence_count`
+- `word_count`
 - `segment_count` (should be > 0 when `--output-segments` is enabled)
 - `segments_output` (path to the segments JSON file, or empty)
+- `warnings` (review especially when any chunk reports a structured-output fallback)
 
 Write to state:
 

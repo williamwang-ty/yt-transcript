@@ -214,10 +214,49 @@ class CoreRegressionTests(unittest.TestCase):
         payload = {"results": {"channels": [{"alternatives": [{"transcript": "你 好 ！"}]}]}}
         result = utils.process_deepgram_payload(payload)
         self.assertEqual(result["transcript"], "你好！")
+        self.assertEqual(result["transcript_source"], "alternative.transcript")
+        self.assertFalse(result["has_paragraphs"])
+        self.assertFalse(result["has_words"])
 
         repeated_payload = {"results": {"channels": [{"alternatives": [{"transcript": "哈哈哈哈哈哈"}]}]}}
         repeated_result = utils.process_deepgram_payload(repeated_payload)
         self.assertEqual(repeated_result["transcript"], "哈哈哈")
+
+    def test_process_deepgram_payload_reports_structured_observability_fields(self):
+        """Test process deepgram payload reports structured observability fields."""
+        payload = json.loads((FIXTURES_DIR / "deepgram_en_structured.json").read_text(encoding="utf-8"))
+
+        result = utils.process_deepgram_payload(payload)
+
+        self.assertEqual(result["transcript"], "Hello world. We are testing Deepgram observability.")
+        self.assertEqual(result["speaker_count"], 2)
+        self.assertEqual(result["transcript_source"], "alternative.transcript")
+        self.assertEqual(result["paragraph_count"], 2)
+        self.assertEqual(result["sentence_count"], 2)
+        self.assertEqual(result["sentence_text_count"], 2)
+        self.assertEqual(result["timed_sentence_count"], 2)
+        self.assertEqual(result["word_count"], 7)
+        self.assertTrue(result["has_paragraphs"])
+        self.assertTrue(result["has_words"])
+
+    def test_extract_deepgram_segments_preserves_sentence_text_when_words_missing(self):
+        """Test extract deepgram segments preserves sentence text when words are missing."""
+        payload = json.loads((FIXTURES_DIR / "deepgram_en_sentence_text_only.json").read_text(encoding="utf-8"))
+
+        segments = utils.extract_deepgram_segments(payload)
+
+        self.assertEqual(len(segments), 1)
+        self.assertEqual(segments[0]["text"], "Fallback sentence text should stay punctuated.")
+        self.assertEqual(segments[0]["speaker"], 2)
+
+    def test_extract_deepgram_segments_falls_back_to_transcript_without_paragraphs(self):
+        """Test extract deepgram segments falls back to transcript without paragraphs."""
+        payload = json.loads((FIXTURES_DIR / "deepgram_zh_transcript_only.json").read_text(encoding="utf-8"))
+
+        segments = utils.extract_deepgram_segments(payload)
+
+        self.assertEqual(len(segments), 1)
+        self.assertEqual(segments[0]["text"], "你好！这是一个没有段落数据的例子。")
 
     def test_transcribe_deepgram_merges_chunk_outputs_and_writes_artifacts(self):
         """Test transcribe deepgram merges chunk outputs and writes artifacts."""
@@ -260,20 +299,35 @@ class CoreRegressionTests(unittest.TestCase):
 
             self.assertEqual(result["transcript"], "Alpha\n\nBeta")
             self.assertEqual(result["speaker_count"], 2)
+            self.assertEqual(result["transcript_source"], "alternative.transcript")
             self.assertEqual(output_text.read_text(encoding="utf-8"), "Alpha\n\nBeta")
             self.assertEqual(result["chunk_count"], 2)
             self.assertTrue(result["used_split_mode"])
             self.assertEqual(len(result["json_outputs"]), 2)
+            self.assertEqual(result["deepgram_request"]["model"], utils.DEFAULT_DEEPGRAM_MODEL)
+            self.assertEqual(result["deepgram_request"]["language"], "en")
+            self.assertEqual(result["paragraph_count"], 0)
+            self.assertEqual(result["sentence_count"], 0)
+            self.assertEqual(result["word_count"], 0)
+            self.assertEqual(len(result["chunk_reports"]), 2)
+            self.assertEqual(result["chunk_reports"][0]["transcript_source"], "alternative.transcript")
+            self.assertEqual(result["chunk_reports"][0]["segment_source"], "alternative.transcript")
+            self.assertEqual(len(result["warnings"]), 2)
             self.assertTrue(output_text.exists())
             self.assertTrue(output_json.exists())
             aggregate = json.loads(output_json.read_text(encoding="utf-8"))
             self.assertEqual(aggregate["chunk_count"], 2)
             self.assertEqual(len(aggregate["chunks"]), 2)
             self.assertEqual(aggregate["split_points"], [12.5])
+            self.assertEqual(aggregate["deepgram_request"]["model"], utils.DEFAULT_DEEPGRAM_MODEL)
+            self.assertEqual(len(aggregate["chunk_reports"]), 2)
+            self.assertEqual(len(aggregate["warnings"]), 2)
             self.assertTrue(all(Path(item).exists() for item in result["json_outputs"]))
             self.assertTrue(output_segments.exists())
             segments_doc = json.loads(output_segments.read_text(encoding="utf-8"))
             self.assertEqual(segments_doc["source"], "deepgram")
+            self.assertEqual(len(segments_doc["chunk_reports"]), 2)
+            self.assertEqual(len(segments_doc["warnings"]), 2)
             self.assertEqual(len(segments_doc["segments"]), 2)
             self.assertEqual(result["segment_count"], 2)
             self.assertEqual(result["segments_output"], str(output_segments))

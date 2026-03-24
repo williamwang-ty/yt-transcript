@@ -1,0 +1,28 @@
+{
+  "results": {
+    "channels": [
+      {
+        "alternatives": [
+          {
+            "transcript": "Fallback sentence text should stay punctuated.",
+            "paragraphs": {
+              "paragraphs": [
+                {
+                  "speaker": 2,
+                  "sentences": [
+                    {
+                      "text": "Fallback sentence text should stay punctuated.",
+                      "start": 0.0,
+                      "end": 2.0,
+                      "speaker": 2
+                    }
+                  ]
+                }
+              ]
+            }
+          }
+        ]
+      }
+    ]
+  }
+}

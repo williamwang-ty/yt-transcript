@@ -332,6 +332,7 @@ DEFAULT_LLM_CHUNK_RECOVERY_BACKOFF_SEC = 1.0
 DEFAULT_YT_DLP_SOCKET_TIMEOUT_SEC = 15
 DEFAULT_YT_DLP_RETRIES = 1
 DEFAULT_YT_DLP_EXTRACTOR_RETRIES = 1
+DEFAULT_DEEPGRAM_MODEL = "nova-2"
 DEFAULT_DEEPGRAM_REQUEST_RETRIES = 2
 DEFAULT_DEEPGRAM_RETRY_BACKOFF_SEC = 1.0
 DEFAULT_CHAPTER_BOUNDARY_TOLERANCE_SEC = 0.35
@@ -2169,9 +2170,10 @@ def process_deepgram(json_path: str) -> dict:
     - Fix spaces around punctuation
     - Remove consecutive repeated phrases
     - Count number of speakers
+    - Surface basic observability fields about which Deepgram structures were present
 
     Returns:
-        {"transcript": "cleaned text", "speaker_count": N}
+        {"transcript": "cleaned text", "speaker_count": N, ...}
     """
     path = Path(json_path)
     if not path.exists():
@@ -2255,19 +2257,98 @@ def _join_deepgram_words(words: list[dict]) -> str:
     return ' '.join(parts).strip()
 
 
-def extract_deepgram_segments(data: dict, *, time_offset: float = 0.0,
-                              source_chunk_index: int = 0, starting_segment_id: int = 0) -> list[dict]:
-    """Extract deepgram segments."""
-    alternative = data['results']['channels'][0]['alternatives'][0]
+def _deepgram_primary_alternative(data: dict) -> dict:
+    """Return the primary Deepgram alternative payload."""
+    return data['results']['channels'][0]['alternatives'][0]
+
+
+def _deepgram_paragraphs(alternative: dict) -> list[dict]:
+    """Return normalized paragraph structures from a Deepgram alternative."""
     paragraphs = alternative.get('paragraphs', {}).get('paragraphs', [])
-    words = alternative.get('words', []) if isinstance(alternative.get('words', []), list) else []
+    return paragraphs if isinstance(paragraphs, list) else []
+
+
+def _deepgram_words(alternative: dict) -> list[dict]:
+    """Return normalized word structures from a Deepgram alternative."""
+    words = alternative.get('words', [])
+    return words if isinstance(words, list) else []
+
+
+def _inspect_deepgram_payload(data: dict) -> dict:
+    """Collect observability fields from a Deepgram payload without changing strategy."""
+    alternative = _deepgram_primary_alternative(data)
+    paragraphs = _deepgram_paragraphs(alternative)
+    words = _deepgram_words(alternative)
+
+    paragraph_count = 0
+    sentence_count = 0
+    sentence_text_count = 0
+    timed_sentence_count = 0
+    speaker_ids = set()
+
+    for paragraph in paragraphs:
+        if not isinstance(paragraph, dict):
+            continue
+        paragraph_count += 1
+
+        sentences = paragraph.get('sentences', [])
+        if not isinstance(sentences, list):
+            continue
+
+        for sentence in sentences:
+            if not isinstance(sentence, dict):
+                continue
+            sentence_count += 1
+            if str(sentence.get('text', '')).strip():
+                sentence_text_count += 1
+            if _coerce_float_or_none(sentence.get('start')) is not None and _coerce_float_or_none(sentence.get('end')) is not None:
+                timed_sentence_count += 1
+            speaker = sentence.get('speaker')
+            if speaker is not None:
+                speaker_ids.add(str(speaker))
+
+    transcript = str(alternative.get('transcript', '') or '')
+    return {
+        "transcript": transcript,
+        "transcript_source": "alternative.transcript",
+        "paragraph_count": paragraph_count,
+        "sentence_count": sentence_count,
+        "sentence_text_count": sentence_text_count,
+        "timed_sentence_count": timed_sentence_count,
+        "word_count": len(words),
+        "has_paragraphs": paragraph_count > 0,
+        "has_words": bool(words),
+        "speaker_count": len(speaker_ids) if speaker_ids else 1,
+    }
+
+
+def _extract_deepgram_segments_with_report(data: dict, *, time_offset: float = 0.0,
+                                           source_chunk_index: int = 0,
+                                           starting_segment_id: int = 0) -> tuple[list[dict], dict]:
+    """Extract Deepgram segments plus observability metadata."""
+    alternative = _deepgram_primary_alternative(data)
+    paragraphs = _deepgram_paragraphs(alternative)
+    words = _deepgram_words(alternative)
 
     segments = []
     next_segment_id = starting_segment_id
+    paragraph_sentence_count = 0
+    word_aligned_segment_count = 0
+    sentence_text_fallback_count = 0
+    warnings = []
 
     for para_index, paragraph in enumerate(paragraphs):
+        if not isinstance(paragraph, dict):
+            continue
         paragraph_speaker = paragraph.get('speaker')
-        for sentence_index, sentence in enumerate(paragraph.get('sentences', [])):
+        sentences = paragraph.get('sentences', [])
+        if not isinstance(sentences, list):
+            continue
+
+        for sentence_index, sentence in enumerate(sentences):
+            if not isinstance(sentence, dict):
+                continue
+            paragraph_sentence_count += 1
             speaker = sentence.get('speaker')
             if speaker is None:
                 speaker = paragraph_speaker
@@ -2277,6 +2358,8 @@ def extract_deepgram_segments(data: dict, *, time_offset: float = 0.0,
             matched_words = []
             if start_time is not None and end_time is not None and words:
                 for word in words:
+                    if not isinstance(word, dict):
+                        continue
                     word_start = _coerce_float_or_none(word.get('start'))
                     word_end = _coerce_float_or_none(word.get('end'))
                     if word_start is None or word_end is None:
@@ -2285,7 +2368,14 @@ def extract_deepgram_segments(data: dict, *, time_offset: float = 0.0,
                         continue
                     matched_words.append(word)
 
-            sentence_text = _join_deepgram_words(matched_words) or str(sentence.get('text', '')).strip()
+            if matched_words:
+                sentence_text = _join_deepgram_words(matched_words)
+                word_aligned_segment_count += 1
+            else:
+                sentence_text = str(sentence.get('text', '')).strip()
+                if sentence_text:
+                    sentence_text_fallback_count += 1
+
             normalized_text = _normalize_transcript_text(sentence_text, remove_repeated_phrases=False)
             if not normalized_text:
                 continue
@@ -2302,51 +2392,82 @@ def extract_deepgram_segments(data: dict, *, time_offset: float = 0.0,
             })
             next_segment_id += 1
 
-    if segments:
-        return segments
+    transcript_fallback_used = False
+    if not segments:
+        transcript = _normalize_transcript_text(alternative.get('transcript', ''), remove_repeated_phrases=False)
+        if transcript:
+            transcript_fallback_used = True
+            word_starts = [_coerce_float_or_none(word.get('start')) for word in words if isinstance(word, dict)]
+            word_ends = [_coerce_float_or_none(word.get('end')) for word in words if isinstance(word, dict)]
+            start_time = min((value for value in word_starts if value is not None), default=None)
+            end_time = max((value for value in word_ends if value is not None), default=None)
+            segments = [{
+                'id': starting_segment_id,
+                'text': transcript,
+                'start_time': None if start_time is None else round(start_time + time_offset, 3),
+                'end_time': None if end_time is None else round(end_time + time_offset, 3),
+                'speaker': None,
+                'source_chunk_index': source_chunk_index,
+                'source_paragraph_index': 0,
+                'source_sentence_index': 0,
+            }]
 
-    transcript = _normalize_transcript_text(alternative.get('transcript', ''), remove_repeated_phrases=False)
-    if not transcript:
-        return []
+    if transcript_fallback_used:
+        warnings.append("segments fell back to alternative.transcript because no paragraph sentences were usable")
+        segment_source = "alternative.transcript"
+    elif word_aligned_segment_count and sentence_text_fallback_count:
+        warnings.append(
+            f"segments fell back to sentence.text for {sentence_text_fallback_count} paragraph sentence(s)"
+        )
+        segment_source = "paragraph_sentence_mixed"
+    elif word_aligned_segment_count:
+        segment_source = "paragraph_sentence_word_join"
+    elif sentence_text_fallback_count:
+        warnings.append(
+            f"segments used sentence.text for all {sentence_text_fallback_count} paragraph sentence(s)"
+        )
+        segment_source = "paragraph_sentence_text"
+    else:
+        segment_source = "none"
 
-    word_starts = [_coerce_float_or_none(word.get('start')) for word in words]
-    word_ends = [_coerce_float_or_none(word.get('end')) for word in words]
-    start_time = min((value for value in word_starts if value is not None), default=None)
-    end_time = max((value for value in word_ends if value is not None), default=None)
+    return segments, {
+        "segment_source": segment_source,
+        "segment_count": len(segments),
+        "paragraph_sentence_count": paragraph_sentence_count,
+        "word_aligned_segment_count": word_aligned_segment_count,
+        "sentence_text_fallback_count": sentence_text_fallback_count,
+        "transcript_fallback_used": transcript_fallback_used,
+        "warnings": warnings,
+    }
 
-    return [{
-        'id': starting_segment_id,
-        'text': transcript,
-        'start_time': None if start_time is None else round(start_time + time_offset, 3),
-        'end_time': None if end_time is None else round(end_time + time_offset, 3),
-        'speaker': None,
-        'source_chunk_index': source_chunk_index,
-        'source_paragraph_index': 0,
-        'source_sentence_index': 0,
-    }]
+
+def extract_deepgram_segments(data: dict, *, time_offset: float = 0.0,
+                              source_chunk_index: int = 0, starting_segment_id: int = 0) -> list[dict]:
+    """Extract deepgram segments."""
+    segments, _ = _extract_deepgram_segments_with_report(
+        data,
+        time_offset=time_offset,
+        source_chunk_index=source_chunk_index,
+        starting_segment_id=starting_segment_id,
+    )
+    return segments
 
 
 def process_deepgram_payload(data: dict) -> dict:
     """Process deepgram payload."""
-    transcript = _normalize_transcript_text(
-        data['results']['channels'][0]['alternatives'][0]['transcript']
-    )
-
-    speakers = set()
-    try:
-        paragraphs = data['results']['channels'][0]['alternatives'][0].get('paragraphs', {}).get('paragraphs', [])
-        for para in paragraphs:
-            for sent in para.get('sentences', []):
-                speaker = sent.get('speaker')
-                if speaker is not None:
-                    speakers.add(speaker)
-    except (KeyError, TypeError):
-        pass
-
-    speaker_count = len(speakers) if speakers else 1
+    inspection = _inspect_deepgram_payload(data)
+    transcript = _normalize_transcript_text(inspection["transcript"])
     return {
         "transcript": transcript.strip(),
-        "speaker_count": speaker_count
+        "speaker_count": inspection["speaker_count"],
+        "transcript_source": inspection["transcript_source"],
+        "paragraph_count": inspection["paragraph_count"],
+        "sentence_count": inspection["sentence_count"],
+        "sentence_text_count": inspection["sentence_text_count"],
+        "timed_sentence_count": inspection["timed_sentence_count"],
+        "word_count": inspection["word_count"],
+        "has_paragraphs": inspection["has_paragraphs"],
+        "has_words": inspection["has_words"],
     }
 
 
@@ -4187,7 +4308,7 @@ def _call_deepgram_api_once(audio_path: str, api_key: str, language: str,
         sys.exit(1)
 
     params = (
-        f"model=nova-2&language={language}"
+        f"model={DEFAULT_DEEPGRAM_MODEL}&language={language}"
         "&diarize=true&punctuate=true&paragraphs=true&smart_format=true"
     )
     url = f"https://api.deepgram.com/v1/listen?{params}"
@@ -4291,6 +4412,10 @@ def transcribe_deepgram(audio_path: str, language: str, config_path: str = None,
     """
     Transcribe audio via Deepgram. Automatically splits large files and merges
     chunk transcripts into one raw transcript output.
+
+    The returned result now also includes lightweight observability fields such
+    as paragraph/sentence/word counts, per-chunk reports, and warnings when
+    segment extraction falls back to less structured Deepgram fields.
     """
     if not api_key:
         config = load_config(config_path)
@@ -4318,6 +4443,13 @@ def transcribe_deepgram(audio_path: str, language: str, config_path: str = None,
     json_outputs = []
     raw_payloads = []
     segments = []
+    chunk_reports = []
+    warnings = []
+    total_paragraph_count = 0
+    total_sentence_count = 0
+    total_sentence_text_count = 0
+    total_timed_sentence_count = 0
+    total_word_count = 0
 
     for idx, chunk_path in enumerate(chunk_paths):
         payload = _call_deepgram_api(chunk_path, api_key=api_key, language=language, timeout=timeout)
@@ -4325,16 +4457,43 @@ def transcribe_deepgram(audio_path: str, language: str, config_path: str = None,
         processed = process_deepgram_payload(payload)
         transcripts.append(processed["transcript"])
         speaker_count = max(speaker_count, processed["speaker_count"])
+        total_paragraph_count += _parse_int(processed.get("paragraph_count"), 0)
+        total_sentence_count += _parse_int(processed.get("sentence_count"), 0)
+        total_sentence_text_count += _parse_int(processed.get("sentence_text_count"), 0)
+        total_timed_sentence_count += _parse_int(processed.get("timed_sentence_count"), 0)
+        total_word_count += _parse_int(processed.get("word_count"), 0)
+
+        chunk_report = {
+            "chunk_index": idx,
+            "transcript_source": str(processed.get("transcript_source", "alternative.transcript") or "alternative.transcript"),
+            "paragraph_count": _parse_int(processed.get("paragraph_count"), 0),
+            "sentence_count": _parse_int(processed.get("sentence_count"), 0),
+            "sentence_text_count": _parse_int(processed.get("sentence_text_count"), 0),
+            "timed_sentence_count": _parse_int(processed.get("timed_sentence_count"), 0),
+            "word_count": _parse_int(processed.get("word_count"), 0),
+        }
 
         if output_segments:
-            segments.extend(
-                extract_deepgram_segments(
-                    payload,
-                    time_offset=chunk_offsets[idx],
-                    source_chunk_index=idx,
-                    starting_segment_id=len(segments),
-                )
+            chunk_segments, segment_report = _extract_deepgram_segments_with_report(
+                payload,
+                time_offset=chunk_offsets[idx],
+                source_chunk_index=idx,
+                starting_segment_id=len(segments),
             )
+            segments.extend(chunk_segments)
+            chunk_report.update({
+                "segment_source": segment_report["segment_source"],
+                "segment_count": segment_report["segment_count"],
+                "paragraph_sentence_count": segment_report["paragraph_sentence_count"],
+                "word_aligned_segment_count": segment_report["word_aligned_segment_count"],
+                "sentence_text_fallback_count": segment_report["sentence_text_fallback_count"],
+                "transcript_fallback_used": segment_report["transcript_fallback_used"],
+            })
+            warnings.extend(
+                f"Chunk {idx}: {warning}" for warning in segment_report.get("warnings", [])
+            )
+
+        chunk_reports.append(chunk_report)
 
         if output_json:
             output_base = Path(output_json)
@@ -4353,8 +4512,18 @@ def transcribe_deepgram(audio_path: str, language: str, config_path: str = None,
         output_base.write_text(
             json.dumps(
                 {
+                    "deepgram_request": {
+                        "model": DEFAULT_DEEPGRAM_MODEL,
+                        "language": language,
+                        "diarize": True,
+                        "punctuate": True,
+                        "paragraphs": True,
+                        "smart_format": True,
+                    },
                     "chunk_count": len(chunk_paths),
                     "split_points": split_points,
+                    "chunk_reports": chunk_reports,
+                    "warnings": warnings,
                     "chunks": [
                         {
                             "index": idx,
@@ -4382,6 +4551,8 @@ def transcribe_deepgram(audio_path: str, language: str, config_path: str = None,
                     "used_split_mode": used_split_mode,
                     "chunk_count": len(chunk_paths),
                     "split_points": split_points,
+                    "chunk_reports": chunk_reports,
+                    "warnings": warnings,
                     "segments": segments,
                 },
                 ensure_ascii=False,
@@ -4393,10 +4564,26 @@ def transcribe_deepgram(audio_path: str, language: str, config_path: str = None,
     return {
         "transcript": transcript,
         "speaker_count": speaker_count,
+        "deepgram_request": {
+            "model": DEFAULT_DEEPGRAM_MODEL,
+            "language": language,
+            "diarize": True,
+            "punctuate": True,
+            "paragraphs": True,
+            "smart_format": True,
+        },
+        "transcript_source": "alternative.transcript",
         "chunk_count": len(chunk_paths),
         "json_outputs": json_outputs,
         "split_points": split_points,
         "used_split_mode": used_split_mode,
+        "paragraph_count": total_paragraph_count,
+        "sentence_count": total_sentence_count,
+        "sentence_text_count": total_sentence_text_count,
+        "timed_sentence_count": total_timed_sentence_count,
+        "word_count": total_word_count,
+        "chunk_reports": chunk_reports,
+        "warnings": warnings,
         "segment_count": len(segments),
         "segments_output": output_segments,
     }
