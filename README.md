@@ -49,6 +49,9 @@ pip install yt-dlp
 2. Edit `config.yaml` with your settings:
    ```yaml
    deepgram_api_key: "your_api_key_here"
+   deepgram_model: "nova-2"
+   deepgram_enable_utterances: false
+   deepgram_prefer_structured_output: false
    output_dir: "~/Downloads"
 
    # LLM API for long video chunk processing (optional)
@@ -112,6 +115,7 @@ pip install yt-dlp
 
    > **Note**:
    > - `deepgram_api_key` is only required when the video has no usable subtitles and audio transcription is needed.
+   > - `deepgram_enable_utterances` and `deepgram_prefer_structured_output` are staged rollout flags; leave them `false` to keep the legacy flat-transcript path until you intentionally opt in.
    > - Deepgram requests now use bounded automatic retries for transient timeout/network failures before surfacing an error.
    > - LLM API config is only needed for long video chunk processing, or when bilingual translation is required.
    > - `llm_base_url` can be either a provider root URL or a `/v1` URL. The tool normalizes both.
@@ -299,6 +303,7 @@ Current policy is intentional and explicit:
 - `chunk-document` is now the canonical long-video chunking entrypoint when `normalized_document.json` exists; it auto-selects `segments` vs `text` but keeps `chunk-text` / `chunk-segments` available as compatible lower-level drivers
 - `chunk-text` force-splits very long unpunctuated passages to stay within downstream LLM chunk budgets
 - `transcribe-deepgram --output-segments` can emit time-aligned segments for downstream timed chunking + YouTube chapter mapping
+- `transcribe-deepgram --enable-utterances --prefer-structured-output` is the current staged opt-in path for utterance-first transcript assembly before the default flips in a later cleanup pass
 - `transcribe-deepgram` now also reports lightweight observability fields such as paragraph/sentence/word counts, per-chunk transcript metadata, and fallback warnings in its result JSON
 - `chunk-segments` produces timed chunk manifests, and `build-chapter-plan` maps YouTube chapters onto chunk boundaries for `merge-content`
 - `parse-vtt-segments` emits the same time-aligned segments format from subtitle VTT files
@@ -369,6 +374,8 @@ python3 yt_transcript_utils.py plan-optimization /tmp/${VIDEO_ID}_state.md
 # 5. Audio fallback when needed
 bash scripts/preflight.sh --require-deepgram
 python3 yt_transcript_utils.py transcribe-deepgram "$AUDIO_FILE" --language "$LANGUAGE" --output-text "/tmp/${VIDEO_ID}_raw_text.txt"
+# staged opt-in for utterance-first assembly:
+# python3 yt_transcript_utils.py transcribe-deepgram "$AUDIO_FILE" --language "$LANGUAGE" --enable-utterances --prefer-structured-output
 
 # 6. Final quality gate
 python3 yt_transcript_utils.py verify-quality /tmp/${VIDEO_ID}_optimized.txt --raw-text /tmp/${VIDEO_ID}_raw_text.txt
@@ -430,6 +437,9 @@ pip install yt-dlp
 2. 编辑 `config.yaml`，填入你的配置：
    ```yaml
    deepgram_api_key: "your_api_key_here"
+   deepgram_model: "nova-2"
+   deepgram_enable_utterances: false
+   deepgram_prefer_structured_output: false
    output_dir: "~/Downloads"
 
    # 长视频 chunk 处理的 LLM API 配置（可选）
@@ -448,6 +458,7 @@ pip install yt-dlp
 
    > **注意**：
    > - `deepgram_api_key` 仅在没有可用字幕、需要音频转录时才必需。
+   > - `deepgram_enable_utterances` 和 `deepgram_prefer_structured_output` 是分阶段放量开关；保持 `false` 可继续沿用当前的 flat transcript 路径，需要时再显式开启。
    > - LLM API 配置仅用于长视频 chunk 处理，或需要双语翻译时。
    > - `llm_base_url` 可以填写服务根地址或带 `/v1` 的地址，工具会自动归一化。
    > - `llm_stream: "auto"` 会在 provider 支持时优先走流式响应。
@@ -622,6 +633,7 @@ bash scripts/preflight.sh --require-llm
 - `chunk-document` 现在是 `normalized_document.json` 已存在时的规范长视频分块入口；它会自动选择 `segments` 或 `text`，但仍保留 `chunk-text` / `chunk-segments` 作为兼容的低层驱动
 - `chunk-text` 会对超长且缺少标点的段落做强制切分，并在提供 `--prompt` 时默认启用 token-aware 规划
 - `transcribe-deepgram --output-segments` 可选输出带时间戳的对齐 segments，用于后续 timed chunk 与 YouTube 章节映射
+- `transcribe-deepgram --enable-utterances --prefer-structured-output` 是当前分阶段引入的 utterance-first 组装路径；默认值会在后续清理 PR 中再切换
 - `transcribe-deepgram` 现在还会在结果 JSON 中输出轻量可观测字段，例如 paragraph/sentence/word 计数、逐 chunk 的 transcript 元数据，以及 structured-output 回退 warning
 - `chunk-segments` 基于 segments 生成带时间轴的 timed manifest；`build-chapter-plan` 可将 YouTube chapters 映射到 chunk 边界，供 `merge-content` 注入标题
 - `parse-vtt-segments` 可从字幕 VTT 生成同格式的带时间戳 segments，用于 timed chunk 与章节映射
@@ -685,6 +697,8 @@ python3 yt_transcript_utils.py plan-optimization /tmp/${VIDEO_ID}_state.md
 # 5. 需要时走音频兜底
 bash scripts/preflight.sh --require-deepgram
 python3 yt_transcript_utils.py transcribe-deepgram "$AUDIO_FILE" --language "$LANGUAGE" --output-text "/tmp/${VIDEO_ID}_raw_text.txt"
+# 分阶段启用 utterance-first 组装：
+# python3 yt_transcript_utils.py transcribe-deepgram "$AUDIO_FILE" --language "$LANGUAGE" --enable-utterances --prefer-structured-output
 
 # 6. 最终质量门禁
 python3 yt_transcript_utils.py verify-quality /tmp/${VIDEO_ID}_optimized.txt --raw-text /tmp/${VIDEO_ID}_raw_text.txt

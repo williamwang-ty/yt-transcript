@@ -74,6 +74,24 @@ class CoreRegressionTests(unittest.TestCase):
             self.assertEqual(config["deepgram_api_key"], "dg#key")
             self.assertEqual(config["llm_base_url"], "https://api.openai.com/v1")
 
+    def test_load_config_parses_deepgram_structured_output_flags(self):
+        """Test load config parses Deepgram structured-output flags."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "config.yaml"
+            config_path.write_text(
+                'output_dir: "~/Downloads"\n'
+                'deepgram_model: "nova-2-meeting"\n'
+                'deepgram_enable_utterances: true\n'
+                'deepgram_prefer_structured_output: yes\n',
+                encoding="utf-8",
+            )
+
+            config = utils.load_config(str(config_path))
+
+            self.assertEqual(config["deepgram_model"], "nova-2-meeting")
+            self.assertTrue(config["deepgram_enable_utterances"])
+            self.assertTrue(config["deepgram_prefer_structured_output"])
+
     def test_chunk_text_splits_chinese_without_spaces(self):
         """Test chunk text splits chinese without spaces."""
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -236,8 +254,26 @@ class CoreRegressionTests(unittest.TestCase):
         self.assertEqual(result["sentence_text_count"], 2)
         self.assertEqual(result["timed_sentence_count"], 2)
         self.assertEqual(result["word_count"], 7)
+        self.assertEqual(result["utterance_count"], 0)
         self.assertTrue(result["has_paragraphs"])
         self.assertTrue(result["has_words"])
+        self.assertFalse(result["has_utterances"])
+
+    def test_process_deepgram_payload_can_prefer_utterances(self):
+        """Test process deepgram payload can prefer utterances over flat transcript."""
+        payload = json.loads((FIXTURES_DIR / "deepgram_en_utterances.json").read_text(encoding="utf-8"))
+
+        legacy_result = utils.process_deepgram_payload(payload)
+        structured_result = utils.process_deepgram_payload(payload, prefer_structured_output=True)
+
+        self.assertEqual(legacy_result["transcript"], "flat transcript without clear speaker turns")
+        self.assertEqual(legacy_result["transcript_source"], "alternative.transcript")
+        self.assertEqual(structured_result["transcript"], "First speaker sentence.\n\nSecond speaker answer.")
+        self.assertEqual(structured_result["transcript_source"], "utterances")
+        self.assertEqual(structured_result["utterance_count"], 2)
+        self.assertTrue(structured_result["has_utterances"])
+        self.assertTrue(structured_result["prefer_structured_output"])
+        self.assertEqual(structured_result["warnings"], [])
 
     def test_extract_deepgram_segments_preserves_sentence_text_when_words_missing(self):
         """Test extract deepgram segments preserves sentence text when words are missing."""
@@ -257,6 +293,18 @@ class CoreRegressionTests(unittest.TestCase):
 
         self.assertEqual(len(segments), 1)
         self.assertEqual(segments[0]["text"], "你好！这是一个没有段落数据的例子。")
+
+    def test_extract_deepgram_segments_can_prefer_utterances(self):
+        """Test extract deepgram segments can prefer utterances."""
+        payload = json.loads((FIXTURES_DIR / "deepgram_en_utterances.json").read_text(encoding="utf-8"))
+
+        segments = utils.extract_deepgram_segments(payload, prefer_structured_output=True)
+
+        self.assertEqual(len(segments), 2)
+        self.assertEqual(segments[0]["text"], "First speaker sentence.")
+        self.assertEqual(segments[1]["text"], "Second speaker answer.")
+        self.assertEqual(segments[0]["speaker"], 0)
+        self.assertEqual(segments[1]["speaker"], 1)
 
     def test_transcribe_deepgram_merges_chunk_outputs_and_writes_artifacts(self):
         """Test transcribe deepgram merges chunk outputs and writes artifacts."""
@@ -306,9 +354,12 @@ class CoreRegressionTests(unittest.TestCase):
             self.assertEqual(len(result["json_outputs"]), 2)
             self.assertEqual(result["deepgram_request"]["model"], utils.DEFAULT_DEEPGRAM_MODEL)
             self.assertEqual(result["deepgram_request"]["language"], "en")
+            self.assertFalse(result["deepgram_request"]["utterances"])
+            self.assertFalse(result["deepgram_request"]["prefer_structured_output"])
             self.assertEqual(result["paragraph_count"], 0)
             self.assertEqual(result["sentence_count"], 0)
             self.assertEqual(result["word_count"], 0)
+            self.assertEqual(result["utterance_count"], 0)
             self.assertEqual(len(result["chunk_reports"]), 2)
             self.assertEqual(result["chunk_reports"][0]["transcript_source"], "alternative.transcript")
             self.assertEqual(result["chunk_reports"][0]["segment_source"], "alternative.transcript")
@@ -331,6 +382,40 @@ class CoreRegressionTests(unittest.TestCase):
             self.assertEqual(len(segments_doc["segments"]), 2)
             self.assertEqual(result["segment_count"], 2)
             self.assertEqual(result["segments_output"], str(output_segments))
+
+    def test_transcribe_deepgram_can_use_structured_output_flags(self):
+        """Test transcribe deepgram can enable utterances and prefer structured output."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            audio_path = Path(tmpdir) / "source.mp3"
+            output_segments = Path(tmpdir) / "segments.json"
+            audio_path.write_bytes(b"src")
+            payload = json.loads((FIXTURES_DIR / "deepgram_en_utterances.json").read_text(encoding="utf-8"))
+
+            with mock.patch.object(utils, "split_audio", return_value={
+                "chunks": [str(audio_path)],
+                "split_points": [],
+            }), mock.patch.object(utils, "_call_deepgram_api", return_value=payload):
+                result = utils.transcribe_deepgram(
+                    str(audio_path),
+                    "en",
+                    api_key="key",
+                    output_segments=str(output_segments),
+                    enable_utterances=True,
+                    prefer_structured_output=True,
+                )
+
+            self.assertEqual(result["transcript"], "First speaker sentence.\n\nSecond speaker answer.")
+            self.assertEqual(result["transcript_source"], "utterances")
+            self.assertTrue(result["deepgram_request"]["utterances"])
+            self.assertTrue(result["deepgram_request"]["prefer_structured_output"])
+            self.assertEqual(result["utterance_count"], 2)
+            self.assertEqual(result["chunk_reports"][0]["transcript_source"], "utterances")
+            self.assertEqual(result["chunk_reports"][0]["segment_source"], "utterances")
+            self.assertEqual(result["chunk_reports"][0]["utterance_count"], 2)
+            self.assertEqual(result["chunk_reports"][0]["utterance_segment_count"], 2)
+            segments_doc = json.loads(output_segments.read_text(encoding="utf-8"))
+            self.assertTrue(segments_doc["deepgram_request"]["utterances"])
+            self.assertEqual(len(segments_doc["segments"]), 2)
 
     def test_chunk_segments_writes_timed_manifest(self):
         """Test chunk segments writes timed manifest."""

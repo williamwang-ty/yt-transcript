@@ -1,0 +1,48 @@
+{
+  "results": {
+    "channels": [
+      {
+        "alternatives": [
+          {
+            "transcript": "flat transcript without clear speaker turns",
+            "utterances": [
+              {
+                "transcript": "First speaker sentence.",
+                "start": 0.0,
+                "end": 1.0,
+                "speaker": 0
+              },
+              {
+                "transcript": "Second speaker answer.",
+                "start": 1.2,
+                "end": 2.4,
+                "speaker": 1
+              }
+            ],
+            "paragraphs": {
+              "paragraphs": [
+                {
+                  "speaker": 0,
+                  "sentences": [
+                    {
+                      "text": "First speaker sentence.",
+                      "start": 0.0,
+                      "end": 1.0,
+                      "speaker": 0
+                    },
+                    {
+                      "text": "Second speaker answer.",
+                      "start": 1.2,
+                      "end": 2.4,
+                      "speaker": 1
+                    }
+                  ]
+                }
+              ]
+            }
+          }
+        ]
+      }
+    ]
+  }
+}

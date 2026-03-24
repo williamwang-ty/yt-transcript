@@ -68,6 +68,16 @@ python3 <skill-root>/yt_transcript_utils.py transcribe-deepgram \
     > /tmp/${VIDEO_ID}_deepgram_result.json
 ```
 
+For the staged structured-output rollout, callers may additionally opt in with:
+
+```bash
+python3 <skill-root>/yt_transcript_utils.py transcribe-deepgram \
+    "$AUDIO_FILE" \
+    --language "$LANGUAGE" \
+    --enable-utterances \
+    --prefer-structured-output
+```
+
 This command automatically:
 
 - Splits files larger than 10 MB
@@ -76,6 +86,7 @@ This command automatically:
 - Merges all chunk transcripts into `/tmp/${VIDEO_ID}_raw_text.txt`
 - When `--output-json` is set, always writes the requested aggregate JSON path; split mode also writes sibling `*_chunk_XXX.json` payload files
 - When `--output-segments` is set, writes aligned sentence-level segments (with `start_time` / `end_time`) for timed chunking + chapter mapping
+- When the staged flags are enabled, prefers `utterances` / sentence text over the legacy flat transcript when assembling output
 - Emits lightweight observability fields in `/tmp/${VIDEO_ID}_deepgram_result.json`, including per-chunk transcript metadata and fallback warnings
 
 No separate split-path workflow is needed.
