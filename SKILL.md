@@ -129,7 +129,7 @@ Quick Mode is an optional fast path inside the broader short-duration bucket. `p
    ```
 
 9. Optimize text:
-   - If `resolved_mode=chinese`, use `prompts/quick_cleanup.md` and save to `/tmp/${VIDEO_ID}_optimized.txt`
+   - If `resolved_mode=chinese`, use `prompts/cleanup_zh.md` and save to `/tmp/${VIDEO_ID}_optimized.txt`
    - If `resolved_mode=bilingual`, first run `prompts/structure_only.md` to `/tmp/${VIDEO_ID}_structured.txt`, then `prompts/translate_only.md` to `/tmp/${VIDEO_ID}_optimized.txt`
 
 10. Assemble final file:

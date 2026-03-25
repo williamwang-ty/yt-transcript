@@ -193,7 +193,7 @@ def build_chunk_verification_contract(prompt_name: str, *, applicable: bool = Tr
             "retry_action": "retry_same_chunk_same_plan",
             "min_output_input_ratio": utils.SHORT_OUTPUT_WARNING_RATIO,
         })
-    if prompt_name in ("structure_only", "quick_cleanup"):
+    if prompt_name in ("structure_only", "quick_cleanup", "cleanup_zh"):
         retryable_checks.append({
             "id": "missing_headers",
             "severity": "repairable_warning",

@@ -1142,6 +1142,35 @@ work_dir: /tmp/vid001_chunks
             self.assertTrue(all(op["execution"]["mode"] == "single_pass" for op in result["operations"]))
             self.assertTrue(all(not op["execution"]["supports_auto_replan"] for op in result["operations"]))
 
+    def test_plan_optimization_routes_short_chinese_youtube_to_cleanup_prompt(self):
+        """Test plan optimization routes Chinese subtitle text through cleanup_zh."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state = Path(tmpdir) / "state.md"
+            state.write_text(
+                "# State\n"
+                "vid: vid001\n"
+                "url: https://example.com/watch?v=1\n"
+                "title: Sample\n"
+                "channel: Channel\n"
+                "upload_date: 20260308\n"
+                "duration: 120\n"
+                "output_dir: /tmp/out\n"
+                "mode: chinese\n"
+                "src: youtube\n"
+                "source_language: zh-Hans\n"
+                "subtitle_source: YouTube Subtitles\n"
+                "work_dir: /tmp/vid001_chunks\n",
+                encoding="utf-8",
+            )
+
+            result = utils.plan_optimization(str(state))
+
+            self.assertTrue(result["passed"], result)
+            self.assertEqual(result["video_path"], "short")
+            self.assertEqual([op["prompt"] for op in result["operations"]], ["cleanup_zh"])
+            self.assertEqual(result["operations"][0]["execution"]["mode"], "single_pass")
+            self.assertEqual(result["operations"][0]["extra_instruction"], "")
+
     def test_plan_optimization_returns_long_deepgram_operations(self):
         """Test plan optimization returns long deepgram operations."""
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1168,8 +1197,8 @@ work_dir: /tmp/vid001_chunks
             self.assertTrue(result["passed"], result)
             self.assertEqual(result["video_path"], "long")
             self.assertTrue(result["requires_llm_preflight"])
-            self.assertEqual(result["operations"][0]["prompt"], "structure_only")
-            self.assertIn("Chinese character spacing", result["operations"][0]["extra_instruction"])
+            self.assertEqual(result["operations"][0]["prompt"], "cleanup_zh")
+            self.assertIn("Deepgram ASR", result["operations"][0]["extra_instruction"])
             self.assertTrue(result["operations"][0]["execution"]["supports_auto_replan"])
             self.assertEqual(result["operations"][0]["execution"]["recommended_cli_flags"], ["--auto-replan"])
             self.assertEqual(result["operations"][0]["execution"]["on_replan_required"], "auto_replan_remaining")
@@ -1177,6 +1206,19 @@ work_dir: /tmp/vid001_chunks
             self.assertEqual(result["operations"][0]["control"]["repair"]["mode"], "bounded_retry")
             self.assertEqual(result["operations"][0]["control"]["replan"]["on_replan_required"], "auto_replan_remaining")
             self.assertEqual(result["quality_contract"]["stop_rule"], "hard_failures_stop")
+
+    def test_cleanup_zh_reuses_structure_only_chunk_tuning(self):
+        """Test cleanup_zh reuses structure_only chunk sizing and budgets."""
+        override_config = {
+            "chunk_size_override": 0,
+            "chunk_tokens_structure_only": 777,
+            "output_ratio_structure_only": 1.23,
+            "max_output_tokens_structure_only": 1999,
+        }
+
+        self.assertEqual(utils._get_task_chunk_target("cleanup_zh", override_config), 777)
+        self.assertEqual(utils._get_task_output_ratio("cleanup_zh", override_config), 1.23)
+        self.assertEqual(utils._get_task_max_output_tokens("cleanup_zh", override_config), 1999)
 
     def test_plan_optimization_marks_processed_path_chunk_stage_for_manual_review(self):
         """Test plan optimization marks processed path chunk stage for manual review."""

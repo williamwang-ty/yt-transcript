@@ -1,6 +1,6 @@
 # Text Optimization Workflow
 
-This workflow handles structure, translation, chunk processing, merge, and quality verification.
+This workflow handles Chinese cleanup, structure, translation, chunk processing, merge, and quality verification.
 
 ---
 
@@ -68,7 +68,7 @@ RAW_TEXT=$(cat /tmp/${VIDEO_ID}_raw_text.txt)
 
 Read `operations` from `PLAN_JSON`.
 
-- If there is one `prompt=structure_only` operation, write directly to `/tmp/${VIDEO_ID}_optimized.txt`
+- If there is one monolingual Chinese cleanup operation, write directly to `/tmp/${VIDEO_ID}_optimized.txt`; it currently uses `prompt=cleanup_zh`
 - If there are two operations, they will be:
   - `prompt=structure_only` from raw text to `/tmp/${VIDEO_ID}_structured.txt`
   - `prompt=translate_only` from structured text to `/tmp/${VIDEO_ID}_optimized.txt`
@@ -105,11 +105,15 @@ Canonical long-path rule: if `PLAN_JSON.normalization.materialized=true`, chunk 
 python3 <skill-root>/yt_transcript_utils.py chunk-document \
     /tmp/${VIDEO_ID}_normalized_document.json \
     /tmp/${VIDEO_ID}_chunks \
-    --prompt structure_only \
+    --prompt <RAW_STAGE_PROMPT> \
     --chapters /tmp/${VIDEO_ID}_chapters.json
 ```
 
 `chunk-document` auto-selects `segments` when the normalized document carries timed segments, and otherwise falls back to normalized text.
+Use the first raw-path operation prompt from `PLAN_JSON.operations` as `<RAW_STAGE_PROMPT>`:
+
+- `cleanup_zh` for Chinese monolingual output
+- `structure_only` for bilingual English-source output
 
 Compatibility fallback: if you do not have a normalized document yet, the lower-level chunkers still work:
 
@@ -117,7 +121,7 @@ Compatibility fallback: if you do not have a normalized document yet, the lower-
 python3 <skill-root>/yt_transcript_utils.py chunk-segments \
     /tmp/${VIDEO_ID}_segments.json \
     /tmp/${VIDEO_ID}_chunks \
-    --prompt structure_only \
+    --prompt <RAW_STAGE_PROMPT> \
     --chapters /tmp/${VIDEO_ID}_chapters.json
 ```
 
@@ -125,7 +129,7 @@ python3 <skill-root>/yt_transcript_utils.py chunk-segments \
 python3 <skill-root>/yt_transcript_utils.py chunk-text \
     /tmp/${VIDEO_ID}_raw_text.txt \
     /tmp/${VIDEO_ID}_chunks \
-    --prompt structure_only
+    --prompt <RAW_STAGE_PROMPT>
 ```
 
 Update state:
@@ -161,12 +165,14 @@ If you are resuming after an interrupted run and want to inspect the repaired ma
 ```bash
 python3 <skill-root>/yt_transcript_utils.py prepare-resume \
     /tmp/${VIDEO_ID}_chunks \
-    --prompt structure_only
+    --prompt <RAW_STAGE_PROMPT>
 ```
 
 This step is optional because `process-chunks` now runs the same resume repair automatically before execution starts.
 
-- The first chunk operation always uses `prompt=structure_only`
+- The first chunk operation is the monolingual cleanup / structuring stage:
+  - `prompt=cleanup_zh` for Chinese monolingual output
+  - `prompt=structure_only` for bilingual English-source output
 - Read `PLAN_JSON.chunking.driver`; when it is `chunk-document`, prefer the canonical normalized-document chunking path above instead of re-deriving raw-text vs timed-segment branching manually
 - If its `extra_instruction` is non-empty, pass it through `--extra-instruction`
 - Every chunk operation includes an `execution` object; follow it instead of re-deriving replan behavior in prose
@@ -175,11 +181,11 @@ This step is optional because `process-chunks` now runs the same resume repair a
 
 Canonical command shape:
 
-- Raw structure stage:
+- Raw first stage:
   ```bash
   python3 <skill-root>/yt_transcript_utils.py process-chunks \
       /tmp/${VIDEO_ID}_chunks \
-      --prompt structure_only \
+      --prompt <RAW_STAGE_PROMPT> \
       --auto-replan
   ```
 - Processed translation stage (when present):

@@ -263,14 +263,19 @@ This project is script-first: helper commands emit machine-readable JSON on stdo
 - `scripts/download.sh "$URL" subtitles`
 - `scripts/download.sh "$URL" audio`
 - `python3 yt_transcript_utils.py get-chapters "$URL"`
-- `python3 yt_transcript_utils.py chunk-segments /tmp/${VIDEO_ID}_segments.json /tmp/${VIDEO_ID}_chunks --prompt structure_only`
-- `python3 yt_transcript_utils.py chunk-document /tmp/${VIDEO_ID}_normalized_document.json /tmp/${VIDEO_ID}_chunks --prompt structure_only`
-- `python3 yt_transcript_utils.py prepare-resume /tmp/${VIDEO_ID}_chunks --prompt structure_only`
+- `python3 yt_transcript_utils.py chunk-segments /tmp/${VIDEO_ID}_segments.json /tmp/${VIDEO_ID}_chunks --prompt <RAW_STAGE_PROMPT>`
+- `python3 yt_transcript_utils.py chunk-document /tmp/${VIDEO_ID}_normalized_document.json /tmp/${VIDEO_ID}_chunks --prompt <RAW_STAGE_PROMPT>`
+- `python3 yt_transcript_utils.py prepare-resume /tmp/${VIDEO_ID}_chunks --prompt <RAW_STAGE_PROMPT>`
 - `python3 yt_transcript_utils.py build-chapter-plan /tmp/${VIDEO_ID}_chapters.json /tmp/${VIDEO_ID}_chunks /tmp/${VIDEO_ID}_chunks/chapter_plan.json`
 - `python3 yt_transcript_utils.py validate-state /tmp/${VIDEO_ID}_state.md --stage <stage>`
 - `python3 yt_transcript_utils.py normalize-document /tmp/${VIDEO_ID}_state.md`
 - `python3 yt_transcript_utils.py plan-optimization /tmp/${VIDEO_ID}_state.md`
 - `python3 yt_transcript_utils.py verify-quality /tmp/${VIDEO_ID}_optimized.txt --raw-text /tmp/${VIDEO_ID}_raw_text.txt`
+
+Here `<RAW_STAGE_PROMPT>` comes from `plan-optimization`:
+
+- `cleanup_zh` for Chinese monolingual runs
+- `structure_only` for bilingual English-source runs
 
 This keeps workflow logic in scripts instead of ad-hoc shell parsing inside the prompt instructions.
 
@@ -297,6 +302,7 @@ Current policy is intentional and explicit:
 
 - `bilingual` means English source text plus Chinese translation, not subtitle file merging
 - If Chinese subtitles exist, they take precedence as the single subtitle source track; English is used only when no usable Chinese subtitle track can be downloaded
+- Chinese-source monolingual optimization now uses a dedicated `cleanup_zh` prompt that preserves meaning while repairing punctuation, paragraphing, duplicate subtitle fragments, and obvious spacing artifacts
 - `config.yaml` is intentionally limited to flat top-level key/value entries; nested or multi-line YAML is not supported
 - YAML frontmatter values are always quoted on purpose to favor safe parsing over prettier formatting
 - Markdown header text is escaped and link destinations are encoded so edge-case titles/channels do not break output structure
@@ -322,7 +328,7 @@ Current policy is intentional and explicit:
 - `download.sh subtitles` now tries one source-family candidate at a time: Chinese first, then English only as a fallback when no usable Chinese track can be downloaded
 - `download.sh subtitles` now distinguishes detection vs downloadability more explicitly: `listed_candidates` shows tracks exposed by YouTube/yt-dlp, while `attempted_candidates`, `blocked_candidates`, and `fallback_used` show what the current runtime could actually fetch
 - when a preferred subtitle candidate fails with an auth-like error such as `HTTP 429`, `download.sh subtitles` now retries the same candidate with Chrome cookies before it gives up and falls back to the next candidate
-- subtitle-driven workflows still support Chinese-source monolingual mode and English-source bilingual mode; when neither usable Chinese nor English subtitles can be downloaded, the workflow should stop and fall back to audio transcription
+- subtitle-driven workflows still support Chinese-source monolingual mode and English-source bilingual mode; Chinese-source runs now prefer `cleanup_zh`, while English-source runs still use `structure_only -> translate_only`; when neither usable Chinese nor English subtitles can be downloaded, the workflow should stop and fall back to audio transcription
 - `plan-optimization` is the canonical short/long router with `< 1800s = short` and `>= 1800s = long`; the Quick Mode shortcut from `SKILL.md` is a narrower `< 900s` subset for subtitle-friendly videos
 - `manifest.json` now separates immutable `plan` metadata from `runtime` state, and `process-chunks` records attempt-level telemetry (`attempt_logs`) in addition to chunk-level fields
 - `process-chunks` no longer rewrites the current batch budget on the fly; when canary chunks or retry history show the plan is unhealthy, it aborts with `replan_required=true` so `replan-remaining` can generate a new plan for unfinished raw chunks
@@ -597,14 +603,19 @@ bash scripts/preflight.sh --require-llm
 - `scripts/download.sh "$URL" subtitles`
 - `scripts/download.sh "$URL" audio`
 - `python3 yt_transcript_utils.py get-chapters "$URL"`
-- `python3 yt_transcript_utils.py chunk-segments /tmp/${VIDEO_ID}_segments.json /tmp/${VIDEO_ID}_chunks --prompt structure_only`
-- `python3 yt_transcript_utils.py chunk-document /tmp/${VIDEO_ID}_normalized_document.json /tmp/${VIDEO_ID}_chunks --prompt structure_only`
-- `python3 yt_transcript_utils.py prepare-resume /tmp/${VIDEO_ID}_chunks --prompt structure_only`
+- `python3 yt_transcript_utils.py chunk-segments /tmp/${VIDEO_ID}_segments.json /tmp/${VIDEO_ID}_chunks --prompt <RAW_STAGE_PROMPT>`
+- `python3 yt_transcript_utils.py chunk-document /tmp/${VIDEO_ID}_normalized_document.json /tmp/${VIDEO_ID}_chunks --prompt <RAW_STAGE_PROMPT>`
+- `python3 yt_transcript_utils.py prepare-resume /tmp/${VIDEO_ID}_chunks --prompt <RAW_STAGE_PROMPT>`
 - `python3 yt_transcript_utils.py build-chapter-plan /tmp/${VIDEO_ID}_chapters.json /tmp/${VIDEO_ID}_chunks /tmp/${VIDEO_ID}_chunks/chapter_plan.json`
 - `python3 yt_transcript_utils.py validate-state /tmp/${VIDEO_ID}_state.md --stage <stage>`
 - `python3 yt_transcript_utils.py normalize-document /tmp/${VIDEO_ID}_state.md`
 - `python3 yt_transcript_utils.py plan-optimization /tmp/${VIDEO_ID}_state.md`
 - `python3 yt_transcript_utils.py verify-quality /tmp/${VIDEO_ID}_optimized.txt --raw-text /tmp/${VIDEO_ID}_raw_text.txt`
+
+这里的 `<RAW_STAGE_PROMPT>` 由 `plan-optimization` 决定：
+
+- 中文单语输出使用 `cleanup_zh`
+- 英文源双语输出使用 `structure_only`
 
 这样 workflow 文档只保留调用顺序，具体判断逻辑下沉到脚本中。
 
@@ -631,6 +642,7 @@ bash scripts/preflight.sh --require-llm
 
 - `bilingual` 表示“英文源文本 + 中文翻译”，不是直接合并双字幕文件
 - 如果存在可用中文字幕，会优先把其中一个中文字幕轨作为唯一源文本；只有在中文字幕不可用时才回退到英文字幕
+- 中文单语优化现在使用专门的 `cleanup_zh` prompt，在不改变原意的前提下修复标点、分段、重复字幕碎片和明显的中文空格问题
 - `config.yaml` 被刻意限制为扁平的顶层键值配置，不支持嵌套结构或多行 YAML
 - YAML frontmatter 的值会统一加引号，优先保证解析安全，而不是追求最简洁的展示
 - Markdown 头部里的标题/频道文本会做转义，链接目标会做编码，避免边界字符破坏结构
@@ -641,6 +653,7 @@ bash scripts/preflight.sh --require-llm
 - `transcribe-deepgram` 现在默认就是 utterance-first 组装；仍保留 `--disable-utterances --legacy-flat-output` 作为兼容/排障回退
 - `transcribe-deepgram` 现在还会在结果 JSON 中输出轻量可观测字段，例如 paragraph/sentence/word 计数、逐 chunk 的 transcript 元数据，以及 structured-output 回退 warning
 - `download.sh subtitles` 现在会按“中文优先、英文回退”的顺序一次只尝试一个源字幕轨；当可见的中文字幕下载失败时，才会继续尝试英文字幕
+- 字幕驱动的 workflow 仍支持“中文字幕单语输出”和“英文字幕双语输出”两条路径；其中中文单语现在优先走 `cleanup_zh`，英文字幕仍走 `structure_only -> translate_only`
 - `download.sh subtitles` 现在会显式区分“平台列出了哪些轨”和“当前运行环境实际下载到了哪条轨”：`listed_candidates` 描述可见候选，`attempted_candidates` / `blocked_candidates` / `fallback_used` 描述实际下载结果
 - 当首选字幕轨因为 `HTTP 429` 这类鉴权/限流问题失败时，`download.sh subtitles` 现在会先用 Chrome cookies 对同一条轨重试，再决定是否回退到下一条候选
 - `chunk-segments` 基于 segments 生成带时间轴的 timed manifest；`build-chapter-plan` 可将 YouTube chapters 映射到 chunk 边界，供 `merge-content` 注入标题

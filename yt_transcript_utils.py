@@ -282,6 +282,10 @@ LEGACY_CHAR_CHUNK_DEFAULTS = {
     "summarize": 8000,
 }
 
+PROMPT_BUDGET_ALIASES = {
+    "cleanup_zh": "structure_only",
+}
+
 TASK_CHUNK_TOKEN_DEFAULTS = {
     "structure_only": 1200,
     "quick_cleanup": 1000,
@@ -338,6 +342,14 @@ DEFAULT_DEEPGRAM_PREFER_STRUCTURED_OUTPUT = True
 DEFAULT_DEEPGRAM_REQUEST_RETRIES = 2
 DEFAULT_DEEPGRAM_RETRY_BACKOFF_SEC = 1.0
 DEFAULT_CHAPTER_BOUNDARY_TOLERANCE_SEC = 0.35
+
+
+def _budget_prompt_name(prompt_name: str = "") -> str:
+    """Return the prompt family used for chunk-budget and sizing config lookups."""
+    prompt = (prompt_name or "").strip().lower()
+    return PROMPT_BUDGET_ALIASES.get(prompt, prompt)
+
+
 MANIFEST_SCHEMA_VERSION = 5
 CHUNK_CONTRACT_SCHEMA_VERSION = 1
 CONTROL_CONTRACT_SCHEMA_VERSION = 1
@@ -439,7 +451,7 @@ def _legacy_chunk_target_chars(prompt_name: str = "", config: dict | None = None
     if override > 0:
         return override
 
-    prompt = (prompt_name or "").strip().lower()
+    prompt = _budget_prompt_name(prompt_name)
     return LEGACY_CHAR_CHUNK_DEFAULTS.get(prompt, DEFAULT_UNKNOWN_LEGACY_CHARS)
 
 
@@ -450,7 +462,7 @@ def _get_task_chunk_target(prompt_name: str, config: dict | None = None) -> int:
     if override > 0:
         return override
 
-    prompt = (prompt_name or "").strip().lower()
+    prompt = _budget_prompt_name(prompt_name)
     key = f"chunk_tokens_{prompt}"
     default = TASK_CHUNK_TOKEN_DEFAULTS.get(prompt, DEFAULT_UNKNOWN_CHUNK_TOKENS)
     return max(1, _parse_int(config.get(key), default))
@@ -459,7 +471,7 @@ def _get_task_chunk_target(prompt_name: str, config: dict | None = None) -> int:
 def _get_task_output_ratio(prompt_name: str, config: dict | None = None) -> float:
     """Return task output ratio."""
     config = config or {}
-    prompt = (prompt_name or "").strip().lower()
+    prompt = _budget_prompt_name(prompt_name)
     key = f"output_ratio_{prompt}"
     default = TASK_OUTPUT_RATIO_DEFAULTS.get(prompt, DEFAULT_UNKNOWN_OUTPUT_RATIO)
     return max(0.01, _parse_float(config.get(key), default))
@@ -468,7 +480,7 @@ def _get_task_output_ratio(prompt_name: str, config: dict | None = None) -> floa
 def _get_task_max_output_tokens(prompt_name: str, config: dict | None = None) -> int:
     """Return task max output tokens."""
     config = config or {}
-    prompt = (prompt_name or "").strip().lower()
+    prompt = _budget_prompt_name(prompt_name)
     key = f"max_output_tokens_{prompt}"
     default = TASK_MAX_OUTPUT_TOKEN_DEFAULTS.get(prompt, DEFAULT_UNKNOWN_MAX_OUTPUT_TOKENS)
     return max(1, _parse_int(config.get(key), default))
@@ -476,7 +488,7 @@ def _get_task_max_output_tokens(prompt_name: str, config: dict | None = None) ->
 
 def _get_task_request_cap(prompt_name: str) -> int:
     """Return task request cap."""
-    prompt = (prompt_name or "").strip().lower()
+    prompt = _budget_prompt_name(prompt_name)
     return TASK_REQUEST_CAP_DEFAULTS.get(prompt, DEFAULT_UNKNOWN_REQUEST_CAP)
 
 
@@ -1440,7 +1452,7 @@ def _evaluate_chunk_output_health(prompt_name: str, chunk_id: int, chunk_char_co
         retry_reasons.append("short_output")
 
     if (
-        prompt_name in ("structure_only", "quick_cleanup")
+        prompt_name in ("structure_only", "quick_cleanup", "cleanup_zh")
         and "##" not in result_text
         and chunk_char_count > STRUCTURE_HEADER_WARNING_MIN_CHARS
     ):
@@ -5844,6 +5856,8 @@ def plan_optimization(state_path: str) -> dict:
             bilingual=bilingual_output,
         )
 
+    chinese_cleanup_prompt = "cleanup_zh"
+
     if video_path == "short":
         if mode == "bilingual":
             operations = [
@@ -5869,31 +5883,42 @@ def plan_optimization(state_path: str) -> dict:
         else:
             extra_instruction = ""
             if source == "deepgram":
-                extra_instruction = "Also fix: Chinese character spacing, add punctuation based on context, remove repeated phrases"
+                extra_instruction = (
+                    "Source is Deepgram ASR. Also repair obvious ASR artifacts such as broken Chinese spacing, "
+                    "missing punctuation, and repeated fragments when confidence is high."
+                )
             operations = [
                 {
                     "kind": "prompt",
-                    "prompt": "structure_only",
+                    "prompt": chinese_cleanup_prompt,
                     "input": outputs["raw_text"],
                     "output": outputs["optimized_text"],
                     "extra_instruction": extra_instruction,
                     "execution": build_execution_contract("prompt"),
-                    "control": build_control_contract("prompt", "structure_only", bilingual_output=False),
+                    "control": build_control_contract("prompt", chinese_cleanup_prompt, bilingual_output=False),
                 }
             ]
     else:
         extra_instruction = ""
         if mode == "chinese" and source == "deepgram":
-            extra_instruction = "Also fix: Chinese character spacing, add punctuation based on context, remove repeated phrases"
+            extra_instruction = (
+                "Source is Deepgram ASR. Also repair obvious ASR artifacts such as broken Chinese spacing, "
+                "missing punctuation, and repeated fragments when confidence is high."
+            )
 
         operations = [
             {
                 "kind": "chunk",
-                "prompt": "structure_only",
+                "prompt": chinese_cleanup_prompt if mode == "chinese" else "structure_only",
                 "input_key": "raw_path",
                 "extra_instruction": extra_instruction,
                 "execution": build_execution_contract("chunk", "raw_path"),
-                "control": build_control_contract("chunk", "structure_only", "raw_path", bilingual_output=False),
+                "control": build_control_contract(
+                    "chunk",
+                    chinese_cleanup_prompt if mode == "chinese" else "structure_only",
+                    "raw_path",
+                    bilingual_output=False,
+                ),
             }
         ]
         if mode == "bilingual":
@@ -6443,7 +6468,7 @@ def main():
     )
     pc_parser.add_argument('work_dir', help='Working directory with manifest.json')
     pc_parser.add_argument('--prompt', required=True,
-                           help='Prompt template name (e.g., structure_only, translate_only, summarize)')
+                           help='Prompt template name (e.g., cleanup_zh, structure_only, translate_only, summarize)')
     pc_parser.add_argument('--extra-instruction', default='',
                            help='Additional instruction to append to prompt')
     pc_parser.add_argument('--input-key', default='raw_path',
