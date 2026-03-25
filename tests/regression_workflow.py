@@ -606,6 +606,72 @@ exit 1
             self.assertEqual(payload["selected_source_kind"], "manual")
             shutil.rmtree("/tmp/vidgb_downloads", ignore_errors=True)
 
+    def test_subtitles_continue_when_optional_bilingual_track_fails(self):
+        """Test subtitles keep the required source track when optional bilingual debug track fails."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fake_bin = Path(tmpdir) / "yt-dlp"
+            fake_bin.write_text(
+                """#!/usr/bin/env bash
+if [ "$1" = "-J" ]; then
+  cat <<'EOF'
+{"id":"vidopt","subtitles":{"en":[{"ext":"vtt"}],"zh-Hans":[{"ext":"vtt"}]}}
+EOF
+  exit 0
+fi
+if [ "$1" = "--write-sub" ]; then
+  out=''
+  langs=''
+  while [ $# -gt 0 ]; do
+    if [ "$1" = "-o" ]; then
+      out="$2"
+      shift 2
+      continue
+    fi
+    if [ "$1" = "--sub-lang" ]; then
+      langs="$2"
+      shift 2
+      continue
+    fi
+    shift
+  done
+  mkdir -p "$(dirname "$out")"
+  if [ "$langs" = "en" ]; then
+    : > "${out}.en.vtt"
+    exit 0
+  fi
+  if [ "$langs" = "zh-Hans" ]; then
+    echo "ERROR: Unable to download video subtitles for 'zh-Hans': HTTP Error 429: Too Many Requests" >&2
+    exit 1
+  fi
+fi
+exit 1
+""",
+                encoding="utf-8",
+            )
+            fake_bin.chmod(0o755)
+
+            env = os.environ.copy()
+            env["PATH"] = f"{tmpdir}:{env['PATH']}"
+            try:
+                result = subprocess.run(
+                    ["bash", str(PROJECT_ROOT / "scripts/download.sh"), "https://example.com/video", "subtitles"],
+                    cwd=PROJECT_ROOT,
+                    env=env,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+                payload = json.loads(result.stdout)
+                self.assertEqual(payload["selected_source_vtt"], "/tmp/vidopt_downloads/subtitles/vidopt.en.vtt")
+                self.assertEqual(payload["selected_source_language"], "en")
+                self.assertEqual(payload["selected_source_kind"], "manual")
+                self.assertEqual(payload["chinese_files"], [])
+                self.assertEqual(len(payload["warnings"]), 1)
+                self.assertIn("continuing with required source track only", payload["warnings"][0])
+                self.assertIn("zh-Hans", result.stderr)
+            finally:
+                shutil.rmtree("/tmp/vidopt_downloads", ignore_errors=True)
+
     def test_subtitles_rejects_unsupported_languages_before_download(self):
         """Test subtitles rejects unsupported languages before download."""
         with tempfile.TemporaryDirectory() as tmpdir:

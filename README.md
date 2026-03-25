@@ -319,6 +319,7 @@ Current policy is intentional and explicit:
 - `process-chunks --dry-run` validates prompts, manifests, and chunk budgets without requiring live LLM credentials; actual execution still requires `llm_api_key`, `llm_base_url`, and `llm_model`
 - `download.sh` now writes subtitle and audio artifacts into per-video isolated temp directories under `/tmp/${VIDEO_ID}_downloads/...` and exposes `download_dir` in JSON for deterministic selection and cleanup
 - `download.sh subtitles` now requests the exact selected subtitle language codes, so regional variants such as `en-GB` / `zh-TW` work instead of being dropped by a hard-coded whitelist
+- `download.sh subtitles` treats bilingual non-source Chinese subtitle downloads as best-effort debugging extras; if the required English source track succeeds, optional-track failures surface as warnings instead of aborting the workflow
 - subtitle-driven workflows intentionally support only English-source bilingual mode and Chinese-source monolingual mode; when only other subtitle languages exist, the workflow should stop and fall back to audio transcription
 - `plan-optimization` is the canonical short/long router with `< 1800s = short` and `>= 1800s = long`; the Quick Mode shortcut from `SKILL.md` is a narrower `< 900s` subset for subtitle-friendly videos
 - `manifest.json` now separates immutable `plan` metadata from `runtime` state, and `process-chunks` records attempt-level telemetry (`attempt_logs`) in addition to chunk-level fields
@@ -637,6 +638,7 @@ bash scripts/preflight.sh --require-llm
 - `transcribe-deepgram --output-segments` 可选输出带时间戳的对齐 segments，用于后续 timed chunk 与 YouTube 章节映射
 - `transcribe-deepgram` 现在默认就是 utterance-first 组装；仍保留 `--disable-utterances --legacy-flat-output` 作为兼容/排障回退
 - `transcribe-deepgram` 现在还会在结果 JSON 中输出轻量可观测字段，例如 paragraph/sentence/word 计数、逐 chunk 的 transcript 元数据，以及 structured-output 回退 warning
+- `download.sh subtitles` 会把双语模式下的中文调试字幕当作 best-effort 附加产物；只要必需的英文源轨已经成功，可选轨失败只会产生 warning，不会中断主流程
 - `chunk-segments` 基于 segments 生成带时间轴的 timed manifest；`build-chapter-plan` 可将 YouTube chapters 映射到 chunk 边界，供 `merge-content` 注入标题
 - `parse-vtt-segments` 可从字幕 VTT 生成同格式的带时间戳 segments，用于 timed chunk 与章节映射
 - `chunk-segments --chapters` 可选在 YouTube 章节起点强制切 chunk，减少章节标题漂移

@@ -638,6 +638,7 @@ PY
     subtitles)
         echo "📥 Downloading subtitles..." >&2
         SUB_INFO_JSON=""
+        SUBTITLE_WARNINGS_JSON="[]"
         METADATA_JSON=$(metadata_json_for_url)
         if [ -n "$METADATA_JSON" ]; then
             VIDEO_ID=$(printf '%s' "$METADATA_JSON" | video_id_from_metadata_json 2>/dev/null || true)
@@ -664,7 +665,7 @@ PY
         SUBTITLE_DIR="$(download_root_for_video "$VIDEO_ID")/subtitles"
         reset_download_dir "$SUBTITLE_DIR"
 
-        if ! SUB_LANGS=$(SUB_INFO_JSON="$SUB_INFO_JSON" python3 - <<'PY'
+        if ! SUBTITLE_PLAN_JSON=$(SUB_INFO_JSON="$SUB_INFO_JSON" python3 - <<'PY'
 import json
 import os
 
@@ -676,43 +677,99 @@ automatic_languages = sub_info.get('automatic_languages', [])
 all_langs = manual_languages + [lang for lang in automatic_languages if lang not in manual_languages]
 chinese_like = [lang for lang in all_langs if lang == 'zh' or lang.startswith('zh-')]
 
-requested = []
+required = []
+optional = []
 if mode == 'bilingual' and preferred_source_language:
-    requested.append(preferred_source_language)
-    requested.extend(chinese_like)
+    required.append(preferred_source_language)
+    optional.extend(lang for lang in chinese_like if lang != preferred_source_language)
 elif mode == 'chinese' and preferred_source_language:
-    requested.append(preferred_source_language)
+    required.append(preferred_source_language)
 else:
     raise SystemExit(1)
 
-deduped = []
-seen = set()
-for lang in requested:
+deduped_required = []
+seen_required = set()
+for lang in required:
     normalized = str(lang or '').strip()
-    if not normalized or normalized in seen:
+    if not normalized or normalized in seen_required:
+        continue
+    seen_required.add(normalized)
+    deduped_required.append(normalized)
+
+deduped_optional = []
+seen = set()
+for lang in optional:
+    normalized = str(lang or '').strip()
+    if (
+        not normalized
+        or normalized in seen
+        or normalized in seen_required
+    ):
         continue
     seen.add(normalized)
-    deduped.append(normalized)
+    deduped_optional.append(normalized)
 
-if not deduped:
+if not deduped_required:
     raise SystemExit(1)
 
-print(','.join(deduped))
+print(json.dumps({
+    "required_languages": deduped_required,
+    "optional_languages": deduped_optional,
+}, ensure_ascii=False))
 PY
 ); then
             echo "❌ Error: Subtitle workflow supports English or Chinese subtitle tracks only; use audio transcription fallback for other languages" >&2
             exit 1
         fi
 
+        REQUIRED_SUB_LANGS=$(SUBTITLE_PLAN_JSON="$SUBTITLE_PLAN_JSON" python3 - <<'PY'
+import json
+import os
+
+payload = json.loads(os.environ['SUBTITLE_PLAN_JSON'])
+print(','.join(payload.get('required_languages', [])))
+PY
+)
+        OPTIONAL_SUB_LANGS=$(SUBTITLE_PLAN_JSON="$SUBTITLE_PLAN_JSON" python3 - <<'PY'
+import json
+import os
+
+payload = json.loads(os.environ['SUBTITLE_PLAN_JSON'])
+print(','.join(payload.get('optional_languages', [])))
+PY
+)
+
         yt_dlp --write-sub --write-auto-sub \
-               --sub-lang "$SUB_LANGS" \
+               --sub-lang "$REQUIRED_SUB_LANGS" \
                --sub-format "vtt" \
                --skip-download \
                -o "$SUBTITLE_DIR/${VIDEO_ID}" \
                "$VIDEO_URL" >&2
 
+        if [ -n "$OPTIONAL_SUB_LANGS" ]; then
+            if ! OPTIONAL_DOWNLOAD_LOG=$(yt_dlp --write-sub --write-auto-sub \
+                                               --sub-lang "$OPTIONAL_SUB_LANGS" \
+                                               --sub-format "vtt" \
+                                               --skip-download \
+                                               -o "$SUBTITLE_DIR/${VIDEO_ID}" \
+                                               "$VIDEO_URL" 2>&1 >/dev/null); then
+                OPTIONAL_WARNING="optional subtitle download failed for languages: $OPTIONAL_SUB_LANGS; continuing with required source track only"
+                echo "⚠️  $OPTIONAL_WARNING" >&2
+                if [ -n "$OPTIONAL_DOWNLOAD_LOG" ]; then
+                    printf '%s\n' "$OPTIONAL_DOWNLOAD_LOG" >&2
+                fi
+                SUBTITLE_WARNINGS_JSON=$(OPTIONAL_WARNING="$OPTIONAL_WARNING" python3 - <<'PY'
+import json
+import os
+
+print(json.dumps([os.environ['OPTIONAL_WARNING']], ensure_ascii=False))
+PY
+)
+            fi
+        fi
+
         YTDLP_RUNTIME_JSON=$(current_ytdlp_runtime_json)
-        VIDEO_ID="$VIDEO_ID" SUB_INFO_JSON="$SUB_INFO_JSON" SUBTITLE_DIR="$SUBTITLE_DIR" YTDLP_RUNTIME_JSON="$YTDLP_RUNTIME_JSON" python3 - <<'PY'
+        VIDEO_ID="$VIDEO_ID" SUB_INFO_JSON="$SUB_INFO_JSON" SUBTITLE_DIR="$SUBTITLE_DIR" YTDLP_RUNTIME_JSON="$YTDLP_RUNTIME_JSON" SUBTITLE_WARNINGS_JSON="$SUBTITLE_WARNINGS_JSON" python3 - <<'PY'
 import json
 import os
 from pathlib import Path
@@ -720,6 +777,7 @@ from pathlib import Path
 video_id = os.environ['VIDEO_ID']
 sub_info = json.loads(os.environ['SUB_INFO_JSON'])
 subtitle_dir = Path(os.environ['SUBTITLE_DIR'])
+warnings = json.loads(os.environ.get('SUBTITLE_WARNINGS_JSON', '[]') or '[]')
 files = sorted(str(path) for path in subtitle_dir.glob(f'{video_id}.*.vtt'))
 manual_languages = sub_info.get('manual_languages', [])
 automatic_languages = sub_info.get('automatic_languages', [])
@@ -798,6 +856,7 @@ print(json.dumps({
     'selected_source_vtt': selected_source_vtt,
     'selected_source_language': selected_source_language,
     'selected_source_kind': selected_source_kind,
+    'warnings': warnings,
     'yt_dlp_runtime': json.loads(os.environ.get('YTDLP_RUNTIME_JSON', '{}') or '{}'),
 }, ensure_ascii=False))
 PY

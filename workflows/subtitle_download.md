@@ -72,6 +72,7 @@ Record:
 `download_dir` points to the per-video isolated temp directory used by the script.
 
 The script downloads the exact selected subtitle language codes instead of a fixed whitelist, so regional variants such as `en-GB` and `zh-TW` are preserved.
+In bilingual mode, non-source Chinese subtitle files are treated as optional debugging artifacts; if they fail to download but the required English source track succeeds, the workflow may continue with a warning.
 
 If no VTT files were downloaded, STOP.
 
