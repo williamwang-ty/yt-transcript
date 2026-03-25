@@ -311,6 +311,14 @@ exit 1
             self.assertEqual(payload["preferred_source_language"], "zh-Hans")
             self.assertEqual(payload["preferred_source_kind"], "manual")
             self.assertEqual(payload["mode"], "chinese")
+            self.assertEqual(
+                payload["listed_candidates"],
+                [
+                    {"language": "zh-Hans", "mode": "chinese", "source_kind": "manual"},
+                    {"language": "en", "mode": "bilingual", "source_kind": "manual"},
+                    {"language": "en-US", "mode": "bilingual", "source_kind": "auto"},
+                ],
+            )
 
     def test_subtitle_info_marks_unsupported_languages_as_no_usable_subtitles(self):
         """Test subtitle info treats non-Chinese/non-English tracks as no usable subtitles."""
@@ -426,6 +434,14 @@ exit 1
             self.assertEqual(payload["preferred_source_language"], "zh-Hans")
             self.assertEqual(payload["preferred_source_kind"], "manual")
             self.assertEqual(payload["mode"], "chinese")
+            self.assertEqual(
+                payload["listed_candidates"],
+                [
+                    {"language": "zh-Hans", "mode": "chinese", "source_kind": "manual"},
+                    {"language": "en", "mode": "bilingual", "source_kind": "manual"},
+                    {"language": "en-US", "mode": "bilingual", "source_kind": "auto"},
+                ],
+            )
 
     def test_subtitles_selects_manual_chinese_source_file_when_available(self):
         """Test subtitles selects a Chinese source file when Chinese subtitles are available."""
@@ -494,6 +510,21 @@ exit 1
             self.assertEqual(payload["selected_source_language"], "zh-Hans")
             self.assertEqual(payload["selected_source_kind"], "manual")
             self.assertEqual(payload["resolved_mode"], "chinese")
+            self.assertEqual(payload["preferred_source_language"], "zh-Hans")
+            self.assertFalse(payload["fallback_used"])
+            self.assertEqual(
+                payload["attempted_candidates"],
+                [
+                    {
+                        "language": "zh-Hans",
+                        "mode": "chinese",
+                        "source_kind": "manual",
+                        "status": "selected",
+                        "auth_retry_used": False,
+                        "auth_strategy_after_attempt": "anonymous",
+                    }
+                ],
+            )
             shutil.rmtree("/tmp/vid001_downloads", ignore_errors=True)
 
     def test_subtitles_selects_manual_chinese_source_file_from_isolated_dir(self):
@@ -623,6 +654,86 @@ exit 1
             self.assertEqual(payload["selected_source_kind"], "manual")
             shutil.rmtree("/tmp/vidgb_downloads", ignore_errors=True)
 
+    def test_subtitles_retries_rate_limited_chinese_candidate_with_chrome(self):
+        """Test subtitles retry a rate-limited Chinese candidate with Chrome cookies before falling back."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fake_bin = Path(tmpdir) / "yt-dlp"
+            fake_bin.write_text(
+                """#!/usr/bin/env bash
+has_chrome=false
+if [ "$1" = "-J" ]; then
+  cat <<'EOF'
+{"id":"vidretry","automatic_captions":{"zh-Hans":[{"ext":"vtt"}],"en":[{"ext":"vtt"}]}}
+EOF
+  exit 0
+fi
+if [ "$1" = "--write-sub" ]; then
+  out=''
+  langs=''
+  while [ $# -gt 0 ]; do
+    if [ "$1" = "--cookies-from-browser" ] && [ $# -ge 2 ] && [ "$2" = "chrome" ]; then
+      has_chrome=true
+      shift 2
+      continue
+    fi
+    if [ "$1" = "-o" ]; then
+      out="$2"
+      shift 2
+      continue
+    fi
+    if [ "$1" = "--sub-lang" ]; then
+      langs="$2"
+      shift 2
+      continue
+    fi
+    shift
+  done
+  mkdir -p "$(dirname "$out")"
+  if [ "$langs" = "zh-Hans" ] && [ "$has_chrome" != true ]; then
+    echo "ERROR: Unable to download video subtitles for 'zh-Hans': HTTP Error 429: Too Many Requests" >&2
+    exit 1
+  fi
+  if [ "$langs" = "zh-Hans" ] && [ "$has_chrome" = true ]; then
+    : > "${out}.zh-Hans.vtt"
+    exit 0
+  fi
+  if [ "$langs" = "en" ]; then
+    : > "${out}.en.vtt"
+    exit 0
+  fi
+fi
+exit 1
+""",
+                encoding="utf-8",
+            )
+            fake_bin.chmod(0o755)
+
+            env = os.environ.copy()
+            env["PATH"] = f"{tmpdir}:{env['PATH']}"
+            try:
+                result = subprocess.run(
+                    ["bash", str(PROJECT_ROOT / "scripts/download.sh"), "https://example.com/video", "subtitles"],
+                    cwd=PROJECT_ROOT,
+                    env=env,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+                payload = json.loads(result.stdout)
+                self.assertEqual(payload["selected_source_vtt"], "/tmp/vidretry_downloads/subtitles/vidretry.zh-Hans.vtt")
+                self.assertEqual(payload["selected_source_language"], "zh-Hans")
+                self.assertEqual(payload["resolved_mode"], "chinese")
+                self.assertFalse(payload["fallback_used"])
+                self.assertEqual(payload["blocked_candidates"], [])
+                self.assertEqual(len(payload["attempted_candidates"]), 1)
+                self.assertTrue(payload["attempted_candidates"][0]["auth_retry_used"])
+                self.assertEqual(payload["attempted_candidates"][0]["status"], "selected")
+                self.assertEqual(payload["yt_dlp_runtime"]["auth_strategy"], "chrome_retry_session")
+                self.assertEqual(payload["yt_dlp_runtime"]["session_browser_cookies"], "chrome")
+                self.assertIn("rate limited; retrying with Chrome cookies", result.stderr)
+            finally:
+                shutil.rmtree("/tmp/vidretry_downloads", ignore_errors=True)
+
     def test_subtitles_fall_back_to_english_when_chinese_candidates_fail(self):
         """Test subtitles fall back to English when advertised Chinese tracks cannot be downloaded."""
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -683,10 +794,31 @@ exit 1
                 self.assertEqual(payload["selected_source_language"], "en")
                 self.assertEqual(payload["selected_source_kind"], "manual")
                 self.assertEqual(payload["resolved_mode"], "bilingual")
+                self.assertEqual(payload["preferred_source_language"], "zh-Hans")
+                self.assertTrue(payload["fallback_used"])
                 self.assertEqual(payload["chinese_files"], [])
                 self.assertEqual(len(payload["warnings"]), 1)
                 self.assertIn("trying next available source track", payload["warnings"][0])
+                self.assertIn("rate limiting", payload["warnings"][0])
+                self.assertEqual(
+                    payload["blocked_candidates"],
+                    [
+                        {
+                            "language": "zh-Hans",
+                            "mode": "chinese",
+                            "source_kind": "manual",
+                            "status": "blocked",
+                            "failure_reason": "rate_limited",
+                            "auth_retry_used": True,
+                            "auth_strategy_after_attempt": "anonymous",
+                        }
+                    ],
+                )
+                self.assertEqual(len(payload["attempted_candidates"]), 2)
+                self.assertEqual(payload["attempted_candidates"][1]["language"], "en")
+                self.assertEqual(payload["attempted_candidates"][1]["status"], "selected")
                 self.assertIn("zh-Hans", result.stderr)
+                self.assertIn("rate limited; retrying with Chrome cookies", result.stderr)
             finally:
                 shutil.rmtree("/tmp/vidopt_downloads", ignore_errors=True)
 

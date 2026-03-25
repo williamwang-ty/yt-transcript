@@ -29,6 +29,7 @@ Record from JSON:
 - `has_auto`
 - `english_available`
 - `chinese_available`
+- `listed_candidates`
 - `preferred_source_language`
 - `mode`
 
@@ -63,17 +64,27 @@ SUB_DOWNLOAD_JSON=$(bash <skill-root>/scripts/download.sh "$VIDEO_URL" subtitles
 Record:
 
 - `download_dir`
+- `listed_candidates`
 - `downloaded_files`
 - `english_files`
 - `chinese_files`
+- `preferred_source_language`
+- `preferred_source_kind`
+- `preferred_mode`
+- `attempted_candidates`
+- `blocked_candidates`
 - `selected_source_vtt`
 - `selected_source_language`
 - `selected_source_kind`
+- `final_source_language`
 - `resolved_mode`
+- `fallback_used`
 
 `download_dir` points to the per-video isolated temp directory used by the script.
 
 The script attempts one source track at a time instead of fetching multiple subtitle families together. It tries Chinese tracks first when available, then falls back to English tracks only if no usable Chinese track can be downloaded. Regional variants such as `en-GB` and `zh-TW` are preserved.
+
+If a preferred candidate fails with an auth-like error such as `HTTP 429`, the script first retries the same candidate with Chrome cookies before marking it as blocked and continuing to the next candidate.
 
 If no VTT files were downloaded, STOP.
 
@@ -89,6 +100,8 @@ Use:
 - `selected_source_language` for state
 - `selected_source_kind` for debugging/reporting
 - `resolved_mode` for the downstream optimization mode
+- `attempted_candidates` / `blocked_candidates` to explain why a listed track was not actually usable
+- `fallback_used` to distinguish "preferred track selected" from "preferred track listed but unavailable"
 
 Do not merge two subtitle files directly in this workflow.
 

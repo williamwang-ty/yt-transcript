@@ -178,6 +178,58 @@ is_not_a_bot_error() {
     return 1
 }
 
+is_rate_limited_error() {
+    local text="$1"
+    case "$text" in
+        *"HTTP Error 429"*|*"Too Many Requests"*)
+            return 0
+            ;;
+    esac
+    return 1
+}
+
+auth_retry_reason_for_error() {
+    local text="$1"
+    if is_not_a_bot_error "$text"; then
+        printf 'bot_verification'
+        return 0
+    fi
+    if is_rate_limited_error "$text"; then
+        printf 'rate_limit'
+        return 0
+    fi
+    return 1
+}
+
+emit_auth_retry_message() {
+    local reason="$1"
+    local attempt="$2"
+    case "$reason" in
+        bot_verification)
+            echo "ℹ️  yt-dlp hit YouTube bot verification; retrying with Chrome cookies (attempt ${attempt}/${YTDLP_CHROME_COOKIES_RETRY_MAX})..." >&2
+            ;;
+        rate_limit)
+            echo "ℹ️  yt-dlp request was rate limited; retrying with Chrome cookies (attempt ${attempt}/${YTDLP_CHROME_COOKIES_RETRY_MAX})..." >&2
+            ;;
+        *)
+            echo "ℹ️  yt-dlp request may require authenticated cookies; retrying with Chrome cookies (attempt ${attempt}/${YTDLP_CHROME_COOKIES_RETRY_MAX})..." >&2
+            ;;
+    esac
+}
+
+classify_subtitle_download_failure() {
+    local text="$1"
+    if is_rate_limited_error "$text"; then
+        printf 'rate_limited'
+    elif is_not_a_bot_error "$text"; then
+        printf 'bot_verification'
+    elif [ -n "$text" ]; then
+        printf 'download_failed'
+    else
+        printf 'unknown_error'
+    fi
+}
+
 # Explain how to provide browser cookies when automatic retries still fail.
 emit_cookies_import_guidance() {
     local attempts="${1:-}"
@@ -230,9 +282,9 @@ run_yt_dlp_command() {
     command yt-dlp ${passthrough[@]+"${passthrough[@]}"} ${args[@]+"${args[@]}"} "$url" >"$stdout_file" 2>"$stderr_file"
 }
 
-# Wrap `yt-dlp` with bot-check detection and a best-effort Chrome-cookies retry.
+# Wrap `yt-dlp` with auth-related failure detection and a best-effort Chrome-cookies retry.
 yt_dlp() {
-    local stdout_file stderr_file status stderr_text
+    local stdout_file stderr_file status stderr_text retry_reason
     stdout_file=$(mktemp)
     stderr_file=$(mktemp)
 
@@ -250,7 +302,12 @@ yt_dlp() {
     stderr_text=$(cat "$stderr_file")
     rm -f "$stdout_file" "$stderr_file"
 
-    if [ -z "$YT_DLP_COOKIES_FILE" ] && [ -z "$YT_DLP_COOKIES_FROM_BROWSER" ] && [ -z "$YTDLP_SESSION_BROWSER_COOKIES" ] && [ ! -s "$YTDLP_SESSION_STATE_FILE" ] && is_not_a_bot_error "$stderr_text"; then
+    retry_reason=""
+    if [ -z "$YT_DLP_COOKIES_FILE" ] && [ -z "$YT_DLP_COOKIES_FROM_BROWSER" ] && [ -z "$YTDLP_SESSION_BROWSER_COOKIES" ] && [ ! -s "$YTDLP_SESSION_STATE_FILE" ]; then
+        retry_reason=$(auth_retry_reason_for_error "$stderr_text" || true)
+    fi
+
+    if [ -n "$retry_reason" ]; then
         local attempt retry_stdout retry_stderr retry_status retry_stderr_text
 
         emit_filtered_stderr "$stderr_text"
@@ -259,7 +316,7 @@ yt_dlp() {
         retry_status="$status"
         while [ "$attempt" -lt "$YTDLP_CHROME_COOKIES_RETRY_MAX" ]; do
             attempt=$((attempt + 1))
-            echo "ℹ️  yt-dlp hit YouTube bot verification; retrying with Chrome cookies (attempt ${attempt}/${YTDLP_CHROME_COOKIES_RETRY_MAX})..." >&2
+            emit_auth_retry_message "$retry_reason" "$attempt"
 
             retry_stdout=$(mktemp)
             retry_stderr=$(mktemp)
@@ -289,7 +346,8 @@ yt_dlp() {
                 emit_filtered_stderr "$retry_stderr_text"
             fi
 
-            if ! is_not_a_bot_error "$retry_stderr_text"; then
+            retry_reason=$(auth_retry_reason_for_error "$retry_stderr_text" || true)
+            if [ -z "$retry_reason" ]; then
                 break
             fi
         done
@@ -419,6 +477,33 @@ all_langs = manual + [lang for lang in automatic if lang not in manual]
 english_like = [lang for lang in all_langs if lang == 'en' or lang.startswith('en-')]
 chinese_like = [lang for lang in all_langs if lang == 'zh' or lang.startswith('zh-')]
 
+def family_candidates(languages, family):
+    return [lang for lang in languages if lang == family or lang.startswith(f'{family}-')]
+
+
+def ordered_family_candidates(family, mode_name):
+    ordered = []
+    seen = set()
+    for source_kind, languages in (('manual', manual), ('auto', automatic)):
+        for lang in family_candidates(languages, family):
+            normalized = str(lang or '').strip()
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            ordered.append({
+                'language': normalized,
+                'mode': mode_name,
+                'source_kind': source_kind,
+            })
+    return ordered
+
+
+listed_candidates = []
+if chinese_like:
+    listed_candidates.extend(ordered_family_candidates('zh', 'chinese'))
+if english_like:
+    listed_candidates.extend(ordered_family_candidates('en', 'bilingual'))
+
 preferred_source_language = ''
 preferred_source_kind = ''
 mode = ''
@@ -440,6 +525,7 @@ print(json.dumps({
     'automatic_languages': automatic,
     'english_available': bool(english_like),
     'chinese_available': bool(chinese_like),
+    'listed_candidates': listed_candidates,
     'preferred_source_language': preferred_source_language,
     'preferred_source_kind': preferred_source_kind,
     'mode': mode,
@@ -491,6 +577,33 @@ all_langs = manual + [lang for lang in automatic if lang not in manual]
 english_like = [lang for lang in all_langs if lang == 'en' or lang.startswith('en-')]
 chinese_like = [lang for lang in all_langs if lang == 'zh' or lang.startswith('zh-')]
 
+def family_candidates(languages, family):
+    return [lang for lang in languages if lang == family or lang.startswith(f'{family}-')]
+
+
+def ordered_family_candidates(family, mode_name):
+    ordered = []
+    seen = set()
+    for source_kind, languages in (('manual', manual), ('auto', automatic)):
+        for lang in family_candidates(languages, family):
+            normalized = str(lang or '').strip()
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            ordered.append({
+                'language': normalized,
+                'mode': mode_name,
+                'source_kind': source_kind,
+            })
+    return ordered
+
+
+listed_candidates = []
+if chinese_like:
+    listed_candidates.extend(ordered_family_candidates('zh', 'chinese'))
+if english_like:
+    listed_candidates.extend(ordered_family_candidates('en', 'bilingual'))
+
 preferred_source_language = ''
 preferred_source_kind = ''
 mode = ''
@@ -512,6 +625,7 @@ print(json.dumps({
     'automatic_languages': automatic,
     'english_available': bool(english_like),
     'chinese_available': bool(chinese_like),
+    'listed_candidates': listed_candidates,
     'preferred_source_language': preferred_source_language,
     'preferred_source_kind': preferred_source_kind,
     'mode': mode,
@@ -640,6 +754,7 @@ PY
         SUB_INFO_JSON=""
         SUBTITLE_WARNINGS_JSON="[]"
         SUBTITLE_WARNING_LINES=""
+        ATTEMPTED_CANDIDATE_LINES=""
         METADATA_JSON=$(metadata_json_for_url)
         if [ -n "$METADATA_JSON" ]; then
             VIDEO_ID=$(printf '%s' "$METADATA_JSON" | video_id_from_metadata_json 2>/dev/null || true)
@@ -671,38 +786,17 @@ import json
 import os
 
 sub_info = json.loads(os.environ['SUB_INFO_JSON'])
-manual_languages = sub_info.get('manual_languages', [])
-automatic_languages = sub_info.get('automatic_languages', [])
-all_langs = manual_languages + [lang for lang in automatic_languages if lang not in manual_languages]
-chinese_like = [lang for lang in all_langs if lang == 'zh' or lang.startswith('zh-')]
-english_like = [lang for lang in all_langs if lang == 'en' or lang.startswith('en-')]
-
-def family_candidates(languages, family):
-    return [lang for lang in languages if lang == family or lang.startswith(f'{family}-')]
-
-
-def ordered_family_candidates(family, mode_name):
-    ordered = []
-    seen = set()
-    for source_kind, languages in (('manual', manual_languages), ('auto', automatic_languages)):
-        for lang in family_candidates(languages, family):
-            normalized = str(lang or '').strip()
-            if not normalized or normalized in seen:
-                continue
-            seen.add(normalized)
-            ordered.append({
-                "language": normalized,
-                "mode": mode_name,
-                "source_kind": source_kind,
-            })
-    return ordered
-
-
 candidates = []
-if chinese_like:
-    candidates.extend(ordered_family_candidates('zh', 'chinese'))
-if english_like:
-    candidates.extend(ordered_family_candidates('en', 'bilingual'))
+for candidate in sub_info.get('listed_candidates', []):
+    language = str(candidate.get('language', '') or '').strip()
+    mode = str(candidate.get('mode', '') or '').strip()
+    source_kind = str(candidate.get('source_kind', '') or '').strip()
+    if language and mode and source_kind:
+        candidates.append({
+            "language": language,
+            "mode": mode,
+            "source_kind": source_kind,
+        })
 
 if not candidates:
     raise SystemExit(1)
@@ -736,22 +830,66 @@ PY
         while IFS=$'\t' read -r CANDIDATE_LANG CANDIDATE_MODE CANDIDATE_KIND; do
             [ -z "$CANDIDATE_LANG" ] && continue
             find "$SUBTITLE_DIR" -maxdepth 1 -type f -name "${VIDEO_ID}.*" -delete 2>/dev/null || true
+            ATTEMPT_AUTH_RETRY_USED="false"
             if DOWNLOAD_LOG=$(yt_dlp --write-sub --write-auto-sub \
                                      --sub-lang "$CANDIDATE_LANG" \
                                      --sub-format "vtt" \
                                      --skip-download \
                                      -o "$SUBTITLE_DIR/${VIDEO_ID}" \
                                      "$VIDEO_URL" 2>&1); then
+                case "$DOWNLOAD_LOG" in
+                    *"retrying with Chrome cookies"*)
+                        ATTEMPT_AUTH_RETRY_USED="true"
+                        ;;
+                esac
                 RESOLVED_MODE="$CANDIDATE_MODE"
                 RESOLVED_SOURCE_LANGUAGE="$CANDIDATE_LANG"
                 RESOLVED_SOURCE_KIND="$CANDIDATE_KIND"
+                ATTEMPT_ROW=$(printf '%s\t%s\t%s\t%s\t%s\t%s\t%s' \
+                    "$CANDIDATE_LANG" \
+                    "$CANDIDATE_MODE" \
+                    "$CANDIDATE_KIND" \
+                    "selected" \
+                    "" \
+                    "$ATTEMPT_AUTH_RETRY_USED" \
+                    "$(current_auth_strategy)")
+                if [ -n "$ATTEMPTED_CANDIDATE_LINES" ]; then
+                    ATTEMPTED_CANDIDATE_LINES="${ATTEMPTED_CANDIDATE_LINES}
+${ATTEMPT_ROW}"
+                else
+                    ATTEMPTED_CANDIDATE_LINES="$ATTEMPT_ROW"
+                fi
                 if [ -n "$DOWNLOAD_LOG" ]; then
                     printf '%s\n' "$DOWNLOAD_LOG" >&2
                 fi
                 break
             fi
 
-            WARNING_MESSAGE="subtitle download failed for preferred candidate '$CANDIDATE_LANG'; trying next available source track"
+            case "$DOWNLOAD_LOG" in
+                *"retrying with Chrome cookies"*)
+                    ATTEMPT_AUTH_RETRY_USED="true"
+                    ;;
+                esac
+            FAILURE_REASON=$(classify_subtitle_download_failure "$DOWNLOAD_LOG")
+            ATTEMPT_ROW=$(printf '%s\t%s\t%s\t%s\t%s\t%s\t%s' \
+                "$CANDIDATE_LANG" \
+                "$CANDIDATE_MODE" \
+                "$CANDIDATE_KIND" \
+                "blocked" \
+                "$FAILURE_REASON" \
+                "$ATTEMPT_AUTH_RETRY_USED" \
+                "$(current_auth_strategy)")
+            if [ -n "$ATTEMPTED_CANDIDATE_LINES" ]; then
+                ATTEMPTED_CANDIDATE_LINES="${ATTEMPTED_CANDIDATE_LINES}
+${ATTEMPT_ROW}"
+            else
+                ATTEMPTED_CANDIDATE_LINES="$ATTEMPT_ROW"
+            fi
+            if [ "$FAILURE_REASON" = "rate_limited" ]; then
+                WARNING_MESSAGE="subtitle download failed for preferred candidate '$CANDIDATE_LANG' due to rate limiting; trying next available source track"
+            else
+                WARNING_MESSAGE="subtitle download failed for preferred candidate '$CANDIDATE_LANG'; trying next available source track"
+            fi
             echo "⚠️  $WARNING_MESSAGE" >&2
             if [ -n "$DOWNLOAD_LOG" ]; then
                 printf '%s\n' "$DOWNLOAD_LOG" >&2
@@ -779,7 +917,7 @@ PY
 )
 
         YTDLP_RUNTIME_JSON=$(current_ytdlp_runtime_json)
-        VIDEO_ID="$VIDEO_ID" SUB_INFO_JSON="$SUB_INFO_JSON" SUBTITLE_DIR="$SUBTITLE_DIR" YTDLP_RUNTIME_JSON="$YTDLP_RUNTIME_JSON" SUBTITLE_WARNINGS_JSON="$SUBTITLE_WARNINGS_JSON" RESOLVED_MODE="$RESOLVED_MODE" RESOLVED_SOURCE_LANGUAGE="$RESOLVED_SOURCE_LANGUAGE" RESOLVED_SOURCE_KIND="$RESOLVED_SOURCE_KIND" python3 - <<'PY'
+        VIDEO_ID="$VIDEO_ID" SUB_INFO_JSON="$SUB_INFO_JSON" SUBTITLE_DIR="$SUBTITLE_DIR" YTDLP_RUNTIME_JSON="$YTDLP_RUNTIME_JSON" SUBTITLE_WARNINGS_JSON="$SUBTITLE_WARNINGS_JSON" RESOLVED_MODE="$RESOLVED_MODE" RESOLVED_SOURCE_LANGUAGE="$RESOLVED_SOURCE_LANGUAGE" RESOLVED_SOURCE_KIND="$RESOLVED_SOURCE_KIND" ATTEMPTED_CANDIDATE_LINES="$ATTEMPTED_CANDIDATE_LINES" python3 - <<'PY'
 import json
 import os
 from pathlib import Path
@@ -794,6 +932,8 @@ automatic_languages = sub_info.get('automatic_languages', [])
 mode = str(os.environ.get('RESOLVED_MODE', '') or sub_info.get('mode', '')).strip()
 preferred_source_language = sub_info.get('preferred_source_language', '')
 preferred_source_kind = sub_info.get('preferred_source_kind', '')
+preferred_mode = str(sub_info.get('mode', '') or '').strip()
+listed_candidates = sub_info.get('listed_candidates', [])
 resolved_source_language = str(os.environ.get('RESOLVED_SOURCE_LANGUAGE', '') or '').strip()
 resolved_source_kind = str(os.environ.get('RESOLVED_SOURCE_KIND', '') or '').strip()
 
@@ -861,17 +1001,55 @@ chinese = [
     path for path in files
     if subtitle_lang(path) == 'zh' or subtitle_lang(path).startswith('zh-')
 ]
+attempted_candidates = []
+blocked_candidates = []
+for raw_line in os.environ.get('ATTEMPTED_CANDIDATE_LINES', '').splitlines():
+    if not raw_line.strip():
+        continue
+    parts = raw_line.split('\t')
+    if len(parts) != 7:
+        continue
+    language, candidate_mode, source_kind, status, failure_reason, auth_retry_used, auth_strategy = parts
+    candidate = {
+        'language': language,
+        'mode': candidate_mode,
+        'source_kind': source_kind,
+        'status': status,
+        'auth_retry_used': auth_retry_used == 'true',
+        'auth_strategy_after_attempt': auth_strategy,
+    }
+    if failure_reason:
+        candidate['failure_reason'] = failure_reason
+    attempted_candidates.append(candidate)
+    if status == 'blocked':
+        blocked_candidates.append(candidate)
+
+fallback_used = bool(
+    preferred_source_language
+    and selected_source_language
+    and preferred_source_language != selected_source_language
+)
 
 print(json.dumps({
     'video_id': video_id,
     'download_dir': str(subtitle_dir),
+    'listed_candidates': listed_candidates,
     'downloaded_files': files,
     'english_files': english,
     'chinese_files': chinese,
+    'preferred_source_language': preferred_source_language,
+    'preferred_source_kind': preferred_source_kind,
+    'preferred_mode': preferred_mode,
+    'attempted_candidates': attempted_candidates,
+    'blocked_candidates': blocked_candidates,
     'selected_source_vtt': selected_source_vtt,
     'selected_source_language': selected_source_language,
     'selected_source_kind': selected_source_kind,
+    'final_source_vtt': selected_source_vtt,
+    'final_source_language': selected_source_language,
+    'final_source_kind': selected_source_kind,
     'resolved_mode': mode,
+    'fallback_used': fallback_used,
     'warnings': warnings,
     'yt_dlp_runtime': json.loads(os.environ.get('YTDLP_RUNTIME_JSON', '{}') or '{}'),
 }, ensure_ascii=False))

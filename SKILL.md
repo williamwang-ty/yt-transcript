@@ -103,6 +103,7 @@ Quick Mode is an optional fast path inside the broader short-duration bucket. `p
    Record:
    - `has_any`
    - `mode` (`chinese` or `bilingual`; provisional before actual download)
+   - `listed_candidates`
    - `preferred_source_language`
 
    Exit Quick Mode if `has_any=false`.
@@ -113,9 +114,13 @@ Quick Mode is an optional fast path inside the broader short-duration bucket. `p
    ```
 
 7. Read subtitle selection from JSON:
+   - `listed_candidates`
+   - `attempted_candidates`
+   - `blocked_candidates`
    - `selected_source_vtt`
    - `selected_source_language`
    - `selected_source_kind`
+   - `fallback_used`
    - `resolved_mode`
 
 8. Parse source VTT:
