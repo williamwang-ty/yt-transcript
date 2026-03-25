@@ -502,6 +502,11 @@ def _is_kana_hangul_char(char: str) -> bool:
     return ("\u3040" <= char <= "\u30ff") or ("\uac00" <= char <= "\ud7af")
 
 
+def _is_cjk_family_char(char: str) -> bool:
+    """Return whether a character belongs to a CJK-family script."""
+    return _is_cjk_char(char) or _is_kana_hangul_char(char)
+
+
 def _is_latin_word_char(char: str) -> bool:
     """Return whether latin word char."""
     return ("a" <= char <= "z") or ("A" <= char <= "Z") or char.isdigit()
@@ -1972,55 +1977,6 @@ def _hard_split_text(text: str, max_len: int) -> list[str]:
     return [text[i:i + max_len].strip() for i in range(0, len(text), max_len) if text[i:i + max_len].strip()]
 
 
-def parse_vtt(vtt_path: str) -> str:
-    """
-    Parse VTT subtitle file, extract plain text
-
-    Processing:
-    - Remove VTT header (WEBVTT, Kind:, Language:)
-    - Remove timestamp lines (00:00:00.000 --> 00:00:05.000)
-    - Remove VTT tags (<c>, </c>, <00:00:01.000>, etc.)
-    - Remove cue numbers (pure digit lines)
-    - Remove consecutive duplicate lines (common in auto-captions)
-    """
-    path = Path(vtt_path)
-    if not path.exists():
-        print(f"Error: File does not exist {vtt_path}", file=sys.stderr)
-        sys.exit(1)
-
-    try:
-        content = path.read_text(encoding='utf-8')
-    except Exception as e:
-        print(f"Error: Cannot read file {e}", file=sys.stderr)
-        sys.exit(2)
-
-    lines = content.split('\n')
-    text_lines = []
-
-    for line in lines:
-        # Skip timestamp lines
-        if '-->' in line:
-            continue
-        # Skip VTT header
-        if line.startswith('WEBVTT') or line.startswith('Kind:') or line.startswith('Language:'):
-            continue
-        # Skip empty lines and pure digit lines (cue numbers)
-        if not line.strip() or line.strip().isdigit():
-            continue
-        # Remove VTT tags
-        clean_line = re.sub(r'<[^>]+>', '', line)
-        if clean_line.strip():
-            text_lines.append(clean_line.strip())
-
-    # Remove consecutive duplicate lines
-    deduplicated = []
-    for line in text_lines:
-        if not deduplicated or line != deduplicated[-1]:
-            deduplicated.append(line)
-
-    return ' '.join(deduplicated)
-
-
 def _parse_vtt_timestamp(value: str) -> float | None:
     """Parse vtt timestamp."""
     token = str(value or "").strip().replace(",", ".")
@@ -2057,38 +2013,92 @@ def _parse_vtt_time_range(line: str) -> tuple[float | None, float | None]:
     return _parse_vtt_timestamp(start_token), _parse_vtt_timestamp(end_token)
 
 
-def parse_vtt_segments(vtt_path: str, *, language: str = "") -> dict:
-    """Parse a VTT file and return aligned segments with timing metadata.
+def _strip_subtitle_markup(text: str) -> str:
+    """Strip lightweight subtitle markup such as VTT cue tags."""
+    cleaned = re.sub(r"<[^>]+>", "", str(text or ""))
+    return cleaned.replace("&nbsp;", " ")
 
-    Output schema matches `chunk-segments` expectations:
 
-    {
-      "source": "vtt",
-      "language": "en" | "zh" | "..." | "",
-      "segments": [{"id": 0, "text": "...", "start_time": 0.0, "end_time": 1.2}, ...]
-    }
-    """
-    path = Path(vtt_path)
-    if not path.exists():
-        print(f"Error: File does not exist {vtt_path}", file=sys.stderr)
-        sys.exit(1)
+def _subtitle_join_needs_space(left: str, right: str) -> bool:
+    """Return whether two subtitle fragments need an inserted ASCII space."""
+    left_text = str(left or "").rstrip()
+    right_text = str(right or "").lstrip()
+    if not left_text or not right_text:
+        return False
 
-    try:
-        content = path.read_text(encoding="utf-8")
-    except Exception as e:
-        print(f"Error: Cannot read file {e}", file=sys.stderr)
-        sys.exit(2)
+    previous = left_text[-1]
+    following = right_text[0]
 
+    if previous in "([{\"'“‘「『《【":
+        return False
+    if following in ",.;:!?，。！？、；：)]}\"'”’」』）》】":
+        return False
+    if _is_cjk_family_char(previous) or _is_cjk_family_char(following):
+        return False
+    return True
+
+
+def _join_subtitle_fragments(fragments: list[str]) -> str:
+    """Join subtitle fragments without inserting spaces inside CJK text."""
+    parts = []
+    for fragment in fragments:
+        cleaned = _strip_subtitle_markup(fragment).strip()
+        if cleaned:
+            parts.append(cleaned)
+
+    if not parts:
+        return ""
+
+    joined = parts[0]
+    for fragment in parts[1:]:
+        if _subtitle_join_needs_space(joined, fragment):
+            joined = f"{joined} {fragment}"
+        else:
+            joined = f"{joined}{fragment}"
+    return joined.strip()
+
+
+def _normalize_subtitle_text(text: str) -> str:
+    """Apply conservative cleanup tailored to subtitle-derived text."""
+    normalized = _normalize_text_body(_strip_subtitle_markup(text))
+    if not normalized:
+        return ""
+
+    normalized = re.sub(r"[ \t]+", " ", normalized)
+    cjk_family = r"\u3400-\u9fff\u3040-\u30ff\uac00-\ud7af"
+    for _ in range(8):
+        updated = re.sub(rf"([{cjk_family}])\s+([{cjk_family}])", r"\1\2", normalized)
+        updated = re.sub(rf"([{cjk_family}])\s+([，。！？、；：,.!?;:])", r"\1\2", updated)
+        updated = re.sub(rf"([（【《「『])\s+([{cjk_family}])", r"\1\2", updated)
+        if updated == normalized:
+            break
+        normalized = updated
+    normalized = re.sub(r"\s+([，。！？、；：,.!?;:])", r"\1", normalized)
+    normalized = re.sub(r"([（【《「『])\s+", r"\1", normalized)
+    normalized = re.sub(r"\s+([）」』】》])", r"\1", normalized)
+    normalized = re.sub(r"\n{3,}", "\n\n", normalized)
+    return normalized.strip()
+
+
+def _normalize_subtitle_segment_text(text: str) -> str:
+    """Normalize a single subtitle cue into a cue-sized text fragment."""
+    normalized = _normalize_subtitle_text(text)
+    if not normalized:
+        return ""
+    return _join_subtitle_fragments(normalized.splitlines())
+
+
+def _parse_vtt_payload(content: str, *, language: str = "", vtt_path: str = "") -> dict:
+    """Parse VTT content into aligned subtitle segments."""
     segments = []
     header_language = ""
     in_note = False
-
     cue_start = None
     cue_end = None
     cue_lines = []
 
     def flush_cue():
-        """Flush cue."""
+        """Flush the current cue into the segment list."""
         nonlocal cue_start, cue_end, cue_lines
         if cue_start is None or cue_end is None:
             cue_start = None
@@ -2096,9 +2106,7 @@ def parse_vtt_segments(vtt_path: str, *, language: str = "") -> dict:
             cue_lines = []
             return
 
-        joined = " ".join(line.strip() for line in cue_lines if line.strip())
-        clean = re.sub(r"<[^>]+>", "", joined)
-        clean = " ".join(clean.split()).strip()
+        clean = _normalize_subtitle_segment_text(_join_subtitle_fragments(cue_lines))
         if not clean:
             cue_start = None
             cue_end = None
@@ -2156,7 +2164,6 @@ def parse_vtt_segments(vtt_path: str, *, language: str = "") -> dict:
             flush_cue()
             continue
 
-        # Ignore cue identifiers that appear before timestamps.
         if cue_start is None and cue_end is None:
             continue
 
@@ -2171,10 +2178,55 @@ def parse_vtt_segments(vtt_path: str, *, language: str = "") -> dict:
     return {
         "source": "vtt",
         "language": language or header_language,
-        "vtt_path": str(path.absolute()),
+        "vtt_path": str(Path(vtt_path).absolute()) if vtt_path else "",
         "segment_count": len(segments),
         "segments": segments,
     }
+
+
+def parse_vtt(vtt_path: str) -> str:
+    """
+    Parse VTT subtitle file, extract plain text
+
+    Processing:
+    - Remove VTT header (WEBVTT, Kind:, Language:)
+    - Remove timestamp lines (00:00:00.000 --> 00:00:05.000)
+    - Remove VTT tags (<c>, </c>, <00:00:01.000>, etc.)
+    - Remove cue numbers (pure digit lines)
+    - Remove consecutive duplicate lines (common in auto-captions)
+    """
+    path = Path(vtt_path)
+    if not path.exists():
+        print(f"Error: File does not exist {vtt_path}", file=sys.stderr)
+        sys.exit(1)
+
+    parsed = parse_vtt_segments(vtt_path)
+    body = "\n".join(segment.get("text", "") for segment in parsed.get("segments", []) if segment.get("text"))
+    return _normalize_subtitle_text(body)
+
+
+def parse_vtt_segments(vtt_path: str, *, language: str = "") -> dict:
+    """Parse a VTT file and return aligned segments with timing metadata.
+
+    Output schema matches `chunk-segments` expectations:
+
+    {
+      "source": "vtt",
+      "language": "en" | "zh" | "..." | "",
+      "segments": [{"id": 0, "text": "...", "start_time": 0.0, "end_time": 1.2}, ...]
+    }
+    """
+    path = Path(vtt_path)
+    if not path.exists():
+        print(f"Error: File does not exist {vtt_path}", file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        content = path.read_text(encoding="utf-8")
+    except Exception as e:
+        print(f"Error: Cannot read file {e}", file=sys.stderr)
+        sys.exit(2)
+    return _parse_vtt_payload(content, language=language, vtt_path=str(path))
 
 
 def process_deepgram(json_path: str, *, prefer_structured_output: bool = DEFAULT_DEEPGRAM_PREFER_STRUCTURED_OUTPUT) -> dict:
@@ -3638,6 +3690,7 @@ def _map_chapter_starts_to_segment_break_ids(chapters: list[dict], segments: lis
 
     return break_ids, warnings
 
+
 def _split_timed_segment(segment: dict, max_size: int, chunk_mode: str,
                          config: dict, warning_index: int) -> tuple[list[dict], list[str]]:
     """Split timed segment."""
@@ -3700,15 +3753,16 @@ def _load_normalized_document(normalized_document_path: str) -> dict:
         print("Error: Normalized document must be a JSON object", file=sys.stderr)
         sys.exit(2)
 
+    source_payload = payload.get("source", {}) if isinstance(payload.get("source", {}), dict) else {}
     content = payload.get("content", {}) if isinstance(payload.get("content", {}), dict) else {}
     payload.setdefault("content", content)
-    payload["content"]["text"] = _normalize_text_body(content.get("text", ""))
+    payload["content"]["text"] = _normalize_document_text_for_source(content.get("text", ""), source_payload)
 
     normalized_segments = []
     for index, raw_segment in enumerate(payload.get("segments", [])):
         if not isinstance(raw_segment, dict):
             continue
-        segment_text = " ".join(_normalize_text_body(raw_segment.get("text", "")).split())
+        segment_text = _normalize_segment_text_for_source(raw_segment.get("text", ""), source_payload)
         if not segment_text:
             continue
         normalized_segments.append({
@@ -5419,6 +5473,37 @@ def _normalize_text_body(text: str) -> str:
     return normalized.strip()
 
 
+def _is_youtube_subtitle_source(source_payload: dict) -> bool:
+    """Return whether the normalized document source came from YouTube subtitles."""
+    if not isinstance(source_payload, dict):
+        return False
+    source_type = str(source_payload.get("type", "")).strip().lower()
+    subtitle_source = str(source_payload.get("subtitle_source", "")).strip().lower()
+    return source_type == "youtube" and "subtitle" in subtitle_source
+
+
+def _normalize_document_text_for_source(text: str, source_payload: dict) -> str:
+    """Normalize document-level text according to the source family."""
+    if _is_youtube_subtitle_source(source_payload):
+        return _normalize_subtitle_text(text)
+    return _normalize_text_body(text)
+
+
+def _normalize_segment_text_for_source(text: str, source_payload: dict) -> str:
+    """Normalize segment-level text according to the source family."""
+    if _is_youtube_subtitle_source(source_payload):
+        return _normalize_subtitle_segment_text(text)
+    return " ".join(_normalize_text_body(text).split())
+
+
+def _prefer_text_chunking_for_source(source_payload: dict, workflow_payload: dict) -> bool:
+    """Return whether chunk-document should prefer text despite timed segments."""
+    if not _is_youtube_subtitle_source(source_payload):
+        return False
+    mode = str((workflow_payload or {}).get("mode", "")).strip().lower()
+    return mode == "chinese"
+
+
 def _update_machine_state_normalization(machine_state_path: str | Path, *, normalized_document_path: str,
                                         source_adapter: str, preferred_chunk_source: str,
                                         segment_count: int, char_count: int,
@@ -5521,10 +5606,15 @@ def normalize_document(state_ref: str, output_path: str = "", prefer: str = "aut
             "materialized": False,
         }
 
+    source_payload = machine_state.get("source", {}) if isinstance(machine_state.get("source", {}), dict) else {}
+    workflow_payload = machine_state.get("workflow", {}) if isinstance(machine_state.get("workflow", {}), dict) else {}
+    prefer_text_chunking = _prefer_text_chunking_for_source(source_payload, workflow_payload)
+
     normalized_segments = []
     has_timing = False
     source_adapter = "raw_text_file"
     preferred_chunk_source = "text"
+    warnings = []
 
     if use_segments:
         try:
@@ -5552,7 +5642,7 @@ def normalize_document(state_ref: str, output_path: str = "", prefer: str = "aut
         for seg in payload.get("segments", []):
             if not isinstance(seg, dict):
                 continue
-            clean_text = " ".join(_normalize_text_body(seg.get("text", "")).split())
+            clean_text = _normalize_segment_text_for_source(seg.get("text", ""), source_payload)
             if not clean_text:
                 continue
             start_time = _coerce_float_or_none(seg.get("start_time"))
@@ -5567,10 +5657,23 @@ def normalize_document(state_ref: str, output_path: str = "", prefer: str = "aut
             })
         normalized_text = "\n".join(segment["text"] for segment in normalized_segments).strip()
         source_adapter = "segments_json"
-        preferred_chunk_source = "segments"
+        preferred_chunk_source = "text" if prefer_text_chunking else "segments"
+        if prefer_text_chunking and raw_text_file and raw_text_file.exists():
+            try:
+                normalized_text = _normalize_document_text_for_source(
+                    raw_text_file.read_text(encoding="utf-8"),
+                    source_payload,
+                )
+            except Exception as e:
+                warnings.append(
+                    f"Cannot read subtitle raw text artifact, fell back to normalized segments: {e}"
+                )
     else:
         try:
-            normalized_text = _normalize_text_body(raw_text_file.read_text(encoding="utf-8"))
+            normalized_text = _normalize_document_text_for_source(
+                raw_text_file.read_text(encoding="utf-8"),
+                source_payload,
+            )
         except Exception as e:
             return {
                 "passed": False,
@@ -5582,8 +5685,6 @@ def normalize_document(state_ref: str, output_path: str = "", prefer: str = "aut
                 "materialized": False,
             }
 
-    source_payload = machine_state.get("source", {}) if isinstance(machine_state.get("source", {}), dict) else {}
-    workflow_payload = machine_state.get("workflow", {}) if isinstance(machine_state.get("workflow", {}), dict) else {}
     normalized_doc = {
         "schema_version": NORMALIZED_DOCUMENT_SCHEMA_VERSION,
         "format": NORMALIZED_DOCUMENT_FORMAT,
@@ -5631,7 +5732,7 @@ def normalize_document(state_ref: str, output_path: str = "", prefer: str = "aut
     )
     return {
         "passed": True,
-        "warnings": [],
+        "warnings": warnings,
         "hard_failures": [],
         "machine_state_path": machine_state_path,
         "legacy_state_path": sync_result["legacy_state_path"],

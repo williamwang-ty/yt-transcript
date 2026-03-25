@@ -109,7 +109,7 @@ python3 <skill-root>/yt_transcript_utils.py chunk-document \
     --chapters /tmp/${VIDEO_ID}_chapters.json
 ```
 
-`chunk-document` auto-selects `segments` when the normalized document carries timed segments, and otherwise falls back to normalized text.
+`chunk-document` auto-selects the normalized document's preferred source shape. Most timed sources still prefer `segments`, but Chinese YouTube-subtitle long paths now prefer cleaned `text` while retaining `segments` for timing/chapter metadata.
 Use the first raw-path operation prompt from `PLAN_JSON.operations` as `<RAW_STAGE_PROMPT>`:
 
 - `cleanup_zh` for Chinese monolingual output
@@ -152,7 +152,7 @@ python3 <skill-root>/yt_transcript_utils.py build-chapter-plan \
 
 Notes:
 
-- `build-chapter-plan` requires each chunk in `manifest.json` to have `start_time` / `end_time`; this works when `chunk-document` selected timed segments, or when you used `chunk-segments` directly. If the plan resolved to text-only chunking, it will STOP with an error.
+- `build-chapter-plan` requires each chunk in `manifest.json` to have `start_time` / `end_time`; this works when `chunk-document` selected timed segments, or when you used `chunk-segments` directly. If the plan resolved to text-first chunking (including Chinese YouTube-subtitle long paths), it will STOP with an error.
 - If you cannot produce timed chunks, continue without `chapter_plan.json`; `merge-content` still succeeds, just without injected YouTube chapter headers.
 - If you must have headings but lack timing, generate a best-effort plan by summarizing chunks and creating `chapter_plan.json` manually (this is not a true YouTube-chapter mapping).
 

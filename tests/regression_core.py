@@ -570,6 +570,34 @@ class CoreRegressionTests(unittest.TestCase):
             self.assertEqual(segments[1]["start_time"], 4.0)
             self.assertEqual(segments[1]["end_time"], 6.5)
 
+    def test_parse_vtt_preserves_cjk_joining_without_invented_spaces(self):
+        """Test parse_vtt and parse_vtt_segments keep CJK subtitle fragments tightly joined."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            vtt_path = Path(tmpdir) / "sub_zh.vtt"
+            vtt_path.write_text(
+                "WEBVTT\n"
+                "Language: zh-Hans\n"
+                "\n"
+                "00:00:00.000 --> 00:00:02.000\n"
+                "<c>你</c>\n"
+                "好，\n"
+                "\n"
+                "00:00:02.000 --> 00:00:04.000\n"
+                "世\n"
+                "界！\n",
+                encoding="utf-8",
+            )
+
+            text_result = utils.parse_vtt(str(vtt_path))
+            segments_result = utils.parse_vtt_segments(str(vtt_path), language="zh-Hans")
+
+            self.assertEqual(text_result, "你好，\n世界！")
+            self.assertEqual(segments_result["language"], "zh-Hans")
+            self.assertEqual(
+                [segment["text"] for segment in segments_result["segments"]],
+                ["你好，", "世界！"],
+            )
+
     def test_cli_parse_vtt_segments_command_is_registered(self):
         """Test cli parse vtt segments command is registered."""
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1047,6 +1075,105 @@ class CoreRegressionTests(unittest.TestCase):
             self.assertEqual(payload["content"]["text"], "First line\nSecond line")
             machine_payload = json.loads(Path(result["machine_state_path"]).read_text(encoding="utf-8"))
             self.assertEqual(machine_payload["normalization"]["source_adapter"], "segments_json")
+
+    def test_load_normalized_document_recovers_subtitle_text_cleanup(self):
+        """Test _load_normalized_document keeps subtitle-derived CJK text normalized."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            normalized_document = Path(tmpdir) / "normalized_document.json"
+            normalized_document.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "format": utils.NORMALIZED_DOCUMENT_FORMAT,
+                        "document_id": "vid001",
+                        "source_adapter": "segments_json",
+                        "source": {
+                            "type": "youtube",
+                            "subtitle_source": "YouTube Subtitles",
+                            "source_language": "zh-Hans",
+                        },
+                        "content": {
+                            "text": "你 好，\n第 二 行。",
+                            "preferred_chunk_source": "text",
+                        },
+                        "segments": [
+                            {"id": 0, "text": "你 好，", "start_time": 0.0, "end_time": 1.0},
+                            {"id": 1, "text": "第 二 行。", "start_time": 1.0, "end_time": 2.0},
+                        ],
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+
+            payload = utils._load_normalized_document(str(normalized_document))
+
+            self.assertEqual(payload["content"]["text"], "你好，\n第二行。")
+            self.assertEqual(
+                [segment["text"] for segment in payload["segments"]],
+                ["你好，", "第二行。"],
+            )
+
+    def test_normalize_document_prefers_text_for_chinese_youtube_subtitles(self):
+        """Test chinese YouTube subtitle documents keep segments but prefer text chunking."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state = Path(tmpdir) / "vid001_state.md"
+            raw_text = Path(tmpdir) / "vid001_raw.txt"
+            segments = Path(tmpdir) / "vid001_segments.json"
+            work_dir = Path(tmpdir) / "chunks"
+            raw_text.write_text("你 好，\n\n第 二 行。", encoding="utf-8")
+            segments.write_text(
+                json.dumps(
+                    {
+                        "source": "vtt",
+                        "language": "zh-Hans",
+                        "segments": [
+                            {"id": 0, "text": "你 好，", "start_time": 0.0, "end_time": 1.0},
+                            {"id": 1, "text": "第 二 行。", "start_time": 1.0, "end_time": 2.0},
+                        ],
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            state.write_text(
+                "# State\n"
+                "vid: vid001\n"
+                "url: https://example.com/watch?v=1\n"
+                "title: Sample\n"
+                "channel: Channel\n"
+                "upload_date: 20260308\n"
+                "duration: 3600\n"
+                "output_dir: /tmp/out\n"
+                "mode: chinese\n"
+                "src: youtube\n"
+                "source_language: zh-Hans\n"
+                "subtitle_source: YouTube Subtitles\n"
+                f"raw_text: {raw_text}\n"
+                f"segments_path: {segments}\n"
+                f"work_dir: {work_dir}\n",
+                encoding="utf-8",
+            )
+
+            result = utils.normalize_document(str(state))
+
+            self.assertTrue(result["passed"], result)
+            self.assertEqual(result["source_adapter"], "segments_json")
+            self.assertEqual(result["preferred_chunk_source"], "text")
+            payload = json.loads(Path(result["normalized_document_path"]).read_text(encoding="utf-8"))
+            self.assertEqual(payload["content"]["preferred_chunk_source"], "text")
+            self.assertEqual(payload["content"]["text"], "你好，\n\n第二行。")
+            self.assertEqual(
+                [segment["text"] for segment in payload["segments"]],
+                ["你好，", "第二行。"],
+            )
+
+            chunk_result = utils.chunk_document(str(result["normalized_document_path"]), str(work_dir), chunk_size=1000)
+
+            self.assertEqual(chunk_result["source_kind"], "text")
+            manifest = json.loads((work_dir / "manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest["plan"]["chunk_contract"]["source_kind"], "text")
+            self.assertNotIn("start_time", manifest["chunks"][0])
 
     def test_plan_optimization_materializes_normalized_document_when_artifact_exists(self):
         """Test plan optimization materializes normalized document when artifact exists."""

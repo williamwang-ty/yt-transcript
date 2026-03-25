@@ -306,14 +306,14 @@ Current policy is intentional and explicit:
 - `config.yaml` is intentionally limited to flat top-level key/value entries; nested or multi-line YAML is not supported
 - YAML frontmatter values are always quoted on purpose to favor safe parsing over prettier formatting
 - Markdown header text is escaped and link destinations are encoded so edge-case titles/channels do not break output structure
-- `chunk-document` is now the canonical long-video chunking entrypoint when `normalized_document.json` exists; it auto-selects `segments` vs `text` but keeps `chunk-text` / `chunk-segments` available as compatible lower-level drivers
+- `chunk-document` is now the canonical long-video chunking entrypoint when `normalized_document.json` exists; it follows `preferred_chunk_source` instead of blindly preferring timed segments, so Chinese YouTube-subtitle long paths now chunk from cleaned `text` while still retaining `segments` for timing metadata
 - `chunk-text` force-splits very long unpunctuated passages to stay within downstream LLM chunk budgets
 - `download.sh metadata` now prefers a single `yt-dlp -J` fetch when available, and subtitle/audio modes reuse metadata-derived video IDs before falling back to extra probes
 - `transcribe-deepgram --output-segments` can emit time-aligned segments for downstream timed chunking + YouTube chapter mapping
 - `transcribe-deepgram` now defaults to utterance-first transcript assembly; `--disable-utterances --legacy-flat-output` remains available for compatibility/debugging checks
 - `transcribe-deepgram` now also reports lightweight observability fields such as paragraph/sentence/word counts, per-chunk transcript metadata, and fallback warnings in its result JSON
 - `chunk-segments` produces timed chunk manifests, and `build-chapter-plan` maps YouTube chapters onto chunk boundaries for `merge-content`
-- `parse-vtt-segments` emits the same time-aligned segments format from subtitle VTT files
+- `parse-vtt` / `parse-vtt-segments` now use subtitle-aware cleanup so CJK subtitle fragments are not re-joined with stray ASCII spaces
 - `chunk-segments --chapters` can force chunk boundaries at YouTube chapter starts to reduce heading drift
 - `chunk-text` now defaults to token-aware planning when `--prompt` is provided, while an explicit `--chunk-size` without `--prompt` keeps legacy character sizing for workflow compatibility
 - prompt names are validated eagerly for chunk planning, so typos fail fast instead of silently falling back to generic budgets
@@ -646,7 +646,7 @@ bash scripts/preflight.sh --require-llm
 - `config.yaml` 被刻意限制为扁平的顶层键值配置，不支持嵌套结构或多行 YAML
 - YAML frontmatter 的值会统一加引号，优先保证解析安全，而不是追求最简洁的展示
 - Markdown 头部里的标题/频道文本会做转义，链接目标会做编码，避免边界字符破坏结构
-- `chunk-document` 现在是 `normalized_document.json` 已存在时的规范长视频分块入口；它会自动选择 `segments` 或 `text`，但仍保留 `chunk-text` / `chunk-segments` 作为兼容的低层驱动
+- `chunk-document` 现在是 `normalized_document.json` 已存在时的规范长视频分块入口；它会遵循 `preferred_chunk_source`，而不是在有 timed segments 时一律偏向 `segments`；因此中文字幕长路径现在会优先使用清洗后的 `text` 做正文分块，同时保留 `segments` 供时间轴 / 章节映射使用
 - `chunk-text` 会对超长且缺少标点的段落做强制切分，并在提供 `--prompt` 时默认启用 token-aware 规划
 - `download.sh metadata` 现在会优先走单次 `yt-dlp -J` 获取；字幕/音频模式也会先复用 metadata 里的 video id，再回退到额外探测
 - `transcribe-deepgram --output-segments` 可选输出带时间戳的对齐 segments，用于后续 timed chunk 与 YouTube 章节映射
@@ -657,7 +657,7 @@ bash scripts/preflight.sh --require-llm
 - `download.sh subtitles` 现在会显式区分“平台列出了哪些轨”和“当前运行环境实际下载到了哪条轨”：`listed_candidates` 描述可见候选，`attempted_candidates` / `blocked_candidates` / `fallback_used` 描述实际下载结果
 - 当首选字幕轨因为 `HTTP 429` 这类鉴权/限流问题失败时，`download.sh subtitles` 现在会先用 Chrome cookies 对同一条轨重试，再决定是否回退到下一条候选
 - `chunk-segments` 基于 segments 生成带时间轴的 timed manifest；`build-chapter-plan` 可将 YouTube chapters 映射到 chunk 边界，供 `merge-content` 注入标题
-- `parse-vtt-segments` 可从字幕 VTT 生成同格式的带时间戳 segments，用于 timed chunk 与章节映射
+- `parse-vtt` / `parse-vtt-segments` 现在都会做 subtitle-aware cleanup，避免 CJK 字幕碎片在重新拼接时被错误插入 ASCII 空格
 - `chunk-segments --chapters` 可选在 YouTube 章节起点强制切 chunk，减少章节标题漂移
 - 如果只传显式 `--chunk-size` 而不传 `--prompt`，`chunk-text` 会继续按 legacy 字符大小解释，避免现有 workflow 被静默改变
 - 分块阶段会提前校验 prompt 名称，避免因为 prompt 拼写错误而静默回退到通用预算
