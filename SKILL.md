@@ -13,7 +13,8 @@ Transcribe YouTube videos into formatted Markdown articles with optional bilingu
 > [!NOTE]
 > Intentional product decisions:
 > - `bilingual` always means English source text plus Chinese translation
-> - If both English and Chinese subtitles exist, English remains the only source text for generation
+> - If usable Chinese subtitles exist, they take precedence as the single source text track
+> - English subtitles are used only when no usable Chinese subtitle track can be downloaded
 > - `scripts/preflight.sh` is intentionally staged so subtitle-only paths do not require Deepgram or LLM credentials
 
 ---
@@ -69,7 +70,7 @@ last_action: got metadata
 Use this streamlined path only when all conditions are true:
 
 - Video duration `< 900` seconds
-- `subtitle-info` reports `has_any=true`
+- `subtitle-info` reports `has_any=true` for a usable Chinese or English subtitle source
 - No chapter planning or multi-speaker output is required
 
 Quick Mode is an optional fast path inside the broader short-duration bucket. `plan-optimization` still records `< 1800s` as `duration_bucket=short`, but it may escalate oversized short transcripts to chunked execution (`video_path=long`, `routing_reason=oversized_short_input`) when single-pass prompting would be too large or too slow.
@@ -101,7 +102,7 @@ Quick Mode is an optional fast path inside the broader short-duration bucket. `p
    ```
    Record:
    - `has_any`
-   - `mode` (`chinese` or `bilingual`)
+   - `mode` (`chinese` or `bilingual`; provisional before actual download)
    - `preferred_source_language`
 
    Exit Quick Mode if `has_any=false`.
@@ -115,6 +116,7 @@ Quick Mode is an optional fast path inside the broader short-duration bucket. `p
    - `selected_source_vtt`
    - `selected_source_language`
    - `selected_source_kind`
+   - `resolved_mode`
 
 8. Parse source VTT:
    ```bash
@@ -122,8 +124,8 @@ Quick Mode is an optional fast path inside the broader short-duration bucket. `p
    ```
 
 9. Optimize text:
-   - If `mode=chinese`, use `prompts/quick_cleanup.md` and save to `/tmp/${VIDEO_ID}_optimized.txt`
-   - If `mode=bilingual`, first run `prompts/structure_only.md` to `/tmp/${VIDEO_ID}_structured.txt`, then `prompts/translate_only.md` to `/tmp/${VIDEO_ID}_optimized.txt`
+   - If `resolved_mode=chinese`, use `prompts/quick_cleanup.md` and save to `/tmp/${VIDEO_ID}_optimized.txt`
+   - If `resolved_mode=bilingual`, first run `prompts/structure_only.md` to `/tmp/${VIDEO_ID}_structured.txt`, then `prompts/translate_only.md` to `/tmp/${VIDEO_ID}_optimized.txt`
 
 10. Assemble final file:
    ```bash
@@ -138,7 +140,7 @@ Quick Mode is an optional fast path inside the broader short-duration bucket. `p
        --duration "$DURATION" \
        --transcript-source "YouTube Subtitles"
    ```
-   Add `--bilingual` if `mode=bilingual`.
+   Add `--bilingual` if `resolved_mode=bilingual`.
 
 11. Cleanup:
    ```bash
@@ -318,7 +320,7 @@ When processing multiple URLs:
 | `download.sh metadata` or `subtitle-info` fails | `yt-dlp` unavailable, outdated, or video unavailable | Run `bash <skill-root>/scripts/preflight.sh`, then retry once |
 | `yt-dlp` says "Sign in to confirm you’re not a bot" | YouTube requires cookies/login for this IP or video | Let `download.sh` auto-retry with Chrome (up to 3 attempts); if it still fails, export a Netscape `cookies.txt`, set `yt_dlp_cookies_file`, then retry |
 | Automatic Chrome cookies retry failed | Chrome is unavailable, not logged in, or inaccessible in this environment | Export `youtube.com` cookies from a logged-in browser, copy the file here, set `yt_dlp_cookies_file` or `YT_DLP_COOKIES_FILE`, then retry |
-| `subtitle-info` returns `has_any=false` | No usable manual or auto subtitles | Switch to Deepgram path and run `bash <skill-root>/scripts/preflight.sh --require-deepgram` |
+| `subtitle-info` returns `has_any=false` | No usable Chinese or English subtitle source exists | Switch to Deepgram path and run `bash <skill-root>/scripts/preflight.sh --require-deepgram` |
 | Deepgram transcription fails | Invalid key, network issue, or API rejection | Stop, surface the error, and ask whether to retry |
 | `verify-quality` returns non-empty `hard_failures` | Hard structural gate failed | Do not assemble final output; fix the optimization step |
 | `verify-quality` returns only `warnings` | Soft quality concern | Review the warnings, then decide whether to proceed |

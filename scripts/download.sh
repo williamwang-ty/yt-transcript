@@ -422,20 +422,20 @@ chinese_like = [lang for lang in all_langs if lang == 'zh' or lang.startswith('z
 preferred_source_language = ''
 preferred_source_kind = ''
 mode = ''
-if english_like:
-    preferred_source_language = english_like[0]
-    preferred_source_kind = 'manual' if preferred_source_language in manual else 'auto'
-    mode = 'bilingual'
-elif chinese_like:
+if chinese_like:
     preferred_source_language = chinese_like[0]
     preferred_source_kind = 'manual' if preferred_source_language in manual else 'auto'
     mode = 'chinese'
+elif english_like:
+    preferred_source_language = english_like[0]
+    preferred_source_kind = 'manual' if preferred_source_language in manual else 'auto'
+    mode = 'bilingual'
 
 print(json.dumps({
     'video_id': payload.get('id') or video_id,
     'has_manual': bool(manual),
     'has_auto': bool(automatic),
-    'has_any': bool(all_langs),
+    'has_any': bool(chinese_like or english_like),
     'manual_languages': manual,
     'automatic_languages': automatic,
     'english_available': bool(english_like),
@@ -494,20 +494,20 @@ chinese_like = [lang for lang in all_langs if lang == 'zh' or lang.startswith('z
 preferred_source_language = ''
 preferred_source_kind = ''
 mode = ''
-if english_like:
-    preferred_source_language = english_like[0]
-    preferred_source_kind = 'manual' if preferred_source_language in manual else 'auto'
-    mode = 'bilingual'
-elif chinese_like:
+if chinese_like:
     preferred_source_language = chinese_like[0]
     preferred_source_kind = 'manual' if preferred_source_language in manual else 'auto'
     mode = 'chinese'
+elif english_like:
+    preferred_source_language = english_like[0]
+    preferred_source_kind = 'manual' if preferred_source_language in manual else 'auto'
+    mode = 'bilingual'
 
 print(json.dumps({
     'video_id': video_id,
     'has_manual': bool(manual),
     'has_auto': bool(automatic),
-    'has_any': bool(all_langs),
+    'has_any': bool(chinese_like or english_like),
     'manual_languages': manual,
     'automatic_languages': automatic,
     'english_available': bool(english_like),
@@ -639,6 +639,7 @@ PY
         echo "📥 Downloading subtitles..." >&2
         SUB_INFO_JSON=""
         SUBTITLE_WARNINGS_JSON="[]"
+        SUBTITLE_WARNING_LINES=""
         METADATA_JSON=$(metadata_json_for_url)
         if [ -n "$METADATA_JSON" ]; then
             VIDEO_ID=$(printf '%s' "$METADATA_JSON" | video_id_from_metadata_json 2>/dev/null || true)
@@ -670,51 +671,44 @@ import json
 import os
 
 sub_info = json.loads(os.environ['SUB_INFO_JSON'])
-mode = sub_info.get('mode', '')
-preferred_source_language = str(sub_info.get('preferred_source_language', '') or '').strip()
 manual_languages = sub_info.get('manual_languages', [])
 automatic_languages = sub_info.get('automatic_languages', [])
 all_langs = manual_languages + [lang for lang in automatic_languages if lang not in manual_languages]
 chinese_like = [lang for lang in all_langs if lang == 'zh' or lang.startswith('zh-')]
+english_like = [lang for lang in all_langs if lang == 'en' or lang.startswith('en-')]
 
-required = []
-optional = []
-if mode == 'bilingual' and preferred_source_language:
-    required.append(preferred_source_language)
-    optional.extend(lang for lang in chinese_like if lang != preferred_source_language)
-elif mode == 'chinese' and preferred_source_language:
-    required.append(preferred_source_language)
-else:
-    raise SystemExit(1)
+def family_candidates(languages, family):
+    return [lang for lang in languages if lang == family or lang.startswith(f'{family}-')]
 
-deduped_required = []
-seen_required = set()
-for lang in required:
-    normalized = str(lang or '').strip()
-    if not normalized or normalized in seen_required:
-        continue
-    seen_required.add(normalized)
-    deduped_required.append(normalized)
 
-deduped_optional = []
-seen = set()
-for lang in optional:
-    normalized = str(lang or '').strip()
-    if (
-        not normalized
-        or normalized in seen
-        or normalized in seen_required
-    ):
-        continue
-    seen.add(normalized)
-    deduped_optional.append(normalized)
+def ordered_family_candidates(family, mode_name):
+    ordered = []
+    seen = set()
+    for source_kind, languages in (('manual', manual_languages), ('auto', automatic_languages)):
+        for lang in family_candidates(languages, family):
+            normalized = str(lang or '').strip()
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            ordered.append({
+                "language": normalized,
+                "mode": mode_name,
+                "source_kind": source_kind,
+            })
+    return ordered
 
-if not deduped_required:
+
+candidates = []
+if chinese_like:
+    candidates.extend(ordered_family_candidates('zh', 'chinese'))
+if english_like:
+    candidates.extend(ordered_family_candidates('en', 'bilingual'))
+
+if not candidates:
     raise SystemExit(1)
 
 print(json.dumps({
-    "required_languages": deduped_required,
-    "optional_languages": deduped_optional,
+    "candidates": candidates,
 }, ensure_ascii=False))
 PY
 ); then
@@ -722,54 +716,70 @@ PY
             exit 1
         fi
 
-        REQUIRED_SUB_LANGS=$(SUBTITLE_PLAN_JSON="$SUBTITLE_PLAN_JSON" python3 - <<'PY'
+        CANDIDATE_ROWS=$(SUBTITLE_PLAN_JSON="$SUBTITLE_PLAN_JSON" python3 - <<'PY'
 import json
 import os
 
 payload = json.loads(os.environ['SUBTITLE_PLAN_JSON'])
-print(','.join(payload.get('required_languages', [])))
+for candidate in payload.get('candidates', []):
+    language = str(candidate.get('language', '') or '').strip()
+    mode = str(candidate.get('mode', '') or '').strip()
+    source_kind = str(candidate.get('source_kind', '') or '').strip()
+    if language:
+        print('\t'.join((language, mode, source_kind)))
 PY
 )
-        OPTIONAL_SUB_LANGS=$(SUBTITLE_PLAN_JSON="$SUBTITLE_PLAN_JSON" python3 - <<'PY'
-import json
-import os
+        RESOLVED_MODE=""
+        RESOLVED_SOURCE_LANGUAGE=""
+        RESOLVED_SOURCE_KIND=""
 
-payload = json.loads(os.environ['SUBTITLE_PLAN_JSON'])
-print(','.join(payload.get('optional_languages', [])))
-PY
-)
-
-        yt_dlp --write-sub --write-auto-sub \
-               --sub-lang "$REQUIRED_SUB_LANGS" \
-               --sub-format "vtt" \
-               --skip-download \
-               -o "$SUBTITLE_DIR/${VIDEO_ID}" \
-               "$VIDEO_URL" >&2
-
-        if [ -n "$OPTIONAL_SUB_LANGS" ]; then
-            if ! OPTIONAL_DOWNLOAD_LOG=$(yt_dlp --write-sub --write-auto-sub \
-                                               --sub-lang "$OPTIONAL_SUB_LANGS" \
-                                               --sub-format "vtt" \
-                                               --skip-download \
-                                               -o "$SUBTITLE_DIR/${VIDEO_ID}" \
-                                               "$VIDEO_URL" 2>&1 >/dev/null); then
-                OPTIONAL_WARNING="optional subtitle download failed for languages: $OPTIONAL_SUB_LANGS; continuing with required source track only"
-                echo "⚠️  $OPTIONAL_WARNING" >&2
-                if [ -n "$OPTIONAL_DOWNLOAD_LOG" ]; then
-                    printf '%s\n' "$OPTIONAL_DOWNLOAD_LOG" >&2
+        while IFS=$'\t' read -r CANDIDATE_LANG CANDIDATE_MODE CANDIDATE_KIND; do
+            [ -z "$CANDIDATE_LANG" ] && continue
+            find "$SUBTITLE_DIR" -maxdepth 1 -type f -name "${VIDEO_ID}.*" -delete 2>/dev/null || true
+            if DOWNLOAD_LOG=$(yt_dlp --write-sub --write-auto-sub \
+                                     --sub-lang "$CANDIDATE_LANG" \
+                                     --sub-format "vtt" \
+                                     --skip-download \
+                                     -o "$SUBTITLE_DIR/${VIDEO_ID}" \
+                                     "$VIDEO_URL" 2>&1); then
+                RESOLVED_MODE="$CANDIDATE_MODE"
+                RESOLVED_SOURCE_LANGUAGE="$CANDIDATE_LANG"
+                RESOLVED_SOURCE_KIND="$CANDIDATE_KIND"
+                if [ -n "$DOWNLOAD_LOG" ]; then
+                    printf '%s\n' "$DOWNLOAD_LOG" >&2
                 fi
-                SUBTITLE_WARNINGS_JSON=$(OPTIONAL_WARNING="$OPTIONAL_WARNING" python3 - <<'PY'
-import json
-import os
-
-print(json.dumps([os.environ['OPTIONAL_WARNING']], ensure_ascii=False))
-PY
-)
+                break
             fi
+
+            WARNING_MESSAGE="subtitle download failed for preferred candidate '$CANDIDATE_LANG'; trying next available source track"
+            echo "⚠️  $WARNING_MESSAGE" >&2
+            if [ -n "$DOWNLOAD_LOG" ]; then
+                printf '%s\n' "$DOWNLOAD_LOG" >&2
+            fi
+            if [ -n "$SUBTITLE_WARNING_LINES" ]; then
+                SUBTITLE_WARNING_LINES="${SUBTITLE_WARNING_LINES}
+${WARNING_MESSAGE}"
+            else
+                SUBTITLE_WARNING_LINES="$WARNING_MESSAGE"
+            fi
+        done <<< "$CANDIDATE_ROWS"
+
+        if [ -z "$RESOLVED_SOURCE_LANGUAGE" ]; then
+            echo "❌ Error: No usable English or Chinese subtitle track could be downloaded; use audio transcription fallback" >&2
+            exit 1
         fi
 
+        SUBTITLE_WARNINGS_JSON=$(SUBTITLE_WARNING_LINES="$SUBTITLE_WARNING_LINES" python3 - <<'PY'
+import json
+import os
+
+lines = [line.strip() for line in os.environ.get('SUBTITLE_WARNING_LINES', '').splitlines() if line.strip()]
+print(json.dumps(lines, ensure_ascii=False))
+PY
+)
+
         YTDLP_RUNTIME_JSON=$(current_ytdlp_runtime_json)
-        VIDEO_ID="$VIDEO_ID" SUB_INFO_JSON="$SUB_INFO_JSON" SUBTITLE_DIR="$SUBTITLE_DIR" YTDLP_RUNTIME_JSON="$YTDLP_RUNTIME_JSON" SUBTITLE_WARNINGS_JSON="$SUBTITLE_WARNINGS_JSON" python3 - <<'PY'
+        VIDEO_ID="$VIDEO_ID" SUB_INFO_JSON="$SUB_INFO_JSON" SUBTITLE_DIR="$SUBTITLE_DIR" YTDLP_RUNTIME_JSON="$YTDLP_RUNTIME_JSON" SUBTITLE_WARNINGS_JSON="$SUBTITLE_WARNINGS_JSON" RESOLVED_MODE="$RESOLVED_MODE" RESOLVED_SOURCE_LANGUAGE="$RESOLVED_SOURCE_LANGUAGE" RESOLVED_SOURCE_KIND="$RESOLVED_SOURCE_KIND" python3 - <<'PY'
 import json
 import os
 from pathlib import Path
@@ -781,9 +791,11 @@ warnings = json.loads(os.environ.get('SUBTITLE_WARNINGS_JSON', '[]') or '[]')
 files = sorted(str(path) for path in subtitle_dir.glob(f'{video_id}.*.vtt'))
 manual_languages = sub_info.get('manual_languages', [])
 automatic_languages = sub_info.get('automatic_languages', [])
-mode = sub_info.get('mode', '')
+mode = str(os.environ.get('RESOLVED_MODE', '') or sub_info.get('mode', '')).strip()
 preferred_source_language = sub_info.get('preferred_source_language', '')
 preferred_source_kind = sub_info.get('preferred_source_kind', '')
+resolved_source_language = str(os.environ.get('RESOLVED_SOURCE_LANGUAGE', '') or '').strip()
+resolved_source_kind = str(os.environ.get('RESOLVED_SOURCE_KIND', '') or '').strip()
 
 if not files:
     raise SystemExit('❌ Error: Subtitle download completed but no VTT files were found')
@@ -806,12 +818,15 @@ for path in files:
 
 
 def family_candidates(languages, family):
-    exact = [lang for lang in languages if lang == family]
-    variants = [lang for lang in languages if lang.startswith(f'{family}-')]
-    return exact + variants
+    return [lang for lang in languages if lang == family or lang.startswith(f'{family}-')]
 
 
 def choose_file():
+    if resolved_source_language:
+        candidates = lang_to_files.get(resolved_source_language, [])
+        if candidates:
+            return candidates[0], resolved_source_language, (resolved_source_kind or preferred_source_kind or '')
+
     if mode == 'bilingual':
         family = 'en'
     elif mode == 'chinese':
@@ -856,6 +871,7 @@ print(json.dumps({
     'selected_source_vtt': selected_source_vtt,
     'selected_source_language': selected_source_language,
     'selected_source_kind': selected_source_kind,
+    'resolved_mode': mode,
     'warnings': warnings,
     'yt_dlp_runtime': json.loads(os.environ.get('YTDLP_RUNTIME_JSON', '{}') or '{}'),
 }, ensure_ascii=False))

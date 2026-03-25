@@ -267,8 +267,8 @@ exit 1
             self.assertIn("yt_dlp_cookies_file", result.stderr)
             self.assertIn("Netscape-format cookies.txt", result.stderr)
 
-    def test_subtitle_info_prefers_english_for_bilingual(self):
-        """Test subtitle info prefers english for bilingual."""
+    def test_subtitle_info_prefers_chinese_when_both_languages_exist(self):
+        """Test subtitle info prefers Chinese when both Chinese and English exist."""
         with tempfile.TemporaryDirectory() as tmpdir:
             fake_bin = Path(tmpdir) / "yt-dlp"
             fake_bin.write_text(
@@ -308,12 +308,12 @@ exit 1
             self.assertTrue(payload["has_manual"])
             self.assertTrue(payload["english_available"])
             self.assertTrue(payload["chinese_available"])
-            self.assertEqual(payload["preferred_source_language"], "en")
+            self.assertEqual(payload["preferred_source_language"], "zh-Hans")
             self.assertEqual(payload["preferred_source_kind"], "manual")
-            self.assertEqual(payload["mode"], "bilingual")
+            self.assertEqual(payload["mode"], "chinese")
 
-    def test_subtitle_info_stops_routing_unsupported_languages_as_chinese(self):
-        """Test subtitle info stops routing unsupported languages as chinese."""
+    def test_subtitle_info_marks_unsupported_languages_as_no_usable_subtitles(self):
+        """Test subtitle info treats non-Chinese/non-English tracks as no usable subtitles."""
         with tempfile.TemporaryDirectory() as tmpdir:
             fake_bin = Path(tmpdir) / "yt-dlp"
             fake_bin.write_text(
@@ -345,7 +345,7 @@ exit 1
                 text=True,
             )
             payload = json.loads(result.stdout)
-            self.assertTrue(payload["has_any"])
+            self.assertFalse(payload["has_any"])
             self.assertFalse(payload["english_available"])
             self.assertFalse(payload["chinese_available"])
             self.assertEqual(payload["preferred_source_language"], "")
@@ -423,12 +423,12 @@ exit 1
             self.assertEqual(payload["video_id"], "vidjson")
             self.assertTrue(payload["english_available"])
             self.assertTrue(payload["chinese_available"])
-            self.assertEqual(payload["preferred_source_language"], "en")
+            self.assertEqual(payload["preferred_source_language"], "zh-Hans")
             self.assertEqual(payload["preferred_source_kind"], "manual")
-            self.assertEqual(payload["mode"], "bilingual")
+            self.assertEqual(payload["mode"], "chinese")
 
-    def test_subtitles_selects_manual_english_source_file(self):
-        """Test subtitles selects manual english source file."""
+    def test_subtitles_selects_manual_chinese_source_file_when_available(self):
+        """Test subtitles selects a Chinese source file when Chinese subtitles are available."""
         with tempfile.TemporaryDirectory() as tmpdir:
             fake_bin = Path(tmpdir) / "yt-dlp"
             fake_bin.write_text(
@@ -451,18 +451,26 @@ EOF
 fi
 if [ "$1" = "--write-sub" ]; then
   out=''
+  langs=''
   while [ $# -gt 0 ]; do
     if [ "$1" = "-o" ]; then
       out="$2"
       shift 2
       continue
     fi
+    if [ "$1" = "--sub-lang" ]; then
+      langs="$2"
+      shift 2
+      continue
+    fi
     shift
   done
   mkdir -p "$(dirname "$out")"
-  : > "${out}.en.vtt"
-  : > "${out}.en-US.vtt"
-  : > "${out}.zh-Hans.vtt"
+  case "$langs" in
+    zh-Hans) : > "${out}.zh-Hans.vtt" ;;
+    en) : > "${out}.en.vtt" ;;
+    en-US) : > "${out}.en-US.vtt" ;;
+  esac
   exit 0
 fi
 exit 1
@@ -482,13 +490,14 @@ exit 1
                 text=True,
             )
             payload = json.loads(result.stdout)
-            self.assertEqual(payload["selected_source_vtt"], "/tmp/vid001_downloads/subtitles/vid001.en.vtt")
-            self.assertEqual(payload["selected_source_language"], "en")
+            self.assertEqual(payload["selected_source_vtt"], "/tmp/vid001_downloads/subtitles/vid001.zh-Hans.vtt")
+            self.assertEqual(payload["selected_source_language"], "zh-Hans")
             self.assertEqual(payload["selected_source_kind"], "manual")
+            self.assertEqual(payload["resolved_mode"], "chinese")
             shutil.rmtree("/tmp/vid001_downloads", ignore_errors=True)
 
-    def test_subtitles_selects_manual_english_source_file_from_isolated_dir(self):
-        """Test subtitles selects manual english source file from isolated dir."""
+    def test_subtitles_selects_manual_chinese_source_file_from_isolated_dir(self):
+        """Test subtitles selects a Chinese source file from the isolated subtitle dir."""
         with tempfile.TemporaryDirectory() as tmpdir:
             fake_bin = Path(tmpdir) / "yt-dlp"
             fake_bin.write_text(
@@ -505,18 +514,26 @@ EOF
 fi
 if [ "$1" = "--write-sub" ]; then
   out=''
+  langs=''
   while [ $# -gt 0 ]; do
     if [ "$1" = "-o" ]; then
       out="$2"
       shift 2
       continue
     fi
+    if [ "$1" = "--sub-lang" ]; then
+      langs="$2"
+      shift 2
+      continue
+    fi
     shift
   done
   mkdir -p "$(dirname "$out")"
-  : > "${out}.en.vtt"
-  : > "${out}.en-US.vtt"
-  : > "${out}.zh-Hans.vtt"
+  case "$langs" in
+    zh-Hans) : > "${out}.zh-Hans.vtt" ;;
+    en) : > "${out}.en.vtt" ;;
+    en-US) : > "${out}.en-US.vtt" ;;
+  esac
   exit 0
 fi
 exit 1
@@ -539,7 +556,7 @@ exit 1
                     text=True,
                 )
                 payload = json.loads(result.stdout)
-                self.assertEqual(payload["selected_source_vtt"], "/tmp/vid001_downloads/subtitles/vid001.en.vtt")
+                self.assertEqual(payload["selected_source_vtt"], "/tmp/vid001_downloads/subtitles/vid001.zh-Hans.vtt")
                 self.assertNotEqual(payload["selected_source_vtt"], str(stale))
                 self.assertTrue(Path(payload["selected_source_vtt"]).exists())
             finally:
@@ -606,8 +623,8 @@ exit 1
             self.assertEqual(payload["selected_source_kind"], "manual")
             shutil.rmtree("/tmp/vidgb_downloads", ignore_errors=True)
 
-    def test_subtitles_continue_when_optional_bilingual_track_fails(self):
-        """Test subtitles keep the required source track when optional bilingual debug track fails."""
+    def test_subtitles_fall_back_to_english_when_chinese_candidates_fail(self):
+        """Test subtitles fall back to English when advertised Chinese tracks cannot be downloaded."""
         with tempfile.TemporaryDirectory() as tmpdir:
             fake_bin = Path(tmpdir) / "yt-dlp"
             fake_bin.write_text(
@@ -635,13 +652,13 @@ if [ "$1" = "--write-sub" ]; then
     shift
   done
   mkdir -p "$(dirname "$out")"
-  if [ "$langs" = "en" ]; then
-    : > "${out}.en.vtt"
-    exit 0
-  fi
   if [ "$langs" = "zh-Hans" ]; then
     echo "ERROR: Unable to download video subtitles for 'zh-Hans': HTTP Error 429: Too Many Requests" >&2
     exit 1
+  fi
+  if [ "$langs" = "en" ]; then
+    : > "${out}.en.vtt"
+    exit 0
   fi
 fi
 exit 1
@@ -665,9 +682,10 @@ exit 1
                 self.assertEqual(payload["selected_source_vtt"], "/tmp/vidopt_downloads/subtitles/vidopt.en.vtt")
                 self.assertEqual(payload["selected_source_language"], "en")
                 self.assertEqual(payload["selected_source_kind"], "manual")
+                self.assertEqual(payload["resolved_mode"], "bilingual")
                 self.assertEqual(payload["chinese_files"], [])
                 self.assertEqual(len(payload["warnings"]), 1)
-                self.assertIn("continuing with required source track only", payload["warnings"][0])
+                self.assertIn("trying next available source track", payload["warnings"][0])
                 self.assertIn("zh-Hans", result.stderr)
             finally:
                 shutil.rmtree("/tmp/vidopt_downloads", ignore_errors=True)

@@ -296,7 +296,7 @@ Current policy is intentional and explicit:
 ### 🧭 Intentional Design Decisions
 
 - `bilingual` means English source text plus Chinese translation, not subtitle file merging
-- If both English and Chinese subtitles exist, English remains the only source text for content generation
+- If Chinese subtitles exist, they take precedence as the single subtitle source track; English is used only when no usable Chinese subtitle track can be downloaded
 - `config.yaml` is intentionally limited to flat top-level key/value entries; nested or multi-line YAML is not supported
 - YAML frontmatter values are always quoted on purpose to favor safe parsing over prettier formatting
 - Markdown header text is escaped and link destinations are encoded so edge-case titles/channels do not break output structure
@@ -319,8 +319,8 @@ Current policy is intentional and explicit:
 - `process-chunks --dry-run` validates prompts, manifests, and chunk budgets without requiring live LLM credentials; actual execution still requires `llm_api_key`, `llm_base_url`, and `llm_model`
 - `download.sh` now writes subtitle and audio artifacts into per-video isolated temp directories under `/tmp/${VIDEO_ID}_downloads/...` and exposes `download_dir` in JSON for deterministic selection and cleanup
 - `download.sh subtitles` now requests the exact selected subtitle language codes, so regional variants such as `en-GB` / `zh-TW` work instead of being dropped by a hard-coded whitelist
-- `download.sh subtitles` treats bilingual non-source Chinese subtitle downloads as best-effort debugging extras; if the required English source track succeeds, optional-track failures surface as warnings instead of aborting the workflow
-- subtitle-driven workflows intentionally support only English-source bilingual mode and Chinese-source monolingual mode; when only other subtitle languages exist, the workflow should stop and fall back to audio transcription
+- `download.sh subtitles` now tries one source-family candidate at a time: Chinese first, then English only as a fallback when no usable Chinese track can be downloaded
+- subtitle-driven workflows still support Chinese-source monolingual mode and English-source bilingual mode; when neither usable Chinese nor English subtitles can be downloaded, the workflow should stop and fall back to audio transcription
 - `plan-optimization` is the canonical short/long router with `< 1800s = short` and `>= 1800s = long`; the Quick Mode shortcut from `SKILL.md` is a narrower `< 900s` subset for subtitle-friendly videos
 - `manifest.json` now separates immutable `plan` metadata from `runtime` state, and `process-chunks` records attempt-level telemetry (`attempt_logs`) in addition to chunk-level fields
 - `process-chunks` no longer rewrites the current batch budget on the fly; when canary chunks or retry history show the plan is unhealthy, it aborts with `replan_required=true` so `replan-remaining` can generate a new plan for unfinished raw chunks
@@ -628,7 +628,7 @@ bash scripts/preflight.sh --require-llm
 ### 🧭 设计上的刻意取舍
 
 - `bilingual` 表示“英文源文本 + 中文翻译”，不是直接合并双字幕文件
-- 当中英字幕同时存在时，内容生成仍只使用英文字幕作为源文本
+- 如果存在可用中文字幕，会优先把其中一个中文字幕轨作为唯一源文本；只有在中文字幕不可用时才回退到英文字幕
 - `config.yaml` 被刻意限制为扁平的顶层键值配置，不支持嵌套结构或多行 YAML
 - YAML frontmatter 的值会统一加引号，优先保证解析安全，而不是追求最简洁的展示
 - Markdown 头部里的标题/频道文本会做转义，链接目标会做编码，避免边界字符破坏结构
@@ -638,7 +638,7 @@ bash scripts/preflight.sh --require-llm
 - `transcribe-deepgram --output-segments` 可选输出带时间戳的对齐 segments，用于后续 timed chunk 与 YouTube 章节映射
 - `transcribe-deepgram` 现在默认就是 utterance-first 组装；仍保留 `--disable-utterances --legacy-flat-output` 作为兼容/排障回退
 - `transcribe-deepgram` 现在还会在结果 JSON 中输出轻量可观测字段，例如 paragraph/sentence/word 计数、逐 chunk 的 transcript 元数据，以及 structured-output 回退 warning
-- `download.sh subtitles` 会把双语模式下的中文调试字幕当作 best-effort 附加产物；只要必需的英文源轨已经成功，可选轨失败只会产生 warning，不会中断主流程
+- `download.sh subtitles` 现在会按“中文优先、英文回退”的顺序一次只尝试一个源字幕轨；当可见的中文字幕下载失败时，才会继续尝试英文字幕
 - `chunk-segments` 基于 segments 生成带时间轴的 timed manifest；`build-chapter-plan` 可将 YouTube chapters 映射到 chunk 边界，供 `merge-content` 注入标题
 - `parse-vtt-segments` 可从字幕 VTT 生成同格式的带时间戳 segments，用于 timed chunk 与章节映射
 - `chunk-segments --chapters` 可选在 YouTube 章节起点强制切 chunk，减少章节标题漂移

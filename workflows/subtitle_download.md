@@ -34,20 +34,21 @@ Record from JSON:
 
 Rules:
 
-- If English subtitles are available, set `mode=bilingual` and use English as the source text
-- Else if Chinese subtitles are available, set `mode=chinese` and use Chinese as the source text
+- If Chinese subtitles are available, prefer a Chinese subtitle track as the source text
+- Else if English subtitles are available, set `mode=bilingual` and use English as the source text
 - Else STOP
-- If only unsupported subtitle languages exist, `subtitle-info` may still report `has_any=true`, but `mode` remains empty and this workflow must STOP and switch to audio transcription
+- If only unsupported subtitle languages exist, `subtitle-info` reports `has_any=false` and the workflow must switch to audio transcription
 
 Explicit product rule:
 
-- If both English and Chinese subtitles exist, bilingual mode still uses English subtitles as the only source text for content generation
-- The Chinese subtitle file is not merged into the output; bilingual output is produced by translating the English source text
+- If Chinese subtitles exist, they take precedence as the single subtitle source track
+- Only when no usable Chinese subtitle track exists do we fall back to a single English subtitle source track
+- Bilingual output is produced only when the selected source track is English; subtitle files are never merged together
 
 Write to state:
 
 - `src: youtube`
-- `mode: chinese|bilingual`
+- `mode: chinese|bilingual` (provisional; confirm with `resolved_mode` after download)
 - `source_language: <preferred_source_language>`
 - `subtitle_source: YouTube Subtitles`
 
@@ -68,11 +69,11 @@ Record:
 - `selected_source_vtt`
 - `selected_source_language`
 - `selected_source_kind`
+- `resolved_mode`
 
 `download_dir` points to the per-video isolated temp directory used by the script.
 
-The script downloads the exact selected subtitle language codes instead of a fixed whitelist, so regional variants such as `en-GB` and `zh-TW` are preserved.
-In bilingual mode, non-source Chinese subtitle files are treated as optional debugging artifacts; if they fail to download but the required English source track succeeds, the workflow may continue with a warning.
+The script attempts one source track at a time instead of fetching multiple subtitle families together. It tries Chinese tracks first when available, then falls back to English tracks only if no usable Chinese track can be downloaded. Regional variants such as `en-GB` and `zh-TW` are preserved.
 
 If no VTT files were downloaded, STOP.
 
@@ -87,11 +88,9 @@ Use:
 - `selected_source_vtt` for raw-text extraction
 - `selected_source_language` for state
 - `selected_source_kind` for debugging/reporting
+- `resolved_mode` for the downstream optimization mode
 
-Optional:
-
-- When `mode=bilingual` and Chinese VTT also exists, keep it on disk for debugging only
-- Do not merge two subtitle files directly in this workflow
+Do not merge two subtitle files directly in this workflow.
 
 ---
 
@@ -111,6 +110,7 @@ python3 <skill-root>/yt_transcript_utils.py parse-vtt-segments \
 Write to state:
 
 - `step: 3`
+- `mode: <resolved_mode>`
 - `source_language: <selected_source_language>`
 - `last_action: parsed subtitles to raw text`
 

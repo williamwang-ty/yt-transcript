@@ -1033,7 +1033,8 @@ Long-text transformation is central, but it is not the whole product.
 The current project intentionally commits to a few product-level decisions:
 
 - `bilingual` means English source text plus Chinese translation
-- if both English and Chinese subtitles exist, English remains the source text for generation
+- if usable Chinese subtitles exist, they take precedence as the single subtitle source track
+- English is used only when no usable Chinese subtitle track can be downloaded
 - subtitle-based acquisition is preferred when it is good enough
 - Deepgram is a fallback acquisition path, not the default path for every video
 - the current design is local-first rather than multi-tenant platform-first
@@ -2166,7 +2167,8 @@ merge 被刻意设计得尽量简单。
 当前项目明确坚持几条产品口径：
 
 - `bilingual` 表示英文源文本 + 中文翻译
-- 当中英字幕同时存在时，内容生成仍以英文字幕为 source text
+- 如果存在可用中文字幕，会优先把其中一个中文字幕轨作为唯一 source text
+- 只有在没有可用中文字幕轨时，才回退到英文字幕作为 source text
 - 当字幕质量足够时，优先走字幕路径
 - Deepgram 是兜底获取路径，而不是每个视频都默认走的主路径
 - 当前设计优先 local-first，而不是 multi-tenant platform-first
