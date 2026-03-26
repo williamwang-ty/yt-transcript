@@ -128,6 +128,92 @@ class RuntimeRegressionTests(unittest.TestCase):
             self.assertTrue(result["passed"], result)
             self.assertLess(bundle["quality_report"]["term_consistency_score"], 1.0)
 
+    def test_contract_bundle_preserves_planner_subtitle_reroute_signals(self):
+        """Test planner contract bundles retain subtitle-quality route explanations."""
+        from kernel.task_runtime import contracts as runtime_contracts
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state = Path(tmpdir) / "state.md"
+            raw_text = Path(tmpdir) / "vid001_raw.txt"
+            segments = Path(tmpdir) / "vid001_segments.json"
+            raw_text.write_text(
+                "\n".join([
+                    "我 们",
+                    "先 看",
+                    "这 里",
+                    "再 说",
+                    "下 一",
+                    "步 呢",
+                    "你 看",
+                    "对 吧",
+                    "现 在",
+                    "继 续",
+                    "往 下",
+                    "讲 吧",
+                ]),
+                encoding="utf-8",
+            )
+            segments.write_text(
+                json.dumps(
+                    {
+                        "source": "vtt",
+                        "language": "zh-Hans",
+                        "diagnostics": {
+                            "cue_count": 20,
+                            "empty_cue_count": 3,
+                            "exact_duplicate_cue_count": 5,
+                            "overlap_trim_count": 5,
+                            "overlap_collapsed_cue_count": 2,
+                            "markup_tag_count": 8,
+                            "nbsp_entity_count": 4,
+                            "collapsed_cjk_spacing_count": 12,
+                            "tightened_punctuation_spacing_count": 6,
+                            "tightened_bracket_spacing_count": 2,
+                        },
+                        "segments": [
+                            {"id": idx, "text": f"片段 {idx}", "start_time": float(idx), "end_time": float(idx + 1)}
+                            for idx in range(20)
+                        ],
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            state.write_text(
+                "# State\n"
+                "vid: vid001\n"
+                "url: https://example.com/watch?v=1\n"
+                "title: Sample\n"
+                "channel: Channel\n"
+                "upload_date: 20260308\n"
+                "duration: 120\n"
+                "output_dir: /tmp/out\n"
+                "mode: chinese\n"
+                "src: youtube\n"
+                "source_language: zh-Hans\n"
+                "subtitle_source: YouTube Subtitles\n"
+                f"raw_text: {raw_text}\n"
+                f"segments_path: {segments}\n"
+                "work_dir: /tmp/vid001_chunks\n",
+                encoding="utf-8",
+            )
+
+            result = utils.plan_optimization(str(state))
+            bundle = runtime_contracts.build_command_contract_bundle(
+                "plan-optimization",
+                result,
+                context={"state_path": str(state)},
+                trace_id="trace_plan_subtitle_quality",
+            )
+
+            self.assertEqual(
+                bundle["quality_report"]["checks"]["source_route_reason"],
+                "subtitle_quality_critical_deepgram_recommended",
+            )
+            self.assertTrue(bundle["quality_report"]["checks"]["reroute_recommended"])
+            self.assertEqual(bundle["quality_report"]["checks"]["reroute_target"], "deepgram")
+            self.assertLess(bundle["quality_report"]["checks"]["subtitle_quality_score"], 0.35)
+
     def test_llm_assisted_decision_selects_only_allowed_actions(self):
         """Test llm-assisted decisioning can rank within the allowed action set only."""
         from kernel.task_runtime import decision as runtime_decision

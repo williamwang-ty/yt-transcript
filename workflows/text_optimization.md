@@ -41,8 +41,13 @@ Read from JSON:
 - `operations`
 - `replan_contract`
 - `outputs`
+- `source_route_reason`
+- `reroute_recommended`
+- `reroute_target`
 
 If `hard_failures` is non-empty, STOP.
+
+If `reroute_recommended=true` and `reroute_target=deepgram`, STOP this subtitle optimization path and switch back to the Deepgram source workflow before continuing.
 
 If `requires_llm_preflight=true`, ensure:
 
@@ -51,6 +56,8 @@ bash <skill-root>/scripts/preflight.sh --require-llm
 ```
 
 `plan-optimization` is the canonical router here. It still reports the raw `duration_bucket` (`short` for `< 1800s`, `long` for `>= 1800s`), but `video_path` may escalate a short-duration transcript to chunked execution when the normalized input is too large for reliable single-pass prompting. The separate Quick Mode from `SKILL.md` is a narrower `< 900` second shortcut inside the short-duration bucket.
+
+`routing_reason` explains duration/size routing. `source_route_reason` explains source-quality routing, including subtitle quality scoring and any Deepgram fallback recommendation.
 
 ---
 

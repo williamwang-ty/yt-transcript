@@ -1197,6 +1197,9 @@ class CoreRegressionTests(unittest.TestCase):
             self.assertEqual(payload["content"]["preferred_chunk_source"], "text")
             self.assertEqual(payload["content"]["text"], "你好，\n\n第二行。")
             self.assertEqual(payload["diagnostics"]["subtitle_cleanup"]["overlap_trim_count"], 1)
+            self.assertIn("subtitle_quality", payload["diagnostics"])
+            self.assertTrue(payload["diagnostics"]["subtitle_quality"]["applicable"])
+            self.assertGreaterEqual(payload["diagnostics"]["subtitle_quality"]["subtitle_quality_score"], 0.75)
             self.assertEqual(
                 [segment["text"] for segment in payload["segments"]],
                 ["你好，", "第二行。"],
@@ -1331,6 +1334,154 @@ work_dir: /tmp/vid001_chunks
             self.assertEqual([op["prompt"] for op in result["operations"]], ["cleanup_zh"])
             self.assertEqual(result["operations"][0]["execution"]["mode"], "single_pass")
             self.assertEqual(result["operations"][0]["extra_instruction"], "")
+            self.assertEqual(result["source_route_reason"], "subtitle_quality_pending")
+            self.assertFalse(result["reroute_recommended"])
+
+    def test_plan_optimization_recommends_deepgram_for_critical_chinese_subtitles(self):
+        """Test plan optimization recommends Deepgram when subtitle quality is critically poor."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state = Path(tmpdir) / "state.md"
+            raw_text = Path(tmpdir) / "vid001_raw.txt"
+            segments = Path(tmpdir) / "vid001_segments.json"
+            raw_text.write_text(
+                "\n".join([
+                    "我 们",
+                    "先 看",
+                    "这 里",
+                    "再 说",
+                    "下 一",
+                    "步 呢",
+                    "你 看",
+                    "对 吧",
+                    "现 在",
+                    "继 续",
+                    "往 下",
+                    "讲 吧",
+                ]),
+                encoding="utf-8",
+            )
+            segments.write_text(
+                json.dumps(
+                    {
+                        "source": "vtt",
+                        "language": "zh-Hans",
+                        "diagnostics": {
+                            "cue_count": 20,
+                            "empty_cue_count": 3,
+                            "exact_duplicate_cue_count": 5,
+                            "overlap_trim_count": 5,
+                            "overlap_collapsed_cue_count": 2,
+                            "markup_tag_count": 8,
+                            "nbsp_entity_count": 4,
+                            "collapsed_cjk_spacing_count": 12,
+                            "tightened_punctuation_spacing_count": 6,
+                            "tightened_bracket_spacing_count": 2,
+                        },
+                        "segments": [
+                            {"id": idx, "text": f"片段 {idx}", "start_time": float(idx), "end_time": float(idx + 1)}
+                            for idx in range(20)
+                        ],
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            state.write_text(
+                "# State\n"
+                "vid: vid001\n"
+                "url: https://example.com/watch?v=1\n"
+                "title: Sample\n"
+                "channel: Channel\n"
+                "upload_date: 20260308\n"
+                "duration: 120\n"
+                "output_dir: /tmp/out\n"
+                "mode: chinese\n"
+                "src: youtube\n"
+                "source_language: zh-Hans\n"
+                "subtitle_source: YouTube Subtitles\n"
+                f"raw_text: {raw_text}\n"
+                f"segments_path: {segments}\n"
+                "work_dir: /tmp/vid001_chunks\n",
+                encoding="utf-8",
+            )
+
+            result = utils.plan_optimization(str(state))
+
+            self.assertTrue(result["passed"], result)
+            self.assertTrue(result["reroute_recommended"])
+            self.assertEqual(result["reroute_target"], "deepgram")
+            self.assertEqual(result["source_route_reason"], "subtitle_quality_critical_deepgram_recommended")
+            self.assertEqual(result["checks"]["source_route_reason"], "subtitle_quality_critical_deepgram_recommended")
+            self.assertEqual(result["subtitle_quality_band"], "critical")
+            self.assertLess(result["subtitle_quality_score"], 0.35)
+            self.assertGreater(result["checks"]["overlap_reduction_count"], 0)
+            self.assertEqual(result["normalization"]["subtitle_quality"]["subtitle_quality_band"], "critical")
+            self.assertTrue(any("Deepgram before text optimization is recommended" in warning for warning in result["warnings"]))
+
+    def test_plan_optimization_keeps_bilingual_subtitles_on_manual_review_for_critical_quality(self):
+        """Test poor bilingual subtitle quality warns without auto-rerouting to Deepgram."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state = Path(tmpdir) / "state.md"
+            raw_text = Path(tmpdir) / "vid001_raw.txt"
+            segments = Path(tmpdir) / "vid001_segments.json"
+            raw_text.write_text(
+                "\n".join([f"segment {idx}" for idx in range(12)]),
+                encoding="utf-8",
+            )
+            segments.write_text(
+                json.dumps(
+                    {
+                        "source": "vtt",
+                        "language": "en",
+                        "diagnostics": {
+                            "cue_count": 20,
+                            "empty_cue_count": 3,
+                            "exact_duplicate_cue_count": 5,
+                            "overlap_trim_count": 5,
+                            "overlap_collapsed_cue_count": 2,
+                            "markup_tag_count": 8,
+                            "nbsp_entity_count": 4,
+                            "collapsed_cjk_spacing_count": 12,
+                            "tightened_punctuation_spacing_count": 6,
+                            "tightened_bracket_spacing_count": 2,
+                        },
+                        "segments": [
+                            {"id": idx, "text": f"segment {idx}", "start_time": float(idx), "end_time": float(idx + 1)}
+                            for idx in range(20)
+                        ],
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            state.write_text(
+                "# State\n"
+                "vid: vid001\n"
+                "url: https://example.com/watch?v=1\n"
+                "title: Sample\n"
+                "channel: Channel\n"
+                "upload_date: 20260308\n"
+                "duration: 120\n"
+                "output_dir: /tmp/out\n"
+                "mode: bilingual\n"
+                "src: youtube\n"
+                "source_language: en\n"
+                "subtitle_source: YouTube Subtitles\n"
+                f"raw_text: {raw_text}\n"
+                f"segments_path: {segments}\n"
+                "work_dir: /tmp/vid001_chunks\n",
+                encoding="utf-8",
+            )
+
+            result = utils.plan_optimization(str(state))
+
+            self.assertTrue(result["passed"], result)
+            self.assertFalse(result["reroute_recommended"])
+            self.assertEqual(result["reroute_target"], "")
+            self.assertEqual(result["source_route_reason"], "subtitle_quality_critical_manual_review_only")
+            self.assertEqual(result["subtitle_quality_band"], "critical")
+            self.assertLess(result["subtitle_quality_score"], 0.35)
+            self.assertTrue(any("continue only with manual review" in warning for warning in result["warnings"]))
 
     def test_plan_optimization_returns_long_deepgram_operations(self):
         """Test plan optimization returns long deepgram operations."""

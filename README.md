@@ -288,7 +288,9 @@ At the whole-project level, it is the routing boundary between source acquisitio
 - `operations[*].execution.recommended_cli_flags`
 - `operations[*].execution.on_replan_required`
 
-`normalize-document` materializes `/tmp/${VIDEO_ID}_normalized_document.json` from either raw text or timed `segments.json`, and `plan-optimization` auto-materializes it when source artifacts already exist. When the source segments came from subtitle cleanup, the normalized document now also preserves lightweight cleanup diagnostics under `diagnostics.subtitle_cleanup`.
+`normalize-document` materializes `/tmp/${VIDEO_ID}_normalized_document.json` from either raw text or timed `segments.json`, and `plan-optimization` auto-materializes it when source artifacts already exist. When the source segments came from subtitle cleanup, the normalized document now also preserves lightweight cleanup diagnostics under `diagnostics.subtitle_cleanup` and an explainable subtitle-path quality summary under `diagnostics.subtitle_quality`.
+
+`plan-optimization` now separates duration routing from source routing: `routing_reason` still explains short-vs-long execution, while `source_route_reason`, `subtitle_quality_score`, `reroute_recommended`, and `reroute_target` explain whether the current subtitle source should be kept, manually reviewed, or replaced with Deepgram.
 
 For long-video chunking, `plan-optimization` now also emits a canonical `chunking` block; when normalization exists, `chunk-document` is the preferred driver and it keeps chunk boundary / continuity assumptions explicit in `manifest.json`.
 
@@ -315,7 +317,8 @@ Current policy is intentional and explicit:
 - `transcribe-deepgram` now also reports lightweight observability fields such as paragraph/sentence/word counts, per-chunk transcript metadata, and fallback warnings in its result JSON
 - `chunk-segments` produces timed chunk manifests, and `build-chapter-plan` maps YouTube chapters onto chunk boundaries for `merge-content`
 - `parse-vtt` / `parse-vtt-segments` now use subtitle-aware cleanup so CJK subtitle fragments are not re-joined with stray ASCII spaces
-- `parse-vtt-segments` now also emits lightweight cleanup diagnostics such as duplicate/overlap trimming counters, and `normalize-document` carries those subtitle-cleanup signals into `normalized_document.json`
+- `parse-vtt-segments` now also emits lightweight cleanup diagnostics such as duplicate/overlap trimming counters, and `normalize-document` carries those subtitle-cleanup signals plus a deterministic `subtitle_quality_score` into `normalized_document.json`
+- `plan-optimization` now exposes explainable source-route fields such as `source_route_reason`, `reroute_recommended`, `reroute_target`, and `reroute_reasons`; critically poor Chinese subtitle paths can recommend Deepgram fallback without silently changing the current workflow shell
 - `merge-content` now runs a deterministic post-merge cleanup pass to repair chunk seams, merge obviously split short fragments, and drop immediately duplicated heading/body seams without asking the LLM to rewrite the document
 - `chunk-segments --chapters` can force chunk boundaries at YouTube chapter starts to reduce heading drift
 - `chunk-text` now defaults to token-aware planning when `--prompt` is provided, while an explicit `--chunk-size` without `--prompt` keeps legacy character sizing for workflow compatibility
@@ -355,6 +358,7 @@ Current policy is intentional and explicit:
 - `Deepgram unified entry`: `python3 yt_transcript_utils.py transcribe-deepgram ...`
 - `Deepgram result observability`: `/tmp/${VIDEO_ID}_deepgram_result.json` now exposes per-chunk `chunk_reports`, aggregate structure counts, and `warnings` when segment extraction falls back from richer structures
 - `quality gate`: `verify-quality` JSON where `hard_failures` means STOP, `warnings` means review before proceeding, and `checks` carries the readability metrics behind those warnings. Pass `--work-dir` or `--glossary-path` when available to enable glossary drift checks.
+- `source routing`: the planning-layer decision about whether the current subtitle/deepgram source should continue as-is. `routing_reason` covers duration/size routing; `source_route_reason` covers source-quality routing.
 
 ### 🧪 Validation Matrix
 
@@ -640,7 +644,9 @@ bash scripts/preflight.sh --require-llm
 - `operations[*].execution.recommended_cli_flags`
 - `operations[*].execution.on_replan_required`
 
-`normalize-document` 会基于 raw text 或带时间戳的 `segments.json` 物化 `/tmp/${VIDEO_ID}_normalized_document.json`；当源 artifact 已存在时，`plan-optimization` 也会自动完成这一步。如果这些 segments 来自字幕清洗阶段，标准化文档还会把轻量清洗诊断透传到 `diagnostics.subtitle_cleanup`。
+`normalize-document` 会基于 raw text 或带时间戳的 `segments.json` 物化 `/tmp/${VIDEO_ID}_normalized_document.json`；当源 artifact 已存在时，`plan-optimization` 也会自动完成这一步。如果这些 segments 来自字幕清洗阶段，标准化文档还会把轻量清洗诊断透传到 `diagnostics.subtitle_cleanup`，并在 `diagnostics.subtitle_quality` 下写入可解释的字幕源质量摘要。
+
+`plan-optimization` 现在把“时长/体积路由”和“源路径质量路由”分开表达：`routing_reason` 仍只解释 short/long 执行路径，而 `source_route_reason`、`subtitle_quality_score`、`reroute_recommended`、`reroute_target` 用来解释当前字幕源是继续沿用、只做人工复核，还是建议切换到 Deepgram。
 
 对于长视频分块，`plan-optimization` 现在还会输出显式的 `chunking` 契约；一旦 normalization 已存在，优先使用 `chunk-document`，并把 chunk 边界 / continuity 假设显式记录到 `manifest.json`。
 
@@ -671,7 +677,8 @@ bash scripts/preflight.sh --require-llm
 - 当首选字幕轨因为 `HTTP 429` 这类鉴权/限流问题失败时，`download.sh subtitles` 现在会先用 Chrome cookies 对同一条轨重试，再决定是否回退到下一条候选
 - `chunk-segments` 基于 segments 生成带时间轴的 timed manifest；`build-chapter-plan` 可将 YouTube chapters 映射到 chunk 边界，供 `merge-content` 注入标题
 - `parse-vtt` / `parse-vtt-segments` 现在都会做 subtitle-aware cleanup，避免 CJK 字幕碎片在重新拼接时被错误插入 ASCII 空格
-- `parse-vtt-segments` 现在还会输出轻量 cleanup diagnostics，例如重复 cue / overlap 裁剪计数；`normalize-document` 会把这些字幕清洗信号透传进 `normalized_document.json`
+- `parse-vtt-segments` 现在还会输出轻量 cleanup diagnostics，例如重复 cue / overlap 裁剪计数；`normalize-document` 会把这些字幕清洗信号以及确定性的 `subtitle_quality_score` 一并透传进 `normalized_document.json`
+- `plan-optimization` 现在会显式输出 `source_route_reason`、`reroute_recommended`、`reroute_target`、`reroute_reasons` 等源路径解释字段；当中文字幕路径质量极差时，它会建议切到 Deepgram，但不会静默改写当前 workflow shell
 - `merge-content` 现在还会执行一层 deterministic post-merge cleanup，用于修复 chunk seam 重复、重新拼合明显被拆开的短碎段，并去掉紧邻重复的标题/正文接缝，而不是把这些机械问题继续留给 LLM
 - `chunk-segments --chapters` 可选在 YouTube 章节起点强制切 chunk，减少章节标题漂移
 - 如果只传显式 `--chunk-size` 而不传 `--prompt`，`chunk-text` 会继续按 legacy 字符大小解释，避免现有 workflow 被静默改变
@@ -701,6 +708,7 @@ bash scripts/preflight.sh --require-llm
 - `Deepgram 统一入口`：`python3 yt_transcript_utils.py transcribe-deepgram ...`
 - `Deepgram 结果可观测性`：`/tmp/${VIDEO_ID}_deepgram_result.json` 现在会暴露逐 chunk 的 `chunk_reports`、聚合结构计数，以及 structured-output 回退时的 `warnings`
 - `质量门禁`：读取 `verify-quality` 的 JSON；`hard_failures` 表示必须 STOP，`warnings` 表示需要人工复核，`checks` 则给出这些告警背后的可读性指标。有 work_dir 或现成 glossary 时，建议额外传 `--work-dir` 或 `--glossary-path` 打开 glossary drift 检查。
+- `源路径路由`：规划层决定当前 subtitle / Deepgram 源是否继续沿用。`routing_reason` 负责解释时长/输入体积路由，`source_route_reason` 负责解释源质量路由。
 
 ### 🧪 验证矩阵
 
