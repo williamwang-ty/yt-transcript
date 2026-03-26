@@ -28,6 +28,13 @@ def _single_line_text(value) -> str:
     return " ".join(str(value or "").split())
 
 
+def _parse_bool(value) -> bool:
+    """Parse boolean-like values conservatively."""
+    if isinstance(value, bool):
+        return value
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _string_list(values) -> list[str]:
     """Normalize a list-like input into a list of strings."""
     if isinstance(values, (list, tuple, set)):
@@ -48,6 +55,15 @@ def _timeout_signal(result: dict) -> bool:
     return "timeout" in text or "timed out" in text
 
 
+def _wants_deepgram_fallback(quality_report: dict | None = None) -> bool:
+    """Return whether the current quality report recommends a Deepgram reroute."""
+    quality_payload = quality_report if isinstance(quality_report, dict) else {}
+    if str(quality_payload.get("recommended_action", "")).strip() == "fallback_to_deepgram":
+        return True
+    checks = quality_payload.get("checks", {}) if isinstance(quality_payload.get("checks", {}), dict) else {}
+    return _parse_bool(checks.get("reroute_recommended")) and str(checks.get("reroute_target", "")).strip() == "deepgram"
+
+
 def evaluate_policy(*, run_state: dict | None = None, result=None,
                     context: dict | None = None, quality_report: dict | None = None,
                     profile: str = DEFAULT_POLICY_PROFILE) -> dict:
@@ -61,6 +77,7 @@ def evaluate_policy(*, run_state: dict | None = None, result=None,
     effective_status = str(run_state.get("effective_runtime_status", "")).strip() or lifecycle_state
     allowed_actions = []
     blocked_actions = []
+    reroute_to_deepgram = _wants_deepgram_fallback(quality_report)
 
     if active_stage == "processing":
         allowed_actions.extend(["continue_stage", "pause_run", "abort_run"])
@@ -82,7 +99,10 @@ def evaluate_policy(*, run_state: dict | None = None, result=None,
     elif active_stage == "assemble":
         allowed_actions.extend(["continue_stage", "abort_run"])
     elif active_stage in {"planning", "normalize", "preflight", "source"}:
-        allowed_actions.extend(["continue_stage", "request_human_escalation", "abort_run"])
+        if reroute_to_deepgram:
+            allowed_actions.extend(["fallback_to_deepgram", "request_human_escalation", "abort_run"])
+        else:
+            allowed_actions.extend(["continue_stage", "request_human_escalation", "abort_run"])
     else:
         allowed_actions.extend(["continue_stage", "abort_run"])
 

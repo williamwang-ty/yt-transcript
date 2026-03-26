@@ -90,6 +90,33 @@ def _read_optional_text(path_text: str) -> str:
         return ""
 
 
+def _is_simple_ascii_term(term: str) -> bool:
+    """Return whether a term can safely use ASCII token-boundary matching."""
+    token = str(term or "").strip()
+    return bool(token) and all(char.isascii() and (char.isalnum() or char in "_-") for char in token)
+
+
+def _build_term_search_pattern(term: str, *, ignore_case: bool = False):
+    """Build a boundary-aware regex for glossary term matching."""
+    token = str(term or "").strip()
+    if not token:
+        return None
+
+    flags = re.IGNORECASE if ignore_case and any(char.isascii() and char.isalpha() for char in token) else 0
+    escaped = re.escape(token)
+    if _is_simple_ascii_term(token):
+        return re.compile(rf"(?<![A-Za-z0-9]){escaped}(?![A-Za-z0-9])", flags)
+    return re.compile(escaped, flags)
+
+
+def _text_contains_term(text: str, term: str, *, ignore_case: bool = False) -> bool:
+    """Return whether text contains a glossary term without substring false positives."""
+    pattern = _build_term_search_pattern(term, ignore_case=ignore_case)
+    if pattern is None:
+        return False
+    return bool(pattern.search(str(text or "")))
+
+
 def _load_manifest_payload(work_dir: str) -> dict:
     """Load manifest.json from a work directory."""
     work_path = Path(str(work_dir or "")).expanduser().resolve()
@@ -413,14 +440,13 @@ def select_glossary_terms(glossary_payload: dict, source_text: str, *, max_terms
     source = str(source_text or "")
     terms = glossary_payload.get("terms", []) if isinstance(glossary_payload.get("terms", []), list) else []
     matched = []
-    lowered_source = source.lower()
     for entry in terms:
         if not isinstance(entry, dict):
             continue
         term = str(entry.get("term", "")).strip()
         if not term:
             continue
-        if term.lower() in lowered_source:
+        if _text_contains_term(source, term, ignore_case=True):
             matched.append(entry)
     matched.sort(
         key=lambda entry: (
@@ -485,7 +511,7 @@ def evaluate_glossary_terms(glossary_payload: dict, source_text: str, result_tex
         expected = preferred_output or term
         if term:
             selected_term_names.append(term)
-        if expected and expected not in result:
+        if expected and not _text_contains_term(result, expected, ignore_case=False):
             missing_terms.append(term)
         elif term:
             preserved_terms.append(term)

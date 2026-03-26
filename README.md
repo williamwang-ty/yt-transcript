@@ -340,6 +340,7 @@ Current policy is intentional and explicit:
 - `process-chunks` no longer rewrites the current batch budget on the fly; when canary chunks or retry history show the plan is unhealthy, it aborts with `replan_required=true` so `replan-remaining` can generate a new plan for unfinished raw chunks
 - `process-chunks --auto-replan` preserves that architecture boundary while automating the orchestration loop (`process -> replan-remaining -> resume`) for raw-path plans
 - `build-glossary --mode transcript` now mines glossary terms from raw chunks plus any available normalized-document title/channel, chapter titles, and optional metadata/description context; `cleanup_zh` auto-builds that glossary when the work_dir does not have one yet
+- glossary selection and verification now use boundary-aware matching for simple ASCII terms, so acronyms like `API` do not get falsely selected from unrelated words such as `rapid` or `capital`
 - `run_kernel_command(...)` is the stable Python envelope API for kernel commands, and `python3 yt_transcript_utils.py --api-envelope ...` emits the same `yt_transcript.command_result/v1` envelope on the CLI without breaking legacy flat JSON output
 - envelope-producing kernel commands append local `yt_transcript.telemetry_event/v1` records to `telemetry.jsonl` when a stable nearby sink path can be inferred
 - `runtime.status` now distinguishes `completed`, `completed_with_errors`, and `aborted`, and raw-path replans remap existing `chapter_plan.json` chunk starts so merged chapter headers still land on valid chunk boundaries
@@ -348,6 +349,7 @@ Current policy is intentional and explicit:
 - `preflight.sh` is staged so subtitle-only workflows do not require Deepgram or LLM credentials up front, while `--require-llm` now performs both reachability and token-count capability probes
 - `transcribe-deepgram` is the only supported Deepgram entry point; split / merge behavior is owned by the Python utility
 - `verify-quality` is a hard gate only when `hard_failures` is non-empty; `warnings` are advisory review signals, and `checks` now expose explainable readability metrics such as `chunk_seam_warning_count`, `cjk_space_ratio`, `duplicate_ngram_ratio`, `short_paragraph_ratio`, `header_density`, `punctuation_density`, `glossary_drift_count`, and `glossary_preservation_ratio`
+- bilingual `verify-quality` now detects adjacent English-to-Chinese paragraph pairs from the full body stream, so short intro paragraphs before paired EN/ZH blocks no longer trigger a false hard failure
 
 ### 📘 Canonical Terms
 
@@ -359,6 +361,7 @@ Current policy is intentional and explicit:
 - `Deepgram result observability`: `/tmp/${VIDEO_ID}_deepgram_result.json` now exposes per-chunk `chunk_reports`, aggregate structure counts, and `warnings` when segment extraction falls back from richer structures
 - `quality gate`: `verify-quality` JSON where `hard_failures` means STOP, `warnings` means review before proceeding, and `checks` carries the readability metrics behind those warnings. Pass `--work-dir` or `--glossary-path` when available to enable glossary drift checks.
 - `source routing`: the planning-layer decision about whether the current subtitle/deepgram source should continue as-is. `routing_reason` covers duration/size routing; `source_route_reason` covers source-quality routing.
+- `runtime reroute action`: when `plan-optimization` / `verify-quality` reports `reroute_recommended=true` with `reroute_target=deepgram`, runtime contracts normalize that into `recommended_action=fallback_to_deepgram` so policy, evaluator, and decision outputs stay aligned
 
 ### 🧪 Validation Matrix
 
@@ -692,12 +695,14 @@ bash scripts/preflight.sh --require-llm
 - `process-chunks` 不再在当前 batch 内偷偷改预算；如果 canary 或重试历史表明当前 plan 不健康，会以 `replan_required=true` 终止，并通过 `replan-remaining` 为剩余原始 chunk 生成新计划
 - `process-chunks --auto-replan` 会在不破坏上述边界的前提下，自动编排 `process -> replan-remaining -> resume` 这一恢复链路（仅适用于 `raw_path` 计划）
 - `build-glossary --mode transcript` 现在会从 raw chunk、可用的 normalized document 标题/频道、chapter 标题，以及可选 metadata/description 上下文中抽取术语；当 `cleanup_zh` 的 work_dir 里还没有 glossary 时，`process-chunks` 会自动生成这一份 glossary
+- glossary 的筛选与校验现在会对简单 ASCII 术语做边界感知匹配，因此像 `API` 这样的缩写不会再因为 `rapid`、`capital` 之类的无关单词而误命中
 - `runtime.status` 现在会区分 `completed` / `completed_with_errors` / `aborted`，而 raw replan 也会同步重映射已有 `chapter_plan.json` 的 chunk 起点，保证 merge 阶段的章节标题仍落在有效 chunk 边界上
 - 运行时 token 估算默认仍是本地启发式 fallback；`test-token-count` / `preflight.sh --require-llm` 会探测 provider 级 token count，并在不可用时明确回退到 local estimate
 - `chunk_hard_cap_multiplier` 会被限制在保守的 `1.0-2.0` 区间，避免配置失误把 chunk 包络静默放大
 - `preflight.sh` 采用分层校验，确保只走字幕路径时不必预先配置 Deepgram 或 LLM 凭据；进入 `--require-llm` 时会同时做连通性和 token count 能力探测
 - `transcribe-deepgram` 是唯一支持的 Deepgram 统一入口，分片与合并逻辑由 Python 工具统一负责
 - `verify-quality` 只有在 `hard_failures` 非空时才阻断流程；`warnings` 仅用于人工复核提示，而 `checks` 现在会额外暴露 `chunk_seam_warning_count`、`cjk_space_ratio`、`duplicate_ngram_ratio`、`short_paragraph_ratio`、`header_density`、`punctuation_density`、`glossary_drift_count`、`glossary_preservation_ratio` 等可解释指标
+- 双语 `verify-quality` 现在会在完整正文流里识别相邻的“英文段 -> 中文段”配对，因此对照正文前面即使有简短导语，也不会再被误判为完全缺少双语段对
 
 ### 📘 术语口径
 
@@ -709,6 +714,7 @@ bash scripts/preflight.sh --require-llm
 - `Deepgram 结果可观测性`：`/tmp/${VIDEO_ID}_deepgram_result.json` 现在会暴露逐 chunk 的 `chunk_reports`、聚合结构计数，以及 structured-output 回退时的 `warnings`
 - `质量门禁`：读取 `verify-quality` 的 JSON；`hard_failures` 表示必须 STOP，`warnings` 表示需要人工复核，`checks` 则给出这些告警背后的可读性指标。有 work_dir 或现成 glossary 时，建议额外传 `--work-dir` 或 `--glossary-path` 打开 glossary drift 检查。
 - `源路径路由`：规划层决定当前 subtitle / Deepgram 源是否继续沿用。`routing_reason` 负责解释时长/输入体积路由，`source_route_reason` 负责解释源质量路由。
+- `运行时 reroute 动作`：当 `plan-optimization` / `verify-quality` 返回 `reroute_recommended=true` 且 `reroute_target=deepgram` 时，runtime contract 会把它标准化为 `recommended_action=fallback_to_deepgram`，这样 policy、evaluator、decision 三层动作口径保持一致
 
 ### 🧪 验证矩阵
 

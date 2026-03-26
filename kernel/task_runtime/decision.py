@@ -20,6 +20,8 @@ def _select_action(*, run_state: dict | None = None, result=None,
     allowed_actions = policy_evaluation.get("allowed_actions", []) if isinstance(policy_evaluation.get("allowed_actions", []), list) else []
     active_stage = str(run_state.get("active_stage", "")).strip()
 
+    if str(quality_report.get("recommended_action", "")).strip() == "fallback_to_deepgram" and "fallback_to_deepgram" in allowed_actions:
+        return "fallback_to_deepgram", "quality report recommends rerouting source acquisition to Deepgram", 0.95, "rule"
     if quality_report.get("passed", False) and "accept_output" in allowed_actions:
         return "accept_output", "quality report passed; accept output", 0.95, "rule"
     if payload.get("replan_required", False) and "replan_remaining" in allowed_actions:

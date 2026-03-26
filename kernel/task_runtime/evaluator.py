@@ -42,6 +42,17 @@ def derive_evaluator_report(command: str, *, quality_report: dict | None = None,
     normalized = str(command or "").strip()
 
     if quality_report:
+        quality_action = str(quality_report.get("recommended_action", "")).strip()
+        if quality_action == "fallback_to_deepgram":
+            return build_evaluator_report(
+                scope="run",
+                quality_gate_state="warn",
+                recommended_action="fallback_to_deepgram",
+                rationale="quality report recommends rerouting source acquisition to Deepgram before continuing",
+                warnings=quality_report.get("warnings", []),
+                hard_failures=quality_report.get("hard_failures", []),
+                metadata={"command": normalized},
+            )
         if quality_report.get("passed", False):
             return build_evaluator_report(
                 scope="run",

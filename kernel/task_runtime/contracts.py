@@ -513,6 +513,12 @@ def derive_quality_report(command: str, result=None, *, context: dict | None = N
         coverage_score = 1.0 if result.get("passed", False) else 0.0
         missing_sections = result.get("missing_semantic_anchors", []) if isinstance(result.get("missing_semantic_anchors", []), list) else []
         recommended_action = "accept_output" if result.get("passed", False) else "repair_or_replan"
+        if (
+            result.get("passed", False)
+            and _parse_bool(checks.get("reroute_recommended"), False)
+            and str(checks.get("reroute_target", "")).strip() == "deepgram"
+        ):
+            recommended_action = "fallback_to_deepgram"
         structure_integrity = "passed" if checks.get("has_structure", result.get("passed", False)) else "failed"
         translation_risk = "low"
         term_consistency_score = 1.0

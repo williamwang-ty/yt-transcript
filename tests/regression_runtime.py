@@ -210,9 +210,13 @@ class RuntimeRegressionTests(unittest.TestCase):
                 bundle["quality_report"]["checks"]["source_route_reason"],
                 "subtitle_quality_critical_deepgram_recommended",
             )
+            self.assertEqual(bundle["quality_report"]["recommended_action"], "fallback_to_deepgram")
             self.assertTrue(bundle["quality_report"]["checks"]["reroute_recommended"])
             self.assertEqual(bundle["quality_report"]["checks"]["reroute_target"], "deepgram")
             self.assertLess(bundle["quality_report"]["checks"]["subtitle_quality_score"], 0.35)
+            self.assertEqual(bundle["evaluator_report"]["recommended_action"], "fallback_to_deepgram")
+            self.assertIn("fallback_to_deepgram", bundle["policy"]["allowed_actions"])
+            self.assertEqual(bundle["decision_record"]["selected_action"], "fallback_to_deepgram")
 
     def test_llm_assisted_decision_selects_only_allowed_actions(self):
         """Test llm-assisted decisioning can rank within the allowed action set only."""
@@ -462,6 +466,30 @@ class RuntimeRegressionTests(unittest.TestCase):
             self.assertIn("API", terms)
             self.assertIn("DeepgramLabs", terms)
             self.assertIn("GPT4", terms)
+
+    def test_glossary_selection_avoids_ascii_substring_false_positives(self):
+        """Test glossary matching avoids selecting acronyms from unrelated substrings."""
+        from kernel.long_text import glossary as kernel_glossary
+
+        payload = {
+            "terms": [
+                {"term": "API", "score": 10, "count": 3},
+                {"term": "OpenAI", "score": 9, "count": 2},
+            ]
+        }
+        source_text = "This chapter discusses rapid iteration and capital allocation."
+
+        selected = kernel_glossary.select_glossary_terms(payload, source_text, max_terms=8)
+        drift = kernel_glossary.evaluate_glossary_drift(
+            payload,
+            source_text,
+            "这段讲快速迭代和资本配置。",
+            max_terms=8,
+        )
+
+        self.assertEqual(selected, [])
+        self.assertEqual(drift["glossary_drift_count"], 0)
+        self.assertEqual(drift["warnings"], [])
 
     def test_process_chunks_injects_glossary_terms_into_prompt(self):
         """Test process chunks injects glossary terms into prompt."""
@@ -743,6 +771,27 @@ class RuntimeRegressionTests(unittest.TestCase):
             raw = Path(tmpdir) / "raw.txt"
             optimized.write_text(
                 "## Section\n\n"
+                "English paragraph one.\n\n"
+                "中文段落一。\n\n"
+                "English paragraph two.\n\n"
+                "中文段落二。\n",
+                encoding="utf-8",
+            )
+            raw.write_text("English paragraph one. English paragraph two.", encoding="utf-8")
+
+            result = utils.verify_quality(str(optimized), str(raw), bilingual=True)
+
+            self.assertTrue(result["passed"], result)
+            self.assertGreaterEqual(result["checks"]["bilingual_pairs"], 1)
+
+    def test_verify_quality_accepts_bilingual_pairs_after_intro_paragraph(self):
+        """Test bilingual pair detection tolerates a leading intro paragraph."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            optimized = Path(tmpdir) / "opt.md"
+            raw = Path(tmpdir) / "raw.txt"
+            optimized.write_text(
+                "## Section\n\n"
+                "这一段是导语，解释下面会按英中对照展开。\n\n"
                 "English paragraph one.\n\n"
                 "中文段落一。\n\n"
                 "English paragraph two.\n\n"

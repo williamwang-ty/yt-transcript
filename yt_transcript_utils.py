@@ -5090,6 +5090,18 @@ def _compute_cjk_readability_metrics(body_paragraphs: list[str]) -> dict:
     }
 
 
+def _count_bilingual_paragraph_pairs(paragraphs: list[str]) -> int:
+    """Count adjacent English-to-Chinese body paragraph pairs."""
+    normalized_blocks = [str(block or "").strip() for block in paragraphs if str(block or "").strip()]
+    paired_blocks = 0
+    for first, second in zip(normalized_blocks, normalized_blocks[1:]):
+        first_has_english = any(ch.isascii() and ch.isalpha() for ch in first)
+        second_has_chinese = any('\u4e00' <= ch <= '\u9fff' for ch in second)
+        if first_has_english and second_has_chinese:
+            paired_blocks += 1
+    return paired_blocks
+
+
 def _load_quality_glossary_payload(*, work_dir: str = "", glossary_path: str = "") -> dict:
     """Load glossary payload for final quality verification."""
     explicit_path_text = str(glossary_path or "").strip()
@@ -5272,14 +5284,7 @@ def verify_quality(optimized_text_path: str, raw_text_path: str = None,
                 warnings.append(f"English character ratio too low ({en_ratio:.1%}), original text may be missing")
 
         text_blocks = body_paragraphs
-        paired_blocks = 0
-        for idx in range(0, len(text_blocks) - 1, 2):
-            first = text_blocks[idx]
-            second = text_blocks[idx + 1]
-            first_en = any(ch.isascii() and ch.isalpha() for ch in first)
-            second_cn = any('\u4e00' <= ch <= '\u9fff' for ch in second)
-            if first_en and second_cn:
-                paired_blocks += 1
+        paired_blocks = _count_bilingual_paragraph_pairs(text_blocks)
         checks["bilingual_pairs"] = paired_blocks
         if text_blocks and paired_blocks == 0:
             hard_failures.append("No English/Chinese paragraph pairs detected in bilingual output")
