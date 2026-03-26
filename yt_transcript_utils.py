@@ -67,6 +67,7 @@ import subprocess
 import sys
 import time
 import urllib.parse
+from collections import Counter
 from pathlib import Path
 
 from kernel.task_runtime import runtime as kernel_runtime
@@ -74,6 +75,8 @@ from kernel.task_runtime import state as kernel_state
 from kernel.task_runtime import controller as kernel_controller
 from kernel.task_runtime import telemetry as kernel_telemetry
 from kernel.task_runtime import api as kernel_runtime_api
+from kernel.text_cleanup import overlap as kernel_overlap
+from kernel.text_cleanup import subtitle as kernel_subtitle_cleanup
 from kernel.long_text import glossary as kernel_glossary
 from kernel.long_text import semantic as kernel_semantic
 from kernel.long_text import chunking as kernel_chunking
@@ -1979,209 +1982,48 @@ def _hard_split_text(text: str, max_len: int) -> list[str]:
 
 def _parse_vtt_timestamp(value: str) -> float | None:
     """Parse vtt timestamp."""
-    token = str(value or "").strip().replace(",", ".")
-    if not token:
-        return None
-
-    parts = token.split(":")
-    if len(parts) == 3:
-        hours_str, minutes_str, seconds_str = parts
-    elif len(parts) == 2:
-        hours_str = "0"
-        minutes_str, seconds_str = parts
-    else:
-        return None
-
-    try:
-        hours = int(hours_str)
-        minutes = int(minutes_str)
-        seconds = float(seconds_str)
-    except ValueError:
-        return None
-
-    return round(hours * 3600 + minutes * 60 + seconds, 3)
+    return kernel_subtitle_cleanup.parse_vtt_timestamp(str(value or "").replace(",", "."))
 
 
 def _parse_vtt_time_range(line: str) -> tuple[float | None, float | None]:
     """Parse vtt time range."""
-    if "-->" not in line:
-        return None, None
-
-    start_raw, end_raw = line.split("-->", 1)
-    start_token = start_raw.strip().split()[0] if start_raw.strip() else ""
-    end_token = end_raw.strip().split()[0] if end_raw.strip() else ""
-    return _parse_vtt_timestamp(start_token), _parse_vtt_timestamp(end_token)
+    return kernel_subtitle_cleanup.parse_vtt_time_range(line)
 
 
 def _strip_subtitle_markup(text: str) -> str:
     """Strip lightweight subtitle markup such as VTT cue tags."""
-    cleaned = re.sub(r"<[^>]+>", "", str(text or ""))
-    return cleaned.replace("&nbsp;", " ")
+    cleaned, _ = kernel_subtitle_cleanup.strip_subtitle_markup(text)
+    return cleaned
 
 
 def _subtitle_join_needs_space(left: str, right: str) -> bool:
     """Return whether two subtitle fragments need an inserted ASCII space."""
-    left_text = str(left or "").rstrip()
-    right_text = str(right or "").lstrip()
-    if not left_text or not right_text:
-        return False
-
-    previous = left_text[-1]
-    following = right_text[0]
-
-    if previous in "([{\"'“‘「『《【":
-        return False
-    if following in ",.;:!?，。！？、；：)]}\"'”’」』）》】":
-        return False
-    if _is_cjk_family_char(previous) or _is_cjk_family_char(following):
-        return False
-    return True
+    return kernel_subtitle_cleanup.subtitle_join_needs_space(left, right)
 
 
 def _join_subtitle_fragments(fragments: list[str]) -> str:
     """Join subtitle fragments without inserting spaces inside CJK text."""
-    parts = []
-    for fragment in fragments:
-        cleaned = _strip_subtitle_markup(fragment).strip()
-        if cleaned:
-            parts.append(cleaned)
-
-    if not parts:
-        return ""
-
-    joined = parts[0]
-    for fragment in parts[1:]:
-        if _subtitle_join_needs_space(joined, fragment):
-            joined = f"{joined} {fragment}"
-        else:
-            joined = f"{joined}{fragment}"
-    return joined.strip()
+    joined, _ = kernel_subtitle_cleanup.join_subtitle_fragments(fragments)
+    return joined
 
 
 def _normalize_subtitle_text(text: str) -> str:
     """Apply conservative cleanup tailored to subtitle-derived text."""
-    normalized = _normalize_text_body(_strip_subtitle_markup(text))
-    if not normalized:
-        return ""
-
-    normalized = re.sub(r"[ \t]+", " ", normalized)
-    cjk_family = r"\u3400-\u9fff\u3040-\u30ff\uac00-\ud7af"
-    for _ in range(8):
-        updated = re.sub(rf"([{cjk_family}])\s+([{cjk_family}])", r"\1\2", normalized)
-        updated = re.sub(rf"([{cjk_family}])\s+([，。！？、；：,.!?;:])", r"\1\2", updated)
-        updated = re.sub(rf"([（【《「『])\s+([{cjk_family}])", r"\1\2", updated)
-        if updated == normalized:
-            break
-        normalized = updated
-    normalized = re.sub(r"\s+([，。！？、；：,.!?;:])", r"\1", normalized)
-    normalized = re.sub(r"([（【《「『])\s+", r"\1", normalized)
-    normalized = re.sub(r"\s+([）」』】》])", r"\1", normalized)
-    normalized = re.sub(r"\n{3,}", "\n\n", normalized)
-    return normalized.strip()
+    return kernel_subtitle_cleanup.normalize_subtitle_text(text)
 
 
 def _normalize_subtitle_segment_text(text: str) -> str:
     """Normalize a single subtitle cue into a cue-sized text fragment."""
-    normalized = _normalize_subtitle_text(text)
-    if not normalized:
-        return ""
-    return _join_subtitle_fragments(normalized.splitlines())
+    return kernel_subtitle_cleanup.normalize_subtitle_segment_text(text)
 
 
 def _parse_vtt_payload(content: str, *, language: str = "", vtt_path: str = "") -> dict:
     """Parse VTT content into aligned subtitle segments."""
-    segments = []
-    header_language = ""
-    in_note = False
-    cue_start = None
-    cue_end = None
-    cue_lines = []
-
-    def flush_cue():
-        """Flush the current cue into the segment list."""
-        nonlocal cue_start, cue_end, cue_lines
-        if cue_start is None or cue_end is None:
-            cue_start = None
-            cue_end = None
-            cue_lines = []
-            return
-
-        clean = _normalize_subtitle_segment_text(_join_subtitle_fragments(cue_lines))
-        if not clean:
-            cue_start = None
-            cue_end = None
-            cue_lines = []
-            return
-
-        if segments and segments[-1]["text"] == clean:
-            previous_end = _coerce_float_or_none(segments[-1].get("end_time"))
-            if previous_end is None or cue_end > previous_end:
-                segments[-1]["end_time"] = cue_end
-            cue_start = None
-            cue_end = None
-            cue_lines = []
-            return
-
-        segments.append({
-            "id": len(segments),
-            "text": clean,
-            "start_time": cue_start,
-            "end_time": cue_end,
-            "speaker": None,
-        })
-        cue_start = None
-        cue_end = None
-        cue_lines = []
-
-    for raw_line in content.splitlines():
-        line = raw_line.strip("\ufeff")
-        stripped = line.strip()
-
-        if stripped.startswith("Language:") and not language:
-            header_language = stripped.split(":", 1)[1].strip()
-
-        if in_note:
-            if not stripped:
-                in_note = False
-            continue
-
-        if stripped.startswith("NOTE"):
-            in_note = True
-            continue
-
-        if stripped.startswith("WEBVTT") or stripped.startswith("Kind:") or stripped.startswith("Style:"):
-            continue
-        if stripped.startswith("STYLE") or stripped.startswith("REGION"):
-            continue
-
-        if "-->" in stripped:
-            flush_cue()
-            cue_start, cue_end = _parse_vtt_time_range(stripped)
-            cue_lines = []
-            continue
-
-        if not stripped:
-            flush_cue()
-            continue
-
-        if cue_start is None and cue_end is None:
-            continue
-
-        cue_lines.append(stripped)
-
-    flush_cue()
-
-    if not segments:
-        print("Error: No usable VTT segments found", file=sys.stderr)
+    try:
+        return kernel_subtitle_cleanup.parse_vtt_payload(content, language=language, vtt_path=vtt_path)
+    except ValueError as error:
+        print(f"Error: {error}", file=sys.stderr)
         sys.exit(2)
-
-    return {
-        "source": "vtt",
-        "language": language or header_language,
-        "vtt_path": str(Path(vtt_path).absolute()) if vtt_path else "",
-        "segment_count": len(segments),
-        "segments": segments,
-    }
 
 
 def parse_vtt(vtt_path: str) -> str:
@@ -3293,12 +3135,21 @@ def telemetry_events(telemetry_ref: str = "", *, telemetry_path: str = "", work_
 
 
 def build_glossary(work_dir: str, max_terms: int = 50,
-                  min_occurrences: int = 1) -> dict:
+                  min_occurrences: int = 1, mode: str = "auto",
+                  normalized_document_path: str = "", chapters_path: str = "",
+                  metadata_json_path: str = "", description_text: str = "",
+                  description_path: str = "") -> dict:
     """Delegate glossary construction to `kernel.long_text.glossary`."""
     return kernel_glossary.build_glossary(
         work_dir,
         max_terms=max_terms,
         min_occurrences=min_occurrences,
+        mode=mode,
+        normalized_document_path=normalized_document_path,
+        chapters_path=chapters_path,
+        metadata_json_path=metadata_json_path,
+        description_text=description_text,
+        description_path=description_path,
     )
 
 
@@ -5077,8 +4928,200 @@ def _line_looks_truncated(last_line: str) -> bool:
     return len(text) > 120 and text[-1].isalnum()
 
 
+QUALITY_PUNCTUATION_CHARS = set(",.;:!?，。！？、；：()[]{}\"'“”‘’`")
+QUALITY_SENTENCE_ENDINGS = ("。", "！", "？", "!", "?", "；", ";")
+QUALITY_TOKEN_RE = re.compile(r"[A-Za-z0-9]+|[\u3400-\u9fff\u3040-\u30ff\uac00-\ud7af]")
+QUALITY_CJK_SPACE_PATTERNS = (
+    re.compile(r"(?<=[\u3400-\u9fff\u3040-\u30ff\uac00-\ud7af])\s+(?=[\u3400-\u9fff\u3040-\u30ff\uac00-\ud7af])"),
+    re.compile(r"(?<=[\u3400-\u9fff\u3040-\u30ff\uac00-\ud7af])\s+(?=[，。！？、；：,.!?;:])"),
+    re.compile(r"(?<=[（《「『【(])\s+(?=[\u3400-\u9fff\u3040-\u30ff\uac00-\ud7af])"),
+    re.compile(r"(?<=[\u3400-\u9fff\u3040-\u30ff\uac00-\ud7af])\s+(?=[）》」』】)])"),
+)
+
+
+def _count_quality_chars(text: str, *, include_punctuation: bool = False) -> int:
+    """Count non-space characters for quality heuristics."""
+    return sum(
+        1
+        for char in str(text or "")
+        if not char.isspace() and (include_punctuation or char not in QUALITY_PUNCTUATION_CHARS)
+    )
+
+
+def _count_cjk_chars(text: str) -> int:
+    """Count CJK-family characters."""
+    return sum(1 for char in str(text or "") if _is_cjk_family_char(char))
+
+
+def _tokenize_quality_text(text: str) -> list[str]:
+    """Tokenize text into Latin words and single CJK-family characters."""
+    tokens = []
+    for token in QUALITY_TOKEN_RE.findall(str(text or "")):
+        tokens.append(token.lower() if token.isascii() else token)
+    return tokens
+
+
+def _is_quality_fragment_paragraph(text: str) -> bool:
+    """Return whether a paragraph looks like a short subtitle fragment."""
+    block = str(text or "").strip()
+    if not block or re.match(r"^(?:[-*+]\s|\d+\.\s)", block):
+        return False
+
+    meaningful_chars = _count_quality_chars(block)
+    cjk_chars = _count_cjk_chars(block)
+    if cjk_chars < 4:
+        return False
+    if meaningful_chars <= 10:
+        return True
+    return meaningful_chars <= 22 and not block.endswith(QUALITY_SENTENCE_ENDINGS)
+
+
+def _is_strong_quality_overlap(text: str) -> bool:
+    """Return whether an adjacent overlap is suspicious enough to warn about."""
+    candidate = str(text or "").strip()
+    if not candidate:
+        return False
+
+    meaningful_chars = _count_quality_chars(candidate)
+    if any(_is_cjk_family_char(char) for char in candidate):
+        return meaningful_chars >= 4
+    return meaningful_chars >= 12 and len(_tokenize_quality_text(candidate)) >= 3
+
+
+def _count_chunk_seam_warnings(paragraphs: list[str]) -> int:
+    """Count duplicated adjacent paragraph seams that survived post-merge cleanup."""
+    warning_count = 0
+    normalized_blocks = [re.sub(r"\s+", " ", block.strip()) for block in paragraphs if block.strip()]
+    for previous, current in zip(normalized_blocks, normalized_blocks[1:]):
+        if previous == current:
+            warning_count += 1
+            continue
+        overlap = kernel_overlap.find_leading_overlap(previous, current)
+        if _is_strong_quality_overlap(overlap):
+            warning_count += 1
+    return warning_count
+
+
+def _compute_duplicate_ngram_metrics(paragraphs: list[str], *, ngram_size: int = 5) -> dict:
+    """Measure repeated phrase density inside paragraph bodies."""
+    windows = []
+    for block in paragraphs:
+        tokens = _tokenize_quality_text(block)
+        if len(tokens) < ngram_size:
+            continue
+        for idx in range(len(tokens) - ngram_size + 1):
+            window = tuple(tokens[idx:idx + ngram_size])
+            if len(set(window)) < 2:
+                continue
+            windows.append(window)
+
+    total_windows = len(windows)
+    if total_windows == 0:
+        return {
+            "duplicate_ngram_ratio": 0.0,
+            "duplicate_ngram_count": 0,
+            "duplicate_ngram_windows": 0,
+        }
+
+    counts = Counter(windows)
+    duplicate_count = sum(count - 1 for count in counts.values() if count > 1)
+    ratio = duplicate_count / total_windows if total_windows else 0.0
+    return {
+        "duplicate_ngram_ratio": round(ratio, 3),
+        "duplicate_ngram_count": duplicate_count,
+        "duplicate_ngram_windows": total_windows,
+    }
+
+
+def _compute_cjk_readability_metrics(body_paragraphs: list[str]) -> dict:
+    """Compute advisory readability signals for Chinese-heavy body text."""
+    cjk_body_paragraphs = [block for block in body_paragraphs if _count_cjk_chars(block) >= 4]
+    cjk_text = "\n\n".join(cjk_body_paragraphs)
+    cjk_chars = _count_cjk_chars(cjk_text)
+    cjk_applicable = cjk_chars >= 24 and len(cjk_body_paragraphs) >= 2
+
+    spacing_anomaly_count = sum(
+        1
+        for pattern in QUALITY_CJK_SPACE_PATTERNS
+        for _ in pattern.finditer(cjk_text)
+    )
+    cjk_space_ratio = spacing_anomaly_count / cjk_chars if cjk_chars else 0.0
+
+    short_paragraph_count = sum(1 for block in cjk_body_paragraphs if _is_quality_fragment_paragraph(block))
+    short_paragraph_ratio = short_paragraph_count / len(cjk_body_paragraphs) if cjk_body_paragraphs else 0.0
+
+    punctuation_count = sum(1 for char in cjk_text if char in QUALITY_PUNCTUATION_CHARS)
+    meaningful_chars = _count_quality_chars(cjk_text)
+    punctuation_density = punctuation_count / meaningful_chars if meaningful_chars else 0.0
+
+    duplicate_metrics = _compute_duplicate_ngram_metrics(cjk_body_paragraphs)
+    cjk_spacing_ok = (not cjk_applicable) or not (
+        spacing_anomaly_count >= 2 and cjk_space_ratio > 0.01
+    )
+    duplicate_ngram_ok = (not cjk_applicable) or not (
+        duplicate_metrics["duplicate_ngram_count"] >= 4 and duplicate_metrics["duplicate_ngram_ratio"] > 0.06
+    )
+    short_paragraph_ok = (not cjk_applicable) or not (
+        len(cjk_body_paragraphs) >= 4
+        and short_paragraph_count >= 4
+        and short_paragraph_ratio > 0.45
+    )
+    punctuation_density_ok = (not cjk_applicable) or not (
+        cjk_chars >= 120 and punctuation_density < 0.01
+    )
+
+    return {
+        "cjk_readability_applicable": cjk_applicable,
+        "cjk_body_paragraph_count": len(cjk_body_paragraphs),
+        "cjk_body_char_count": cjk_chars,
+        "cjk_spacing_anomaly_count": spacing_anomaly_count,
+        "cjk_space_ratio": round(cjk_space_ratio, 3),
+        "cjk_spacing_ok": cjk_spacing_ok,
+        "duplicate_ngram_ratio": duplicate_metrics["duplicate_ngram_ratio"],
+        "duplicate_ngram_count": duplicate_metrics["duplicate_ngram_count"],
+        "duplicate_ngram_windows": duplicate_metrics["duplicate_ngram_windows"],
+        "duplicate_ngram_ok": duplicate_ngram_ok,
+        "short_paragraph_count": short_paragraph_count,
+        "short_paragraph_ratio": round(short_paragraph_ratio, 3),
+        "fragment_paragraph_ratio": round(short_paragraph_ratio, 3),
+        "short_paragraph_ratio_ok": short_paragraph_ok,
+        "punctuation_density": round(punctuation_density, 3),
+        "punctuation_density_ok": punctuation_density_ok,
+    }
+
+
+def _count_bilingual_paragraph_pairs(paragraphs: list[str]) -> int:
+    """Count adjacent English-to-Chinese body paragraph pairs."""
+    normalized_blocks = [str(block or "").strip() for block in paragraphs if str(block or "").strip()]
+    paired_blocks = 0
+    for first, second in zip(normalized_blocks, normalized_blocks[1:]):
+        first_has_english = any(ch.isascii() and ch.isalpha() for ch in first)
+        second_has_chinese = any('\u4e00' <= ch <= '\u9fff' for ch in second)
+        if first_has_english and second_has_chinese:
+            paired_blocks += 1
+    return paired_blocks
+
+
+def _load_quality_glossary_payload(*, work_dir: str = "", glossary_path: str = "") -> dict:
+    """Load glossary payload for final quality verification."""
+    explicit_path_text = str(glossary_path or "").strip()
+    if explicit_path_text:
+        explicit_path = Path(explicit_path_text).expanduser()
+        try:
+            payload = json.loads(explicit_path.read_text(encoding="utf-8"))
+        except (FileNotFoundError, OSError, json.JSONDecodeError):
+            return {}
+        return payload if isinstance(payload, dict) else {}
+
+    resolved_work_dir = str(work_dir or "").strip()
+    if resolved_work_dir:
+        return kernel_glossary.load_glossary(resolved_work_dir)
+    return {}
+
+
 def verify_quality(optimized_text_path: str, raw_text_path: str = None,
-                   bilingual: bool = False) -> dict:
+                   bilingual: bool = False, work_dir: str = "",
+                   glossary_path: str = "", glossary_max_terms: int = 12) -> dict:
     """
     Verify quality of optimized text file with structural checks.
     
@@ -5088,7 +5131,9 @@ def verify_quality(optimized_text_path: str, raw_text_path: str = None,
     2. Has section headers (##)
     3. No abrupt truncation (last line is complete)
     4. Bilingual balance (Chinese char ratio in expected range)
-    5. Size ratio vs raw text (if raw_text_path provided)
+    5. Chinese readability warnings (spacing, duplication, paragraph fragmentation)
+    6. Size ratio vs raw text (if raw_text_path provided)
+    7. Glossary drift warnings (if glossary context is available)
     
     Args:
         optimized_text_path: Path to the optimized text file
@@ -5164,6 +5209,62 @@ def verify_quality(optimized_text_path: str, raw_text_path: str = None,
         checks["no_truncation"] = False
         warnings.append("No non-empty lines found")
 
+    chunk_seam_warning_count = _count_chunk_seam_warnings(body_paragraphs)
+    checks["chunk_seam_warning_count"] = chunk_seam_warning_count
+    checks["chunk_seam_duplication_ok"] = chunk_seam_warning_count == 0
+    if chunk_seam_warning_count:
+        warnings.append(
+            "Chunk seam duplication signals detected between adjacent paragraphs "
+            f"({chunk_seam_warning_count} suspect boundary/boundaries)"
+        )
+
+    body_char_count = sum(len(block) for block in body_paragraphs)
+    header_density = len(section_headers) / len(body_paragraphs) if body_paragraphs else float(len(section_headers))
+    avg_chars_per_section = body_char_count / len(section_headers) if section_headers else float(body_char_count)
+    checks["header_density"] = round(header_density, 3)
+    checks["avg_chars_per_section"] = round(avg_chars_per_section, 1)
+    checks["header_fragment_balance_ok"] = not (
+        len(section_headers) >= 4
+        and len(body_paragraphs) >= 4
+        and header_density > 0.6
+        and avg_chars_per_section < 220
+    )
+    if not checks["header_fragment_balance_ok"]:
+        warnings.append(
+            "Header density looks unusually high for the available body text "
+            f"({len(section_headers)} sections across {len(body_paragraphs)} body paragraphs)"
+        )
+
+    cjk_readability_checks = _compute_cjk_readability_metrics(body_paragraphs)
+    checks.update(cjk_readability_checks)
+    if not checks["cjk_spacing_ok"]:
+        warnings.append(
+            "Chinese spacing anomalies detected "
+            f"({checks['cjk_spacing_anomaly_count']} issue(s), ratio {checks['cjk_space_ratio']:.3f})"
+        )
+    if not checks["duplicate_ngram_ok"]:
+        warnings.append(
+            "Repeated phrase density is high in Chinese body text "
+            f"(ratio {checks['duplicate_ngram_ratio']:.3f})"
+        )
+    if not checks["short_paragraph_ratio_ok"]:
+        warnings.append(
+            "Too many short Chinese body paragraphs look like subtitle fragments "
+            f"({checks['short_paragraph_count']} of {checks['cjk_body_paragraph_count']})"
+        )
+    if not checks["punctuation_density_ok"]:
+        warnings.append(
+            "Chinese punctuation density looks unusually low "
+            f"(density {checks['punctuation_density']:.3f})"
+        )
+
+    checks["glossary_drift_applicable"] = False
+    checks["glossary_selected_term_count"] = 0
+    checks["glossary_matched_term_count"] = 0
+    checks["glossary_drift_count"] = 0
+    checks["glossary_preservation_ratio"] = 1.0
+    checks["glossary_drift_ok"] = True
+
     # Check 4: Bilingual balance
     if bilingual:
         cn_chars = sum(1 for c in text if '\u4e00' <= c <= '\u9fff')
@@ -5183,14 +5284,7 @@ def verify_quality(optimized_text_path: str, raw_text_path: str = None,
                 warnings.append(f"English character ratio too low ({en_ratio:.1%}), original text may be missing")
 
         text_blocks = body_paragraphs
-        paired_blocks = 0
-        for idx in range(0, len(text_blocks) - 1, 2):
-            first = text_blocks[idx]
-            second = text_blocks[idx + 1]
-            first_en = any(ch.isascii() and ch.isalpha() for ch in first)
-            second_cn = any('\u4e00' <= ch <= '\u9fff' for ch in second)
-            if first_en and second_cn:
-                paired_blocks += 1
+        paired_blocks = _count_bilingual_paragraph_pairs(text_blocks)
         checks["bilingual_pairs"] = paired_blocks
         if text_blocks and paired_blocks == 0:
             hard_failures.append("No English/Chinese paragraph pairs detected in bilingual output")
@@ -5223,6 +5317,34 @@ def verify_quality(optimized_text_path: str, raw_text_path: str = None,
                     checks["semantic_anchor_coverage_ok"] = len(semantic_evaluation["missing_anchors"]) == 0
                     if semantic_evaluation["missing_anchors"]:
                         warnings.extend(semantic_evaluation["warnings"])
+
+                    glossary_payload = _load_quality_glossary_payload(
+                        work_dir=work_dir,
+                        glossary_path=glossary_path,
+                    )
+                    glossary_evaluation = kernel_glossary.evaluate_glossary_drift(
+                        glossary_payload,
+                        raw_text,
+                        text,
+                        max_terms=max(0, int(glossary_max_terms)),
+                    ) if glossary_payload else {
+                        "warnings": [],
+                        "selected_terms": [],
+                        "preserved_terms": [],
+                        "missing_terms": [],
+                        "glossary_drift_count": 0,
+                        "preservation_ratio": 1.0,
+                    }
+                    selected_terms = glossary_evaluation.get("selected_terms", []) if isinstance(glossary_evaluation.get("selected_terms", []), list) else []
+                    preserved_terms = glossary_evaluation.get("preserved_terms", []) if isinstance(glossary_evaluation.get("preserved_terms", []), list) else []
+                    checks["glossary_drift_applicable"] = bool(selected_terms)
+                    checks["glossary_selected_term_count"] = len(selected_terms)
+                    checks["glossary_matched_term_count"] = len(preserved_terms)
+                    checks["glossary_drift_count"] = int(glossary_evaluation.get("glossary_drift_count", 0) or 0)
+                    checks["glossary_preservation_ratio"] = float(glossary_evaluation.get("preservation_ratio", 1.0) or 0.0)
+                    checks["glossary_drift_ok"] = checks["glossary_drift_count"] == 0
+                    if glossary_evaluation["warnings"]:
+                        warnings.extend(glossary_evaluation["warnings"])
             except Exception:
                 pass  # Non-critical, skip if raw text unreadable
     
@@ -5504,6 +5626,235 @@ def _prefer_text_chunking_for_source(source_payload: dict, workflow_payload: dic
     return mode == "chinese"
 
 
+def _subtitle_quality_penalty(density: float, *, safe: float, scale: float, max_penalty: float) -> float:
+    """Convert a cleanup density into a bounded subtitle-quality penalty."""
+    bounded_density = max(0.0, _parse_float(density, 0.0))
+    return round(min(max_penalty, max(0.0, bounded_density - safe) * scale), 4)
+
+
+def _classify_subtitle_quality_band(score: float) -> str:
+    """Return a stable quality band for subtitle-derived source text."""
+    bounded_score = max(0.0, min(1.0, _parse_float(score, 0.0)))
+    if bounded_score >= 0.92:
+        return "excellent"
+    if bounded_score >= 0.78:
+        return "good"
+    if bounded_score >= 0.58:
+        return "fair"
+    if bounded_score >= 0.35:
+        return "poor"
+    return "critical"
+
+
+def _default_subtitle_quality_signal() -> dict:
+    """Return an empty subtitle-quality payload for non-applicable routes."""
+    return {
+        "applicable": False,
+        "evaluated": False,
+        "subtitle_quality_score": None,
+        "subtitle_quality_band": "",
+        "subtitle_quality_reasons": [],
+        "overlap_reduction_count": 0,
+        "metrics": {
+            "cue_count": 0,
+            "line_count": 0,
+            "fragment_line_count": 0,
+            "fragment_line_ratio": 0.0,
+            "avg_line_char_count": 0.0,
+            "exact_duplicate_cue_ratio": 0.0,
+            "overlap_reduction_ratio": 0.0,
+            "spacing_cleanup_ratio": 0.0,
+            "markup_cleanup_ratio": 0.0,
+            "empty_cue_ratio": 0.0,
+        },
+    }
+
+
+def _evaluate_subtitle_quality(normalized_text: str, cleanup_diagnostics: dict | None = None, *,
+                               source_payload: dict | None = None, workflow_payload: dict | None = None,
+                               segment_count: int = 0) -> dict:
+    """Build explainable quality signals for subtitle-derived YouTube source text."""
+    source_payload = source_payload if isinstance(source_payload, dict) else {}
+    workflow_payload = workflow_payload if isinstance(workflow_payload, dict) else {}
+    if not _is_youtube_subtitle_source(source_payload):
+        return _default_subtitle_quality_signal()
+
+    diagnostics = cleanup_diagnostics if isinstance(cleanup_diagnostics, dict) else {}
+    mode = str(workflow_payload.get("mode", "")).strip().lower()
+    lines = [line.strip() for line in str(normalized_text or "").splitlines() if line.strip()]
+    cue_count = max(1, _parse_int(diagnostics.get("cue_count"), 0) or int(segment_count) or len(lines) or 1)
+    density_base = max(cue_count, 20)
+
+    exact_duplicate_cue_count = max(0, _parse_int(diagnostics.get("exact_duplicate_cue_count"), 0))
+    overlap_trim_count = max(0, _parse_int(diagnostics.get("overlap_trim_count"), 0))
+    overlap_collapsed_cue_count = max(0, _parse_int(diagnostics.get("overlap_collapsed_cue_count"), 0))
+    collapsed_cjk_spacing_count = max(0, _parse_int(diagnostics.get("collapsed_cjk_spacing_count"), 0))
+    tightened_punctuation_spacing_count = max(0, _parse_int(diagnostics.get("tightened_punctuation_spacing_count"), 0))
+    tightened_bracket_spacing_count = max(0, _parse_int(diagnostics.get("tightened_bracket_spacing_count"), 0))
+    markup_tag_count = max(0, _parse_int(diagnostics.get("markup_tag_count"), 0))
+    nbsp_entity_count = max(0, _parse_int(diagnostics.get("nbsp_entity_count"), 0))
+    empty_cue_count = max(0, _parse_int(diagnostics.get("empty_cue_count"), 0))
+
+    overlap_reduction_count = overlap_trim_count + overlap_collapsed_cue_count
+    spacing_cleanup_count = (
+        collapsed_cjk_spacing_count
+        + tightened_punctuation_spacing_count
+        + tightened_bracket_spacing_count
+    )
+    markup_cleanup_count = markup_tag_count + nbsp_entity_count
+    exact_duplicate_cue_ratio = exact_duplicate_cue_count / density_base
+    overlap_reduction_ratio = overlap_reduction_count / density_base
+    spacing_cleanup_ratio = spacing_cleanup_count / density_base
+    markup_cleanup_ratio = markup_cleanup_count / density_base
+    empty_cue_ratio = empty_cue_count / density_base
+
+    fragment_line_count = sum(1 for line in lines if _is_quality_fragment_paragraph(line))
+    fragment_line_ratio = fragment_line_count / len(lines) if lines else 0.0
+    avg_line_char_count = (
+        sum(_count_quality_chars(line) for line in lines) / len(lines)
+        if lines else 0.0
+    )
+
+    duplicate_penalty = _subtitle_quality_penalty(
+        exact_duplicate_cue_ratio,
+        safe=0.04,
+        scale=3.5,
+        max_penalty=0.35,
+    )
+    overlap_penalty = _subtitle_quality_penalty(
+        overlap_reduction_ratio,
+        safe=0.06,
+        scale=3.0,
+        max_penalty=0.30,
+    )
+    spacing_penalty = _subtitle_quality_penalty(
+        spacing_cleanup_ratio,
+        safe=0.10,
+        scale=2.0,
+        max_penalty=0.20,
+    )
+    markup_penalty = _subtitle_quality_penalty(
+        markup_cleanup_ratio,
+        safe=0.15,
+        scale=1.2,
+        max_penalty=0.08,
+    )
+    empty_penalty = _subtitle_quality_penalty(
+        empty_cue_ratio,
+        safe=0.05,
+        scale=2.0,
+        max_penalty=0.10,
+    )
+    fragmentation_penalty = 0.0
+    if mode == "chinese" and len(lines) >= 10:
+        fragmentation_penalty = _subtitle_quality_penalty(
+            fragment_line_ratio,
+            safe=0.55,
+            scale=0.6,
+            max_penalty=0.12,
+        )
+
+    penalties = (
+        duplicate_penalty
+        + overlap_penalty
+        + spacing_penalty
+        + markup_penalty
+        + empty_penalty
+        + fragmentation_penalty
+    )
+    subtitle_quality_score = round(max(0.0, 1.0 - penalties), 3)
+    subtitle_quality_band = _classify_subtitle_quality_band(subtitle_quality_score)
+    subtitle_quality_reasons = []
+    if duplicate_penalty > 0:
+        subtitle_quality_reasons.append("duplicate_cue_density_high")
+    if overlap_penalty > 0:
+        subtitle_quality_reasons.append("overlap_reduction_density_high")
+    if spacing_penalty > 0:
+        subtitle_quality_reasons.append("spacing_cleanup_density_high")
+    if markup_penalty > 0:
+        subtitle_quality_reasons.append("markup_cleanup_density_high")
+    if empty_penalty > 0:
+        subtitle_quality_reasons.append("empty_cue_density_high")
+    if fragmentation_penalty > 0:
+        subtitle_quality_reasons.append("subtitle_fragmentation_high")
+
+    return {
+        "applicable": True,
+        "evaluated": True,
+        "subtitle_quality_score": subtitle_quality_score,
+        "subtitle_quality_band": subtitle_quality_band,
+        "subtitle_quality_reasons": subtitle_quality_reasons,
+        "overlap_reduction_count": overlap_reduction_count,
+        "metrics": {
+            "cue_count": cue_count,
+            "line_count": len(lines),
+            "fragment_line_count": fragment_line_count,
+            "fragment_line_ratio": round(fragment_line_ratio, 3),
+            "avg_line_char_count": round(avg_line_char_count, 1),
+            "exact_duplicate_cue_ratio": round(exact_duplicate_cue_ratio, 3),
+            "overlap_reduction_ratio": round(overlap_reduction_ratio, 3),
+            "spacing_cleanup_ratio": round(spacing_cleanup_ratio, 3),
+            "markup_cleanup_ratio": round(markup_cleanup_ratio, 3),
+            "empty_cue_ratio": round(empty_cue_ratio, 3),
+        },
+    }
+
+
+def _build_source_routing_signal(source: str, mode: str, subtitle_quality: dict | None = None) -> dict:
+    """Return explainable source-routing fields for planning and audits."""
+    quality_payload = dict(_default_subtitle_quality_signal())
+    if isinstance(subtitle_quality, dict):
+        quality_payload.update(subtitle_quality)
+    quality_payload["metrics"] = dict(quality_payload.get("metrics", {}))
+
+    score = quality_payload.get("subtitle_quality_score")
+    band = str(quality_payload.get("subtitle_quality_band", "")).strip()
+    reasons = quality_payload.get("subtitle_quality_reasons", [])
+    subtitle_quality_reasons = reasons if isinstance(reasons, list) else []
+    overlap_reduction_count = max(0, _parse_int(quality_payload.get("overlap_reduction_count"), 0))
+
+    source_route_reason = "source_route_unknown"
+    reroute_recommended = False
+    reroute_target = ""
+    reroute_reasons = []
+
+    normalized_source = str(source or "").strip().lower()
+    normalized_mode = str(mode or "").strip().lower()
+    if normalized_source == "deepgram":
+        source_route_reason = "deepgram_source_selected"
+    elif quality_payload.get("applicable"):
+        if quality_payload.get("evaluated"):
+            if band == "critical" and normalized_mode == "chinese":
+                source_route_reason = "subtitle_quality_critical_deepgram_recommended"
+                reroute_recommended = True
+                reroute_target = "deepgram"
+                reroute_reasons = list(subtitle_quality_reasons)
+            elif band == "critical":
+                source_route_reason = "subtitle_quality_critical_manual_review_only"
+            elif band == "poor":
+                source_route_reason = "subtitle_quality_poor_review_subtitle_path"
+            else:
+                source_route_reason = "subtitle_quality_acceptable"
+        else:
+            source_route_reason = "subtitle_quality_pending"
+    elif normalized_source == "youtube":
+        source_route_reason = "subtitle_quality_pending"
+    elif normalized_source:
+        source_route_reason = f"{normalized_source}_source_selected"
+
+    return {
+        "source_route_reason": source_route_reason,
+        "reroute_recommended": reroute_recommended,
+        "reroute_target": reroute_target,
+        "reroute_reasons": reroute_reasons,
+        "subtitle_quality_score": score,
+        "subtitle_quality_band": band,
+        "subtitle_quality_reasons": subtitle_quality_reasons,
+        "overlap_reduction_count": overlap_reduction_count,
+        "subtitle_quality": quality_payload,
+    }
+
+
 def _update_machine_state_normalization(machine_state_path: str | Path, *, normalized_document_path: str,
                                         source_adapter: str, preferred_chunk_source: str,
                                         segment_count: int, char_count: int,
@@ -5614,6 +5965,7 @@ def normalize_document(state_ref: str, output_path: str = "", prefer: str = "aut
     has_timing = False
     source_adapter = "raw_text_file"
     preferred_chunk_source = "text"
+    cleanup_diagnostics = {}
     warnings = []
 
     if use_segments:
@@ -5639,6 +5991,9 @@ def normalize_document(state_ref: str, output_path: str = "", prefer: str = "aut
                 "normalized_document_path": normalized_document_path,
                 "materialized": False,
             }
+        payload_diagnostics = payload.get("diagnostics", {}) if isinstance(payload.get("diagnostics", {}), dict) else {}
+        if _is_youtube_subtitle_source(source_payload) or str(payload.get("source", "")).strip().lower() == "vtt":
+            cleanup_diagnostics = payload_diagnostics
         for seg in payload.get("segments", []):
             if not isinstance(seg, dict):
                 continue
@@ -5719,6 +6074,19 @@ def normalize_document(state_ref: str, output_path: str = "", prefer: str = "aut
         },
         "segments": normalized_segments,
     }
+    subtitle_quality = _evaluate_subtitle_quality(
+        normalized_text,
+        cleanup_diagnostics,
+        source_payload=source_payload,
+        workflow_payload=workflow_payload,
+        segment_count=len(normalized_segments),
+    )
+    if cleanup_diagnostics or subtitle_quality.get("applicable"):
+        normalized_doc["diagnostics"] = {}
+        if cleanup_diagnostics:
+            normalized_doc["diagnostics"]["subtitle_cleanup"] = cleanup_diagnostics
+        if subtitle_quality.get("applicable"):
+            normalized_doc["diagnostics"]["subtitle_quality"] = subtitle_quality
     _atomic_write_text(Path(normalized_document_path), json.dumps(normalized_doc, ensure_ascii=False, indent=2))
     _update_machine_state_normalization(
         machine_state_path,
@@ -5743,6 +6111,8 @@ def normalize_document(state_ref: str, output_path: str = "", prefer: str = "aut
         "segment_count": len(normalized_segments),
         "has_timing": has_timing,
         "char_count": len(normalized_text),
+        "cleanup_diagnostics": cleanup_diagnostics,
+        "subtitle_quality": subtitle_quality,
     }
 
 
@@ -5903,6 +6273,11 @@ def plan_optimization(state_path: str) -> dict:
         "oversized_short_input" if oversized_short_input else "duration_short_single_pass"
     )
     video_path = "long" if duration_bucket == "long" or oversized_short_input else "short"
+    source_routing = _build_source_routing_signal(
+        source,
+        mode,
+        normalization.get("subtitle_quality", {}),
+    )
     plan_warnings = list(normalization.get("warnings", []))
     if oversized_short_input:
         plan_warnings.append(
@@ -5911,6 +6286,21 @@ def plan_optimization(state_path: str) -> dict:
     if source == "deepgram":
         plan_warnings.append(
             "Deepgram fallback is active; review proper nouns and mixed-language terms carefully in the final output."
+        )
+    elif source_routing["reroute_recommended"] and source_routing["reroute_target"] == "deepgram":
+        plan_warnings.append(
+            "Subtitle quality is critical; reroute to Deepgram before text optimization is recommended "
+            f"(subtitle_quality_score={source_routing['subtitle_quality_score']:.3f})."
+        )
+    elif source_routing["subtitle_quality_band"] == "critical":
+        plan_warnings.append(
+            "Subtitle quality is critical on the current subtitle route; continue only with manual review "
+            f"(subtitle_quality_score={source_routing['subtitle_quality_score']:.3f})."
+        )
+    elif source_routing["subtitle_quality_band"] == "poor":
+        plan_warnings.append(
+            "Subtitle quality looks poor; keep the subtitle path only with extra review "
+            f"(subtitle_quality_score={source_routing['subtitle_quality_score']:.3f})."
         )
 
     outputs = {
@@ -6059,18 +6449,32 @@ def plan_optimization(state_path: str) -> dict:
             "estimated_input_tokens": estimated_input_tokens,
             "estimated_input_chars": estimated_input_chars,
             "single_pass_token_limit": single_pass_token_limit,
+            "subtitle_quality_score": source_routing["subtitle_quality_score"],
+            "subtitle_quality_band": source_routing["subtitle_quality_band"],
+            "overlap_reduction_count": source_routing["overlap_reduction_count"],
+            "source_route_reason": source_routing["source_route_reason"],
+            "reroute_recommended": source_routing["reroute_recommended"],
+            "reroute_target": source_routing["reroute_target"],
         },
         "warnings": plan_warnings,
         "hard_failures": [],
         "video_path": video_path,
         "duration_bucket": duration_bucket,
         "routing_reason": routing_reason,
+        "source_route_reason": source_routing["source_route_reason"],
+        "reroute_recommended": source_routing["reroute_recommended"],
+        "reroute_target": source_routing["reroute_target"],
+        "reroute_reasons": source_routing["reroute_reasons"],
+        "subtitle_quality_score": source_routing["subtitle_quality_score"],
+        "subtitle_quality_band": source_routing["subtitle_quality_band"],
+        "subtitle_quality_reasons": source_routing["subtitle_quality_reasons"],
         "normalization": {
             "materialized": normalization.get("materialized", False),
             "source_adapter": normalization.get("source_adapter", ""),
             "preferred_chunk_source": normalization.get("preferred_chunk_source", ""),
             "segment_count": normalization.get("segment_count", 0),
             "normalized_document_path": normalization.get("normalized_document_path", ""),
+            "subtitle_quality": normalization.get("subtitle_quality", {}),
         },
         "chunking": chunking,
         "requires_llm_preflight": video_path == "long",
@@ -6675,6 +7079,18 @@ def main():
     glossary_parser.add_argument('work_dir', help='Working directory with manifest.json and raw chunks')
     glossary_parser.add_argument('--max-terms', type=int, default=50, help='Maximum number of glossary terms to keep')
     glossary_parser.add_argument('--min-occurrences', type=int, default=1, help='Minimum source occurrences required for a term')
+    glossary_parser.add_argument('--mode', choices=['auto', 'manifest', 'transcript'], default='auto',
+                                 help='Glossary source mode; transcript adds normalized-doc/chapter/metadata context when available')
+    glossary_parser.add_argument('--normalized-document', dest='normalized_document_path', default='',
+                                 help='Optional normalized_document.json path')
+    glossary_parser.add_argument('--chapters-path', default='',
+                                 help='Optional chapters or chapter_plan JSON path')
+    glossary_parser.add_argument('--metadata-json', dest='metadata_json_path', default='',
+                                 help='Optional metadata JSON path with title/channel/description/chapter fields')
+    glossary_parser.add_argument('--description-text', default='',
+                                 help='Optional description text to mine for glossary terms')
+    glossary_parser.add_argument('--description-path', default='',
+                                 help='Optional text file path containing description text')
 
     # assemble-final command
     af_parser = subparsers.add_parser(
@@ -6700,6 +7116,10 @@ def main():
     vq_parser.add_argument('optimized_text_path', help='Path to optimized text file')
     vq_parser.add_argument('--raw-text', default=None, help='Path to raw text file for size comparison')
     vq_parser.add_argument('--bilingual', action='store_true', help='Whether content should be bilingual')
+    vq_parser.add_argument('--work-dir', default='', help='Optional work_dir used to load glossary.json for drift checks')
+    vq_parser.add_argument('--glossary-path', default='', help='Optional glossary.json path for final drift checks')
+    vq_parser.add_argument('--glossary-max-terms', type=int, default=12,
+                           help='Maximum glossary terms to verify in final output')
 
     # load-config command
     config_parser = subparsers.add_parser(
@@ -7099,6 +7519,12 @@ def main():
             work_dir=args.work_dir,
             max_terms=args.max_terms,
             min_occurrences=args.min_occurrences,
+            mode=args.mode,
+            normalized_document_path=args.normalized_document_path,
+            chapters_path=args.chapters_path,
+            metadata_json_path=args.metadata_json_path,
+            description_text=args.description_text,
+            description_path=args.description_path,
         )
         result = envelope['result']
         print(json.dumps(envelope if args.api_envelope else result, ensure_ascii=False))
@@ -7127,6 +7553,9 @@ def main():
             optimized_text_path=args.optimized_text_path,
             raw_text_path=args.raw_text,
             bilingual=args.bilingual,
+            work_dir=args.work_dir,
+            glossary_path=args.glossary_path,
+            glossary_max_terms=args.glossary_max_terms,
         )
         result = envelope['result']
         print(json.dumps(envelope if args.api_envelope else result, ensure_ascii=False))

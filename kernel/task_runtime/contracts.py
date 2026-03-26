@@ -458,6 +458,7 @@ def derive_artifacts(command: str, result=None, *, context: dict | None = None,
     candidates = [
         ("manifest", result.get("manifest_path", "")),
         ("work_dir", result.get("work_dir", "") or context.get("work_dir", "")),
+        ("glossary", result.get("glossary_path", "") or context.get("glossary_path", "")),
         ("normalized_document", result.get("normalized_document_path", "") or context.get("normalized_document_path", "")),
         ("output_file", result.get("output_file", "") or context.get("output_file", "")),
         ("output_path", result.get("output_path", "") or context.get("output_path", "")),
@@ -512,14 +513,23 @@ def derive_quality_report(command: str, result=None, *, context: dict | None = N
         coverage_score = 1.0 if result.get("passed", False) else 0.0
         missing_sections = result.get("missing_semantic_anchors", []) if isinstance(result.get("missing_semantic_anchors", []), list) else []
         recommended_action = "accept_output" if result.get("passed", False) else "repair_or_replan"
+        if (
+            result.get("passed", False)
+            and _parse_bool(checks.get("reroute_recommended"), False)
+            and str(checks.get("reroute_target", "")).strip() == "deepgram"
+        ):
+            recommended_action = "fallback_to_deepgram"
         structure_integrity = "passed" if checks.get("has_structure", result.get("passed", False)) else "failed"
         translation_risk = "low"
+        term_consistency_score = 1.0
         if checks.get("bilingual_balanced") is False:
             translation_risk = "high"
+        if checks.get("glossary_drift_applicable"):
+            term_consistency_score = _parse_float(checks.get("glossary_preservation_ratio", 1.0), 1.0)
         return build_quality_report(
             coverage_score=coverage_score,
             missing_sections=missing_sections,
-            term_consistency_score=1.0,
+            term_consistency_score=term_consistency_score,
             translation_risk=translation_risk,
             structure_integrity=structure_integrity,
             recommended_action=recommended_action,

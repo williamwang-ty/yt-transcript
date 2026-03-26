@@ -41,8 +41,13 @@ Read from JSON:
 - `operations`
 - `replan_contract`
 - `outputs`
+- `source_route_reason`
+- `reroute_recommended`
+- `reroute_target`
 
 If `hard_failures` is non-empty, STOP.
+
+If `reroute_recommended=true` and `reroute_target=deepgram`, STOP this subtitle optimization path and switch back to the Deepgram source workflow before continuing.
 
 If `requires_llm_preflight=true`, ensure:
 
@@ -51,6 +56,8 @@ bash <skill-root>/scripts/preflight.sh --require-llm
 ```
 
 `plan-optimization` is the canonical router here. It still reports the raw `duration_bucket` (`short` for `< 1800s`, `long` for `>= 1800s`), but `video_path` may escalate a short-duration transcript to chunked execution when the normalized input is too large for reliable single-pass prompting. The separate Quick Mode from `SKILL.md` is a narrower `< 900` second shortcut inside the short-duration bucket.
+
+`routing_reason` explains duration/size routing. `source_route_reason` explains source-quality routing, including subtitle quality scoring and any Deepgram fallback recommendation.
 
 ---
 
@@ -178,6 +185,7 @@ This step is optional because `process-chunks` now runs the same resume repair a
 - Every chunk operation includes an `execution` object; follow it instead of re-deriving replan behavior in prose
 - When `execution.supports_auto_replan=true`, include every flag in `execution.recommended_cli_flags`
 - When `execution.on_replan_required=stop_and_review`, do not call `replan-remaining`; STOP and surface the manifest/runtime state for manual review
+- When the raw-stage prompt is `cleanup_zh`, `process-chunks` now auto-builds a transcript glossary if `/tmp/${VIDEO_ID}_chunks/glossary.json` does not exist yet; you may still run `build-glossary --mode transcript` explicitly beforehand if you want to inspect the terms first
 
 Canonical command shape:
 
@@ -210,6 +218,8 @@ python3 <skill-root>/yt_transcript_utils.py merge-content \
     /tmp/${VIDEO_ID}_optimized.txt
 ```
 
+`merge-content` now includes a deterministic post-merge cleanup step for chunk seams. It can trim repeated seam text, merge obviously split short fragments, and remove duplicate chapter/title lines introduced at the merge boundary.
+
 Write to state:
 
 - `step: 4`
@@ -222,7 +232,8 @@ Write to state:
 ```bash
 python3 <skill-root>/yt_transcript_utils.py verify-quality \
     /tmp/${VIDEO_ID}_optimized.txt \
-    --raw-text /tmp/${VIDEO_ID}_raw_text.txt
+    --raw-text /tmp/${VIDEO_ID}_raw_text.txt \
+    --work-dir /tmp/${VIDEO_ID}_chunks
 ```
 
 Add `--bilingual` if `mode=bilingual`.
@@ -230,5 +241,9 @@ Add `--bilingual` if `mode=bilingual`.
 If `hard_failures` is non-empty, STOP.
 
 If only `warnings` are present, review them before deciding to continue.
+
+`checks` now also carries advisory readability metrics such as chunk seam duplication,
+Chinese spacing anomalies, repeated phrase density, short paragraph ratio,
+header density, punctuation density, and glossary drift so the warning reasons stay explainable.
 
 Do not continue to final assembly until verification passes.

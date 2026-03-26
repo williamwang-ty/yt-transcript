@@ -227,6 +227,8 @@ If `hard_failures` is non-empty, STOP.
 
 Load and follow [workflows/text_optimization.md](workflows/text_optimization.md).
 
+If `plan-optimization` returns `reroute_recommended=true` with `reroute_target=deepgram`, stop the subtitle path here and switch to Step 3B Deepgram Path before any prompt execution.
+
 ### Checkpoint After Step 4
 
 ```bash

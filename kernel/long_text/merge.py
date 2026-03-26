@@ -5,6 +5,8 @@ import math
 import sys
 from pathlib import Path
 
+from kernel.text_cleanup import post_merge as kernel_post_merge_cleanup
+
 
 def _resolve_manifest_path(manifest_ref: str) -> Path:
     """Resolve a manifest reference to an absolute manifest path."""
@@ -140,6 +142,17 @@ def build_chapter_plan(chapters_path: str, manifest_ref: str, output_path: str =
     }
 
 
+def _normalize_header_content(header_content: str) -> str:
+    """Normalize optional prefixed header content without touching merge-body cleanup."""
+    normalized = str(header_content or "").replace("\r\n", "\n").replace("\r", "\n")
+    normalized = "\n".join(line.rstrip() for line in normalized.split("\n")).strip()
+    if not normalized:
+        return ""
+    if normalized.endswith("---"):
+        return normalized
+    return f"{normalized}\n\n---"
+
+
 def merge_content(work_dir: str, output_file: str, header_content: str = "") -> dict:
     """Merge processed chunk outputs into the final Markdown document."""
     import yt_transcript_utils as utils
@@ -177,17 +190,10 @@ def merge_content(work_dir: str, output_file: str, header_content: str = "") -> 
         except (json.JSONDecodeError, KeyError) as error:
             print(f"Warning: Could not parse chapter_plan.json: {error}", file=sys.stderr)
 
-    output_lines: list[str] = []
+    header_prefix = _normalize_header_content(header_content)
+    body_lines: list[str] = []
     chapters_inserted = 0
     missing_files: list[str] = []
-
-    if header_content:
-        header_content = header_content.strip()
-        output_lines.append(header_content)
-        if not header_content.endswith("---"):
-            output_lines.append("\n---\n")
-        else:
-            output_lines.append("\n")
 
     for chunk_info in manifest["chunks"]:
         chunk_id = chunk_info["id"]
@@ -213,23 +219,32 @@ def merge_content(work_dir: str, output_file: str, header_content: str = "") -> 
                 if not headings:
                     continue
 
-                output_lines.append("\n")
+                body_lines.append("\n")
                 for heading in headings:
-                    output_lines.append(f"## {heading}\n")
-                output_lines.append("\n")
+                    body_lines.append(f"## {heading}\n")
+                body_lines.append("\n")
                 chapters_inserted += 1
 
         if processed_path.exists():
             content = processed_path.read_text(encoding="utf-8")
-            output_lines.append(content)
-            output_lines.append("\n")
+            body_lines.append(content)
+            body_lines.append(f"\n\n{kernel_post_merge_cleanup.CHUNK_SEAM_MARKER}\n\n")
         elif status == "done":
             missing_files.append(str(processed_path))
             print(f"Warning: Processed file not found: {processed_path}", file=sys.stderr)
 
     output_path = Path(output_file)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    final_content = "".join(output_lines)
+    body_content = "".join(body_lines)
+    cleaned_body, cleanup_diagnostics = kernel_post_merge_cleanup.post_merge_cleanup(body_content)
+    cleanup_applied = cleaned_body != body_content
+
+    sections = []
+    if header_prefix:
+        sections.append(header_prefix)
+    if cleaned_body:
+        sections.append(cleaned_body)
+    final_content = "\n\n".join(section.strip() for section in sections if section.strip()).strip()
     output_path.write_text(final_content, encoding="utf-8")
 
     return {
@@ -239,4 +254,6 @@ def merge_content(work_dir: str, output_file: str, header_content: str = "") -> 
         "total_chars": len(final_content),
         "chapters_inserted": chapters_inserted,
         "missing_files": missing_files,
+        "post_merge_cleanup_applied": cleanup_applied,
+        "cleanup_diagnostics": cleanup_diagnostics,
     }

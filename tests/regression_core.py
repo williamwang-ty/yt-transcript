@@ -598,6 +598,32 @@ class CoreRegressionTests(unittest.TestCase):
                 ["你好，", "世界！"],
             )
 
+    def test_parse_vtt_segments_trims_overlap_and_reports_diagnostics(self):
+        """Test adjacent subtitle overlap is trimmed deterministically and reported."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            vtt_path = Path(tmpdir) / "sub_overlap.vtt"
+            vtt_path.write_text(
+                "WEBVTT\n"
+                "Language: zh-Hans\n"
+                "\n"
+                "00:00:00.000 --> 00:00:02.000\n"
+                "大家好今天\n"
+                "\n"
+                "00:00:02.000 --> 00:00:04.000\n"
+                "好今天我们来聊测试\n",
+                encoding="utf-8",
+            )
+
+            result = utils.parse_vtt_segments(str(vtt_path), language="zh-Hans")
+
+            self.assertEqual(
+                [segment["text"] for segment in result["segments"]],
+                ["大家好今天", "我们来聊测试"],
+            )
+            self.assertEqual(result["diagnostics"]["cue_count"], 2)
+            self.assertEqual(result["diagnostics"]["overlap_trim_count"], 1)
+            self.assertEqual(result["diagnostics"]["overlap_trimmed_chars"], 3)
+
     def test_cli_parse_vtt_segments_command_is_registered(self):
         """Test cli parse vtt segments command is registered."""
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -633,6 +659,8 @@ class CoreRegressionTests(unittest.TestCase):
             self.assertEqual(payload["source"], "vtt")
             self.assertEqual(payload["language"], "en")
             self.assertEqual(payload["segment_count"], 1)
+            self.assertIn("diagnostics", payload)
+            self.assertEqual(payload["diagnostics"]["exact_duplicate_cue_count"], 1)
             self.assertEqual(payload["segments"][0]["text"], "Hello world.")
             self.assertEqual(payload["segments"][0]["start_time"], 0.0)
             self.assertEqual(payload["segments"][0]["end_time"], 4.0)
@@ -1127,6 +1155,10 @@ class CoreRegressionTests(unittest.TestCase):
                     {
                         "source": "vtt",
                         "language": "zh-Hans",
+                        "diagnostics": {
+                            "cue_count": 2,
+                            "overlap_trim_count": 1,
+                        },
                         "segments": [
                             {"id": 0, "text": "你 好，", "start_time": 0.0, "end_time": 1.0},
                             {"id": 1, "text": "第 二 行。", "start_time": 1.0, "end_time": 2.0},
@@ -1160,9 +1192,14 @@ class CoreRegressionTests(unittest.TestCase):
             self.assertTrue(result["passed"], result)
             self.assertEqual(result["source_adapter"], "segments_json")
             self.assertEqual(result["preferred_chunk_source"], "text")
+            self.assertEqual(result["cleanup_diagnostics"]["overlap_trim_count"], 1)
             payload = json.loads(Path(result["normalized_document_path"]).read_text(encoding="utf-8"))
             self.assertEqual(payload["content"]["preferred_chunk_source"], "text")
             self.assertEqual(payload["content"]["text"], "你好，\n\n第二行。")
+            self.assertEqual(payload["diagnostics"]["subtitle_cleanup"]["overlap_trim_count"], 1)
+            self.assertIn("subtitle_quality", payload["diagnostics"])
+            self.assertTrue(payload["diagnostics"]["subtitle_quality"]["applicable"])
+            self.assertGreaterEqual(payload["diagnostics"]["subtitle_quality"]["subtitle_quality_score"], 0.75)
             self.assertEqual(
                 [segment["text"] for segment in payload["segments"]],
                 ["你好，", "第二行。"],
@@ -1297,6 +1334,154 @@ work_dir: /tmp/vid001_chunks
             self.assertEqual([op["prompt"] for op in result["operations"]], ["cleanup_zh"])
             self.assertEqual(result["operations"][0]["execution"]["mode"], "single_pass")
             self.assertEqual(result["operations"][0]["extra_instruction"], "")
+            self.assertEqual(result["source_route_reason"], "subtitle_quality_pending")
+            self.assertFalse(result["reroute_recommended"])
+
+    def test_plan_optimization_recommends_deepgram_for_critical_chinese_subtitles(self):
+        """Test plan optimization recommends Deepgram when subtitle quality is critically poor."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state = Path(tmpdir) / "state.md"
+            raw_text = Path(tmpdir) / "vid001_raw.txt"
+            segments = Path(tmpdir) / "vid001_segments.json"
+            raw_text.write_text(
+                "\n".join([
+                    "我 们",
+                    "先 看",
+                    "这 里",
+                    "再 说",
+                    "下 一",
+                    "步 呢",
+                    "你 看",
+                    "对 吧",
+                    "现 在",
+                    "继 续",
+                    "往 下",
+                    "讲 吧",
+                ]),
+                encoding="utf-8",
+            )
+            segments.write_text(
+                json.dumps(
+                    {
+                        "source": "vtt",
+                        "language": "zh-Hans",
+                        "diagnostics": {
+                            "cue_count": 20,
+                            "empty_cue_count": 3,
+                            "exact_duplicate_cue_count": 5,
+                            "overlap_trim_count": 5,
+                            "overlap_collapsed_cue_count": 2,
+                            "markup_tag_count": 8,
+                            "nbsp_entity_count": 4,
+                            "collapsed_cjk_spacing_count": 12,
+                            "tightened_punctuation_spacing_count": 6,
+                            "tightened_bracket_spacing_count": 2,
+                        },
+                        "segments": [
+                            {"id": idx, "text": f"片段 {idx}", "start_time": float(idx), "end_time": float(idx + 1)}
+                            for idx in range(20)
+                        ],
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            state.write_text(
+                "# State\n"
+                "vid: vid001\n"
+                "url: https://example.com/watch?v=1\n"
+                "title: Sample\n"
+                "channel: Channel\n"
+                "upload_date: 20260308\n"
+                "duration: 120\n"
+                "output_dir: /tmp/out\n"
+                "mode: chinese\n"
+                "src: youtube\n"
+                "source_language: zh-Hans\n"
+                "subtitle_source: YouTube Subtitles\n"
+                f"raw_text: {raw_text}\n"
+                f"segments_path: {segments}\n"
+                "work_dir: /tmp/vid001_chunks\n",
+                encoding="utf-8",
+            )
+
+            result = utils.plan_optimization(str(state))
+
+            self.assertTrue(result["passed"], result)
+            self.assertTrue(result["reroute_recommended"])
+            self.assertEqual(result["reroute_target"], "deepgram")
+            self.assertEqual(result["source_route_reason"], "subtitle_quality_critical_deepgram_recommended")
+            self.assertEqual(result["checks"]["source_route_reason"], "subtitle_quality_critical_deepgram_recommended")
+            self.assertEqual(result["subtitle_quality_band"], "critical")
+            self.assertLess(result["subtitle_quality_score"], 0.35)
+            self.assertGreater(result["checks"]["overlap_reduction_count"], 0)
+            self.assertEqual(result["normalization"]["subtitle_quality"]["subtitle_quality_band"], "critical")
+            self.assertTrue(any("Deepgram before text optimization is recommended" in warning for warning in result["warnings"]))
+
+    def test_plan_optimization_keeps_bilingual_subtitles_on_manual_review_for_critical_quality(self):
+        """Test poor bilingual subtitle quality warns without auto-rerouting to Deepgram."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state = Path(tmpdir) / "state.md"
+            raw_text = Path(tmpdir) / "vid001_raw.txt"
+            segments = Path(tmpdir) / "vid001_segments.json"
+            raw_text.write_text(
+                "\n".join([f"segment {idx}" for idx in range(12)]),
+                encoding="utf-8",
+            )
+            segments.write_text(
+                json.dumps(
+                    {
+                        "source": "vtt",
+                        "language": "en",
+                        "diagnostics": {
+                            "cue_count": 20,
+                            "empty_cue_count": 3,
+                            "exact_duplicate_cue_count": 5,
+                            "overlap_trim_count": 5,
+                            "overlap_collapsed_cue_count": 2,
+                            "markup_tag_count": 8,
+                            "nbsp_entity_count": 4,
+                            "collapsed_cjk_spacing_count": 12,
+                            "tightened_punctuation_spacing_count": 6,
+                            "tightened_bracket_spacing_count": 2,
+                        },
+                        "segments": [
+                            {"id": idx, "text": f"segment {idx}", "start_time": float(idx), "end_time": float(idx + 1)}
+                            for idx in range(20)
+                        ],
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            state.write_text(
+                "# State\n"
+                "vid: vid001\n"
+                "url: https://example.com/watch?v=1\n"
+                "title: Sample\n"
+                "channel: Channel\n"
+                "upload_date: 20260308\n"
+                "duration: 120\n"
+                "output_dir: /tmp/out\n"
+                "mode: bilingual\n"
+                "src: youtube\n"
+                "source_language: en\n"
+                "subtitle_source: YouTube Subtitles\n"
+                f"raw_text: {raw_text}\n"
+                f"segments_path: {segments}\n"
+                "work_dir: /tmp/vid001_chunks\n",
+                encoding="utf-8",
+            )
+
+            result = utils.plan_optimization(str(state))
+
+            self.assertTrue(result["passed"], result)
+            self.assertFalse(result["reroute_recommended"])
+            self.assertEqual(result["reroute_target"], "")
+            self.assertEqual(result["source_route_reason"], "subtitle_quality_critical_manual_review_only")
+            self.assertEqual(result["subtitle_quality_band"], "critical")
+            self.assertLess(result["subtitle_quality_score"], 0.35)
+            self.assertTrue(any("continue only with manual review" in warning for warning in result["warnings"]))
 
     def test_plan_optimization_returns_long_deepgram_operations(self):
         """Test plan optimization returns long deepgram operations."""
@@ -1378,6 +1563,20 @@ work_dir: /tmp/vid001_chunks
             self.assertEqual(result["replan_contract"]["processed_path"]["on_replan_required"], "stop_and_review")
             self.assertFalse(result["operations"][1]["control"]["replan"]["supports_auto_replan"])
             self.assertEqual(result["operations"][1]["control"]["quality_gate"]["hard_failure_checks"][-1]["id"], "bilingual_pairs")
+
+    def test_quality_gate_contract_exposes_advisory_readability_metrics(self):
+        """Test quality gate contract exposes advisory readability metrics."""
+        contract = utils._build_quality_gate_contract(bilingual=False)
+
+        warning_ids = [entry["id"] for entry in contract["warning_checks"]]
+
+        self.assertIn("chunk_seam_duplication", warning_ids)
+        self.assertIn("header_fragment_balance", warning_ids)
+        self.assertIn("cjk_spacing_anomaly", warning_ids)
+        self.assertIn("fragment_paragraph_ratio", warning_ids)
+        self.assertIn("duplicate_ngram_ratio", warning_ids)
+        self.assertIn("punctuation_density", warning_ids)
+        self.assertIn("glossary_drift", warning_ids)
 
     def test_cli_api_envelope_wraps_plan_optimization(self):
         """Test cli api envelope wraps plan optimization."""
@@ -1816,6 +2015,244 @@ work_dir: /tmp/vid001_chunks
             self.assertIn("## 甲", merged_text)
             self.assertIn("## B", merged_text)
             self.assertIn("## 乙", merged_text)
+
+    def test_merge_content_trims_chunk_seam_overlap(self):
+        """Test merge content removes repeated seam text after chunk concat."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            work_dir = Path(tmpdir) / "chunks"
+            output_file = Path(tmpdir) / "merged.md"
+            work_dir.mkdir(parents=True, exist_ok=True)
+
+            (work_dir / "manifest.json").write_text(
+                json.dumps(
+                    {
+                        "chunks": [
+                            {"id": 0, "processed_path": "processed_000.md", "status": "done"},
+                            {"id": 1, "processed_path": "processed_001.md", "status": "done"},
+                        ]
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+            (work_dir / "processed_000.md").write_text("第一句。\n这是重复句。", encoding="utf-8")
+            (work_dir / "processed_001.md").write_text("这是重复句。\n第二句。", encoding="utf-8")
+
+            merge_result = utils.merge_content(str(work_dir), str(output_file))
+            merged_text = output_file.read_text(encoding="utf-8")
+
+            self.assertTrue(merge_result["success"])
+            self.assertTrue(merge_result["post_merge_cleanup_applied"])
+            self.assertEqual(merge_result["cleanup_diagnostics"]["seam_overlap_trim_count"], 1)
+            self.assertEqual(merged_text.count("这是重复句。"), 1)
+            self.assertNotIn("yt-transcript-chunk-seam", merged_text)
+
+    def test_merge_content_merges_short_incomplete_fragments(self):
+        """Test merge content rejoins short body fragments split across chunks."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            work_dir = Path(tmpdir) / "chunks"
+            output_file = Path(tmpdir) / "merged.md"
+            work_dir.mkdir(parents=True, exist_ok=True)
+
+            (work_dir / "manifest.json").write_text(
+                json.dumps(
+                    {
+                        "chunks": [
+                            {"id": 0, "processed_path": "processed_000.md", "status": "done"},
+                            {"id": 1, "processed_path": "processed_001.md", "status": "done"},
+                        ]
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+            (work_dir / "processed_000.md").write_text("这是一个被拆开的段落", encoding="utf-8")
+            (work_dir / "processed_001.md").write_text("后半句，补完。", encoding="utf-8")
+
+            merge_result = utils.merge_content(str(work_dir), str(output_file))
+            merged_text = output_file.read_text(encoding="utf-8")
+
+            self.assertTrue(merge_result["success"])
+            self.assertEqual(merge_result["cleanup_diagnostics"]["short_paragraph_merge_count"], 1)
+            self.assertIn("这是一个被拆开的段落\n后半句，补完。", merged_text)
+            self.assertNotIn("这是一个被拆开的段落\n\n后半句，补完。", merged_text)
+
+    def test_merge_content_preserves_unrelated_short_chinese_paragraphs(self):
+        """Test merge content keeps standalone short Chinese paragraphs separated."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            work_dir = Path(tmpdir) / "chunks"
+            output_file = Path(tmpdir) / "merged.md"
+            work_dir.mkdir(parents=True, exist_ok=True)
+
+            (work_dir / "manifest.json").write_text(
+                json.dumps(
+                    {
+                        "chunks": [
+                            {"id": 0, "processed_path": "processed_000.md", "status": "done"},
+                            {"id": 1, "processed_path": "processed_001.md", "status": "done"},
+                        ]
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+            (work_dir / "processed_000.md").write_text("短句", encoding="utf-8")
+            (work_dir / "processed_001.md").write_text("第二段。", encoding="utf-8")
+
+            merge_result = utils.merge_content(str(work_dir), str(output_file))
+            merged_text = output_file.read_text(encoding="utf-8")
+
+            self.assertTrue(merge_result["success"])
+            self.assertEqual(merge_result["cleanup_diagnostics"]["short_paragraph_merge_count"], 0)
+            self.assertIn("短句\n\n第二段。", merged_text)
+
+    def test_merge_content_preserves_short_english_heading_like_paragraphs(self):
+        """Test merge content keeps short English heading-like body paragraphs separated."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            work_dir = Path(tmpdir) / "chunks"
+            output_file = Path(tmpdir) / "merged.md"
+            work_dir.mkdir(parents=True, exist_ok=True)
+
+            (work_dir / "manifest.json").write_text(
+                json.dumps(
+                    {
+                        "chunks": [
+                            {"id": 0, "processed_path": "processed_000.md", "status": "done"},
+                            {"id": 1, "processed_path": "processed_001.md", "status": "done"},
+                        ]
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+            (work_dir / "processed_000.md").write_text("Background and Context", encoding="utf-8")
+            (work_dir / "processed_001.md").write_text("Next paragraph.", encoding="utf-8")
+
+            merge_result = utils.merge_content(str(work_dir), str(output_file))
+            merged_text = output_file.read_text(encoding="utf-8")
+
+            self.assertTrue(merge_result["success"])
+            self.assertEqual(merge_result["cleanup_diagnostics"]["short_paragraph_merge_count"], 0)
+            self.assertIn("Background and Context\n\nNext paragraph.", merged_text)
+
+    def test_merge_content_preserves_markdown_list_blocks(self):
+        """Test merge content does not collapse markdown list blocks into following body text."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            work_dir = Path(tmpdir) / "chunks"
+            output_file = Path(tmpdir) / "merged.md"
+            work_dir.mkdir(parents=True, exist_ok=True)
+
+            (work_dir / "manifest.json").write_text(
+                json.dumps(
+                    {
+                        "chunks": [
+                            {"id": 0, "processed_path": "processed_000.md", "status": "done"},
+                            {"id": 1, "processed_path": "processed_001.md", "status": "done"},
+                        ]
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+            (work_dir / "processed_000.md").write_text("- item", encoding="utf-8")
+            (work_dir / "processed_001.md").write_text("continued", encoding="utf-8")
+
+            merge_result = utils.merge_content(str(work_dir), str(output_file))
+            merged_text = output_file.read_text(encoding="utf-8")
+
+            self.assertTrue(merge_result["success"])
+            self.assertEqual(merge_result["cleanup_diagnostics"]["short_paragraph_merge_count"], 0)
+            self.assertIn("- item\n\ncontinued", merged_text)
+
+    def test_merge_content_preserves_complex_header_prefix_while_cleaning_body(self):
+        """Test merge content keeps explicit header prefixes untouched while cleaning the merge body."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            work_dir = Path(tmpdir) / "chunks"
+            output_file = Path(tmpdir) / "merged.md"
+            work_dir.mkdir(parents=True, exist_ok=True)
+
+            (work_dir / "manifest.json").write_text(
+                json.dumps(
+                    {
+                        "chunks": [
+                            {"id": 0, "processed_path": "processed_000.md", "status": "done"},
+                            {"id": 1, "processed_path": "processed_001.md", "status": "done"},
+                        ]
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+            (work_dir / "processed_000.md").write_text(
+                "```md\nalpha\n---\nbeta\n```\n\n这是重复句。",
+                encoding="utf-8",
+            )
+            (work_dir / "processed_001.md").write_text("这是重复句。\n第二句。", encoding="utf-8")
+
+            header = (
+                "---\n"
+                "title: \"Sample\"\n"
+                "source: \"https://example.com\"\n"
+                "---\n\n"
+                "# Sample\n\n"
+                "> Source: Example\n\n"
+                "---"
+            )
+
+            merge_result = utils.merge_content(str(work_dir), str(output_file), header_content=header)
+            merged_text = output_file.read_text(encoding="utf-8")
+
+            self.assertTrue(merge_result["success"])
+            self.assertTrue(merged_text.startswith(header + "\n\n"))
+            self.assertIn("```md\nalpha\n---\nbeta\n```", merged_text)
+            self.assertEqual(merged_text.count("这是重复句。"), 1)
+            self.assertEqual(merge_result["cleanup_diagnostics"]["seam_overlap_trim_count"], 1)
+
+    def test_merge_content_dedupes_chunk_heading_after_chapter_injection(self):
+        """Test merge content removes heading lines duplicated by chapter injection."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            work_dir = Path(tmpdir) / "chunks"
+            output_file = Path(tmpdir) / "merged.md"
+            work_dir.mkdir(parents=True, exist_ok=True)
+
+            (work_dir / "manifest.json").write_text(
+                json.dumps(
+                    {
+                        "chunks": [
+                            {"id": 0, "processed_path": "processed_000.md", "status": "done"},
+                        ]
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+            (work_dir / "processed_000.md").write_text("## Intro\n\n正文", encoding="utf-8")
+            (work_dir / "chapter_plan.json").write_text(
+                json.dumps(
+                    [
+                        {"start_chunk": 0, "title_en": "Intro"},
+                    ],
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+
+            merge_result = utils.merge_content(str(work_dir), str(output_file))
+            merged_text = output_file.read_text(encoding="utf-8")
+
+            self.assertTrue(merge_result["success"])
+            self.assertEqual(merge_result["chapters_inserted"], 1)
+            self.assertEqual(merge_result["cleanup_diagnostics"]["heading_line_dedup_count"], 1)
+            self.assertEqual(merged_text.count("## Intro"), 1)
+            self.assertIn("正文", merged_text)
 
     def test_test_llm_api_returns_probe_metadata(self):
         """Test test llm api returns probe metadata."""

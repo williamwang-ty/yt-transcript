@@ -267,6 +267,7 @@ This project is script-first: helper commands emit machine-readable JSON on stdo
 - `python3 yt_transcript_utils.py chunk-document /tmp/${VIDEO_ID}_normalized_document.json /tmp/${VIDEO_ID}_chunks --prompt <RAW_STAGE_PROMPT>`
 - `python3 yt_transcript_utils.py prepare-resume /tmp/${VIDEO_ID}_chunks --prompt <RAW_STAGE_PROMPT>`
 - `python3 yt_transcript_utils.py build-chapter-plan /tmp/${VIDEO_ID}_chapters.json /tmp/${VIDEO_ID}_chunks /tmp/${VIDEO_ID}_chunks/chapter_plan.json`
+- `python3 yt_transcript_utils.py build-glossary /tmp/${VIDEO_ID}_chunks --mode transcript`
 - `python3 yt_transcript_utils.py validate-state /tmp/${VIDEO_ID}_state.md --stage <stage>`
 - `python3 yt_transcript_utils.py normalize-document /tmp/${VIDEO_ID}_state.md`
 - `python3 yt_transcript_utils.py plan-optimization /tmp/${VIDEO_ID}_state.md`
@@ -287,7 +288,9 @@ At the whole-project level, it is the routing boundary between source acquisitio
 - `operations[*].execution.recommended_cli_flags`
 - `operations[*].execution.on_replan_required`
 
-`normalize-document` materializes `/tmp/${VIDEO_ID}_normalized_document.json` from either raw text or timed `segments.json`, and `plan-optimization` auto-materializes it when source artifacts already exist.
+`normalize-document` materializes `/tmp/${VIDEO_ID}_normalized_document.json` from either raw text or timed `segments.json`, and `plan-optimization` auto-materializes it when source artifacts already exist. When the source segments came from subtitle cleanup, the normalized document now also preserves lightweight cleanup diagnostics under `diagnostics.subtitle_cleanup` and an explainable subtitle-path quality summary under `diagnostics.subtitle_quality`.
+
+`plan-optimization` now separates duration routing from source routing: `routing_reason` still explains short-vs-long execution, while `source_route_reason`, `subtitle_quality_score`, `reroute_recommended`, and `reroute_target` explain whether the current subtitle source should be kept, manually reviewed, or replaced with Deepgram.
 
 For long-video chunking, `plan-optimization` now also emits a canonical `chunking` block; when normalization exists, `chunk-document` is the preferred driver and it keeps chunk boundary / continuity assumptions explicit in `manifest.json`.
 
@@ -314,6 +317,9 @@ Current policy is intentional and explicit:
 - `transcribe-deepgram` now also reports lightweight observability fields such as paragraph/sentence/word counts, per-chunk transcript metadata, and fallback warnings in its result JSON
 - `chunk-segments` produces timed chunk manifests, and `build-chapter-plan` maps YouTube chapters onto chunk boundaries for `merge-content`
 - `parse-vtt` / `parse-vtt-segments` now use subtitle-aware cleanup so CJK subtitle fragments are not re-joined with stray ASCII spaces
+- `parse-vtt-segments` now also emits lightweight cleanup diagnostics such as duplicate/overlap trimming counters, and `normalize-document` carries those subtitle-cleanup signals plus a deterministic `subtitle_quality_score` into `normalized_document.json`
+- `plan-optimization` now exposes explainable source-route fields such as `source_route_reason`, `reroute_recommended`, `reroute_target`, and `reroute_reasons`; critically poor Chinese subtitle paths can recommend Deepgram fallback without silently changing the current workflow shell
+- `merge-content` now runs a deterministic post-merge cleanup pass on the merged body only: it repairs chunk seams, conservatively rejoins continuation-like split fragments, preserves any explicit prefixed header/frontmatter verbatim, and drops immediately duplicated heading/body seams without asking the LLM to rewrite the document
 - `chunk-segments --chapters` can force chunk boundaries at YouTube chapter starts to reduce heading drift
 - `chunk-text` now defaults to token-aware planning when `--prompt` is provided, while an explicit `--chunk-size` without `--prompt` keeps legacy character sizing for workflow compatibility
 - prompt names are validated eagerly for chunk planning, so typos fail fast instead of silently falling back to generic budgets
@@ -333,6 +339,8 @@ Current policy is intentional and explicit:
 - `manifest.json` now separates immutable `plan` metadata from `runtime` state, and `process-chunks` records attempt-level telemetry (`attempt_logs`) in addition to chunk-level fields
 - `process-chunks` no longer rewrites the current batch budget on the fly; when canary chunks or retry history show the plan is unhealthy, it aborts with `replan_required=true` so `replan-remaining` can generate a new plan for unfinished raw chunks
 - `process-chunks --auto-replan` preserves that architecture boundary while automating the orchestration loop (`process -> replan-remaining -> resume`) for raw-path plans
+- `build-glossary --mode transcript` now mines glossary terms from raw chunks plus any available normalized-document title/channel, chapter titles, and optional metadata/description context; `cleanup_zh` auto-builds that glossary when the work_dir does not have one yet
+- glossary selection and verification now use boundary-aware matching for simple ASCII terms, so acronyms like `API` do not get falsely selected from unrelated words such as `rapid` or `capital`
 - `run_kernel_command(...)` is the stable Python envelope API for kernel commands, and `python3 yt_transcript_utils.py --api-envelope ...` emits the same `yt_transcript.command_result/v1` envelope on the CLI without breaking legacy flat JSON output
 - envelope-producing kernel commands append local `yt_transcript.telemetry_event/v1` records to `telemetry.jsonl` when a stable nearby sink path can be inferred
 - `runtime.status` now distinguishes `completed`, `completed_with_errors`, and `aborted`, and raw-path replans remap existing `chapter_plan.json` chunk starts so merged chapter headers still land on valid chunk boundaries
@@ -340,7 +348,8 @@ Current policy is intentional and explicit:
 - `chunk_hard_cap_multiplier` is constrained to a conservative `1.0-2.0` range so misconfiguration cannot silently blow up chunk envelopes
 - `preflight.sh` is staged so subtitle-only workflows do not require Deepgram or LLM credentials up front, while `--require-llm` now performs both reachability and token-count capability probes
 - `transcribe-deepgram` is the only supported Deepgram entry point; split / merge behavior is owned by the Python utility
-- `verify-quality` is a hard gate only when `hard_failures` is non-empty; `warnings` are advisory review signals
+- `verify-quality` is a hard gate only when `hard_failures` is non-empty; `warnings` are advisory review signals, and `checks` now expose explainable readability metrics such as `chunk_seam_warning_count`, `cjk_space_ratio`, `duplicate_ngram_ratio`, `short_paragraph_ratio`, `header_density`, `punctuation_density`, `glossary_drift_count`, and `glossary_preservation_ratio`
+- bilingual `verify-quality` now detects adjacent English-to-Chinese paragraph pairs from the full body stream, so short intro paragraphs before paired EN/ZH blocks no longer trigger a false hard failure
 
 ### 📘 Canonical Terms
 
@@ -350,7 +359,9 @@ Current policy is intentional and explicit:
 - `preflight llm`: `bash scripts/preflight.sh --require-llm` only when `plan-optimization` says long-video chunk processing requires it.
 - `Deepgram unified entry`: `python3 yt_transcript_utils.py transcribe-deepgram ...`
 - `Deepgram result observability`: `/tmp/${VIDEO_ID}_deepgram_result.json` now exposes per-chunk `chunk_reports`, aggregate structure counts, and `warnings` when segment extraction falls back from richer structures
-- `quality gate`: `verify-quality` JSON where `hard_failures` means STOP and `warnings` means review before proceeding.
+- `quality gate`: `verify-quality` JSON where `hard_failures` means STOP, `warnings` means review before proceeding, and `checks` carries the readability metrics behind those warnings. Pass `--work-dir` or `--glossary-path` when available to enable glossary drift checks.
+- `source routing`: the planning-layer decision about whether the current subtitle/deepgram source should continue as-is. `routing_reason` covers duration/size routing; `source_route_reason` covers source-quality routing.
+- `runtime reroute action`: when `plan-optimization` / `verify-quality` reports `reroute_recommended=true` with `reroute_target=deepgram`, runtime contracts normalize that into `recommended_action=fallback_to_deepgram` so policy, evaluator, and decision outputs stay aligned
 
 ### 🧪 Validation Matrix
 
@@ -387,8 +398,16 @@ python3 yt_transcript_utils.py transcribe-deepgram "$AUDIO_FILE" --language "$LA
 # optional parity check against the legacy flat path:
 # python3 yt_transcript_utils.py transcribe-deepgram "$AUDIO_FILE" --language "$LANGUAGE" --disable-utterances --legacy-flat-output
 
-# 6. Final quality gate
+# 6. Optional explicit transcript glossary build for chunked cleanup paths
+python3 yt_transcript_utils.py build-glossary /tmp/${VIDEO_ID}_chunks --mode transcript
+
+# 7. Final quality gate
 python3 yt_transcript_utils.py verify-quality /tmp/${VIDEO_ID}_optimized.txt --raw-text /tmp/${VIDEO_ID}_raw_text.txt
+# add --work-dir /tmp/${VIDEO_ID}_chunks when a glossary/work_dir exists and you want glossary drift checks
+
+# `checks` now includes advisory readability signals such as chunk seam duplication,
+# Chinese spacing anomalies, repeated phrase density, short paragraph ratio,
+# header density, punctuation density, and glossary drift metrics.
 ```
 
 ### 📄 License
@@ -607,6 +626,7 @@ bash scripts/preflight.sh --require-llm
 - `python3 yt_transcript_utils.py chunk-document /tmp/${VIDEO_ID}_normalized_document.json /tmp/${VIDEO_ID}_chunks --prompt <RAW_STAGE_PROMPT>`
 - `python3 yt_transcript_utils.py prepare-resume /tmp/${VIDEO_ID}_chunks --prompt <RAW_STAGE_PROMPT>`
 - `python3 yt_transcript_utils.py build-chapter-plan /tmp/${VIDEO_ID}_chapters.json /tmp/${VIDEO_ID}_chunks /tmp/${VIDEO_ID}_chunks/chapter_plan.json`
+- `python3 yt_transcript_utils.py build-glossary /tmp/${VIDEO_ID}_chunks --mode transcript`
 - `python3 yt_transcript_utils.py validate-state /tmp/${VIDEO_ID}_state.md --stage <stage>`
 - `python3 yt_transcript_utils.py normalize-document /tmp/${VIDEO_ID}_state.md`
 - `python3 yt_transcript_utils.py plan-optimization /tmp/${VIDEO_ID}_state.md`
@@ -627,7 +647,9 @@ bash scripts/preflight.sh --require-llm
 - `operations[*].execution.recommended_cli_flags`
 - `operations[*].execution.on_replan_required`
 
-`normalize-document` 会基于 raw text 或带时间戳的 `segments.json` 物化 `/tmp/${VIDEO_ID}_normalized_document.json`；当源 artifact 已存在时，`plan-optimization` 也会自动完成这一步。
+`normalize-document` 会基于 raw text 或带时间戳的 `segments.json` 物化 `/tmp/${VIDEO_ID}_normalized_document.json`；当源 artifact 已存在时，`plan-optimization` 也会自动完成这一步。如果这些 segments 来自字幕清洗阶段，标准化文档还会把轻量清洗诊断透传到 `diagnostics.subtitle_cleanup`，并在 `diagnostics.subtitle_quality` 下写入可解释的字幕源质量摘要。
+
+`plan-optimization` 现在把“时长/体积路由”和“源路径质量路由”分开表达：`routing_reason` 仍只解释 short/long 执行路径，而 `source_route_reason`、`subtitle_quality_score`、`reroute_recommended`、`reroute_target` 用来解释当前字幕源是继续沿用、只做人工复核，还是建议切换到 Deepgram。
 
 对于长视频分块，`plan-optimization` 现在还会输出显式的 `chunking` 契约；一旦 normalization 已存在，优先使用 `chunk-document`，并把 chunk 边界 / continuity 假设显式记录到 `manifest.json`。
 
@@ -658,6 +680,9 @@ bash scripts/preflight.sh --require-llm
 - 当首选字幕轨因为 `HTTP 429` 这类鉴权/限流问题失败时，`download.sh subtitles` 现在会先用 Chrome cookies 对同一条轨重试，再决定是否回退到下一条候选
 - `chunk-segments` 基于 segments 生成带时间轴的 timed manifest；`build-chapter-plan` 可将 YouTube chapters 映射到 chunk 边界，供 `merge-content` 注入标题
 - `parse-vtt` / `parse-vtt-segments` 现在都会做 subtitle-aware cleanup，避免 CJK 字幕碎片在重新拼接时被错误插入 ASCII 空格
+- `parse-vtt-segments` 现在还会输出轻量 cleanup diagnostics，例如重复 cue / overlap 裁剪计数；`normalize-document` 会把这些字幕清洗信号以及确定性的 `subtitle_quality_score` 一并透传进 `normalized_document.json`
+- `plan-optimization` 现在会显式输出 `source_route_reason`、`reroute_recommended`、`reroute_target`、`reroute_reasons` 等源路径解释字段；当中文字幕路径质量极差时，它会建议切到 Deepgram，但不会静默改写当前 workflow shell
+- `merge-content` 现在会只对合并后的正文 body 执行 deterministic post-merge cleanup：它会修复 chunk seam 重复、以更保守的续写片段规则重新拼合被拆开的正文、原样保留显式传入的 header/frontmatter，并去掉紧邻重复的标题/正文接缝，而不是把这些机械问题继续留给 LLM
 - `chunk-segments --chapters` 可选在 YouTube 章节起点强制切 chunk，减少章节标题漂移
 - 如果只传显式 `--chunk-size` 而不传 `--prompt`，`chunk-text` 会继续按 legacy 字符大小解释，避免现有 workflow 被静默改变
 - 分块阶段会提前校验 prompt 名称，避免因为 prompt 拼写错误而静默回退到通用预算
@@ -669,12 +694,15 @@ bash scripts/preflight.sh --require-llm
 - `manifest.json` 现在会把不可变 `plan` 和可变 `runtime` 状态分开，同时为每个 chunk 记录 `attempt_logs` 级别的请求观测数据
 - `process-chunks` 不再在当前 batch 内偷偷改预算；如果 canary 或重试历史表明当前 plan 不健康，会以 `replan_required=true` 终止，并通过 `replan-remaining` 为剩余原始 chunk 生成新计划
 - `process-chunks --auto-replan` 会在不破坏上述边界的前提下，自动编排 `process -> replan-remaining -> resume` 这一恢复链路（仅适用于 `raw_path` 计划）
+- `build-glossary --mode transcript` 现在会从 raw chunk、可用的 normalized document 标题/频道、chapter 标题，以及可选 metadata/description 上下文中抽取术语；当 `cleanup_zh` 的 work_dir 里还没有 glossary 时，`process-chunks` 会自动生成这一份 glossary
+- glossary 的筛选与校验现在会对简单 ASCII 术语做边界感知匹配，因此像 `API` 这样的缩写不会再因为 `rapid`、`capital` 之类的无关单词而误命中
 - `runtime.status` 现在会区分 `completed` / `completed_with_errors` / `aborted`，而 raw replan 也会同步重映射已有 `chapter_plan.json` 的 chunk 起点，保证 merge 阶段的章节标题仍落在有效 chunk 边界上
 - 运行时 token 估算默认仍是本地启发式 fallback；`test-token-count` / `preflight.sh --require-llm` 会探测 provider 级 token count，并在不可用时明确回退到 local estimate
 - `chunk_hard_cap_multiplier` 会被限制在保守的 `1.0-2.0` 区间，避免配置失误把 chunk 包络静默放大
 - `preflight.sh` 采用分层校验，确保只走字幕路径时不必预先配置 Deepgram 或 LLM 凭据；进入 `--require-llm` 时会同时做连通性和 token count 能力探测
 - `transcribe-deepgram` 是唯一支持的 Deepgram 统一入口，分片与合并逻辑由 Python 工具统一负责
-- `verify-quality` 只有在 `hard_failures` 非空时才阻断流程；`warnings` 仅用于人工复核提示
+- `verify-quality` 只有在 `hard_failures` 非空时才阻断流程；`warnings` 仅用于人工复核提示，而 `checks` 现在会额外暴露 `chunk_seam_warning_count`、`cjk_space_ratio`、`duplicate_ngram_ratio`、`short_paragraph_ratio`、`header_density`、`punctuation_density`、`glossary_drift_count`、`glossary_preservation_ratio` 等可解释指标
+- 双语 `verify-quality` 现在会在完整正文流里识别相邻的“英文段 -> 中文段”配对，因此对照正文前面即使有简短导语，也不会再被误判为完全缺少双语段对
 
 ### 📘 术语口径
 
@@ -684,7 +712,9 @@ bash scripts/preflight.sh --require-llm
 - `LLM preflight`：只有当 `plan-optimization` 返回 long-video chunk 处理需要时，才执行 `bash scripts/preflight.sh --require-llm`。
 - `Deepgram 统一入口`：`python3 yt_transcript_utils.py transcribe-deepgram ...`
 - `Deepgram 结果可观测性`：`/tmp/${VIDEO_ID}_deepgram_result.json` 现在会暴露逐 chunk 的 `chunk_reports`、聚合结构计数，以及 structured-output 回退时的 `warnings`
-- `质量门禁`：读取 `verify-quality` 的 JSON；`hard_failures` 表示必须 STOP，`warnings` 表示需要人工复核。
+- `质量门禁`：读取 `verify-quality` 的 JSON；`hard_failures` 表示必须 STOP，`warnings` 表示需要人工复核，`checks` 则给出这些告警背后的可读性指标。有 work_dir 或现成 glossary 时，建议额外传 `--work-dir` 或 `--glossary-path` 打开 glossary drift 检查。
+- `源路径路由`：规划层决定当前 subtitle / Deepgram 源是否继续沿用。`routing_reason` 负责解释时长/输入体积路由，`source_route_reason` 负责解释源质量路由。
+- `运行时 reroute 动作`：当 `plan-optimization` / `verify-quality` 返回 `reroute_recommended=true` 且 `reroute_target=deepgram` 时，runtime contract 会把它标准化为 `recommended_action=fallback_to_deepgram`，这样 policy、evaluator、decision 三层动作口径保持一致
 
 ### 🧪 验证矩阵
 
@@ -721,8 +751,15 @@ python3 yt_transcript_utils.py transcribe-deepgram "$AUDIO_FILE" --language "$LA
 # 需要与 legacy flat path 做对照时：
 # python3 yt_transcript_utils.py transcribe-deepgram "$AUDIO_FILE" --language "$LANGUAGE" --disable-utterances --legacy-flat-output
 
-# 6. 最终质量门禁
+# 6. 仅在 chunk cleanup 路径下可选的 transcript glossary 构建
+python3 yt_transcript_utils.py build-glossary /tmp/${VIDEO_ID}_chunks --mode transcript
+
+# 7. 最终质量门禁
 python3 yt_transcript_utils.py verify-quality /tmp/${VIDEO_ID}_optimized.txt --raw-text /tmp/${VIDEO_ID}_raw_text.txt
+# 如果存在 glossary/work_dir，且希望检查 glossary drift，可额外传 --work-dir /tmp/${VIDEO_ID}_chunks
+
+# `checks` 现在还会包含 chunk seam 重复、中文空格异常、
+# 重复短语密度、短碎段比例、标题密度、标点密度，以及 glossary drift 等 advisory 指标。
 ```
 
 ### 📄 许可证
