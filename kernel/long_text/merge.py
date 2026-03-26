@@ -5,6 +5,8 @@ import math
 import sys
 from pathlib import Path
 
+from kernel.text_cleanup import post_merge as kernel_post_merge_cleanup
+
 
 def _resolve_manifest_path(manifest_ref: str) -> Path:
     """Resolve a manifest reference to an absolute manifest path."""
@@ -222,7 +224,7 @@ def merge_content(work_dir: str, output_file: str, header_content: str = "") -> 
         if processed_path.exists():
             content = processed_path.read_text(encoding="utf-8")
             output_lines.append(content)
-            output_lines.append("\n")
+            output_lines.append(f"\n\n{kernel_post_merge_cleanup.CHUNK_SEAM_MARKER}\n\n")
         elif status == "done":
             missing_files.append(str(processed_path))
             print(f"Warning: Processed file not found: {processed_path}", file=sys.stderr)
@@ -230,6 +232,13 @@ def merge_content(work_dir: str, output_file: str, header_content: str = "") -> 
     output_path = Path(output_file)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     final_content = "".join(output_lines)
+    cleaned_content, cleanup_diagnostics = kernel_post_merge_cleanup.post_merge_cleanup(
+        final_content,
+        has_header=bool(str(header_content or "").strip()),
+    )
+    cleanup_applied = cleaned_content != final_content
+    if cleanup_applied:
+        final_content = cleaned_content
     output_path.write_text(final_content, encoding="utf-8")
 
     return {
@@ -239,4 +248,6 @@ def merge_content(work_dir: str, output_file: str, header_content: str = "") -> 
         "total_chars": len(final_content),
         "chapters_inserted": chapters_inserted,
         "missing_files": missing_files,
+        "post_merge_cleanup_applied": cleanup_applied,
+        "cleanup_diagnostics": cleanup_diagnostics,
     }

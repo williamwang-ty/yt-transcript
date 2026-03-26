@@ -315,6 +315,7 @@ Current policy is intentional and explicit:
 - `chunk-segments` produces timed chunk manifests, and `build-chapter-plan` maps YouTube chapters onto chunk boundaries for `merge-content`
 - `parse-vtt` / `parse-vtt-segments` now use subtitle-aware cleanup so CJK subtitle fragments are not re-joined with stray ASCII spaces
 - `parse-vtt-segments` now also emits lightweight cleanup diagnostics such as duplicate/overlap trimming counters, and `normalize-document` carries those subtitle-cleanup signals into `normalized_document.json`
+- `merge-content` now runs a deterministic post-merge cleanup pass to repair chunk seams, merge obviously split short fragments, and drop immediately duplicated heading/body seams without asking the LLM to rewrite the document
 - `chunk-segments --chapters` can force chunk boundaries at YouTube chapter starts to reduce heading drift
 - `chunk-text` now defaults to token-aware planning when `--prompt` is provided, while an explicit `--chunk-size` without `--prompt` keeps legacy character sizing for workflow compatibility
 - prompt names are validated eagerly for chunk planning, so typos fail fast instead of silently falling back to generic budgets
@@ -660,6 +661,7 @@ bash scripts/preflight.sh --require-llm
 - `chunk-segments` 基于 segments 生成带时间轴的 timed manifest；`build-chapter-plan` 可将 YouTube chapters 映射到 chunk 边界，供 `merge-content` 注入标题
 - `parse-vtt` / `parse-vtt-segments` 现在都会做 subtitle-aware cleanup，避免 CJK 字幕碎片在重新拼接时被错误插入 ASCII 空格
 - `parse-vtt-segments` 现在还会输出轻量 cleanup diagnostics，例如重复 cue / overlap 裁剪计数；`normalize-document` 会把这些字幕清洗信号透传进 `normalized_document.json`
+- `merge-content` 现在还会执行一层 deterministic post-merge cleanup，用于修复 chunk seam 重复、重新拼合明显被拆开的短碎段，并去掉紧邻重复的标题/正文接缝，而不是把这些机械问题继续留给 LLM
 - `chunk-segments --chapters` 可选在 YouTube 章节起点强制切 chunk，减少章节标题漂移
 - 如果只传显式 `--chunk-size` 而不传 `--prompt`，`chunk-text` 会继续按 legacy 字符大小解释，避免现有 workflow 被静默改变
 - 分块阶段会提前校验 prompt 名称，避免因为 prompt 拼写错误而静默回退到通用预算

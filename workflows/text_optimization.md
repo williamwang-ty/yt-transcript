@@ -210,6 +210,8 @@ python3 <skill-root>/yt_transcript_utils.py merge-content \
     /tmp/${VIDEO_ID}_optimized.txt
 ```
 
+`merge-content` now includes a deterministic post-merge cleanup step for chunk seams. It can trim repeated seam text, merge obviously split short fragments, and remove duplicate chapter/title lines introduced at the merge boundary.
+
 Write to state:
 
 - `step: 4`
