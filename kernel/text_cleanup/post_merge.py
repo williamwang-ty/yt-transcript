@@ -11,6 +11,7 @@ from .overlap import find_leading_overlap
 SENTENCE_TERMINATORS = "。！？!?；;"
 SOFT_CONTINUATION_ENDINGS = "，、；：,:([{（【《「『-"
 LIST_PREFIX_RE = re.compile(r"^(?:[-*+]\s|\d+\.\s)")
+ASCII_WORD_RE = re.compile(r"[A-Za-z0-9]+(?:[-'][A-Za-z0-9]+)?")
 CHUNK_SEAM_MARKER = "<!-- yt-transcript-chunk-seam -->"
 
 
@@ -108,6 +109,32 @@ def _ends_with_terminal_punctuation(text: str) -> bool:
     return bool(stripped) and stripped[-1] in SENTENCE_TERMINATORS
 
 
+def _contains_cjk(text: str) -> bool:
+    """Return whether the block contains any CJK-family character."""
+    return any(is_cjk_family_char(char) for char in str(text or ""))
+
+
+def _ascii_word_tokens(text: str) -> list[str]:
+    """Return lightweight ASCII word tokens for heading/fragment heuristics."""
+    return ASCII_WORD_RE.findall(str(text or ""))
+
+
+def _looks_like_titleish_ascii_line(text: str) -> bool:
+    """Return whether an ASCII line looks more like a short heading than a sentence fragment."""
+    stripped = str(text or "").strip()
+    if not stripped or "\n" in stripped:
+        return False
+    if re.search(r"[.!?,:;]", stripped):
+        return False
+
+    tokens = _ascii_word_tokens(stripped)
+    if not tokens or len(tokens) > 6:
+        return False
+
+    titleish_tokens = sum(1 for token in tokens if token.isupper() or token[:1].isupper())
+    return titleish_tokens >= max(1, len(tokens) - 1)
+
+
 def _looks_like_incomplete_fragment(text: str) -> bool:
     """Return whether a body block looks like a split fragment."""
     stripped = str(text or "").rstrip()
@@ -115,7 +142,21 @@ def _looks_like_incomplete_fragment(text: str) -> bool:
         return False
     if _ends_with_terminal_punctuation(stripped):
         return False
-    return stripped[-1] in SOFT_CONTINUATION_ENDINGS or len(stripped) <= 40
+    if LIST_PREFIX_RE.match(stripped) or stripped.startswith(("#", ">")):
+        return False
+    if stripped[-1] in SOFT_CONTINUATION_ENDINGS:
+        return True
+    if _contains_cjk(stripped):
+        punctuation_count = sum(1 for char in stripped if char in "，。！？；：,:;!?")
+        return punctuation_count == 0 and _meaningful_char_count(stripped) >= 8
+
+    tokens = _ascii_word_tokens(stripped)
+    if tokens:
+        if len(tokens) < 3 or _looks_like_titleish_ascii_line(stripped):
+            return False
+        return len(stripped) >= 12
+
+    return len(stripped) >= 16
 
 
 def _should_merge_short_body_blocks(previous_block: str, current_block: str) -> bool:
@@ -217,27 +258,18 @@ def _cleanup_body_blocks(text: str, diagnostics: dict) -> str:
 
 
 def post_merge_cleanup(text: str, *, has_header: bool = False) -> tuple[str, dict]:
-    """Clean merge seams while preserving markdown structure and frontmatter."""
+    """Clean merge-body seams while preserving markdown structure.
+
+    Callers should pass the merge body only. ``has_header`` is retained for
+    backward compatibility and is otherwise ignored.
+    """
+    del has_header
     diagnostics = build_empty_post_merge_diagnostics()
     normalized = _normalize_text_body(text)
     if not normalized:
         return "", diagnostics
 
-    prefix = ""
-    body = normalized
-    separator = ""
-    if has_header:
-        prefix, separator, tail = normalized.partition("\n---\n")
-        if separator:
-            body = tail
-            prefix = f"{prefix}{separator}"
-
-    cleaned_body = _cleanup_body_blocks(body, diagnostics)
-    if separator:
-        cleaned_text = f"{prefix}{cleaned_body}".strip()
-    else:
-        cleaned_text = cleaned_body
-
+    cleaned_text = _cleanup_body_blocks(normalized, diagnostics)
     cleaned_text, collapsed_count = re.subn(r"\n{3,}", "\n\n", cleaned_text)
     diagnostics["blank_line_groups_collapsed"] = collapsed_count
     return cleaned_text.strip(), diagnostics

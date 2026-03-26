@@ -2079,6 +2079,141 @@ work_dir: /tmp/vid001_chunks
             self.assertIn("这是一个被拆开的段落\n后半句，补完。", merged_text)
             self.assertNotIn("这是一个被拆开的段落\n\n后半句，补完。", merged_text)
 
+    def test_merge_content_preserves_unrelated_short_chinese_paragraphs(self):
+        """Test merge content keeps standalone short Chinese paragraphs separated."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            work_dir = Path(tmpdir) / "chunks"
+            output_file = Path(tmpdir) / "merged.md"
+            work_dir.mkdir(parents=True, exist_ok=True)
+
+            (work_dir / "manifest.json").write_text(
+                json.dumps(
+                    {
+                        "chunks": [
+                            {"id": 0, "processed_path": "processed_000.md", "status": "done"},
+                            {"id": 1, "processed_path": "processed_001.md", "status": "done"},
+                        ]
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+            (work_dir / "processed_000.md").write_text("短句", encoding="utf-8")
+            (work_dir / "processed_001.md").write_text("第二段。", encoding="utf-8")
+
+            merge_result = utils.merge_content(str(work_dir), str(output_file))
+            merged_text = output_file.read_text(encoding="utf-8")
+
+            self.assertTrue(merge_result["success"])
+            self.assertEqual(merge_result["cleanup_diagnostics"]["short_paragraph_merge_count"], 0)
+            self.assertIn("短句\n\n第二段。", merged_text)
+
+    def test_merge_content_preserves_short_english_heading_like_paragraphs(self):
+        """Test merge content keeps short English heading-like body paragraphs separated."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            work_dir = Path(tmpdir) / "chunks"
+            output_file = Path(tmpdir) / "merged.md"
+            work_dir.mkdir(parents=True, exist_ok=True)
+
+            (work_dir / "manifest.json").write_text(
+                json.dumps(
+                    {
+                        "chunks": [
+                            {"id": 0, "processed_path": "processed_000.md", "status": "done"},
+                            {"id": 1, "processed_path": "processed_001.md", "status": "done"},
+                        ]
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+            (work_dir / "processed_000.md").write_text("Background and Context", encoding="utf-8")
+            (work_dir / "processed_001.md").write_text("Next paragraph.", encoding="utf-8")
+
+            merge_result = utils.merge_content(str(work_dir), str(output_file))
+            merged_text = output_file.read_text(encoding="utf-8")
+
+            self.assertTrue(merge_result["success"])
+            self.assertEqual(merge_result["cleanup_diagnostics"]["short_paragraph_merge_count"], 0)
+            self.assertIn("Background and Context\n\nNext paragraph.", merged_text)
+
+    def test_merge_content_preserves_markdown_list_blocks(self):
+        """Test merge content does not collapse markdown list blocks into following body text."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            work_dir = Path(tmpdir) / "chunks"
+            output_file = Path(tmpdir) / "merged.md"
+            work_dir.mkdir(parents=True, exist_ok=True)
+
+            (work_dir / "manifest.json").write_text(
+                json.dumps(
+                    {
+                        "chunks": [
+                            {"id": 0, "processed_path": "processed_000.md", "status": "done"},
+                            {"id": 1, "processed_path": "processed_001.md", "status": "done"},
+                        ]
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+            (work_dir / "processed_000.md").write_text("- item", encoding="utf-8")
+            (work_dir / "processed_001.md").write_text("continued", encoding="utf-8")
+
+            merge_result = utils.merge_content(str(work_dir), str(output_file))
+            merged_text = output_file.read_text(encoding="utf-8")
+
+            self.assertTrue(merge_result["success"])
+            self.assertEqual(merge_result["cleanup_diagnostics"]["short_paragraph_merge_count"], 0)
+            self.assertIn("- item\n\ncontinued", merged_text)
+
+    def test_merge_content_preserves_complex_header_prefix_while_cleaning_body(self):
+        """Test merge content keeps explicit header prefixes untouched while cleaning the merge body."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            work_dir = Path(tmpdir) / "chunks"
+            output_file = Path(tmpdir) / "merged.md"
+            work_dir.mkdir(parents=True, exist_ok=True)
+
+            (work_dir / "manifest.json").write_text(
+                json.dumps(
+                    {
+                        "chunks": [
+                            {"id": 0, "processed_path": "processed_000.md", "status": "done"},
+                            {"id": 1, "processed_path": "processed_001.md", "status": "done"},
+                        ]
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+            (work_dir / "processed_000.md").write_text(
+                "```md\nalpha\n---\nbeta\n```\n\n这是重复句。",
+                encoding="utf-8",
+            )
+            (work_dir / "processed_001.md").write_text("这是重复句。\n第二句。", encoding="utf-8")
+
+            header = (
+                "---\n"
+                "title: \"Sample\"\n"
+                "source: \"https://example.com\"\n"
+                "---\n\n"
+                "# Sample\n\n"
+                "> Source: Example\n\n"
+                "---"
+            )
+
+            merge_result = utils.merge_content(str(work_dir), str(output_file), header_content=header)
+            merged_text = output_file.read_text(encoding="utf-8")
+
+            self.assertTrue(merge_result["success"])
+            self.assertTrue(merged_text.startswith(header + "\n\n"))
+            self.assertIn("```md\nalpha\n---\nbeta\n```", merged_text)
+            self.assertEqual(merged_text.count("这是重复句。"), 1)
+            self.assertEqual(merge_result["cleanup_diagnostics"]["seam_overlap_trim_count"], 1)
+
     def test_merge_content_dedupes_chunk_heading_after_chapter_injection(self):
         """Test merge content removes heading lines duplicated by chapter injection."""
         with tempfile.TemporaryDirectory() as tmpdir:

@@ -319,7 +319,7 @@ Current policy is intentional and explicit:
 - `parse-vtt` / `parse-vtt-segments` now use subtitle-aware cleanup so CJK subtitle fragments are not re-joined with stray ASCII spaces
 - `parse-vtt-segments` now also emits lightweight cleanup diagnostics such as duplicate/overlap trimming counters, and `normalize-document` carries those subtitle-cleanup signals plus a deterministic `subtitle_quality_score` into `normalized_document.json`
 - `plan-optimization` now exposes explainable source-route fields such as `source_route_reason`, `reroute_recommended`, `reroute_target`, and `reroute_reasons`; critically poor Chinese subtitle paths can recommend Deepgram fallback without silently changing the current workflow shell
-- `merge-content` now runs a deterministic post-merge cleanup pass to repair chunk seams, merge obviously split short fragments, and drop immediately duplicated heading/body seams without asking the LLM to rewrite the document
+- `merge-content` now runs a deterministic post-merge cleanup pass on the merged body only: it repairs chunk seams, conservatively rejoins continuation-like split fragments, preserves any explicit prefixed header/frontmatter verbatim, and drops immediately duplicated heading/body seams without asking the LLM to rewrite the document
 - `chunk-segments --chapters` can force chunk boundaries at YouTube chapter starts to reduce heading drift
 - `chunk-text` now defaults to token-aware planning when `--prompt` is provided, while an explicit `--chunk-size` without `--prompt` keeps legacy character sizing for workflow compatibility
 - prompt names are validated eagerly for chunk planning, so typos fail fast instead of silently falling back to generic budgets
@@ -682,7 +682,7 @@ bash scripts/preflight.sh --require-llm
 - `parse-vtt` / `parse-vtt-segments` 现在都会做 subtitle-aware cleanup，避免 CJK 字幕碎片在重新拼接时被错误插入 ASCII 空格
 - `parse-vtt-segments` 现在还会输出轻量 cleanup diagnostics，例如重复 cue / overlap 裁剪计数；`normalize-document` 会把这些字幕清洗信号以及确定性的 `subtitle_quality_score` 一并透传进 `normalized_document.json`
 - `plan-optimization` 现在会显式输出 `source_route_reason`、`reroute_recommended`、`reroute_target`、`reroute_reasons` 等源路径解释字段；当中文字幕路径质量极差时，它会建议切到 Deepgram，但不会静默改写当前 workflow shell
-- `merge-content` 现在还会执行一层 deterministic post-merge cleanup，用于修复 chunk seam 重复、重新拼合明显被拆开的短碎段，并去掉紧邻重复的标题/正文接缝，而不是把这些机械问题继续留给 LLM
+- `merge-content` 现在会只对合并后的正文 body 执行 deterministic post-merge cleanup：它会修复 chunk seam 重复、以更保守的续写片段规则重新拼合被拆开的正文、原样保留显式传入的 header/frontmatter，并去掉紧邻重复的标题/正文接缝，而不是把这些机械问题继续留给 LLM
 - `chunk-segments --chapters` 可选在 YouTube 章节起点强制切 chunk，减少章节标题漂移
 - 如果只传显式 `--chunk-size` 而不传 `--prompt`，`chunk-text` 会继续按 legacy 字符大小解释，避免现有 workflow 被静默改变
 - 分块阶段会提前校验 prompt 名称，避免因为 prompt 拼写错误而静默回退到通用预算
