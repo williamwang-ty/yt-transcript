@@ -97,6 +97,37 @@ class RuntimeRegressionTests(unittest.TestCase):
             self.assertIn("repair_chunk", bundle["policy"]["allowed_actions"])
             self.assertEqual(bundle["decision_record"]["selected_action"], "repair_chunk")
 
+    def test_contract_bundle_uses_glossary_preservation_ratio_in_quality_report(self):
+        """Test runtime quality report reflects glossary preservation ratio."""
+        from kernel.task_runtime import contracts as runtime_contracts
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            raw = Path(tmpdir) / "raw.txt"
+            optimized = Path(tmpdir) / "optimized.md"
+            source = Path(tmpdir) / "source.txt"
+            work_dir = Path(tmpdir) / "chunks"
+            source.write_text("OpenAI API 与 Deepgram SDK 发布。", encoding="utf-8")
+            utils.chunk_text(str(source), str(work_dir), 80, "cleanup_zh")
+            utils.build_glossary(str(work_dir), mode="transcript", max_terms=10, min_occurrences=1)
+            raw.write_text("OpenAI API 与 Deepgram SDK 发布。", encoding="utf-8")
+            optimized.write_text("## Section\n\nOpen AI 接口与 Deepgram SDK 发布。", encoding="utf-8")
+
+            result = utils.verify_quality(
+                str(optimized),
+                str(raw),
+                bilingual=False,
+                work_dir=str(work_dir),
+            )
+            bundle = runtime_contracts.build_command_contract_bundle(
+                "verify-quality",
+                result,
+                context={"optimized_text_path": str(optimized), "work_dir": str(work_dir)},
+                trace_id="trace_verify_glossary_contract",
+            )
+
+            self.assertTrue(result["passed"], result)
+            self.assertLess(bundle["quality_report"]["term_consistency_score"], 1.0)
+
     def test_llm_assisted_decision_selects_only_allowed_actions(self):
         """Test llm-assisted decisioning can rank within the allowed action set only."""
         from kernel.task_runtime import decision as runtime_decision
@@ -283,6 +314,69 @@ class RuntimeRegressionTests(unittest.TestCase):
             self.assertIn("API", terms)
             self.assertIn("Deepgram", terms)
 
+    def test_build_glossary_transcript_mode_prioritizes_document_context(self):
+        """Test build glossary transcript mode prioritizes document context."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            work_dir = Path(tmpdir) / "chunks"
+            work_dir.mkdir(parents=True, exist_ok=True)
+            raw_chunk = work_dir / "chunk_000.txt"
+            raw_chunk.write_text("这一段主要解释 SDK 的使用方式。", encoding="utf-8")
+            normalized_document = Path(tmpdir) / "normalized_document.json"
+            normalized_document.write_text(
+                json.dumps(
+                    {
+                        "source": {
+                            "title": "OpenAI API Walkthrough",
+                            "channel": "DeepgramLabs",
+                        },
+                        "content": {
+                            "text": "这一段主要解释 SDK 的使用方式。",
+                        },
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+            (work_dir / "chapter_plan.json").write_text(
+                json.dumps(
+                    [
+                        {"title": "GPT4 API Setup", "start_chunk": 0},
+                    ],
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+            (work_dir / "manifest.json").write_text(
+                json.dumps(
+                    {
+                        "normalized_document_path": str(normalized_document),
+                        "chunks": [
+                            {"id": 0, "raw_path": "chunk_000.txt"},
+                        ],
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+
+            result = utils.build_glossary(
+                str(work_dir),
+                mode="transcript",
+                max_terms=20,
+                min_occurrences=2,
+            )
+
+            self.assertTrue(result["success"], result)
+            self.assertEqual(result["mode"], "transcript")
+            terms = [entry["term"] for entry in result["terms"]]
+            self.assertIn("OpenAI", terms)
+            self.assertIn("API", terms)
+            self.assertIn("DeepgramLabs", terms)
+            self.assertIn("GPT4", terms)
+
     def test_process_chunks_injects_glossary_terms_into_prompt(self):
         """Test process chunks injects glossary terms into prompt."""
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -325,6 +419,70 @@ class RuntimeRegressionTests(unittest.TestCase):
             self.assertIn("OpenAI", captured["prompt"])
             self.assertIn("API", captured["prompt"])
             self.assertEqual(result["glossary"]["mode"], "local_file")
+
+    def test_process_chunks_cleanup_zh_autobuilds_transcript_glossary(self):
+        """Test cleanup_zh auto-builds a transcript glossary when missing."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source = Path(tmpdir) / "raw.txt"
+            work_dir = Path(tmpdir) / "chunks"
+            normalized_document = Path(tmpdir) / "normalized_document.json"
+            source.write_text("OpenAI API 发布流程。", encoding="utf-8")
+            utils.chunk_text(str(source), str(work_dir), 80, "cleanup_zh")
+            normalized_document.write_text(
+                json.dumps(
+                    {
+                        "source": {
+                            "title": "OpenAI API Deep Dive",
+                            "channel": "DeepgramLabs",
+                        },
+                        "content": {
+                            "text": "OpenAI API 发布流程。",
+                        },
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+            manifest_path = work_dir / "manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["normalized_document_path"] = str(normalized_document)
+            manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+
+            config = utils._default_config_values()
+            config.update({
+                "llm_api_key": "key",
+                "llm_base_url": "https://api.example.com",
+                "llm_model": "demo",
+                "llm_api_format": "openai",
+            })
+
+            captured = {}
+
+            def fake_llm(*args, **kwargs):
+                """Fake llm."""
+                captured["prompt"] = kwargs["messages"][0]["content"]
+                return {
+                    "text": "## 结果\n\nOpenAI API 发布流程。",
+                    "latency_ms": 12,
+                    "request_url": "https://api.example.com/v1/chat/completions",
+                    "streaming_used": False,
+                    "attempts": 1,
+                }
+
+            with mock.patch.object(utils, "load_config", return_value=config), mock.patch.object(
+                utils,
+                "_call_llm_api",
+                side_effect=fake_llm,
+            ):
+                result = utils.process_chunks(str(work_dir), "cleanup_zh")
+
+            self.assertTrue(result["success"], result)
+            self.assertIn("Terminology Guardrails", captured["prompt"])
+            self.assertIn("OpenAI", captured["prompt"])
+            self.assertEqual(result["glossary"]["mode"], "auto_transcript_build")
+            self.assertEqual(result["glossary"]["source"], "transcript_context")
+            self.assertTrue((work_dir / "glossary.json").exists())
 
     def test_process_chunks_retries_when_glossary_terms_are_missing(self):
         """Test process chunks retries when glossary terms are missing."""
@@ -585,6 +743,66 @@ class RuntimeRegressionTests(unittest.TestCase):
             self.assertGreater(result["checks"]["chunk_seam_warning_count"], 0)
             self.assertFalse(result["checks"]["duplicate_ngram_ok"])
             self.assertTrue(any("Repeated phrase density" in warning for warning in result["warnings"]))
+
+    def test_verify_quality_warns_on_glossary_drift(self):
+        """Test verify quality warns on glossary drift."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            raw = Path(tmpdir) / "raw.txt"
+            optimized = Path(tmpdir) / "opt.md"
+            source = Path(tmpdir) / "source.txt"
+            work_dir = Path(tmpdir) / "chunks"
+            source.write_text("OpenAI API 与 Deepgram SDK 发布。", encoding="utf-8")
+            utils.chunk_text(str(source), str(work_dir), 80, "cleanup_zh")
+            utils.build_glossary(str(work_dir), mode="transcript", max_terms=10, min_occurrences=1)
+            raw.write_text("OpenAI API 与 Deepgram SDK 发布。", encoding="utf-8")
+            optimized.write_text(
+                "## Section\n\n"
+                "Open AI 接口与 Deepgram SDK 发布。\n",
+                encoding="utf-8",
+            )
+
+            result = utils.verify_quality(
+                str(optimized),
+                str(raw),
+                bilingual=False,
+                work_dir=str(work_dir),
+            )
+
+            self.assertTrue(result["passed"], result)
+            self.assertTrue(result["checks"]["glossary_drift_applicable"])
+            self.assertFalse(result["checks"]["glossary_drift_ok"])
+            self.assertGreater(result["checks"]["glossary_drift_count"], 0)
+            self.assertTrue(any("Glossary drift detected" in warning for warning in result["warnings"]))
+
+    def test_verify_quality_accepts_preserved_glossary_terms(self):
+        """Test verify quality accepts preserved glossary terms."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            raw = Path(tmpdir) / "raw.txt"
+            optimized = Path(tmpdir) / "opt.md"
+            source = Path(tmpdir) / "source.txt"
+            work_dir = Path(tmpdir) / "chunks"
+            source.write_text("OpenAI API 与 Deepgram SDK 发布。", encoding="utf-8")
+            utils.chunk_text(str(source), str(work_dir), 80, "cleanup_zh")
+            utils.build_glossary(str(work_dir), mode="transcript", max_terms=10, min_occurrences=1)
+            raw.write_text("OpenAI API 与 Deepgram SDK 发布。", encoding="utf-8")
+            optimized.write_text(
+                "## Section\n\n"
+                "OpenAI API 与 Deepgram SDK 发布。\n",
+                encoding="utf-8",
+            )
+
+            result = utils.verify_quality(
+                str(optimized),
+                str(raw),
+                bilingual=False,
+                work_dir=str(work_dir),
+            )
+
+            self.assertTrue(result["passed"], result)
+            self.assertTrue(result["checks"]["glossary_drift_applicable"])
+            self.assertTrue(result["checks"]["glossary_drift_ok"])
+            self.assertEqual(result["checks"]["glossary_drift_count"], 0)
+            self.assertFalse(any("Glossary drift detected" in warning for warning in result["warnings"]))
 
     def test_verify_quality_warns_on_fragmented_chinese_paragraphs(self):
         """Test verify quality warns on fragmented chinese paragraphs."""

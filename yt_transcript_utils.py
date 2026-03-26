@@ -3135,12 +3135,21 @@ def telemetry_events(telemetry_ref: str = "", *, telemetry_path: str = "", work_
 
 
 def build_glossary(work_dir: str, max_terms: int = 50,
-                  min_occurrences: int = 1) -> dict:
+                  min_occurrences: int = 1, mode: str = "auto",
+                  normalized_document_path: str = "", chapters_path: str = "",
+                  metadata_json_path: str = "", description_text: str = "",
+                  description_path: str = "") -> dict:
     """Delegate glossary construction to `kernel.long_text.glossary`."""
     return kernel_glossary.build_glossary(
         work_dir,
         max_terms=max_terms,
         min_occurrences=min_occurrences,
+        mode=mode,
+        normalized_document_path=normalized_document_path,
+        chapters_path=chapters_path,
+        metadata_json_path=metadata_json_path,
+        description_text=description_text,
+        description_path=description_path,
     )
 
 
@@ -5081,8 +5090,26 @@ def _compute_cjk_readability_metrics(body_paragraphs: list[str]) -> dict:
     }
 
 
+def _load_quality_glossary_payload(*, work_dir: str = "", glossary_path: str = "") -> dict:
+    """Load glossary payload for final quality verification."""
+    explicit_path_text = str(glossary_path or "").strip()
+    if explicit_path_text:
+        explicit_path = Path(explicit_path_text).expanduser()
+        try:
+            payload = json.loads(explicit_path.read_text(encoding="utf-8"))
+        except (FileNotFoundError, OSError, json.JSONDecodeError):
+            return {}
+        return payload if isinstance(payload, dict) else {}
+
+    resolved_work_dir = str(work_dir or "").strip()
+    if resolved_work_dir:
+        return kernel_glossary.load_glossary(resolved_work_dir)
+    return {}
+
+
 def verify_quality(optimized_text_path: str, raw_text_path: str = None,
-                   bilingual: bool = False) -> dict:
+                   bilingual: bool = False, work_dir: str = "",
+                   glossary_path: str = "", glossary_max_terms: int = 12) -> dict:
     """
     Verify quality of optimized text file with structural checks.
     
@@ -5094,6 +5121,7 @@ def verify_quality(optimized_text_path: str, raw_text_path: str = None,
     4. Bilingual balance (Chinese char ratio in expected range)
     5. Chinese readability warnings (spacing, duplication, paragraph fragmentation)
     6. Size ratio vs raw text (if raw_text_path provided)
+    7. Glossary drift warnings (if glossary context is available)
     
     Args:
         optimized_text_path: Path to the optimized text file
@@ -5218,6 +5246,13 @@ def verify_quality(optimized_text_path: str, raw_text_path: str = None,
             f"(density {checks['punctuation_density']:.3f})"
         )
 
+    checks["glossary_drift_applicable"] = False
+    checks["glossary_selected_term_count"] = 0
+    checks["glossary_matched_term_count"] = 0
+    checks["glossary_drift_count"] = 0
+    checks["glossary_preservation_ratio"] = 1.0
+    checks["glossary_drift_ok"] = True
+
     # Check 4: Bilingual balance
     if bilingual:
         cn_chars = sum(1 for c in text if '\u4e00' <= c <= '\u9fff')
@@ -5277,6 +5312,34 @@ def verify_quality(optimized_text_path: str, raw_text_path: str = None,
                     checks["semantic_anchor_coverage_ok"] = len(semantic_evaluation["missing_anchors"]) == 0
                     if semantic_evaluation["missing_anchors"]:
                         warnings.extend(semantic_evaluation["warnings"])
+
+                    glossary_payload = _load_quality_glossary_payload(
+                        work_dir=work_dir,
+                        glossary_path=glossary_path,
+                    )
+                    glossary_evaluation = kernel_glossary.evaluate_glossary_drift(
+                        glossary_payload,
+                        raw_text,
+                        text,
+                        max_terms=max(0, int(glossary_max_terms)),
+                    ) if glossary_payload else {
+                        "warnings": [],
+                        "selected_terms": [],
+                        "preserved_terms": [],
+                        "missing_terms": [],
+                        "glossary_drift_count": 0,
+                        "preservation_ratio": 1.0,
+                    }
+                    selected_terms = glossary_evaluation.get("selected_terms", []) if isinstance(glossary_evaluation.get("selected_terms", []), list) else []
+                    preserved_terms = glossary_evaluation.get("preserved_terms", []) if isinstance(glossary_evaluation.get("preserved_terms", []), list) else []
+                    checks["glossary_drift_applicable"] = bool(selected_terms)
+                    checks["glossary_selected_term_count"] = len(selected_terms)
+                    checks["glossary_matched_term_count"] = len(preserved_terms)
+                    checks["glossary_drift_count"] = int(glossary_evaluation.get("glossary_drift_count", 0) or 0)
+                    checks["glossary_preservation_ratio"] = float(glossary_evaluation.get("preservation_ratio", 1.0) or 0.0)
+                    checks["glossary_drift_ok"] = checks["glossary_drift_count"] == 0
+                    if glossary_evaluation["warnings"]:
+                        warnings.extend(glossary_evaluation["warnings"])
             except Exception:
                 pass  # Non-critical, skip if raw text unreadable
     
@@ -6738,6 +6801,18 @@ def main():
     glossary_parser.add_argument('work_dir', help='Working directory with manifest.json and raw chunks')
     glossary_parser.add_argument('--max-terms', type=int, default=50, help='Maximum number of glossary terms to keep')
     glossary_parser.add_argument('--min-occurrences', type=int, default=1, help='Minimum source occurrences required for a term')
+    glossary_parser.add_argument('--mode', choices=['auto', 'manifest', 'transcript'], default='auto',
+                                 help='Glossary source mode; transcript adds normalized-doc/chapter/metadata context when available')
+    glossary_parser.add_argument('--normalized-document', dest='normalized_document_path', default='',
+                                 help='Optional normalized_document.json path')
+    glossary_parser.add_argument('--chapters-path', default='',
+                                 help='Optional chapters or chapter_plan JSON path')
+    glossary_parser.add_argument('--metadata-json', dest='metadata_json_path', default='',
+                                 help='Optional metadata JSON path with title/channel/description/chapter fields')
+    glossary_parser.add_argument('--description-text', default='',
+                                 help='Optional description text to mine for glossary terms')
+    glossary_parser.add_argument('--description-path', default='',
+                                 help='Optional text file path containing description text')
 
     # assemble-final command
     af_parser = subparsers.add_parser(
@@ -6763,6 +6838,10 @@ def main():
     vq_parser.add_argument('optimized_text_path', help='Path to optimized text file')
     vq_parser.add_argument('--raw-text', default=None, help='Path to raw text file for size comparison')
     vq_parser.add_argument('--bilingual', action='store_true', help='Whether content should be bilingual')
+    vq_parser.add_argument('--work-dir', default='', help='Optional work_dir used to load glossary.json for drift checks')
+    vq_parser.add_argument('--glossary-path', default='', help='Optional glossary.json path for final drift checks')
+    vq_parser.add_argument('--glossary-max-terms', type=int, default=12,
+                           help='Maximum glossary terms to verify in final output')
 
     # load-config command
     config_parser = subparsers.add_parser(
@@ -7162,6 +7241,12 @@ def main():
             work_dir=args.work_dir,
             max_terms=args.max_terms,
             min_occurrences=args.min_occurrences,
+            mode=args.mode,
+            normalized_document_path=args.normalized_document_path,
+            chapters_path=args.chapters_path,
+            metadata_json_path=args.metadata_json_path,
+            description_text=args.description_text,
+            description_path=args.description_path,
         )
         result = envelope['result']
         print(json.dumps(envelope if args.api_envelope else result, ensure_ascii=False))
@@ -7190,6 +7275,9 @@ def main():
             optimized_text_path=args.optimized_text_path,
             raw_text_path=args.raw_text,
             bilingual=args.bilingual,
+            work_dir=args.work_dir,
+            glossary_path=args.glossary_path,
+            glossary_max_terms=args.glossary_max_terms,
         )
         result = envelope['result']
         print(json.dumps(envelope if args.api_envelope else result, ensure_ascii=False))

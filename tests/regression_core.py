@@ -1425,6 +1425,7 @@ work_dir: /tmp/vid001_chunks
         self.assertIn("fragment_paragraph_ratio", warning_ids)
         self.assertIn("duplicate_ngram_ratio", warning_ids)
         self.assertIn("punctuation_density", warning_ids)
+        self.assertIn("glossary_drift", warning_ids)
 
     def test_cli_api_envelope_wraps_plan_optimization(self):
         """Test cli api envelope wraps plan optimization."""

@@ -178,6 +178,7 @@ This step is optional because `process-chunks` now runs the same resume repair a
 - Every chunk operation includes an `execution` object; follow it instead of re-deriving replan behavior in prose
 - When `execution.supports_auto_replan=true`, include every flag in `execution.recommended_cli_flags`
 - When `execution.on_replan_required=stop_and_review`, do not call `replan-remaining`; STOP and surface the manifest/runtime state for manual review
+- When the raw-stage prompt is `cleanup_zh`, `process-chunks` now auto-builds a transcript glossary if `/tmp/${VIDEO_ID}_chunks/glossary.json` does not exist yet; you may still run `build-glossary --mode transcript` explicitly beforehand if you want to inspect the terms first
 
 Canonical command shape:
 
@@ -224,7 +225,8 @@ Write to state:
 ```bash
 python3 <skill-root>/yt_transcript_utils.py verify-quality \
     /tmp/${VIDEO_ID}_optimized.txt \
-    --raw-text /tmp/${VIDEO_ID}_raw_text.txt
+    --raw-text /tmp/${VIDEO_ID}_raw_text.txt \
+    --work-dir /tmp/${VIDEO_ID}_chunks
 ```
 
 Add `--bilingual` if `mode=bilingual`.
@@ -235,6 +237,6 @@ If only `warnings` are present, review them before deciding to continue.
 
 `checks` now also carries advisory readability metrics such as chunk seam duplication,
 Chinese spacing anomalies, repeated phrase density, short paragraph ratio,
-header density, and punctuation density so the warning reasons stay explainable.
+header density, punctuation density, and glossary drift so the warning reasons stay explainable.
 
 Do not continue to final assembly until verification passes.

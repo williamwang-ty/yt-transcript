@@ -94,11 +94,19 @@ def _process_chunks_impl(work_dir: str, prompt_name: str, extra_instruction: str
     plan = manifest["plan"]
     runtime = manifest["runtime"]
     glossary_payload = kernel_glossary.load_glossary(work_dir)
+    glossary_auto_built = False
+    if not glossary_payload and prompt_name == "cleanup_zh":
+        glossary_build = kernel_glossary.build_glossary(work_dir, mode="transcript")
+        if glossary_build.get("success", False):
+            glossary_payload = glossary_build
+            glossary_auto_built = True
     glossary_term_count = len(glossary_payload.get("terms", [])) if isinstance(glossary_payload.get("terms", []), list) else 0
     plan["glossary"] = {
-        "mode": "local_file" if glossary_term_count > 0 else "disabled",
+        "mode": "auto_transcript_build" if glossary_auto_built else ("local_file" if glossary_term_count > 0 else "disabled"),
         "glossary_path": str(kernel_glossary.glossary_path_for(work_dir)) if glossary_term_count > 0 else "",
         "term_count": glossary_term_count,
+        "source": str(glossary_payload.get("source", "")).strip() if glossary_term_count > 0 else "",
+        "auto_built": glossary_auto_built,
         "max_prompt_terms": max(0, _parse_int_min(config.get("chunk_glossary_max_prompt_terms"), 8, 0)),
     }
     plan["semantic_verification"] = {

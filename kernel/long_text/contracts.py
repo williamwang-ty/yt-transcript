@@ -192,6 +192,13 @@ def build_quality_gate_contract(*, bilingual: bool = False) -> dict:
             "min_cjk_chars": 120,
         },
         {
+            "id": "glossary_drift",
+            "severity": "warning",
+            "metric": "glossary_drift_count",
+            "applies_when": "glossary_drift_applicable",
+            "expected_value": 0,
+        },
+        {
             "id": "size_ratio_vs_raw",
             "severity": "warning",
             "expected_range": [1.2, 4.0] if bilingual else [0.7, 2.0],
