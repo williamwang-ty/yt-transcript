@@ -287,7 +287,7 @@ At the whole-project level, it is the routing boundary between source acquisitio
 - `operations[*].execution.recommended_cli_flags`
 - `operations[*].execution.on_replan_required`
 
-`normalize-document` materializes `/tmp/${VIDEO_ID}_normalized_document.json` from either raw text or timed `segments.json`, and `plan-optimization` auto-materializes it when source artifacts already exist.
+`normalize-document` materializes `/tmp/${VIDEO_ID}_normalized_document.json` from either raw text or timed `segments.json`, and `plan-optimization` auto-materializes it when source artifacts already exist. When the source segments came from subtitle cleanup, the normalized document now also preserves lightweight cleanup diagnostics under `diagnostics.subtitle_cleanup`.
 
 For long-video chunking, `plan-optimization` now also emits a canonical `chunking` block; when normalization exists, `chunk-document` is the preferred driver and it keeps chunk boundary / continuity assumptions explicit in `manifest.json`.
 
@@ -314,6 +314,7 @@ Current policy is intentional and explicit:
 - `transcribe-deepgram` now also reports lightweight observability fields such as paragraph/sentence/word counts, per-chunk transcript metadata, and fallback warnings in its result JSON
 - `chunk-segments` produces timed chunk manifests, and `build-chapter-plan` maps YouTube chapters onto chunk boundaries for `merge-content`
 - `parse-vtt` / `parse-vtt-segments` now use subtitle-aware cleanup so CJK subtitle fragments are not re-joined with stray ASCII spaces
+- `parse-vtt-segments` now also emits lightweight cleanup diagnostics such as duplicate/overlap trimming counters, and `normalize-document` carries those subtitle-cleanup signals into `normalized_document.json`
 - `chunk-segments --chapters` can force chunk boundaries at YouTube chapter starts to reduce heading drift
 - `chunk-text` now defaults to token-aware planning when `--prompt` is provided, while an explicit `--chunk-size` without `--prompt` keeps legacy character sizing for workflow compatibility
 - prompt names are validated eagerly for chunk planning, so typos fail fast instead of silently falling back to generic budgets
@@ -627,7 +628,7 @@ bash scripts/preflight.sh --require-llm
 - `operations[*].execution.recommended_cli_flags`
 - `operations[*].execution.on_replan_required`
 
-`normalize-document` 会基于 raw text 或带时间戳的 `segments.json` 物化 `/tmp/${VIDEO_ID}_normalized_document.json`；当源 artifact 已存在时，`plan-optimization` 也会自动完成这一步。
+`normalize-document` 会基于 raw text 或带时间戳的 `segments.json` 物化 `/tmp/${VIDEO_ID}_normalized_document.json`；当源 artifact 已存在时，`plan-optimization` 也会自动完成这一步。如果这些 segments 来自字幕清洗阶段，标准化文档还会把轻量清洗诊断透传到 `diagnostics.subtitle_cleanup`。
 
 对于长视频分块，`plan-optimization` 现在还会输出显式的 `chunking` 契约；一旦 normalization 已存在，优先使用 `chunk-document`，并把 chunk 边界 / continuity 假设显式记录到 `manifest.json`。
 
@@ -658,6 +659,7 @@ bash scripts/preflight.sh --require-llm
 - 当首选字幕轨因为 `HTTP 429` 这类鉴权/限流问题失败时，`download.sh subtitles` 现在会先用 Chrome cookies 对同一条轨重试，再决定是否回退到下一条候选
 - `chunk-segments` 基于 segments 生成带时间轴的 timed manifest；`build-chapter-plan` 可将 YouTube chapters 映射到 chunk 边界，供 `merge-content` 注入标题
 - `parse-vtt` / `parse-vtt-segments` 现在都会做 subtitle-aware cleanup，避免 CJK 字幕碎片在重新拼接时被错误插入 ASCII 空格
+- `parse-vtt-segments` 现在还会输出轻量 cleanup diagnostics，例如重复 cue / overlap 裁剪计数；`normalize-document` 会把这些字幕清洗信号透传进 `normalized_document.json`
 - `chunk-segments --chapters` 可选在 YouTube 章节起点强制切 chunk，减少章节标题漂移
 - 如果只传显式 `--chunk-size` 而不传 `--prompt`，`chunk-text` 会继续按 legacy 字符大小解释，避免现有 workflow 被静默改变
 - 分块阶段会提前校验 prompt 名称，避免因为 prompt 拼写错误而静默回退到通用预算

@@ -74,6 +74,7 @@ from kernel.task_runtime import state as kernel_state
 from kernel.task_runtime import controller as kernel_controller
 from kernel.task_runtime import telemetry as kernel_telemetry
 from kernel.task_runtime import api as kernel_runtime_api
+from kernel.text_cleanup import subtitle as kernel_subtitle_cleanup
 from kernel.long_text import glossary as kernel_glossary
 from kernel.long_text import semantic as kernel_semantic
 from kernel.long_text import chunking as kernel_chunking
@@ -1979,209 +1980,48 @@ def _hard_split_text(text: str, max_len: int) -> list[str]:
 
 def _parse_vtt_timestamp(value: str) -> float | None:
     """Parse vtt timestamp."""
-    token = str(value or "").strip().replace(",", ".")
-    if not token:
-        return None
-
-    parts = token.split(":")
-    if len(parts) == 3:
-        hours_str, minutes_str, seconds_str = parts
-    elif len(parts) == 2:
-        hours_str = "0"
-        minutes_str, seconds_str = parts
-    else:
-        return None
-
-    try:
-        hours = int(hours_str)
-        minutes = int(minutes_str)
-        seconds = float(seconds_str)
-    except ValueError:
-        return None
-
-    return round(hours * 3600 + minutes * 60 + seconds, 3)
+    return kernel_subtitle_cleanup.parse_vtt_timestamp(str(value or "").replace(",", "."))
 
 
 def _parse_vtt_time_range(line: str) -> tuple[float | None, float | None]:
     """Parse vtt time range."""
-    if "-->" not in line:
-        return None, None
-
-    start_raw, end_raw = line.split("-->", 1)
-    start_token = start_raw.strip().split()[0] if start_raw.strip() else ""
-    end_token = end_raw.strip().split()[0] if end_raw.strip() else ""
-    return _parse_vtt_timestamp(start_token), _parse_vtt_timestamp(end_token)
+    return kernel_subtitle_cleanup.parse_vtt_time_range(line)
 
 
 def _strip_subtitle_markup(text: str) -> str:
     """Strip lightweight subtitle markup such as VTT cue tags."""
-    cleaned = re.sub(r"<[^>]+>", "", str(text or ""))
-    return cleaned.replace("&nbsp;", " ")
+    cleaned, _ = kernel_subtitle_cleanup.strip_subtitle_markup(text)
+    return cleaned
 
 
 def _subtitle_join_needs_space(left: str, right: str) -> bool:
     """Return whether two subtitle fragments need an inserted ASCII space."""
-    left_text = str(left or "").rstrip()
-    right_text = str(right or "").lstrip()
-    if not left_text or not right_text:
-        return False
-
-    previous = left_text[-1]
-    following = right_text[0]
-
-    if previous in "([{\"'“‘「『《【":
-        return False
-    if following in ",.;:!?，。！？、；：)]}\"'”’」』）》】":
-        return False
-    if _is_cjk_family_char(previous) or _is_cjk_family_char(following):
-        return False
-    return True
+    return kernel_subtitle_cleanup.subtitle_join_needs_space(left, right)
 
 
 def _join_subtitle_fragments(fragments: list[str]) -> str:
     """Join subtitle fragments without inserting spaces inside CJK text."""
-    parts = []
-    for fragment in fragments:
-        cleaned = _strip_subtitle_markup(fragment).strip()
-        if cleaned:
-            parts.append(cleaned)
-
-    if not parts:
-        return ""
-
-    joined = parts[0]
-    for fragment in parts[1:]:
-        if _subtitle_join_needs_space(joined, fragment):
-            joined = f"{joined} {fragment}"
-        else:
-            joined = f"{joined}{fragment}"
-    return joined.strip()
+    joined, _ = kernel_subtitle_cleanup.join_subtitle_fragments(fragments)
+    return joined
 
 
 def _normalize_subtitle_text(text: str) -> str:
     """Apply conservative cleanup tailored to subtitle-derived text."""
-    normalized = _normalize_text_body(_strip_subtitle_markup(text))
-    if not normalized:
-        return ""
-
-    normalized = re.sub(r"[ \t]+", " ", normalized)
-    cjk_family = r"\u3400-\u9fff\u3040-\u30ff\uac00-\ud7af"
-    for _ in range(8):
-        updated = re.sub(rf"([{cjk_family}])\s+([{cjk_family}])", r"\1\2", normalized)
-        updated = re.sub(rf"([{cjk_family}])\s+([，。！？、；：,.!?;:])", r"\1\2", updated)
-        updated = re.sub(rf"([（【《「『])\s+([{cjk_family}])", r"\1\2", updated)
-        if updated == normalized:
-            break
-        normalized = updated
-    normalized = re.sub(r"\s+([，。！？、；：,.!?;:])", r"\1", normalized)
-    normalized = re.sub(r"([（【《「『])\s+", r"\1", normalized)
-    normalized = re.sub(r"\s+([）」』】》])", r"\1", normalized)
-    normalized = re.sub(r"\n{3,}", "\n\n", normalized)
-    return normalized.strip()
+    return kernel_subtitle_cleanup.normalize_subtitle_text(text)
 
 
 def _normalize_subtitle_segment_text(text: str) -> str:
     """Normalize a single subtitle cue into a cue-sized text fragment."""
-    normalized = _normalize_subtitle_text(text)
-    if not normalized:
-        return ""
-    return _join_subtitle_fragments(normalized.splitlines())
+    return kernel_subtitle_cleanup.normalize_subtitle_segment_text(text)
 
 
 def _parse_vtt_payload(content: str, *, language: str = "", vtt_path: str = "") -> dict:
     """Parse VTT content into aligned subtitle segments."""
-    segments = []
-    header_language = ""
-    in_note = False
-    cue_start = None
-    cue_end = None
-    cue_lines = []
-
-    def flush_cue():
-        """Flush the current cue into the segment list."""
-        nonlocal cue_start, cue_end, cue_lines
-        if cue_start is None or cue_end is None:
-            cue_start = None
-            cue_end = None
-            cue_lines = []
-            return
-
-        clean = _normalize_subtitle_segment_text(_join_subtitle_fragments(cue_lines))
-        if not clean:
-            cue_start = None
-            cue_end = None
-            cue_lines = []
-            return
-
-        if segments and segments[-1]["text"] == clean:
-            previous_end = _coerce_float_or_none(segments[-1].get("end_time"))
-            if previous_end is None or cue_end > previous_end:
-                segments[-1]["end_time"] = cue_end
-            cue_start = None
-            cue_end = None
-            cue_lines = []
-            return
-
-        segments.append({
-            "id": len(segments),
-            "text": clean,
-            "start_time": cue_start,
-            "end_time": cue_end,
-            "speaker": None,
-        })
-        cue_start = None
-        cue_end = None
-        cue_lines = []
-
-    for raw_line in content.splitlines():
-        line = raw_line.strip("\ufeff")
-        stripped = line.strip()
-
-        if stripped.startswith("Language:") and not language:
-            header_language = stripped.split(":", 1)[1].strip()
-
-        if in_note:
-            if not stripped:
-                in_note = False
-            continue
-
-        if stripped.startswith("NOTE"):
-            in_note = True
-            continue
-
-        if stripped.startswith("WEBVTT") or stripped.startswith("Kind:") or stripped.startswith("Style:"):
-            continue
-        if stripped.startswith("STYLE") or stripped.startswith("REGION"):
-            continue
-
-        if "-->" in stripped:
-            flush_cue()
-            cue_start, cue_end = _parse_vtt_time_range(stripped)
-            cue_lines = []
-            continue
-
-        if not stripped:
-            flush_cue()
-            continue
-
-        if cue_start is None and cue_end is None:
-            continue
-
-        cue_lines.append(stripped)
-
-    flush_cue()
-
-    if not segments:
-        print("Error: No usable VTT segments found", file=sys.stderr)
+    try:
+        return kernel_subtitle_cleanup.parse_vtt_payload(content, language=language, vtt_path=vtt_path)
+    except ValueError as error:
+        print(f"Error: {error}", file=sys.stderr)
         sys.exit(2)
-
-    return {
-        "source": "vtt",
-        "language": language or header_language,
-        "vtt_path": str(Path(vtt_path).absolute()) if vtt_path else "",
-        "segment_count": len(segments),
-        "segments": segments,
-    }
 
 
 def parse_vtt(vtt_path: str) -> str:
@@ -5614,6 +5454,7 @@ def normalize_document(state_ref: str, output_path: str = "", prefer: str = "aut
     has_timing = False
     source_adapter = "raw_text_file"
     preferred_chunk_source = "text"
+    cleanup_diagnostics = {}
     warnings = []
 
     if use_segments:
@@ -5639,6 +5480,9 @@ def normalize_document(state_ref: str, output_path: str = "", prefer: str = "aut
                 "normalized_document_path": normalized_document_path,
                 "materialized": False,
             }
+        payload_diagnostics = payload.get("diagnostics", {}) if isinstance(payload.get("diagnostics", {}), dict) else {}
+        if _is_youtube_subtitle_source(source_payload) or str(payload.get("source", "")).strip().lower() == "vtt":
+            cleanup_diagnostics = payload_diagnostics
         for seg in payload.get("segments", []):
             if not isinstance(seg, dict):
                 continue
@@ -5719,6 +5563,10 @@ def normalize_document(state_ref: str, output_path: str = "", prefer: str = "aut
         },
         "segments": normalized_segments,
     }
+    if cleanup_diagnostics:
+        normalized_doc["diagnostics"] = {
+            "subtitle_cleanup": cleanup_diagnostics,
+        }
     _atomic_write_text(Path(normalized_document_path), json.dumps(normalized_doc, ensure_ascii=False, indent=2))
     _update_machine_state_normalization(
         machine_state_path,
@@ -5743,6 +5591,7 @@ def normalize_document(state_ref: str, output_path: str = "", prefer: str = "aut
         "segment_count": len(normalized_segments),
         "has_timing": has_timing,
         "char_count": len(normalized_text),
+        "cleanup_diagnostics": cleanup_diagnostics,
     }
 
 

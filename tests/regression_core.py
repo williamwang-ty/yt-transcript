@@ -598,6 +598,32 @@ class CoreRegressionTests(unittest.TestCase):
                 ["你好，", "世界！"],
             )
 
+    def test_parse_vtt_segments_trims_overlap_and_reports_diagnostics(self):
+        """Test adjacent subtitle overlap is trimmed deterministically and reported."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            vtt_path = Path(tmpdir) / "sub_overlap.vtt"
+            vtt_path.write_text(
+                "WEBVTT\n"
+                "Language: zh-Hans\n"
+                "\n"
+                "00:00:00.000 --> 00:00:02.000\n"
+                "大家好今天\n"
+                "\n"
+                "00:00:02.000 --> 00:00:04.000\n"
+                "好今天我们来聊测试\n",
+                encoding="utf-8",
+            )
+
+            result = utils.parse_vtt_segments(str(vtt_path), language="zh-Hans")
+
+            self.assertEqual(
+                [segment["text"] for segment in result["segments"]],
+                ["大家好今天", "我们来聊测试"],
+            )
+            self.assertEqual(result["diagnostics"]["cue_count"], 2)
+            self.assertEqual(result["diagnostics"]["overlap_trim_count"], 1)
+            self.assertEqual(result["diagnostics"]["overlap_trimmed_chars"], 3)
+
     def test_cli_parse_vtt_segments_command_is_registered(self):
         """Test cli parse vtt segments command is registered."""
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -633,6 +659,8 @@ class CoreRegressionTests(unittest.TestCase):
             self.assertEqual(payload["source"], "vtt")
             self.assertEqual(payload["language"], "en")
             self.assertEqual(payload["segment_count"], 1)
+            self.assertIn("diagnostics", payload)
+            self.assertEqual(payload["diagnostics"]["exact_duplicate_cue_count"], 1)
             self.assertEqual(payload["segments"][0]["text"], "Hello world.")
             self.assertEqual(payload["segments"][0]["start_time"], 0.0)
             self.assertEqual(payload["segments"][0]["end_time"], 4.0)
@@ -1127,6 +1155,10 @@ class CoreRegressionTests(unittest.TestCase):
                     {
                         "source": "vtt",
                         "language": "zh-Hans",
+                        "diagnostics": {
+                            "cue_count": 2,
+                            "overlap_trim_count": 1,
+                        },
                         "segments": [
                             {"id": 0, "text": "你 好，", "start_time": 0.0, "end_time": 1.0},
                             {"id": 1, "text": "第 二 行。", "start_time": 1.0, "end_time": 2.0},
@@ -1160,9 +1192,11 @@ class CoreRegressionTests(unittest.TestCase):
             self.assertTrue(result["passed"], result)
             self.assertEqual(result["source_adapter"], "segments_json")
             self.assertEqual(result["preferred_chunk_source"], "text")
+            self.assertEqual(result["cleanup_diagnostics"]["overlap_trim_count"], 1)
             payload = json.loads(Path(result["normalized_document_path"]).read_text(encoding="utf-8"))
             self.assertEqual(payload["content"]["preferred_chunk_source"], "text")
             self.assertEqual(payload["content"]["text"], "你好，\n\n第二行。")
+            self.assertEqual(payload["diagnostics"]["subtitle_cleanup"]["overlap_trim_count"], 1)
             self.assertEqual(
                 [segment["text"] for segment in payload["segments"]],
                 ["你好，", "第二行。"],

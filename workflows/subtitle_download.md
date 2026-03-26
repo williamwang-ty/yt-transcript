@@ -114,6 +114,7 @@ Do not merge two subtitle files directly in this workflow.
 python3 <skill-root>/yt_transcript_utils.py parse-vtt "$SELECTED_SOURCE_VTT" > /tmp/${VIDEO_ID}_raw_text.txt
 
 # 2) Also persist time-aligned segments for long-video timed chunking + chapter mapping
+#    The JSON output now also includes lightweight subtitle-cleanup diagnostics.
 python3 <skill-root>/yt_transcript_utils.py parse-vtt-segments \
     "$SELECTED_SOURCE_VTT" \
     --language "$SELECTED_SOURCE_LANGUAGE" \
