@@ -1413,6 +1413,19 @@ work_dir: /tmp/vid001_chunks
             self.assertFalse(result["operations"][1]["control"]["replan"]["supports_auto_replan"])
             self.assertEqual(result["operations"][1]["control"]["quality_gate"]["hard_failure_checks"][-1]["id"], "bilingual_pairs")
 
+    def test_quality_gate_contract_exposes_advisory_readability_metrics(self):
+        """Test quality gate contract exposes advisory readability metrics."""
+        contract = utils._build_quality_gate_contract(bilingual=False)
+
+        warning_ids = [entry["id"] for entry in contract["warning_checks"]]
+
+        self.assertIn("chunk_seam_duplication", warning_ids)
+        self.assertIn("header_fragment_balance", warning_ids)
+        self.assertIn("cjk_spacing_anomaly", warning_ids)
+        self.assertIn("fragment_paragraph_ratio", warning_ids)
+        self.assertIn("duplicate_ngram_ratio", warning_ids)
+        self.assertIn("punctuation_density", warning_ids)
+
     def test_cli_api_envelope_wraps_plan_optimization(self):
         """Test cli api envelope wraps plan optimization."""
         with tempfile.TemporaryDirectory() as tmpdir:

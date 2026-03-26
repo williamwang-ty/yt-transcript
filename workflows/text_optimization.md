@@ -233,4 +233,8 @@ If `hard_failures` is non-empty, STOP.
 
 If only `warnings` are present, review them before deciding to continue.
 
+`checks` now also carries advisory readability metrics such as chunk seam duplication,
+Chinese spacing anomalies, repeated phrase density, short paragraph ratio,
+header density, and punctuation density so the warning reasons stay explainable.
+
 Do not continue to final assembly until verification passes.

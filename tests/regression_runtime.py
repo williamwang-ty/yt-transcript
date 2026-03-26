@@ -549,6 +549,87 @@ class RuntimeRegressionTests(unittest.TestCase):
             self.assertEqual(result["hard_failures"], [])
             self.assertTrue(result["warnings"])
 
+    def test_verify_quality_warns_on_chinese_spacing_anomalies(self):
+        """Test verify quality warns on chinese spacing anomalies."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            optimized = Path(tmpdir) / "opt.md"
+            optimized.write_text(
+                "## Section\n\n"
+                "这 是 一 段 被 字 幕 空 格 污 染 的 中 文 文 本 ， 读 起 来 很 生 硬 。\n\n"
+                "我 们 还 会 看 到 很 多 词 被 错 误 地 拆 开 ， 让 阅 读 节 奏 明 显 变 差 。\n\n"
+                "如 果 最 终 输 出 还 保 留 这 种 空 格 ， 就 应 该 给 出 质 量 告 警 。\n",
+                encoding="utf-8",
+            )
+
+            result = utils.verify_quality(str(optimized), bilingual=False)
+
+            self.assertTrue(result["passed"], result)
+            self.assertFalse(result["checks"]["cjk_spacing_ok"])
+            self.assertTrue(any("Chinese spacing anomalies" in warning for warning in result["warnings"]))
+
+    def test_verify_quality_warns_on_repeated_chunk_seam_phrases(self):
+        """Test verify quality warns on repeated chunk seam phrases."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            optimized = Path(tmpdir) / "opt.md"
+            optimized.write_text(
+                "## Section\n\n"
+                "我们需要稳定输出结构化结果，并保持上下文一致、术语一致、段落一致。\n\n"
+                "保持上下文一致、术语一致、段落一致。这一段因为 chunk seam 重复了一次，然后才继续展开说明。\n\n"
+                "保持上下文一致、术语一致、段落一致。接下来再说明第二个关键约束，以及为什么需要人工复核。\n",
+                encoding="utf-8",
+            )
+
+            result = utils.verify_quality(str(optimized), bilingual=False)
+
+            self.assertTrue(result["passed"], result)
+            self.assertGreater(result["checks"]["chunk_seam_warning_count"], 0)
+            self.assertFalse(result["checks"]["duplicate_ngram_ok"])
+            self.assertTrue(any("Repeated phrase density" in warning for warning in result["warnings"]))
+
+    def test_verify_quality_warns_on_fragmented_chinese_paragraphs(self):
+        """Test verify quality warns on fragmented chinese paragraphs."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            optimized = Path(tmpdir) / "opt.md"
+            optimized.write_text(
+                "## Section\n\n"
+                "先说背景\n\n"
+                "再说问题\n\n"
+                "继续补充\n\n"
+                "最后总结\n\n"
+                "还没说完\n\n"
+                "接着展开\n",
+                encoding="utf-8",
+            )
+
+            result = utils.verify_quality(str(optimized), bilingual=False)
+
+            self.assertTrue(result["passed"], result)
+            self.assertFalse(result["checks"]["short_paragraph_ratio_ok"])
+            self.assertTrue(any("Too many short Chinese body paragraphs" in warning for warning in result["warnings"]))
+
+    def test_verify_quality_avoids_false_positives_for_healthy_chinese_output(self):
+        """Test verify quality avoids false positives for healthy chinese output."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            optimized = Path(tmpdir) / "opt.md"
+            optimized.write_text(
+                "## 背景\n\n"
+                "这份整理稿先交代问题背景，说明为什么当前流程需要更稳定的质量门禁，并给出清晰的执行边界。\n\n"
+                "随后我们补充约束条件，强调输出必须保留结构、术语和段落层次，不能只是把字幕机械拼接起来。\n\n"
+                "## 方法\n\n"
+                "在实现层面，我们优先做确定性的机械修复，再把剩余问题通过告警暴露给人工复核，而不是直接阻断流程。\n\n"
+                "最终成稿会保留自然的中文标点、合理的段落长度，以及稳定可解释的检查指标，便于持续回归验证。\n",
+                encoding="utf-8",
+            )
+
+            result = utils.verify_quality(str(optimized), bilingual=False)
+
+            self.assertTrue(result["passed"], result)
+            self.assertEqual(result["warnings"], [], result)
+            self.assertTrue(result["checks"]["cjk_spacing_ok"])
+            self.assertTrue(result["checks"]["duplicate_ngram_ok"])
+            self.assertTrue(result["checks"]["short_paragraph_ratio_ok"])
+            self.assertTrue(result["checks"]["punctuation_density_ok"])
+
     def test_process_chunks_dry_run_does_not_require_llm_credentials(self):
         """Test process chunks dry run does not require llm credentials."""
         with tempfile.TemporaryDirectory() as tmpdir:

@@ -67,6 +67,7 @@ import subprocess
 import sys
 import time
 import urllib.parse
+from collections import Counter
 from pathlib import Path
 
 from kernel.task_runtime import runtime as kernel_runtime
@@ -74,6 +75,7 @@ from kernel.task_runtime import state as kernel_state
 from kernel.task_runtime import controller as kernel_controller
 from kernel.task_runtime import telemetry as kernel_telemetry
 from kernel.task_runtime import api as kernel_runtime_api
+from kernel.text_cleanup import overlap as kernel_overlap
 from kernel.text_cleanup import subtitle as kernel_subtitle_cleanup
 from kernel.long_text import glossary as kernel_glossary
 from kernel.long_text import semantic as kernel_semantic
@@ -4917,6 +4919,168 @@ def _line_looks_truncated(last_line: str) -> bool:
     return len(text) > 120 and text[-1].isalnum()
 
 
+QUALITY_PUNCTUATION_CHARS = set(",.;:!?，。！？、；：()[]{}\"'“”‘’`")
+QUALITY_SENTENCE_ENDINGS = ("。", "！", "？", "!", "?", "；", ";")
+QUALITY_TOKEN_RE = re.compile(r"[A-Za-z0-9]+|[\u3400-\u9fff\u3040-\u30ff\uac00-\ud7af]")
+QUALITY_CJK_SPACE_PATTERNS = (
+    re.compile(r"(?<=[\u3400-\u9fff\u3040-\u30ff\uac00-\ud7af])\s+(?=[\u3400-\u9fff\u3040-\u30ff\uac00-\ud7af])"),
+    re.compile(r"(?<=[\u3400-\u9fff\u3040-\u30ff\uac00-\ud7af])\s+(?=[，。！？、；：,.!?;:])"),
+    re.compile(r"(?<=[（《「『【(])\s+(?=[\u3400-\u9fff\u3040-\u30ff\uac00-\ud7af])"),
+    re.compile(r"(?<=[\u3400-\u9fff\u3040-\u30ff\uac00-\ud7af])\s+(?=[）》」』】)])"),
+)
+
+
+def _count_quality_chars(text: str, *, include_punctuation: bool = False) -> int:
+    """Count non-space characters for quality heuristics."""
+    return sum(
+        1
+        for char in str(text or "")
+        if not char.isspace() and (include_punctuation or char not in QUALITY_PUNCTUATION_CHARS)
+    )
+
+
+def _count_cjk_chars(text: str) -> int:
+    """Count CJK-family characters."""
+    return sum(1 for char in str(text or "") if _is_cjk_family_char(char))
+
+
+def _tokenize_quality_text(text: str) -> list[str]:
+    """Tokenize text into Latin words and single CJK-family characters."""
+    tokens = []
+    for token in QUALITY_TOKEN_RE.findall(str(text or "")):
+        tokens.append(token.lower() if token.isascii() else token)
+    return tokens
+
+
+def _is_quality_fragment_paragraph(text: str) -> bool:
+    """Return whether a paragraph looks like a short subtitle fragment."""
+    block = str(text or "").strip()
+    if not block or re.match(r"^(?:[-*+]\s|\d+\.\s)", block):
+        return False
+
+    meaningful_chars = _count_quality_chars(block)
+    cjk_chars = _count_cjk_chars(block)
+    if cjk_chars < 4:
+        return False
+    if meaningful_chars <= 10:
+        return True
+    return meaningful_chars <= 22 and not block.endswith(QUALITY_SENTENCE_ENDINGS)
+
+
+def _is_strong_quality_overlap(text: str) -> bool:
+    """Return whether an adjacent overlap is suspicious enough to warn about."""
+    candidate = str(text or "").strip()
+    if not candidate:
+        return False
+
+    meaningful_chars = _count_quality_chars(candidate)
+    if any(_is_cjk_family_char(char) for char in candidate):
+        return meaningful_chars >= 4
+    return meaningful_chars >= 12 and len(_tokenize_quality_text(candidate)) >= 3
+
+
+def _count_chunk_seam_warnings(paragraphs: list[str]) -> int:
+    """Count duplicated adjacent paragraph seams that survived post-merge cleanup."""
+    warning_count = 0
+    normalized_blocks = [re.sub(r"\s+", " ", block.strip()) for block in paragraphs if block.strip()]
+    for previous, current in zip(normalized_blocks, normalized_blocks[1:]):
+        if previous == current:
+            warning_count += 1
+            continue
+        overlap = kernel_overlap.find_leading_overlap(previous, current)
+        if _is_strong_quality_overlap(overlap):
+            warning_count += 1
+    return warning_count
+
+
+def _compute_duplicate_ngram_metrics(paragraphs: list[str], *, ngram_size: int = 5) -> dict:
+    """Measure repeated phrase density inside paragraph bodies."""
+    windows = []
+    for block in paragraphs:
+        tokens = _tokenize_quality_text(block)
+        if len(tokens) < ngram_size:
+            continue
+        for idx in range(len(tokens) - ngram_size + 1):
+            window = tuple(tokens[idx:idx + ngram_size])
+            if len(set(window)) < 2:
+                continue
+            windows.append(window)
+
+    total_windows = len(windows)
+    if total_windows == 0:
+        return {
+            "duplicate_ngram_ratio": 0.0,
+            "duplicate_ngram_count": 0,
+            "duplicate_ngram_windows": 0,
+        }
+
+    counts = Counter(windows)
+    duplicate_count = sum(count - 1 for count in counts.values() if count > 1)
+    ratio = duplicate_count / total_windows if total_windows else 0.0
+    return {
+        "duplicate_ngram_ratio": round(ratio, 3),
+        "duplicate_ngram_count": duplicate_count,
+        "duplicate_ngram_windows": total_windows,
+    }
+
+
+def _compute_cjk_readability_metrics(body_paragraphs: list[str]) -> dict:
+    """Compute advisory readability signals for Chinese-heavy body text."""
+    cjk_body_paragraphs = [block for block in body_paragraphs if _count_cjk_chars(block) >= 4]
+    cjk_text = "\n\n".join(cjk_body_paragraphs)
+    cjk_chars = _count_cjk_chars(cjk_text)
+    cjk_applicable = cjk_chars >= 24 and len(cjk_body_paragraphs) >= 2
+
+    spacing_anomaly_count = sum(
+        1
+        for pattern in QUALITY_CJK_SPACE_PATTERNS
+        for _ in pattern.finditer(cjk_text)
+    )
+    cjk_space_ratio = spacing_anomaly_count / cjk_chars if cjk_chars else 0.0
+
+    short_paragraph_count = sum(1 for block in cjk_body_paragraphs if _is_quality_fragment_paragraph(block))
+    short_paragraph_ratio = short_paragraph_count / len(cjk_body_paragraphs) if cjk_body_paragraphs else 0.0
+
+    punctuation_count = sum(1 for char in cjk_text if char in QUALITY_PUNCTUATION_CHARS)
+    meaningful_chars = _count_quality_chars(cjk_text)
+    punctuation_density = punctuation_count / meaningful_chars if meaningful_chars else 0.0
+
+    duplicate_metrics = _compute_duplicate_ngram_metrics(cjk_body_paragraphs)
+    cjk_spacing_ok = (not cjk_applicable) or not (
+        spacing_anomaly_count >= 2 and cjk_space_ratio > 0.01
+    )
+    duplicate_ngram_ok = (not cjk_applicable) or not (
+        duplicate_metrics["duplicate_ngram_count"] >= 4 and duplicate_metrics["duplicate_ngram_ratio"] > 0.06
+    )
+    short_paragraph_ok = (not cjk_applicable) or not (
+        len(cjk_body_paragraphs) >= 4
+        and short_paragraph_count >= 4
+        and short_paragraph_ratio > 0.45
+    )
+    punctuation_density_ok = (not cjk_applicable) or not (
+        cjk_chars >= 120 and punctuation_density < 0.01
+    )
+
+    return {
+        "cjk_readability_applicable": cjk_applicable,
+        "cjk_body_paragraph_count": len(cjk_body_paragraphs),
+        "cjk_body_char_count": cjk_chars,
+        "cjk_spacing_anomaly_count": spacing_anomaly_count,
+        "cjk_space_ratio": round(cjk_space_ratio, 3),
+        "cjk_spacing_ok": cjk_spacing_ok,
+        "duplicate_ngram_ratio": duplicate_metrics["duplicate_ngram_ratio"],
+        "duplicate_ngram_count": duplicate_metrics["duplicate_ngram_count"],
+        "duplicate_ngram_windows": duplicate_metrics["duplicate_ngram_windows"],
+        "duplicate_ngram_ok": duplicate_ngram_ok,
+        "short_paragraph_count": short_paragraph_count,
+        "short_paragraph_ratio": round(short_paragraph_ratio, 3),
+        "fragment_paragraph_ratio": round(short_paragraph_ratio, 3),
+        "short_paragraph_ratio_ok": short_paragraph_ok,
+        "punctuation_density": round(punctuation_density, 3),
+        "punctuation_density_ok": punctuation_density_ok,
+    }
+
+
 def verify_quality(optimized_text_path: str, raw_text_path: str = None,
                    bilingual: bool = False) -> dict:
     """
@@ -4928,7 +5092,8 @@ def verify_quality(optimized_text_path: str, raw_text_path: str = None,
     2. Has section headers (##)
     3. No abrupt truncation (last line is complete)
     4. Bilingual balance (Chinese char ratio in expected range)
-    5. Size ratio vs raw text (if raw_text_path provided)
+    5. Chinese readability warnings (spacing, duplication, paragraph fragmentation)
+    6. Size ratio vs raw text (if raw_text_path provided)
     
     Args:
         optimized_text_path: Path to the optimized text file
@@ -5003,6 +5168,55 @@ def verify_quality(optimized_text_path: str, raw_text_path: str = None,
     else:
         checks["no_truncation"] = False
         warnings.append("No non-empty lines found")
+
+    chunk_seam_warning_count = _count_chunk_seam_warnings(body_paragraphs)
+    checks["chunk_seam_warning_count"] = chunk_seam_warning_count
+    checks["chunk_seam_duplication_ok"] = chunk_seam_warning_count == 0
+    if chunk_seam_warning_count:
+        warnings.append(
+            "Chunk seam duplication signals detected between adjacent paragraphs "
+            f"({chunk_seam_warning_count} suspect boundary/boundaries)"
+        )
+
+    body_char_count = sum(len(block) for block in body_paragraphs)
+    header_density = len(section_headers) / len(body_paragraphs) if body_paragraphs else float(len(section_headers))
+    avg_chars_per_section = body_char_count / len(section_headers) if section_headers else float(body_char_count)
+    checks["header_density"] = round(header_density, 3)
+    checks["avg_chars_per_section"] = round(avg_chars_per_section, 1)
+    checks["header_fragment_balance_ok"] = not (
+        len(section_headers) >= 4
+        and len(body_paragraphs) >= 4
+        and header_density > 0.6
+        and avg_chars_per_section < 220
+    )
+    if not checks["header_fragment_balance_ok"]:
+        warnings.append(
+            "Header density looks unusually high for the available body text "
+            f"({len(section_headers)} sections across {len(body_paragraphs)} body paragraphs)"
+        )
+
+    cjk_readability_checks = _compute_cjk_readability_metrics(body_paragraphs)
+    checks.update(cjk_readability_checks)
+    if not checks["cjk_spacing_ok"]:
+        warnings.append(
+            "Chinese spacing anomalies detected "
+            f"({checks['cjk_spacing_anomaly_count']} issue(s), ratio {checks['cjk_space_ratio']:.3f})"
+        )
+    if not checks["duplicate_ngram_ok"]:
+        warnings.append(
+            "Repeated phrase density is high in Chinese body text "
+            f"(ratio {checks['duplicate_ngram_ratio']:.3f})"
+        )
+    if not checks["short_paragraph_ratio_ok"]:
+        warnings.append(
+            "Too many short Chinese body paragraphs look like subtitle fragments "
+            f"({checks['short_paragraph_count']} of {checks['cjk_body_paragraph_count']})"
+        )
+    if not checks["punctuation_density_ok"]:
+        warnings.append(
+            "Chinese punctuation density looks unusually low "
+            f"(density {checks['punctuation_density']:.3f})"
+        )
 
     # Check 4: Bilingual balance
     if bilingual:

@@ -342,7 +342,7 @@ Current policy is intentional and explicit:
 - `chunk_hard_cap_multiplier` is constrained to a conservative `1.0-2.0` range so misconfiguration cannot silently blow up chunk envelopes
 - `preflight.sh` is staged so subtitle-only workflows do not require Deepgram or LLM credentials up front, while `--require-llm` now performs both reachability and token-count capability probes
 - `transcribe-deepgram` is the only supported Deepgram entry point; split / merge behavior is owned by the Python utility
-- `verify-quality` is a hard gate only when `hard_failures` is non-empty; `warnings` are advisory review signals
+- `verify-quality` is a hard gate only when `hard_failures` is non-empty; `warnings` are advisory review signals, and `checks` now expose explainable readability metrics such as `chunk_seam_warning_count`, `cjk_space_ratio`, `duplicate_ngram_ratio`, `short_paragraph_ratio`, `header_density`, and `punctuation_density`
 
 ### 📘 Canonical Terms
 
@@ -352,7 +352,7 @@ Current policy is intentional and explicit:
 - `preflight llm`: `bash scripts/preflight.sh --require-llm` only when `plan-optimization` says long-video chunk processing requires it.
 - `Deepgram unified entry`: `python3 yt_transcript_utils.py transcribe-deepgram ...`
 - `Deepgram result observability`: `/tmp/${VIDEO_ID}_deepgram_result.json` now exposes per-chunk `chunk_reports`, aggregate structure counts, and `warnings` when segment extraction falls back from richer structures
-- `quality gate`: `verify-quality` JSON where `hard_failures` means STOP and `warnings` means review before proceeding.
+- `quality gate`: `verify-quality` JSON where `hard_failures` means STOP, `warnings` means review before proceeding, and `checks` carries the readability metrics behind those warnings.
 
 ### 🧪 Validation Matrix
 
@@ -391,6 +391,10 @@ python3 yt_transcript_utils.py transcribe-deepgram "$AUDIO_FILE" --language "$LA
 
 # 6. Final quality gate
 python3 yt_transcript_utils.py verify-quality /tmp/${VIDEO_ID}_optimized.txt --raw-text /tmp/${VIDEO_ID}_raw_text.txt
+
+# `checks` now includes advisory readability signals such as chunk seam duplication,
+# Chinese spacing anomalies, repeated phrase density, short paragraph ratio,
+# header density, and punctuation density.
 ```
 
 ### 📄 License
@@ -678,7 +682,7 @@ bash scripts/preflight.sh --require-llm
 - `chunk_hard_cap_multiplier` 会被限制在保守的 `1.0-2.0` 区间，避免配置失误把 chunk 包络静默放大
 - `preflight.sh` 采用分层校验，确保只走字幕路径时不必预先配置 Deepgram 或 LLM 凭据；进入 `--require-llm` 时会同时做连通性和 token count 能力探测
 - `transcribe-deepgram` 是唯一支持的 Deepgram 统一入口，分片与合并逻辑由 Python 工具统一负责
-- `verify-quality` 只有在 `hard_failures` 非空时才阻断流程；`warnings` 仅用于人工复核提示
+- `verify-quality` 只有在 `hard_failures` 非空时才阻断流程；`warnings` 仅用于人工复核提示，而 `checks` 现在会额外暴露 `chunk_seam_warning_count`、`cjk_space_ratio`、`duplicate_ngram_ratio`、`short_paragraph_ratio`、`header_density`、`punctuation_density` 等可解释指标
 
 ### 📘 术语口径
 
@@ -688,7 +692,7 @@ bash scripts/preflight.sh --require-llm
 - `LLM preflight`：只有当 `plan-optimization` 返回 long-video chunk 处理需要时，才执行 `bash scripts/preflight.sh --require-llm`。
 - `Deepgram 统一入口`：`python3 yt_transcript_utils.py transcribe-deepgram ...`
 - `Deepgram 结果可观测性`：`/tmp/${VIDEO_ID}_deepgram_result.json` 现在会暴露逐 chunk 的 `chunk_reports`、聚合结构计数，以及 structured-output 回退时的 `warnings`
-- `质量门禁`：读取 `verify-quality` 的 JSON；`hard_failures` 表示必须 STOP，`warnings` 表示需要人工复核。
+- `质量门禁`：读取 `verify-quality` 的 JSON；`hard_failures` 表示必须 STOP，`warnings` 表示需要人工复核，`checks` 则给出这些告警背后的可读性指标。
 
 ### 🧪 验证矩阵
 
@@ -727,6 +731,9 @@ python3 yt_transcript_utils.py transcribe-deepgram "$AUDIO_FILE" --language "$LA
 
 # 6. 最终质量门禁
 python3 yt_transcript_utils.py verify-quality /tmp/${VIDEO_ID}_optimized.txt --raw-text /tmp/${VIDEO_ID}_raw_text.txt
+
+# `checks` 现在还会包含 chunk seam 重复、中文空格异常、
+# 重复短语密度、短碎段比例、标题密度、标点密度等 advisory 指标。
 ```
 
 ### 📄 许可证
