@@ -160,7 +160,12 @@ def _process_chunks_impl(work_dir: str, prompt_name: str, extra_instruction: str
         planned_max_output_tokens,
         autotune_state,
     )
-    resume_report = _prepare_manifest_for_resume(manifest, work_path, prompt_name)
+    resume_report = _prepare_manifest_for_resume(
+        manifest,
+        work_path,
+        prompt_name,
+        input_key=input_key,
+    )
     resume_summary = _format_resume_report(resume_report)
     if resume_summary:
         setup_warnings.append(resume_summary)
@@ -400,13 +405,24 @@ def _process_chunks_impl(work_dir: str, prompt_name: str, extra_instruction: str
         else:
             out_filename = chunk_info["processed_path"]
         out_path = work_path / out_filename
+        output_matches_operation = _chunk_output_matches_operation(
+            chunk_info,
+            out_path,
+            prompt_name=prompt_name,
+            input_key=input_key,
+        )
 
         # A durable output file plus `done` status is a valid checkpoint; skip it
         # unless the caller explicitly forces regeneration.
-        if not force and chunk_info.get("status") == "done" and out_path.exists():
+        if not force and chunk_info.get("status") == "done" and output_matches_operation:
             skipped_count += 1
             print(f"Skipping chunk {active_index}/{total} (chunk_id={chunk_id}, output exists at {out_path.name})", file=sys.stderr)
             continue
+        if not force and chunk_info.get("status") == "done" and out_path.exists() and not output_matches_operation:
+            print(
+                f"Reprocessing chunk {active_index}/{total} (chunk_id={chunk_id}) because {out_path.name} belongs to a previous operation",
+                file=sys.stderr,
+            )
 
         if not input_path.exists():
             error_message = f"Input file not found: {input_path}"
@@ -617,6 +633,11 @@ def _process_chunks_impl(work_dir: str, prompt_name: str, extra_instruction: str
                 chunk_info["last_error"] = ""
                 chunk_info["last_error_type"] = ""
                 chunk_info["error_type"] = ""
+                _stamp_chunk_output_operation(
+                    chunk_info,
+                    prompt_name=prompt_name,
+                    input_key=input_key,
+                )
                 chunk_info["latency_ms"] = llm_result["latency_ms"]
                 chunk_info["output_chars"] = result_char_count
                 chunk_info["actual_output_tokens"] = actual_output_tokens

@@ -2,6 +2,7 @@
 
 import json
 import os
+import tempfile
 import time
 from pathlib import Path
 
@@ -24,9 +25,26 @@ def _now_iso() -> str:
 
 def atomic_write_text(path: Path, content: str) -> None:
     """Atomically replace `path` with the provided text content."""
-    tmp_path = path.with_name(f".{path.name}.tmp")
-    tmp_path.write_text(content, encoding="utf-8")
-    os.replace(tmp_path, path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        dir=str(path.parent),
+        text=True,
+    )
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_path, path)
+    except Exception:
+        try:
+            tmp_path.unlink()
+        except FileNotFoundError:
+            pass
+        raise
 
 
 def write_json_file(path: Path, payload: dict) -> None:

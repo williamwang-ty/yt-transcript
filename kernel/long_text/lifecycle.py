@@ -62,6 +62,8 @@ def _new_chunk_manifest_entry(chunk_id: int, chunk_content: str, budget: dict,
         "processed_tail_context_text": "",
         "processed_input_tail_context_text": "",
         "processed_input_section_title": "",
+        "output_prompt_name": "",
+        "output_input_key": "",
         "continuity_prev_chunk_id": continuity_prev_chunk_id,
         "continuity_context_chars": 0,
         "continuity_context_tokens": 0,
@@ -138,6 +140,8 @@ def _ensure_chunk_runtime_defaults(manifest: dict, runtime: dict, plan: dict,
         chunk_info.setdefault("processed_tail_context_text", "")
         chunk_info.setdefault("processed_input_tail_context_text", "")
         chunk_info.setdefault("processed_input_section_title", "")
+        chunk_info.setdefault("output_prompt_name", "")
+        chunk_info.setdefault("output_input_key", "")
         chunk_info.setdefault("continuity_prev_chunk_id", None)
         chunk_info.setdefault("continuity_context_chars", 0)
         chunk_info.setdefault("continuity_context_tokens", 0)
@@ -192,11 +196,13 @@ def _infer_resume_runtime_status(runtime: dict, chunks: list[dict]) -> str:
         return "completed_with_errors"
     return previous_status
 
-def _prepare_manifest_for_resume(manifest: dict, work_path: Path, prompt_name: str = "") -> dict:
+def _prepare_manifest_for_resume(manifest: dict, work_path: Path, prompt_name: str = "",
+                                 input_key: str = "raw_path") -> dict:
     """Repair stale chunk/runtime state so an interrupted run can resume safely."""
     _bind_utils_globals()
     runtime = manifest.get("runtime", {}) if isinstance(manifest.get("runtime", {}), dict) else {}
     now = _now_iso()
+    normalized_input_key = _normalize_operation_input_key(input_key)
     report = {
         "repaired": False,
         "repair_count": 0,
@@ -226,6 +232,11 @@ def _prepare_manifest_for_resume(manifest: dict, work_path: Path, prompt_name: s
         chunk_info["error_type"] = ""
         chunk_info["completed_at"] = str(chunk_info.get("completed_at", "")).strip() or now
         chunk_info["updated_at"] = now
+        _stamp_chunk_output_operation(
+            chunk_info,
+            prompt_name=prompt_name,
+            input_key=normalized_input_key,
+        )
         report["promoted_done_chunk_ids"].append(_parse_int(chunk_info.get("id"), 0))
         report["warnings"].append(reason)
 
@@ -245,17 +256,29 @@ def _prepare_manifest_for_resume(manifest: dict, work_path: Path, prompt_name: s
             continue
         output_path = _resolve_chunk_output_path(work_path, chunk_info, prompt_name)
         output_exists = output_path.exists()
+        output_matches_operation = _chunk_output_matches_operation(
+            chunk_info,
+            output_path,
+            prompt_name=prompt_name,
+            input_key=normalized_input_key,
+        )
         status = str(chunk_info.get("status", "pending")).strip() or "pending"
 
         if status == "running":
             # A stale `running` chunk means the previous process exited mid-run.
             # If the output file exists we can safely promote it to done; if not,
             # we downgrade it to interrupted for an explicit retry.
-            if output_exists:
+            if output_matches_operation:
                 mark_promoted_done(
                     chunk_info,
                     output_path,
                     f"Resume repair: promoted stale running chunk {_parse_int(chunk_info.get('id'), 0)} to done from {output_path.name}",
+                )
+            elif output_exists:
+                mark_interrupted(
+                    chunk_info,
+                    f"Resume repair: marked stale running chunk {_parse_int(chunk_info.get('id'), 0)} as interrupted because {output_path.name} belongs to a different operation",
+                    "interrupted_chunk_ids",
                 )
             else:
                 mark_interrupted(
@@ -271,7 +294,7 @@ def _prepare_manifest_for_resume(manifest: dict, work_path: Path, prompt_name: s
                 f"Resume repair: demoted done chunk {_parse_int(chunk_info.get('id'), 0)} because checkpoint file {output_path.name} is missing",
                 "demoted_missing_output_chunk_ids",
             )
-        elif status == INTERRUPTED_CHUNK_STATUS and output_exists:
+        elif status == INTERRUPTED_CHUNK_STATUS and output_matches_operation:
             # If a prior run wrote the output before failing to update manifest
             # state, prefer the durable file over the stale interrupted marker.
             mark_promoted_done(
@@ -318,7 +341,6 @@ def _prepare_resume_impl(work_dir: str, prompt_name: str = "", config_path: str 
                          input_key: str = "raw_path") -> dict:
     """Load, repair, and persist manifest state before a resume attempt."""
     _bind_utils_globals()
-    del input_key
     work_path = Path(work_dir)
     manifest_path = work_path / "manifest.json"
     if not manifest_path.exists():
@@ -353,7 +375,12 @@ def _prepare_resume_impl(work_dir: str, prompt_name: str = "", config_path: str 
         planned_max_output_tokens=planned_max_output_tokens,
         autotune_state=autotune_state,
     )
-    resume = _prepare_manifest_for_resume(manifest, work_path, resolved_prompt_name)
+    resume = _prepare_manifest_for_resume(
+        manifest,
+        work_path,
+        resolved_prompt_name,
+        input_key=input_key,
+    )
     _refresh_manifest_token_source_summary(manifest)
     _sync_manifest_legacy_fields(manifest)
     _write_manifest(manifest_path, manifest)

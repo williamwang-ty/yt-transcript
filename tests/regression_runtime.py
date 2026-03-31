@@ -5,6 +5,69 @@ from tests._support import *
 
 class RuntimeRegressionTests(unittest.TestCase):
     """Regression coverage for runtime ownership, pause, resume, and replan behavior."""
+    def test_atomic_write_text_avoids_shared_tmp_name_race_for_same_target(self):
+        """Concurrent writers to the same target should not share a temp path."""
+        from kernel.task_runtime import state as kernel_state
+        import threading
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target = Path(tmpdir) / "machine_state.json"
+            barrier = threading.Barrier(2)
+            writer_b_replaced = threading.Event()
+            failures = []
+            path_type = type(target)
+            original_write_text = path_type.write_text
+            original_replace = kernel_state.os.replace
+
+            def patched_write_text(path_obj, data, *args, **kwargs):
+                result = original_write_text(path_obj, data, *args, **kwargs)
+                candidate = Path(path_obj)
+                if (
+                    candidate.parent == target.parent
+                    and candidate.name.startswith(f".{target.name}.")
+                    and candidate.name.endswith(".tmp")
+                ):
+                    barrier.wait(timeout=2)
+                return result
+
+            def patched_replace(src, dst, *args, **kwargs):
+                src_path = Path(src)
+                dst_path = Path(dst)
+                if (
+                    dst_path == target
+                    and src_path.parent == target.parent
+                    and src_path.name.startswith(f".{target.name}.")
+                    and src_path.name.endswith(".tmp")
+                ):
+                    if threading.current_thread().name == "writer_a":
+                        self.assertTrue(writer_b_replaced.wait(timeout=2))
+                    result = original_replace(src, dst, *args, **kwargs)
+                    if threading.current_thread().name == "writer_b":
+                        writer_b_replaced.set()
+                    return result
+                return original_replace(src, dst, *args, **kwargs)
+
+            def writer(content):
+                try:
+                    kernel_state.atomic_write_text(target, content)
+                except Exception as exc:  # pragma: no cover - captured for assertion below
+                    failures.append(exc)
+
+            with mock.patch.object(path_type, "write_text", new=patched_write_text), \
+                 mock.patch.object(kernel_state.os, "replace", side_effect=patched_replace):
+                thread_a = threading.Thread(target=writer, name="writer_a", args=('{"writer":"a"}',))
+                thread_b = threading.Thread(target=writer, name="writer_b", args=('{"writer":"b"}',))
+                thread_a.start()
+                thread_b.start()
+                thread_a.join()
+                thread_b.join()
+
+            self.assertEqual(failures, [], failures)
+            self.assertIn(
+                target.read_text(encoding="utf-8"),
+                {'{"writer":"a"}', '{"writer":"b"}'},
+            )
+
     def test_run_kernel_command_returns_envelope_and_writes_telemetry(self):
         """Test run kernel command returns envelope and writes telemetry."""
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1404,6 +1467,57 @@ class RuntimeRegressionTests(unittest.TestCase):
             self.assertEqual(result["skipped_count"], 1)
             mocked_call.assert_not_called()
 
+    def test_process_chunks_processed_path_legacy_done_output_is_reprocessed(self):
+        """Legacy processed-path outputs should not be skipped for a new stage."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source = Path(tmpdir) / "raw.txt"
+            work_dir = Path(tmpdir) / "chunks"
+            source.write_text("First sentence. Second sentence.", encoding="utf-8")
+            utils.chunk_text(str(source), str(work_dir), 200, "structure_only")
+
+            manifest_path = work_dir / "manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["chunks"][0]["status"] = "done"
+            manifest["runtime"]["status"] = "completed"
+            manifest["chunks"][0].pop("output_prompt_name", None)
+            manifest["chunks"][0].pop("output_input_key", None)
+            manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+            (work_dir / "processed_000.md").write_text("## Intro\n\nFirst sentence. Second sentence.", encoding="utf-8")
+
+            config = utils._default_config_values()
+            config.update({
+                "llm_api_key": "key",
+                "llm_base_url": "https://api.example.com",
+                "llm_model": "demo",
+                "llm_api_format": "openai",
+                "llm_timeout_sec": 30,
+                "llm_max_retries": 0,
+                "llm_backoff_sec": 0.1,
+                "llm_stream": "false",
+                "llm_stop_after_consecutive_timeouts": 2,
+            })
+
+            with mock.patch.object(utils, "load_config", return_value=config), mock.patch.object(
+                utils,
+                "_call_llm_api",
+                return_value={
+                    "text": "## Intro\n\nFirst sentence.\n第一句话。\n\nSecond sentence.\n第二句话。",
+                    "latency_ms": 12,
+                    "request_url": "https://api.example.com/v1/chat/completions",
+                    "streaming_used": False,
+                    "attempts": 1,
+                },
+            ) as mocked_call:
+                result = utils.process_chunks(str(work_dir), "translate_only", input_key="processed_path")
+
+            manifest_after = json.loads(manifest_path.read_text(encoding="utf-8"))
+            self.assertTrue(result["success"])
+            self.assertEqual(result["processed_count"], 1)
+            self.assertEqual(result["skipped_count"], 0)
+            mocked_call.assert_called_once()
+            self.assertEqual(manifest_after["chunks"][0]["output_prompt_name"], "translate_only")
+            self.assertEqual(manifest_after["chunks"][0]["output_input_key"], "processed_path")
+
     def test_process_chunks_rejects_active_runtime_owner(self):
         """Test process chunks rejects active runtime owner."""
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1594,6 +1708,37 @@ class RuntimeRegressionTests(unittest.TestCase):
             self.assertEqual(manifest_after["chunks"][0]["status"], "done")
             self.assertGreater(manifest_after["chunks"][0]["output_chars"], 0)
             self.assertEqual(result["resume"]["promoted_done_chunk_ids"], [0])
+
+    def test_prepare_resume_processed_path_mismatch_stays_interrupted(self):
+        """A stale running chunk should not promote prior-stage processed output to done."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source = Path(tmpdir) / "raw.txt"
+            work_dir = Path(tmpdir) / "chunks"
+            source.write_text("First sentence. Second sentence.", encoding="utf-8")
+            utils.chunk_text(str(source), str(work_dir), 200, "structure_only")
+
+            manifest_path = work_dir / "manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["chunks"][0]["status"] = "running"
+            manifest["chunks"][0]["output_prompt_name"] = "structure_only"
+            manifest["chunks"][0]["output_input_key"] = "raw_path"
+            manifest["runtime"]["status"] = "running"
+            manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+            (work_dir / "processed_000.md").write_text("## Intro\n\nFirst sentence. Second sentence.", encoding="utf-8")
+
+            result = utils.prepare_resume(
+                str(work_dir),
+                prompt_name="translate_only",
+                input_key="processed_path",
+            )
+
+            manifest_after = json.loads(manifest_path.read_text(encoding="utf-8"))
+            self.assertTrue(result["success"])
+            self.assertTrue(result["resume"]["repaired"])
+            self.assertEqual(manifest_after["chunks"][0]["status"], utils.INTERRUPTED_CHUNK_STATUS)
+            self.assertEqual(result["resume"]["promoted_done_chunk_ids"], [])
+            self.assertEqual(result["resume"]["interrupted_chunk_ids"], [0])
+            self.assertEqual(manifest_after["runtime"]["status"], utils.RESUMABLE_RUNTIME_STATUS)
 
     def test_prepare_resume_demotes_done_chunk_missing_output_to_interrupted(self):
         """Test prepare resume demotes done chunk missing output to interrupted."""

@@ -356,6 +356,8 @@ def _budget_prompt_name(prompt_name: str = "") -> str:
 MANIFEST_SCHEMA_VERSION = 5
 CHUNK_CONTRACT_SCHEMA_VERSION = 1
 CONTROL_CONTRACT_SCHEMA_VERSION = 1
+DEEPGRAM_CHUNK_CACHE_SCHEMA_VERSION = 1
+DEEPGRAM_CHUNK_CACHE_FORMAT = "yt_transcript.deepgram_chunk_cache/v1"
 COMMAND_RESULT_SCHEMA_VERSION = kernel_runtime.COMMAND_RESULT_SCHEMA_VERSION
 COMMAND_RESULT_FORMAT = kernel_runtime.COMMAND_RESULT_FORMAT
 TELEMETRY_EVENT_SCHEMA_VERSION = kernel_runtime.TELEMETRY_EVENT_SCHEMA_VERSION
@@ -948,6 +950,43 @@ def _normalize_operation_input_key(input_key: str = "") -> str:
     return kernel_contracts.normalize_operation_input_key(input_key)
 
 
+def _chunk_output_matches_operation(chunk_info: dict | None, output_path: str | Path, *,
+                                    prompt_name: str = "", input_key: str = "raw_path") -> bool:
+    """Return whether a durable output file belongs to the current operation.
+
+    Backward compatibility:
+    - legacy `raw_path` runs without output-operation metadata still count as reusable
+    - legacy `processed_path` runs are ambiguous, so they must be regenerated
+    """
+    output_file = Path(output_path)
+    if not output_file.exists():
+        return False
+
+    chunk_info = chunk_info if isinstance(chunk_info, dict) else {}
+    normalized_prompt = str(prompt_name or "").strip()
+    normalized_input_key = _normalize_operation_input_key(input_key)
+    recorded_prompt = str(chunk_info.get("output_prompt_name", "")).strip()
+    recorded_input_key = _normalize_operation_input_key(chunk_info.get("output_input_key", ""))
+
+    if recorded_prompt:
+        if normalized_prompt and recorded_prompt != normalized_prompt:
+            return False
+        if recorded_input_key and recorded_input_key != normalized_input_key:
+            return False
+        return True
+
+    return normalized_input_key != "processed_path"
+
+
+def _stamp_chunk_output_operation(chunk_info: dict | None, *, prompt_name: str = "",
+                                  input_key: str = "raw_path") -> None:
+    """Persist the operation identity for the chunk's current durable output."""
+    if not isinstance(chunk_info, dict):
+        return
+    chunk_info["output_prompt_name"] = str(prompt_name or "").strip()
+    chunk_info["output_input_key"] = _normalize_operation_input_key(input_key)
+
+
 def _resolve_replan_action(input_key: str = "") -> str:
     """Resolve replan action."""
     return kernel_contracts.resolve_replan_action(input_key)
@@ -1113,9 +1152,15 @@ def _infer_resume_runtime_status(runtime: dict, chunks: list[dict]) -> str:
     return kernel_lifecycle._infer_resume_runtime_status(runtime, chunks)
 
 
-def _prepare_manifest_for_resume(manifest: dict, work_path: Path, prompt_name: str = "") -> dict:
+def _prepare_manifest_for_resume(manifest: dict, work_path: Path, prompt_name: str = "",
+                                 input_key: str = "raw_path") -> dict:
     """Prepare manifest for resume."""
-    return kernel_lifecycle._prepare_manifest_for_resume(manifest, work_path, prompt_name)
+    return kernel_lifecycle._prepare_manifest_for_resume(
+        manifest,
+        work_path,
+        prompt_name,
+        input_key=input_key,
+    )
 
 
 def _format_resume_report(report: dict) -> str:
@@ -2101,6 +2146,11 @@ def process_deepgram(json_path: str, *, prefer_structured_output: bool = DEFAULT
         sys.exit(2)
 
     try:
+        if isinstance(data, dict) and str(data.get("format", "")).strip() == DEEPGRAM_CHUNK_CACHE_FORMAT:
+            envelope_payload = data.get("payload")
+            if not isinstance(envelope_payload, dict):
+                raise KeyError("payload")
+            data = envelope_payload
         return process_deepgram_payload(data, prefer_structured_output=prefer_structured_output)
     except (KeyError, IndexError) as e:
         print(f"Error: Deepgram JSON structure unexpected {e}", file=sys.stderr)
@@ -4585,13 +4635,113 @@ def _call_deepgram_api(audio_path: str, api_key: str, language: str,
     print(f"Error: Deepgram API call failed: {last_error}", file=sys.stderr)
     sys.exit(1)
 
+
+def _deepgram_chunk_json_path(output_json: str, chunk_count: int, chunk_index: int) -> Path | None:
+    """Return the per-chunk Deepgram JSON path when JSON output is enabled."""
+    if not output_json:
+        return None
+    output_base = Path(output_json)
+    if chunk_count == 1:
+        return output_base
+    return output_base.with_name(f"{output_base.stem}_chunk_{chunk_index:03d}{output_base.suffix or '.json'}")
+
+
+def _sha256_file(path: str | Path) -> str:
+    """Return the SHA-256 digest for a file path."""
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _deepgram_request_cache_fingerprint(request_settings: dict | None = None) -> dict:
+    """Return the stable subset of Deepgram request settings that affect payloads."""
+    settings = request_settings if isinstance(request_settings, dict) else {}
+    return {
+        "model": str(settings.get("model", "")).strip(),
+        "language": str(settings.get("language", "")).strip(),
+        "diarize": bool(settings.get("diarize", False)),
+        "punctuate": bool(settings.get("punctuate", False)),
+        "paragraphs": bool(settings.get("paragraphs", False)),
+        "smart_format": bool(settings.get("smart_format", False)),
+        "utterances": bool(settings.get("utterances", False)),
+    }
+
+
+def _build_deepgram_chunk_cache_metadata(chunk_path: str | Path, *, chunk_count: int,
+                                         chunk_index: int, request_settings: dict | None = None) -> dict:
+    """Build the validation metadata stored alongside a Deepgram chunk payload."""
+    path = Path(chunk_path)
+    stat = path.stat()
+    return {
+        "chunk_index": int(chunk_index),
+        "chunk_count": int(chunk_count),
+        "chunk_name": path.name,
+        "chunk_size_bytes": int(stat.st_size),
+        "chunk_sha256": _sha256_file(path),
+        "request_fingerprint": _deepgram_request_cache_fingerprint(request_settings),
+    }
+
+
+def _build_deepgram_chunk_cache_envelope(payload: dict, *, cache_metadata: dict | None = None) -> dict:
+    """Wrap a raw Deepgram payload with resumable cache metadata."""
+    return {
+        "schema_version": DEEPGRAM_CHUNK_CACHE_SCHEMA_VERSION,
+        "format": DEEPGRAM_CHUNK_CACHE_FORMAT,
+        "cache_metadata": dict(cache_metadata or {}),
+        "payload": payload,
+    }
+
+
+def _deepgram_chunk_cache_matches_expected(cache_metadata: dict | None, expected_metadata: dict | None) -> str:
+    """Return an empty string when chunk-cache metadata matches; otherwise a reason."""
+    actual = cache_metadata if isinstance(cache_metadata, dict) else {}
+    expected = expected_metadata if isinstance(expected_metadata, dict) else {}
+    if not actual:
+        return "cache_metadata_missing"
+    for key in ("chunk_index", "chunk_count", "chunk_size_bytes", "chunk_sha256"):
+        if actual.get(key) != expected.get(key):
+            return f"{key}_mismatch"
+    if actual.get("request_fingerprint") != expected.get("request_fingerprint"):
+        return "request_fingerprint_mismatch"
+    return ""
+
+
+def _load_existing_deepgram_chunk_payload(json_path: Path, *, expected_metadata: dict | None = None) -> tuple[dict | None, str]:
+    """Best-effort load for a previously completed and validated Deepgram chunk payload."""
+    if not json_path.exists():
+        return None, "missing"
+    try:
+        payload = json.loads(json_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None, "unreadable_or_invalid_json"
+    if not isinstance(payload, dict):
+        return None, "not_a_json_object"
+    if str(payload.get("format", "")).strip() != DEEPGRAM_CHUNK_CACHE_FORMAT:
+        return None, "legacy_or_unversioned_payload"
+    cached_payload = payload.get("payload")
+    if not isinstance(cached_payload, dict):
+        return None, "payload_missing_or_invalid"
+    mismatch_reason = _deepgram_chunk_cache_matches_expected(
+        payload.get("cache_metadata"),
+        expected_metadata,
+    )
+    if mismatch_reason:
+        return None, mismatch_reason
+    return cached_payload, ""
+
+
 def transcribe_deepgram(audio_path: str, language: str, config_path: str = None,
                         api_key: str = "", max_size_mb: float = 10.0,
                         max_deviation_sec: float = 60.0, timeout: int = 300,
                         output_json: str = "", output_text: str = "",
                         output_segments: str = "", deepgram_model: str = "",
                         enable_utterances: bool | None = None,
-                        prefer_structured_output: bool | None = None) -> dict:
+                        prefer_structured_output: bool | None = None,
+                        resume_existing_chunks: bool = False) -> dict:
     """
     Transcribe audio via Deepgram. Automatically splits large files and merges
     chunk transcripts into one raw transcript output.
@@ -4635,6 +4785,7 @@ def transcribe_deepgram(audio_path: str, language: str, config_path: str = None,
     raw_payloads = []
     segments = []
     chunk_reports = []
+    chunk_cache_metadatas = []
     warnings = []
     total_paragraph_count = 0
     total_sentence_count = 0
@@ -4644,14 +4795,53 @@ def transcribe_deepgram(audio_path: str, language: str, config_path: str = None,
     total_utterance_count = 0
 
     for idx, chunk_path in enumerate(chunk_paths):
-        payload = _call_deepgram_api(
-            chunk_path,
-            api_key=api_key,
-            language=language,
-            timeout=timeout,
-            model=request_settings["model"],
-            enable_utterances=request_settings["utterances"],
-        )
+        chunk_json_path = _deepgram_chunk_json_path(output_json, len(chunk_paths), idx)
+        cache_metadata = None
+        if chunk_json_path is not None:
+            try:
+                cache_metadata = _build_deepgram_chunk_cache_metadata(
+                    chunk_path,
+                    chunk_count=len(chunk_paths),
+                    chunk_index=idx,
+                    request_settings=request_settings,
+                )
+            except OSError as error:
+                print(f"Error: Cannot fingerprint Deepgram chunk {chunk_path}: {error}", file=sys.stderr)
+                sys.exit(2)
+        payload = None
+        reused_existing_payload = False
+        if resume_existing_chunks and chunk_json_path is not None:
+            payload, reuse_reason = _load_existing_deepgram_chunk_payload(
+                chunk_json_path,
+                expected_metadata=cache_metadata,
+            )
+            if payload is not None:
+                reused_existing_payload = True
+                print(
+                    f"Info: Reusing existing Deepgram chunk payload {chunk_json_path.name} ({idx + 1}/{len(chunk_paths)})",
+                    file=sys.stderr,
+                )
+            else:
+                if reuse_reason == "missing":
+                    print(
+                        f"Info: No reusable Deepgram chunk payload for chunk {idx + 1}/{len(chunk_paths)}; requesting it now",
+                        file=sys.stderr,
+                    )
+                else:
+                    print(
+                        f"Info: Existing Deepgram chunk payload {chunk_json_path.name} is not reusable ({reuse_reason}); requesting it now",
+                        file=sys.stderr,
+                    )
+
+        if payload is None:
+            payload = _call_deepgram_api(
+                chunk_path,
+                api_key=api_key,
+                language=language,
+                timeout=timeout,
+                model=request_settings["model"],
+                enable_utterances=request_settings["utterances"],
+            )
         raw_payloads.append(payload)
         processed = process_deepgram_payload(
             payload,
@@ -4679,6 +4869,7 @@ def transcribe_deepgram(audio_path: str, language: str, config_path: str = None,
             "word_count": _parse_int(processed.get("word_count"), 0),
             "utterance_count": _parse_int(processed.get("utterance_count"), 0),
             "prefer_structured_output": _parse_bool(processed.get("prefer_structured_output"), False),
+            "reused_existing_payload": reused_existing_payload,
         }
 
         if output_segments:
@@ -4704,14 +4895,18 @@ def transcribe_deepgram(audio_path: str, language: str, config_path: str = None,
             )
 
         chunk_reports.append(chunk_report)
+        chunk_cache_metadatas.append(cache_metadata or {})
 
-        if output_json:
-            output_base = Path(output_json)
-            if len(chunk_paths) == 1:
-                json_path = output_base
-            else:
-                json_path = output_base.with_name(f"{output_base.stem}_chunk_{idx:03d}{output_base.suffix or '.json'}")
-            json_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        if chunk_json_path is not None:
+            json_path = chunk_json_path
+            json_path.write_text(
+                json.dumps(
+                    _build_deepgram_chunk_cache_envelope(payload, cache_metadata=cache_metadata),
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
             json_outputs.append(str(json_path))
 
     transcript = "\n\n".join(t for t in transcripts if t).strip()
@@ -4734,9 +4929,12 @@ def transcribe_deepgram(audio_path: str, language: str, config_path: str = None,
                         {
                             "index": idx,
                             "chunk_path": str(chunk_path),
+                            "cache_metadata": cache_metadata,
                             "payload": payload,
                         }
-                        for idx, (chunk_path, payload) in enumerate(zip(chunk_paths, raw_payloads))
+                        for idx, (chunk_path, cache_metadata, payload) in enumerate(
+                            zip(chunk_paths, chunk_cache_metadatas, raw_payloads)
+                        )
                     ],
                 },
                 ensure_ascii=False,
@@ -6765,6 +6963,8 @@ def main():
     tdg_parser.add_argument('--output-text', default='', help='Optional path to write merged transcript text')
     tdg_parser.add_argument('--output-segments', default='', help='Optional path to write aligned source segments JSON')
     tdg_parser.add_argument('--model', default='', help='Optional Deepgram model override')
+    tdg_parser.add_argument('--resume-existing-chunks', action='store_true',
+                            help='Reuse existing sibling *_chunk_XXX.json payloads when resuming a split Deepgram run')
     tdg_parser.set_defaults(enable_utterances_override=None, prefer_structured_output_override=None)
     tdg_utterance_group = tdg_parser.add_mutually_exclusive_group()
     tdg_utterance_group.add_argument('--enable-utterances', dest='enable_utterances_override', action='store_true',
@@ -7212,6 +7412,7 @@ def main():
             deepgram_model=args.model,
             enable_utterances=args.enable_utterances_override,
             prefer_structured_output=args.prefer_structured_output_override,
+            resume_existing_chunks=args.resume_existing_chunks,
         )
         print(json.dumps(result, ensure_ascii=False))
 

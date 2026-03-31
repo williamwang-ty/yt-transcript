@@ -317,6 +317,28 @@ class CoreRegressionTests(unittest.TestCase):
             self.assertEqual(legacy_result["transcript"], "flat transcript without clear speaker turns")
             self.assertFalse(legacy_result["prefer_structured_output"])
 
+    def test_process_deepgram_accepts_chunk_cache_envelope(self):
+        """Test process_deepgram can unwrap a persisted Deepgram chunk-cache envelope."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            payload_path = Path(tmpdir) / "deepgram.json"
+            raw_payload = json.loads((FIXTURES_DIR / "deepgram_en_utterances.json").read_text(encoding="utf-8"))
+            payload_path.write_text(
+                json.dumps(
+                    utils._build_deepgram_chunk_cache_envelope(
+                        raw_payload,
+                        cache_metadata={"chunk_index": 0, "chunk_count": 1},
+                    ),
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+
+            result = utils.process_deepgram(str(payload_path))
+
+            self.assertEqual(result["transcript_source"], "utterances")
+            self.assertEqual(result["transcript"], "First speaker sentence.\n\nSecond speaker answer.")
+
     def test_extract_deepgram_segments_preserves_sentence_text_when_words_missing(self):
         """Test extract deepgram segments preserves sentence text when words are missing."""
         payload = json.loads((FIXTURES_DIR / "deepgram_en_sentence_text_only.json").read_text(encoding="utf-8"))
@@ -428,6 +450,139 @@ class CoreRegressionTests(unittest.TestCase):
             self.assertEqual(len(segments_doc["segments"]), 2)
             self.assertEqual(result["segment_count"], 2)
             self.assertEqual(result["segments_output"], str(output_segments))
+
+    def test_transcribe_deepgram_can_resume_from_existing_chunk_jsons(self):
+        """Test transcribe deepgram reuses existing chunk payloads when resuming."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            audio_path = Path(tmpdir) / "source.mp3"
+            chunk_a = Path(tmpdir) / "chunk_a.mp3"
+            chunk_b = Path(tmpdir) / "chunk_b.mp3"
+            chunk_c = Path(tmpdir) / "chunk_c.mp3"
+            output_json = Path(tmpdir) / "deepgram.json"
+            output_text = Path(tmpdir) / "raw.txt"
+            audio_path.write_bytes(b"src")
+            chunk_a.write_bytes(b"a")
+            chunk_b.write_bytes(b"b")
+            chunk_c.write_bytes(b"c")
+
+            existing_payloads = [
+                {"results": {"channels": [{"alternatives": [{"transcript": "first"}]}]}},
+                {"results": {"channels": [{"alternatives": [{"transcript": "second"}]}]}},
+            ]
+            request_settings = utils._resolve_deepgram_request_settings({}, language="en")
+            for idx, payload in enumerate(existing_payloads):
+                chunk_json = output_json.with_name(f"{output_json.stem}_chunk_{idx:03d}.json")
+                chunk_json.write_text(
+                    json.dumps(
+                        utils._build_deepgram_chunk_cache_envelope(
+                            payload,
+                            cache_metadata=utils._build_deepgram_chunk_cache_metadata(
+                                [chunk_a, chunk_b, chunk_c][idx],
+                                chunk_count=3,
+                                chunk_index=idx,
+                                request_settings=request_settings,
+                            ),
+                        ),
+                        ensure_ascii=False,
+                        indent=2,
+                    ),
+                    encoding="utf-8",
+                )
+
+            payload_c = {"results": {"channels": [{"alternatives": [{"transcript": "third"}]}]}}
+
+            def fake_process(payload, prefer_structured_output=True):
+                transcript = payload["results"]["channels"][0]["alternatives"][0]["transcript"]
+                return {
+                    "transcript": transcript.upper(),
+                    "speaker_count": 1,
+                    "transcript_source": "alternative.transcript",
+                    "prefer_structured_output": prefer_structured_output,
+                }
+
+            with mock.patch.object(utils, "split_audio", return_value={
+                "chunks": [str(chunk_a), str(chunk_b), str(chunk_c)],
+                "split_points": [10.0, 20.0],
+            }), mock.patch.object(utils, "_call_deepgram_api", return_value=payload_c) as deepgram_call, mock.patch.object(
+                utils,
+                "process_deepgram_payload",
+                side_effect=fake_process,
+            ):
+                result = utils.transcribe_deepgram(
+                    str(audio_path),
+                    "en",
+                    api_key="key",
+                    output_json=str(output_json),
+                    output_text=str(output_text),
+                    resume_existing_chunks=True,
+                )
+
+            self.assertEqual(deepgram_call.call_count, 1)
+            self.assertEqual(result["transcript"], "FIRST\n\nSECOND\n\nTHIRD")
+            self.assertEqual([report["reused_existing_payload"] for report in result["chunk_reports"]], [True, True, False])
+            self.assertTrue(output_json.exists())
+            self.assertEqual(len(result["json_outputs"]), 3)
+            aggregate = json.loads(output_json.read_text(encoding="utf-8"))
+            self.assertEqual(aggregate["chunk_count"], 3)
+            self.assertEqual(
+                [chunk["payload"]["results"]["channels"][0]["alternatives"][0]["transcript"] for chunk in aggregate["chunks"]],
+                ["first", "second", "third"],
+            )
+            self.assertEqual(output_text.read_text(encoding="utf-8"), "FIRST\n\nSECOND\n\nTHIRD")
+
+    def test_transcribe_deepgram_does_not_reuse_mismatched_chunk_cache(self):
+        """Test transcribe deepgram rejects stale chunk-cache envelopes whose metadata no longer matches."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            audio_path = Path(tmpdir) / "source.mp3"
+            chunk_a = Path(tmpdir) / "chunk_a.mp3"
+            output_json = Path(tmpdir) / "deepgram.json"
+            audio_path.write_bytes(b"src")
+            chunk_a.write_bytes(b"a")
+
+            chunk_json = output_json
+            chunk_json.write_text(
+                json.dumps(
+                    utils._build_deepgram_chunk_cache_envelope(
+                        {"results": {"channels": [{"alternatives": [{"transcript": "stale"}]}]}},
+                        cache_metadata=utils._build_deepgram_chunk_cache_metadata(
+                            chunk_a,
+                            chunk_count=1,
+                            chunk_index=0,
+                            request_settings=utils._resolve_deepgram_request_settings({}, language="zh"),
+                        ),
+                    ),
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+
+            fresh_payload = {"results": {"channels": [{"alternatives": [{"transcript": "fresh"}]}]}}
+
+            with mock.patch.object(utils, "split_audio", return_value={
+                "chunks": [str(chunk_a)],
+                "split_points": [],
+            }), mock.patch.object(utils, "_call_deepgram_api", return_value=fresh_payload) as deepgram_call, mock.patch.object(
+                utils,
+                "process_deepgram_payload",
+                return_value={
+                    "transcript": "FRESH",
+                    "speaker_count": 1,
+                    "transcript_source": "alternative.transcript",
+                    "prefer_structured_output": True,
+                },
+            ):
+                result = utils.transcribe_deepgram(
+                    str(audio_path),
+                    "en",
+                    api_key="key",
+                    output_json=str(output_json),
+                    resume_existing_chunks=True,
+                )
+
+            self.assertEqual(deepgram_call.call_count, 1)
+            self.assertEqual(result["transcript"], "FRESH")
+            self.assertEqual([report["reused_existing_payload"] for report in result["chunk_reports"]], [False])
 
     def test_transcribe_deepgram_defaults_to_structured_output(self):
         """Test transcribe deepgram now defaults to utterances and structured output."""
