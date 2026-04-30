@@ -3,6 +3,7 @@ config.yaml
 
 # Local workspace artifacts
 .claude/
+AGENTS.md
 work-note.md
 
 # Python

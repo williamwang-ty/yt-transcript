@@ -247,3 +247,4 @@ Chinese spacing anomalies, repeated phrase density, short paragraph ratio,
 header density, punctuation density, and glossary drift so the warning reasons stay explainable.
 
 Do not continue to final assembly until verification passes.
+When continuing to final assembly, construct any date fragment in the final Markdown filename as `yyyy-mm-dd`; do not reuse raw metadata `upload_date` (`yyyymmdd`) in the filename.

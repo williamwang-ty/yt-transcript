@@ -273,6 +273,33 @@ def _normalize_stream_mode(value) -> str:
     return "auto"
 
 
+def _is_reasoning_llm_model(model: str = "") -> bool:
+    """Return whether the configured model exposes hidden reasoning tokens."""
+    normalized = str(model or "").strip().lower().replace("_", "-")
+    return (
+        "deepseek-v4" in normalized
+        or "deepseek-reasoner" in normalized
+        or "deepseek-r1" in normalized
+    )
+
+
+def _resolve_chunk_stream_mode_for_model(model: str = "", stream_mode: str = "auto") -> str:
+    """Resolve chunk request streaming mode for models that require usage telemetry."""
+    normalized_stream = _normalize_stream_mode(stream_mode)
+    if _is_reasoning_llm_model(model) and normalized_stream in {"auto", "true"}:
+        return "false"
+    return normalized_stream
+
+
+def _llm_reasoning_probe_enabled(config: dict | None = None) -> bool:
+    """Return whether chunk processing may probe unknown models for reasoning metadata."""
+    config = config or {}
+    return _parse_bool(
+        config.get("llm_reasoning_probe_enabled", True),
+        True,
+    )
+
+
 def _now_iso() -> str:
     """Return the current local timestamp in ISO-like wall-clock format."""
     return time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime())
@@ -285,13 +312,12 @@ LEGACY_CHAR_CHUNK_DEFAULTS = {
     "summarize": 8000,
 }
 
-PROMPT_BUDGET_ALIASES = {
-    "cleanup_zh": "structure_only",
-}
+PROMPT_BUDGET_ALIASES = {}
 
 TASK_CHUNK_TOKEN_DEFAULTS = {
     "structure_only": 1200,
     "quick_cleanup": 1000,
+    "cleanup_zh": 1000,
     "translate_only": 900,
     "summarize": 2500,
 }
@@ -299,23 +325,32 @@ TASK_CHUNK_TOKEN_DEFAULTS = {
 TASK_OUTPUT_RATIO_DEFAULTS = {
     "structure_only": 1.15,
     "quick_cleanup": 1.05,
+    "cleanup_zh": 1.05,
     "translate_only": 1.10,
     "summarize": 0.15,
 }
 
 TASK_MAX_OUTPUT_TOKEN_DEFAULTS = {
     "structure_only": 1800,
-    "quick_cleanup": 1400,
+    "quick_cleanup": 3200,
+    "cleanup_zh": 3200,
     "translate_only": 1500,
     "summarize": 384,
 }
 
 TASK_REQUEST_CAP_DEFAULTS = {
     "structure_only": 3000,
-    "quick_cleanup": 3000,
+    "quick_cleanup": 4500,
+    "cleanup_zh": 4500,
     "translate_only": 2600,
     "summarize": 4500,
 }
+
+DEFAULT_REASONING_RETRY_ATTEMPTS = 2
+DEFAULT_REASONING_RETRY_MULTIPLIER = 2.0
+DEFAULT_REASONING_RETRY_MAX_TOKENS = 4096
+DEFAULT_LLM_MODEL = "deepseek-v4-pro"
+DEFAULT_LLM_BASE_URL = "https://api.deepseek.com"
 
 DEFAULT_CHUNK_MODE = "tokens"
 DEFAULT_CONTEXT_WINDOW = 32000
@@ -351,6 +386,14 @@ def _budget_prompt_name(prompt_name: str = "") -> str:
     """Return the prompt family used for chunk-budget and sizing config lookups."""
     prompt = (prompt_name or "").strip().lower()
     return PROMPT_BUDGET_ALIASES.get(prompt, prompt)
+
+
+def _legacy_budget_prompt_names(prompt_name: str = "") -> list[str]:
+    """Return older prompt families that can still provide fallback config."""
+    prompt = (prompt_name or "").strip().lower()
+    if prompt == "cleanup_zh":
+        return ["structure_only", "quick_cleanup"]
+    return []
 
 
 MANIFEST_SCHEMA_VERSION = 5
@@ -399,8 +442,8 @@ def _default_config_values(config_path: str = "") -> dict:
         "deepgram_enable_utterances": DEFAULT_DEEPGRAM_ENABLE_UTTERANCES,
         "deepgram_prefer_structured_output": DEFAULT_DEEPGRAM_PREFER_STRUCTURED_OUTPUT,
         "llm_api_key": "",
-        "llm_base_url": "",
-        "llm_model": "",
+        "llm_base_url": DEFAULT_LLM_BASE_URL,
+        "llm_model": DEFAULT_LLM_MODEL,
         "llm_api_format": "openai",
         "yt_dlp_socket_timeout_sec": DEFAULT_YT_DLP_SOCKET_TIMEOUT_SEC,
         "yt_dlp_retries": DEFAULT_YT_DLP_RETRIES,
@@ -413,13 +456,20 @@ def _default_config_values(config_path: str = "") -> dict:
         "llm_stream": "auto",
         "llm_probe_timeout_sec": 20,
         "llm_probe_max_tokens": 16,
+        # Real config parsing defaults this to true; the raw fallback dict stays
+        # side-effect-free for dry runs and direct in-memory test configs.
+        "llm_reasoning_probe_enabled": False,
         "llm_stop_after_consecutive_timeouts": 2,
         "llm_chunk_recovery_attempts": DEFAULT_LLM_CHUNK_RECOVERY_ATTEMPTS,
         "llm_chunk_recovery_backoff_sec": DEFAULT_LLM_CHUNK_RECOVERY_BACKOFF_SEC,
+        "llm_reasoning_retry_attempts": DEFAULT_REASONING_RETRY_ATTEMPTS,
+        "llm_reasoning_retry_multiplier": DEFAULT_REASONING_RETRY_MULTIPLIER,
+        "llm_reasoning_retry_max_tokens": DEFAULT_REASONING_RETRY_MAX_TOKENS,
         "chunk_mode": DEFAULT_CHUNK_MODE,
         "chunk_size_override": 0,
         "chunk_tokens_structure_only": TASK_CHUNK_TOKEN_DEFAULTS["structure_only"],
         "chunk_tokens_quick_cleanup": TASK_CHUNK_TOKEN_DEFAULTS["quick_cleanup"],
+        "chunk_tokens_cleanup_zh": TASK_CHUNK_TOKEN_DEFAULTS["cleanup_zh"],
         "chunk_tokens_translate_only": TASK_CHUNK_TOKEN_DEFAULTS["translate_only"],
         "chunk_tokens_summarize": TASK_CHUNK_TOKEN_DEFAULTS["summarize"],
         "chunk_hard_cap_multiplier": DEFAULT_CHUNK_HARD_CAP_MULTIPLIER,
@@ -431,10 +481,12 @@ def _default_config_values(config_path: str = "") -> dict:
         "chunk_semantic_max_anchors": 8,
         "output_ratio_structure_only": TASK_OUTPUT_RATIO_DEFAULTS["structure_only"],
         "output_ratio_quick_cleanup": TASK_OUTPUT_RATIO_DEFAULTS["quick_cleanup"],
+        "output_ratio_cleanup_zh": TASK_OUTPUT_RATIO_DEFAULTS["cleanup_zh"],
         "output_ratio_translate_only": TASK_OUTPUT_RATIO_DEFAULTS["translate_only"],
         "output_ratio_summarize": TASK_OUTPUT_RATIO_DEFAULTS["summarize"],
         "max_output_tokens_structure_only": TASK_MAX_OUTPUT_TOKEN_DEFAULTS["structure_only"],
         "max_output_tokens_quick_cleanup": TASK_MAX_OUTPUT_TOKEN_DEFAULTS["quick_cleanup"],
+        "max_output_tokens_cleanup_zh": TASK_MAX_OUTPUT_TOKEN_DEFAULTS["cleanup_zh"],
         "max_output_tokens_translate_only": TASK_MAX_OUTPUT_TOKEN_DEFAULTS["translate_only"],
         "max_output_tokens_summarize": TASK_MAX_OUTPUT_TOKEN_DEFAULTS["summarize"],
         "enable_token_count_probe": DEFAULT_ENABLE_TOKEN_COUNT_PROBE,
@@ -470,6 +522,11 @@ def _get_task_chunk_target(prompt_name: str, config: dict | None = None) -> int:
     prompt = _budget_prompt_name(prompt_name)
     key = f"chunk_tokens_{prompt}"
     default = TASK_CHUNK_TOKEN_DEFAULTS.get(prompt, DEFAULT_UNKNOWN_CHUNK_TOKENS)
+    if key not in config:
+        for legacy_prompt in _legacy_budget_prompt_names(prompt_name):
+            legacy_key = f"chunk_tokens_{legacy_prompt}"
+            if legacy_key in config:
+                return max(1, _parse_int(config.get(legacy_key), default))
     return max(1, _parse_int(config.get(key), default))
 
 
@@ -479,6 +536,11 @@ def _get_task_output_ratio(prompt_name: str, config: dict | None = None) -> floa
     prompt = _budget_prompt_name(prompt_name)
     key = f"output_ratio_{prompt}"
     default = TASK_OUTPUT_RATIO_DEFAULTS.get(prompt, DEFAULT_UNKNOWN_OUTPUT_RATIO)
+    if key not in config:
+        for legacy_prompt in _legacy_budget_prompt_names(prompt_name):
+            legacy_key = f"output_ratio_{legacy_prompt}"
+            if legacy_key in config:
+                return max(0.01, _parse_float(config.get(legacy_key), default))
     return max(0.01, _parse_float(config.get(key), default))
 
 
@@ -488,6 +550,11 @@ def _get_task_max_output_tokens(prompt_name: str, config: dict | None = None) ->
     prompt = _budget_prompt_name(prompt_name)
     key = f"max_output_tokens_{prompt}"
     default = TASK_MAX_OUTPUT_TOKEN_DEFAULTS.get(prompt, DEFAULT_UNKNOWN_MAX_OUTPUT_TOKENS)
+    if key not in config:
+        for legacy_prompt in _legacy_budget_prompt_names(prompt_name):
+            legacy_key = f"max_output_tokens_{legacy_prompt}"
+            if legacy_key in config:
+                return max(1, _parse_int(config.get(legacy_key), default))
     return max(1, _parse_int(config.get(key), default))
 
 
@@ -1383,6 +1450,8 @@ def _build_attempt_log_from_result(result: dict, attempt_index: int | None = Non
         "request_url": result.get("request_url", ""),
         "streaming_used": bool(result.get("streaming_used", False)),
         "retryable": False,
+        "finish_reason": str(result.get("finish_reason", "") or ""),
+        "usage": result.get("usage", {}) if isinstance(result.get("usage", {}), dict) else {},
     }
 
 
@@ -1420,6 +1489,198 @@ def _has_timeout_attempt(attempt_logs: list[dict]) -> bool:
         if str(attempt_log.get("error_type", "")).strip() in {"timeout", "socket_timeout", "read_timeout"}:
             return True
     return False
+
+
+def _reasoning_usage_stats(llm_result: dict | None) -> dict:
+    """Return normalized reasoning/content token stats for one LLM result."""
+    result = llm_result if isinstance(llm_result, dict) else {}
+    usage = result.get("usage") if isinstance(result.get("usage"), dict) else {}
+    reasoning_tokens = max(0, _parse_int(usage.get("reasoning_tokens"), 0))
+    completion_tokens = max(0, _parse_int(usage.get("completion_tokens"), 0))
+    content_tokens = max(0, _parse_int(usage.get("content_tokens"), completion_tokens - reasoning_tokens))
+    ratio = reasoning_tokens / completion_tokens if completion_tokens > 0 else 0.0
+    return {
+        "reasoning_tokens": reasoning_tokens,
+        "completion_tokens": completion_tokens,
+        "content_tokens": content_tokens,
+        "reasoning_ratio": ratio,
+    }
+
+
+def _is_reasoning_budget_exhaustion(llm_result: dict | None, result_text: str,
+                                    requested_max_tokens: int) -> bool:
+    """Detect the DeepSeek-style case where reasoning consumes the whole budget."""
+    if result_text.strip():
+        return False
+    result = llm_result if isinstance(llm_result, dict) else {}
+    finish_reason = str(result.get("finish_reason", "") or "").strip().lower()
+    if finish_reason not in {"stop", "end_turn", "length", "max_tokens"}:
+        return False
+    stats = _reasoning_usage_stats(result)
+    if stats["reasoning_tokens"] <= 0:
+        return False
+    requested = max(1, _parse_int(requested_max_tokens, 1))
+    if stats["completion_tokens"] >= max(1, int(math.floor(requested * 0.95))):
+        return True
+    return stats["reasoning_ratio"] >= 0.95 and stats["content_tokens"] == 0
+
+
+def _next_reasoning_retry_max_tokens(current_max_tokens: int, config: dict | None = None) -> int:
+    """Increase completion budget for a reasoning-token exhaustion retry."""
+    config = config or {}
+    current = max(1, _parse_int(current_max_tokens, 1))
+    multiplier = _parse_float_range(
+        config.get("llm_reasoning_retry_multiplier"),
+        DEFAULT_REASONING_RETRY_MULTIPLIER,
+        1.01,
+        4.0,
+    )
+    cap = max(
+        current,
+        _parse_int_min(
+            config.get("llm_reasoning_retry_max_tokens"),
+            DEFAULT_REASONING_RETRY_MAX_TOKENS,
+            current,
+        ),
+    )
+    return min(cap, max(current + 1, int(math.ceil(current * multiplier))))
+
+
+def _build_reasoning_exhaustion_warning(chunk_id: int, stats: dict, requested_max_tokens: int) -> str:
+    """Build a concise warning for reasoning-heavy empty chunk responses."""
+    return (
+        f"⚠️ Chunk {chunk_id}: LLM returned empty content after spending "
+        f"{stats['reasoning_tokens']}/{max(1, stats['completion_tokens'])} completion tokens on reasoning "
+        f"(max_tokens={requested_max_tokens}). Retrying with a larger completion budget."
+    )
+
+
+def _structured_reasoning_metadata_reason(value) -> str:
+    """Detect provider-specific reasoning fields inside a structured payload."""
+    if isinstance(value, dict):
+        for raw_key, item in value.items():
+            key = str(raw_key or "").strip().lower()
+            if key == "reasoning_tokens" and _parse_int(item, 0) > 0:
+                return "reasoning_tokens"
+            if key in {"reasoning_content", "reasoning", "thinking"}:
+                if isinstance(item, (dict, list)):
+                    nested_reason = _structured_reasoning_metadata_reason(item)
+                    if nested_reason:
+                        return nested_reason
+                elif str(item or "").strip():
+                    return key
+            nested_reason = _structured_reasoning_metadata_reason(item)
+            if nested_reason:
+                return nested_reason
+    if isinstance(value, list):
+        for item in value:
+            nested_reason = _structured_reasoning_metadata_reason(item)
+            if nested_reason:
+                return nested_reason
+    return ""
+
+
+def _reasoning_metadata_reason(llm_result: dict | None) -> str:
+    """Return the structured signal that indicates a reasoning-capable response."""
+    result = llm_result if isinstance(llm_result, dict) else {}
+    stats = _reasoning_usage_stats(result)
+    if stats["reasoning_tokens"] > 0:
+        return "reasoning_tokens"
+    if str(result.get("reasoning_text", "") or "").strip():
+        return "reasoning_text"
+    usage = result.get("usage") if isinstance(result.get("usage"), dict) else {}
+    raw_usage = usage.get("raw") if isinstance(usage, dict) else {}
+    return _structured_reasoning_metadata_reason(raw_usage)
+
+
+def _has_reasoning_metadata(llm_result: dict | None) -> bool:
+    """Return whether an LLM response exposes structured reasoning metadata."""
+    return bool(_reasoning_metadata_reason(llm_result))
+
+
+def _build_reasoning_probe_record(model: str = "", api_format: str = "openai",
+                                  reason: str = "not_attempted") -> dict:
+    """Build a manifest-safe reasoning probe record."""
+    return {
+        "enabled": True,
+        "attempted": False,
+        "detected": False,
+        "reason": reason,
+        "model": str(model or ""),
+        "api_format": str(api_format or "openai"),
+        "stream_mode": "false",
+        "max_tokens": None,
+        "request_url": "",
+        "latency_ms": None,
+        "finish_reason": "",
+        "reasoning_tokens": 0,
+        "completion_tokens": 0,
+        "content_tokens": 0,
+        "reasoning_text_present": False,
+        "streaming_used": False,
+        "error_type": "",
+        "error": "",
+    }
+
+
+def _probe_llm_reasoning_metadata(api_key: str, base_url: str, model: str,
+                                  api_format: str = "openai",
+                                  config: dict | None = None) -> dict:
+    """Probe an unknown OpenAI-compatible model for structured reasoning metadata."""
+    config = config or {}
+    api_format = str(api_format or "openai").strip().lower() or "openai"
+    record = _build_reasoning_probe_record(model, api_format)
+    record["enabled"] = _llm_reasoning_probe_enabled(config)
+    record["max_tokens"] = max(1, _parse_int(config.get("llm_probe_max_tokens"), 16))
+    record["request_url"] = _build_api_url(base_url, api_format) if base_url else ""
+
+    if not record["enabled"]:
+        record["reason"] = "disabled_by_config"
+        return record
+    if api_format != "openai":
+        record["reason"] = "unsupported_api_format"
+        return record
+    if not api_key or not base_url or not model:
+        record["reason"] = "missing_llm_config"
+        return record
+
+    record["attempted"] = True
+    try:
+        result = _call_llm_api(
+            api_key=api_key,
+            base_url=base_url,
+            model=model,
+            messages=[{"role": "user", "content": "Reply with OK only."}],
+            api_format=api_format,
+            max_tokens=record["max_tokens"],
+            temperature=0.0,
+            timeout_sec=max(1, _parse_int(config.get("llm_probe_timeout_sec"), 20)),
+            max_retries=1,
+            backoff_sec=min(_parse_float(config.get("llm_backoff_sec"), 1.5), 1.0),
+            stream_mode="false",
+        )
+    except LLMRequestError as error:
+        record["reason"] = "probe_failed"
+        record["request_url"] = error.request_url or record["request_url"]
+        record["error_type"] = str(error.error_type or "unknown")
+        record["error"] = str(error)
+        return record
+
+    stats = _reasoning_usage_stats(result)
+    reason = _reasoning_metadata_reason(result)
+    record.update({
+        "detected": bool(reason),
+        "reason": reason or "no_reasoning_metadata",
+        "request_url": result.get("request_url", record["request_url"]),
+        "latency_ms": result.get("latency_ms"),
+        "finish_reason": str(result.get("finish_reason", "") or ""),
+        "reasoning_tokens": stats["reasoning_tokens"],
+        "completion_tokens": stats["completion_tokens"],
+        "content_tokens": stats["content_tokens"],
+        "reasoning_text_present": bool(str(result.get("reasoning_text", "") or "").strip()),
+        "streaming_used": bool(result.get("streaming_used", False)),
+    })
+    return record
 
 
 def _classify_llm_transport_issue(error_or_reason) -> tuple[str, bool]:
@@ -1497,6 +1758,13 @@ def _evaluate_chunk_output_health(prompt_name: str, chunk_id: int, chunk_char_co
     warnings = []
     retry_reasons = []
 
+    if prompt_name != "summarize" and result_char_count == 0 and chunk_char_count > 0:
+        warnings.append(
+            f"⚠️ Chunk {chunk_id}: LLM returned an empty output for a non-empty input "
+            f"({chunk_char_count} chars)."
+        )
+        retry_reasons.append("empty_output")
+
     if prompt_name != "summarize" and ratio < SHORT_OUTPUT_WARNING_RATIO:
         warnings.append(
             f"⚠️ Chunk {chunk_id}: output is only {ratio:.0%} of input size "
@@ -1557,7 +1825,9 @@ def _evaluate_chunk_output_health(prompt_name: str, chunk_id: int, chunk_char_co
 def _append_chunk_recovery_log(chunk_info: dict, *, action: str, reasons: list[str],
                                details: list[str], request_attempts: int,
                                request_url: str = "", latency_ms: int | None = None,
-                               sleep_sec: float = 0.0) -> None:
+                               sleep_sec: float = 0.0,
+                               from_max_tokens: int = 0,
+                               to_max_tokens: int = 0) -> None:
     """Append chunk recovery log."""
     recovery_logs = list(chunk_info.get("recovery_logs", []))
     recovery_logs.append({
@@ -1569,11 +1839,18 @@ def _append_chunk_recovery_log(chunk_info: dict, *, action: str, reasons: list[s
         "request_url": str(request_url or ""),
         "latency_ms": latency_ms,
         "sleep_sec": round(max(0.0, _parse_float(sleep_sec, 0.0)), 2),
+        "from_max_tokens": max(0, _parse_int(from_max_tokens, 0)),
+        "to_max_tokens": max(0, _parse_int(to_max_tokens, 0)),
         "updated_at": _now_iso(),
     })
     chunk_info["recovery_logs"] = recovery_logs
     if action == "retry":
         chunk_info["recovery_attempts"] = max(0, _parse_int(chunk_info.get("recovery_attempts"), 0)) + 1
+    elif action == "expand_max_tokens":
+        chunk_info["reasoning_recovery_attempts"] = max(
+            0,
+            _parse_int(chunk_info.get("reasoning_recovery_attempts"), 0),
+        ) + 1
 
 
 def _available_prompt_names() -> list[str]:
@@ -1742,6 +2019,115 @@ def _is_timeout_error(error: Exception) -> bool:
     return False
 
 
+def _extract_openai_content_from_message(message) -> str:
+    """Extract user-visible content from an OpenAI-compatible message payload."""
+    if not isinstance(message, dict):
+        return ""
+    content = message.get("content", "")
+    if isinstance(content, list):
+        text_parts = []
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            text_parts.append(str(part.get("text", part.get("content", "")) or ""))
+        return "".join(text_parts)
+    return str(content or "")
+
+
+def _extract_llm_finish_reason(result: dict, api_format: str) -> str:
+    """Extract finish reason from a provider response when present."""
+    if api_format == "anthropic":
+        return str(result.get("stop_reason", "") or "")
+    choices = result.get("choices") or []
+    if not choices or not isinstance(choices[0], dict):
+        return ""
+    return str(choices[0].get("finish_reason", "") or "")
+
+
+def _extract_llm_reasoning_text(result: dict, api_format: str) -> str:
+    """Extract hidden/reasoning text if the gateway exposes it."""
+    if api_format == "anthropic":
+        return ""
+    choices = result.get("choices") or []
+    if not choices or not isinstance(choices[0], dict):
+        return ""
+    message = choices[0].get("message") or {}
+    if not isinstance(message, dict):
+        return ""
+    candidates = [
+        message.get("reasoning_content"),
+        message.get("reasoning"),
+        message.get("thinking"),
+    ]
+    for candidate in candidates:
+        if isinstance(candidate, dict):
+            candidate = candidate.get("content") or candidate.get("text")
+        if candidate:
+            return str(candidate)
+    return ""
+
+
+def _extract_openai_usage(usage: dict | None) -> dict:
+    """Normalize OpenAI-compatible usage, including reasoning token details."""
+    usage = usage if isinstance(usage, dict) else {}
+    completion_details = usage.get("completion_tokens_details")
+    if not isinstance(completion_details, dict):
+        completion_details = {}
+    prompt_details = usage.get("prompt_tokens_details")
+    if not isinstance(prompt_details, dict):
+        prompt_details = {}
+
+    completion_tokens = max(0, _parse_int(usage.get("completion_tokens"), 0))
+    reasoning_tokens = max(
+        0,
+        _parse_int(
+            completion_details.get("reasoning_tokens", usage.get("reasoning_tokens", 0)),
+            0,
+        ),
+    )
+    content_tokens = max(0, completion_tokens - reasoning_tokens)
+    return {
+        "prompt_tokens": max(0, _parse_int(usage.get("prompt_tokens"), 0)),
+        "completion_tokens": completion_tokens,
+        "total_tokens": max(0, _parse_int(usage.get("total_tokens"), 0)),
+        "reasoning_tokens": reasoning_tokens,
+        "content_tokens": content_tokens,
+        "cached_prompt_tokens": max(
+            0,
+            _parse_int(prompt_details.get("cached_tokens", usage.get("cached_prompt_tokens", 0)), 0),
+        ),
+        "raw": usage,
+    }
+
+
+def _extract_llm_usage(result: dict, api_format: str) -> dict:
+    """Normalize token usage from a provider response."""
+    if api_format == "anthropic":
+        usage = result.get("usage") if isinstance(result, dict) else {}
+        usage = usage if isinstance(usage, dict) else {}
+        input_tokens = max(0, _parse_int(usage.get("input_tokens"), 0))
+        output_tokens = max(0, _parse_int(usage.get("output_tokens"), 0))
+        return {
+            "prompt_tokens": input_tokens,
+            "completion_tokens": output_tokens,
+            "total_tokens": input_tokens + output_tokens,
+            "reasoning_tokens": 0,
+            "content_tokens": output_tokens,
+            "cached_prompt_tokens": 0,
+            "raw": usage,
+        }
+    return _extract_openai_usage(result.get("usage") if isinstance(result, dict) else {})
+
+
+def _build_llm_result_metadata(result: dict, api_format: str) -> dict:
+    """Build normalized response metadata used by chunk recovery logic."""
+    return {
+        "finish_reason": _extract_llm_finish_reason(result, api_format),
+        "usage": _extract_llm_usage(result, api_format),
+        "reasoning_text": _extract_llm_reasoning_text(result, api_format),
+    }
+
+
 def _extract_openai_stream_text(payload: dict) -> str:
     """Extract openai stream text."""
     choices = payload.get("choices") or []
@@ -1776,15 +2162,16 @@ def _extract_llm_text(result: dict, api_format: str) -> str:
         for block in content:
             if isinstance(block, dict) and block.get("type") == "text":
                 text_parts.append(block.get("text", ""))
-        if text_parts:
+        if text_parts or "content" in result:
             return "".join(text_parts)
         raise KeyError("content")
-    return result["choices"][0]["message"]["content"]
+    return _extract_openai_content_from_message(result["choices"][0]["message"])
 
 
-def _read_streaming_response(response, api_format: str) -> str:
+def _read_streaming_response(response, api_format: str) -> dict:
     """Read streaming response."""
     text_parts = []
+    finish_reason = ""
     for raw_line in response:
         line = raw_line.decode("utf-8", errors="replace").strip()
         if not line or line.startswith("event:"):
@@ -1800,11 +2187,20 @@ def _read_streaming_response(response, api_format: str) -> str:
             continue
         if api_format == "anthropic":
             text = _extract_anthropic_stream_text(payload)
+            finish_reason = finish_reason or _extract_llm_finish_reason(payload, api_format)
         else:
             text = _extract_openai_stream_text(payload)
+            choices = payload.get("choices") or []
+            if choices and isinstance(choices[0], dict) and choices[0].get("finish_reason"):
+                finish_reason = str(choices[0].get("finish_reason") or "")
         if text:
             text_parts.append(text)
-    return "".join(text_parts)
+    return {
+        "text": "".join(text_parts),
+        "finish_reason": finish_reason,
+        "usage": {},
+        "reasoning_text": "",
+    }
 
 
 def _build_llm_request(api_key: str, base_url: str, model: str, messages: list,
@@ -1870,11 +2266,13 @@ def _execute_llm_request(api_key: str, base_url: str, model: str, messages: list
         with urllib.request.urlopen(req, timeout=timeout_sec) as response:
             content_type = (response.headers.get("Content-Type") or "").lower()
             if use_stream and "text/event-stream" in content_type:
-                text = _read_streaming_response(response, api_format)
+                metadata = _read_streaming_response(response, api_format)
+                text = metadata["text"]
                 streaming_used = True
             else:
                 result = json.loads(response.read().decode("utf-8"))
                 text = _extract_llm_text(result, api_format)
+                metadata = _build_llm_result_metadata(result, api_format)
                 streaming_used = False
         latency_ms = int((time.monotonic() - started_at) * 1000)
         return {
@@ -1882,6 +2280,9 @@ def _execute_llm_request(api_key: str, base_url: str, model: str, messages: list
             "latency_ms": latency_ms,
             "request_url": url,
             "streaming_used": streaming_used,
+            "finish_reason": metadata.get("finish_reason", ""),
+            "usage": metadata.get("usage", {}),
+            "reasoning_text": metadata.get("reasoning_text", ""),
         }
     except urllib.error.HTTPError as e:
         error_body = e.read().decode("utf-8", errors="replace")
@@ -2661,6 +3062,52 @@ def sanitize_filename(title: str) -> str:
     if len(sanitized) > 200:
         sanitized = sanitized[:200]
     return sanitized
+
+
+def _is_valid_compact_date_fragment(value: str) -> bool:
+    """Return whether an 8-digit string is a real YYYYMMDD calendar date."""
+    text = str(value or "").strip()
+    if not re.fullmatch(r"\d{8}", text):
+        return False
+    try:
+        time.strptime(text, "%Y%m%d")
+    except ValueError:
+        return False
+    return True
+
+
+def _find_compact_dates_in_filename(output_file: str) -> list[str]:
+    """Find compact YYYYMMDD date fragments in a file basename."""
+    filename = Path(str(output_file or "")).name
+    compact_dates = []
+    for match in re.finditer(r"(?<![A-Za-z0-9])(\d{8})(?![A-Za-z0-9])", filename):
+        date_text = match.group(1)
+        if _is_valid_compact_date_fragment(date_text):
+            compact_dates.append(date_text)
+    return compact_dates
+
+
+def _validate_output_filename_date_format(output_file: str) -> list[str]:
+    """Return validation failures for date fragments in final output filenames."""
+    compact_dates = _find_compact_dates_in_filename(output_file)
+    if not compact_dates:
+        return []
+    normalized_examples = [
+        f"{date_text[:4]}-{date_text[4:6]}-{date_text[6:]}"
+        for date_text in compact_dates
+    ]
+    return [
+        "Output filename date must use yyyy-mm-dd, not yyyymmdd "
+        f"({', '.join(compact_dates)} -> {', '.join(normalized_examples)})."
+    ]
+
+
+def _normalize_frontmatter_date(value: str) -> str:
+    """Normalize compact YYYYMMDD dates for article frontmatter."""
+    text = str(value or "").strip()
+    if _is_valid_compact_date_fragment(text):
+        return f"{text[:4]}-{text[4:6]}-{text[6:]}"
+    return text
 
 
 def split_audio(audio_path: str, max_size_mb: float = 10.0, max_deviation_sec: float = 60.0) -> dict:
@@ -5033,22 +5480,28 @@ def assemble_final(optimized_text_path: str, output_file: str,
     safe_title = _escape_markdown_text(title)
     safe_channel = _escape_markdown_text(channel)
     safe_source = _sanitize_markdown_url(source)
+    frontmatter_date = _normalize_frontmatter_date(date)
+    frontmatter_created = _normalize_frontmatter_date(created)
     
     # Build YAML frontmatter
     frontmatter_lines = [
         "---",
         f"title: {_yaml_string(title)}",
         f"source: {_yaml_string(source)}",
+        f"url: {_yaml_string(source)}",
         f"channel: {_yaml_string(channel)}",
+        f"author: {_yaml_string(channel)}",
     ]
-    if date:
-        frontmatter_lines.append(f"date: {_yaml_string(date)}")
+    if frontmatter_date:
+        frontmatter_lines.append(f"date: {_yaml_string(frontmatter_date)}")
     frontmatter_lines.extend([
-        f"created: {_yaml_string(created)}",
+        f"created: {_yaml_string(frontmatter_created)}",
         "type: video-transcript",
         f"bilingual: {bilingual_str}",
         f"duration: {_yaml_string(f'{duration_min}m')}",
         f"transcript_source: {_yaml_string(transcript_source)}",
+        "tags: [youtube, video-transcript]",
+        f"via: {_yaml_string('youtube')}",
         "---",
     ])
     
@@ -5545,6 +5998,41 @@ def verify_quality(optimized_text_path: str, raw_text_path: str = None,
                         warnings.extend(glossary_evaluation["warnings"])
             except Exception:
                 pass  # Non-critical, skip if raw text unreadable
+
+    empty_processed_files = []
+    if work_dir:
+        work_path = Path(work_dir)
+        if work_path.exists() and work_path.is_dir():
+            try:
+                manifest_path = work_path / "manifest.json"
+                if manifest_path.exists():
+                    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                    processed_names = []
+                    for chunk in manifest.get("chunks", []):
+                        if not isinstance(chunk, dict):
+                            continue
+                        if chunk.get("status") == SUPERSEDED_CHUNK_STATUS:
+                            continue
+                        processed_name = str(chunk.get("processed_path", "") or "").strip()
+                        if processed_name:
+                            processed_names.append(processed_name)
+                else:
+                    processed_names = [path.name for path in sorted(work_path.glob("processed_*.md"))]
+
+                for processed_name in processed_names:
+                    processed_path = work_path / processed_name
+                    if processed_path.exists() and processed_path.is_file() and processed_path.stat().st_size == 0:
+                        empty_processed_files.append(str(processed_path))
+            except Exception:
+                empty_processed_files = []
+
+    checks["empty_processed_file_count"] = len(empty_processed_files)
+    checks["empty_processed_files"] = empty_processed_files
+    checks["processed_chunks_non_empty"] = len(empty_processed_files) == 0
+    if empty_processed_files:
+        preview = ", ".join(Path(path).name for path in empty_processed_files[:5])
+        suffix = "" if len(empty_processed_files) <= 5 else f", +{len(empty_processed_files) - 5} more"
+        hard_failures.append(f"Empty processed chunk file(s) detected: {preview}{suffix}")
     
     # Overall result
     passed = len(hard_failures) == 0
@@ -6356,6 +6844,10 @@ def validate_state(state_path: str, stage: str = "", require: list[str] | None =
         hard_failures.append("Missing required state fields: " + ", ".join(missing_fields))
     if placeholder_fields:
         hard_failures.append("Unresolved placeholder state fields: " + ", ".join(placeholder_fields))
+    output_filename_date_failures = []
+    if stage == "final" and state.get("output_file"):
+        output_filename_date_failures = _validate_output_filename_date_format(state.get("output_file", ""))
+        hard_failures.extend(output_filename_date_failures)
 
     checks = {
         "stage": stage or "custom",
@@ -6363,6 +6855,7 @@ def validate_state(state_path: str, stage: str = "", require: list[str] | None =
         "present_fields": present_fields,
         "missing_fields": missing_fields,
         "placeholder_fields": placeholder_fields,
+        "output_filename_date_failures": output_filename_date_failures,
     }
 
     return {
@@ -6817,6 +7310,10 @@ def load_config(config_path: str = None, allow_missing: bool = False) -> dict:
     llm_backoff_sec = parse_float_field('llm_backoff_sec', 1.5, minimum=0.1)
     llm_probe_timeout_sec = parse_int_field('llm_probe_timeout_sec', 20, minimum=1)
     llm_probe_max_tokens = parse_int_field('llm_probe_max_tokens', 16, minimum=1)
+    llm_reasoning_probe_enabled = _parse_bool(
+        config.get('llm_reasoning_probe_enabled', True),
+        True,
+    )
     llm_stop_after_consecutive_timeouts = parse_int_field('llm_stop_after_consecutive_timeouts', 2, minimum=1)
     llm_chunk_recovery_attempts = parse_int_field(
         'llm_chunk_recovery_attempts',
@@ -6828,6 +7325,92 @@ def load_config(config_path: str = None, allow_missing: bool = False) -> dict:
         DEFAULT_LLM_CHUNK_RECOVERY_BACKOFF_SEC,
         minimum=0.0,
     )
+    llm_reasoning_retry_attempts = parse_int_field(
+        'llm_reasoning_retry_attempts',
+        DEFAULT_REASONING_RETRY_ATTEMPTS,
+        minimum=0,
+    )
+    llm_reasoning_retry_multiplier = parse_float_field(
+        'llm_reasoning_retry_multiplier',
+        DEFAULT_REASONING_RETRY_MULTIPLIER,
+        minimum=1.01,
+        maximum=4.0,
+    )
+    llm_reasoning_retry_max_tokens = parse_int_field(
+        'llm_reasoning_retry_max_tokens',
+        DEFAULT_REASONING_RETRY_MAX_TOKENS,
+        minimum=1,
+    )
+
+    def has_config_value(key: str) -> bool:
+        """Return whether a config key is explicitly set to a non-empty value."""
+        return key in config and str(config.get(key, "")).strip() != ""
+
+    chunk_tokens_structure_only = parse_int_field(
+        'chunk_tokens_structure_only',
+        TASK_CHUNK_TOKEN_DEFAULTS['structure_only'],
+        minimum=1,
+    )
+    chunk_tokens_quick_cleanup = parse_int_field(
+        'chunk_tokens_quick_cleanup',
+        TASK_CHUNK_TOKEN_DEFAULTS['quick_cleanup'],
+        minimum=1,
+    )
+    chunk_tokens_cleanup_default = TASK_CHUNK_TOKEN_DEFAULTS['cleanup_zh']
+    if not has_config_value('chunk_tokens_cleanup_zh'):
+        if has_config_value('chunk_tokens_structure_only'):
+            chunk_tokens_cleanup_default = chunk_tokens_structure_only
+        elif has_config_value('chunk_tokens_quick_cleanup'):
+            chunk_tokens_cleanup_default = chunk_tokens_quick_cleanup
+    chunk_tokens_cleanup_zh = parse_int_field(
+        'chunk_tokens_cleanup_zh',
+        chunk_tokens_cleanup_default,
+        minimum=1,
+    )
+
+    output_ratio_structure_only = parse_float_field(
+        'output_ratio_structure_only',
+        TASK_OUTPUT_RATIO_DEFAULTS['structure_only'],
+        minimum=0.01,
+    )
+    output_ratio_quick_cleanup = parse_float_field(
+        'output_ratio_quick_cleanup',
+        TASK_OUTPUT_RATIO_DEFAULTS['quick_cleanup'],
+        minimum=0.01,
+    )
+    output_ratio_cleanup_default = TASK_OUTPUT_RATIO_DEFAULTS['cleanup_zh']
+    if not has_config_value('output_ratio_cleanup_zh'):
+        if has_config_value('output_ratio_structure_only'):
+            output_ratio_cleanup_default = output_ratio_structure_only
+        elif has_config_value('output_ratio_quick_cleanup'):
+            output_ratio_cleanup_default = output_ratio_quick_cleanup
+    output_ratio_cleanup_zh = parse_float_field(
+        'output_ratio_cleanup_zh',
+        output_ratio_cleanup_default,
+        minimum=0.01,
+    )
+
+    max_output_tokens_structure_only = parse_int_field(
+        'max_output_tokens_structure_only',
+        TASK_MAX_OUTPUT_TOKEN_DEFAULTS['structure_only'],
+        minimum=1,
+    )
+    max_output_tokens_quick_cleanup = parse_int_field(
+        'max_output_tokens_quick_cleanup',
+        TASK_MAX_OUTPUT_TOKEN_DEFAULTS['quick_cleanup'],
+        minimum=1,
+    )
+    max_output_tokens_cleanup_default = TASK_MAX_OUTPUT_TOKEN_DEFAULTS['cleanup_zh']
+    if not has_config_value('max_output_tokens_cleanup_zh'):
+        if has_config_value('max_output_tokens_structure_only'):
+            max_output_tokens_cleanup_default = max_output_tokens_structure_only
+        elif has_config_value('max_output_tokens_quick_cleanup'):
+            max_output_tokens_cleanup_default = max_output_tokens_quick_cleanup
+    max_output_tokens_cleanup_zh = parse_int_field(
+        'max_output_tokens_cleanup_zh',
+        max_output_tokens_cleanup_default,
+        minimum=1,
+    )
 
     parsed = dict(defaults)
     parsed.update({
@@ -6837,8 +7420,8 @@ def load_config(config_path: str = None, allow_missing: bool = False) -> dict:
         "deepgram_enable_utterances": deepgram_enable_utterances,
         "deepgram_prefer_structured_output": deepgram_prefer_structured_output,
         "llm_api_key": config.get('llm_api_key', ''),
-        "llm_base_url": config.get('llm_base_url', ''),
-        "llm_model": config.get('llm_model', ''),
+        "llm_base_url": config.get('llm_base_url', DEFAULT_LLM_BASE_URL),
+        "llm_model": str(config.get('llm_model', DEFAULT_LLM_MODEL) or '').strip() or DEFAULT_LLM_MODEL,
         "llm_api_format": config.get('llm_api_format', 'openai'),
         "yt_dlp_socket_timeout_sec": yt_dlp_socket_timeout_sec,
         "yt_dlp_retries": yt_dlp_retries,
@@ -6851,13 +7434,18 @@ def load_config(config_path: str = None, allow_missing: bool = False) -> dict:
         "llm_stream": _normalize_stream_mode(config.get('llm_stream', 'auto')),
         "llm_probe_timeout_sec": llm_probe_timeout_sec,
         "llm_probe_max_tokens": llm_probe_max_tokens,
+        "llm_reasoning_probe_enabled": llm_reasoning_probe_enabled,
         "llm_stop_after_consecutive_timeouts": llm_stop_after_consecutive_timeouts,
         "llm_chunk_recovery_attempts": llm_chunk_recovery_attempts,
         "llm_chunk_recovery_backoff_sec": llm_chunk_recovery_backoff_sec,
+        "llm_reasoning_retry_attempts": llm_reasoning_retry_attempts,
+        "llm_reasoning_retry_multiplier": llm_reasoning_retry_multiplier,
+        "llm_reasoning_retry_max_tokens": llm_reasoning_retry_max_tokens,
         "chunk_mode": _normalize_chunk_mode(config.get('chunk_mode', DEFAULT_CHUNK_MODE)),
         "chunk_size_override": parse_int_field('chunk_size_override', 0, minimum=0),
-        "chunk_tokens_structure_only": parse_int_field('chunk_tokens_structure_only', TASK_CHUNK_TOKEN_DEFAULTS['structure_only'], minimum=1),
-        "chunk_tokens_quick_cleanup": parse_int_field('chunk_tokens_quick_cleanup', TASK_CHUNK_TOKEN_DEFAULTS['quick_cleanup'], minimum=1),
+        "chunk_tokens_structure_only": chunk_tokens_structure_only,
+        "chunk_tokens_quick_cleanup": chunk_tokens_quick_cleanup,
+        "chunk_tokens_cleanup_zh": chunk_tokens_cleanup_zh,
         "chunk_tokens_translate_only": parse_int_field('chunk_tokens_translate_only', TASK_CHUNK_TOKEN_DEFAULTS['translate_only'], minimum=1),
         "chunk_tokens_summarize": parse_int_field('chunk_tokens_summarize', TASK_CHUNK_TOKEN_DEFAULTS['summarize'], minimum=1),
         "chunk_hard_cap_multiplier": parse_float_field(
@@ -6870,12 +7458,14 @@ def load_config(config_path: str = None, allow_missing: bool = False) -> dict:
         "chunk_overlap_sentences": parse_int_field('chunk_overlap_sentences', DEFAULT_CHUNK_OVERLAP_SENTENCES, minimum=0),
         "chunk_context_tail_sentences": parse_int_field('chunk_context_tail_sentences', DEFAULT_CHUNK_CONTEXT_TAIL_SENTENCES, minimum=0),
         "chunk_context_summary_tokens": parse_int_field('chunk_context_summary_tokens', DEFAULT_CHUNK_CONTEXT_SUMMARY_TOKENS, minimum=0),
-        "output_ratio_structure_only": parse_float_field('output_ratio_structure_only', TASK_OUTPUT_RATIO_DEFAULTS['structure_only'], minimum=0.01),
-        "output_ratio_quick_cleanup": parse_float_field('output_ratio_quick_cleanup', TASK_OUTPUT_RATIO_DEFAULTS['quick_cleanup'], minimum=0.01),
+        "output_ratio_structure_only": output_ratio_structure_only,
+        "output_ratio_quick_cleanup": output_ratio_quick_cleanup,
+        "output_ratio_cleanup_zh": output_ratio_cleanup_zh,
         "output_ratio_translate_only": parse_float_field('output_ratio_translate_only', TASK_OUTPUT_RATIO_DEFAULTS['translate_only'], minimum=0.01),
         "output_ratio_summarize": parse_float_field('output_ratio_summarize', TASK_OUTPUT_RATIO_DEFAULTS['summarize'], minimum=0.01),
-        "max_output_tokens_structure_only": parse_int_field('max_output_tokens_structure_only', TASK_MAX_OUTPUT_TOKEN_DEFAULTS['structure_only'], minimum=1),
-        "max_output_tokens_quick_cleanup": parse_int_field('max_output_tokens_quick_cleanup', TASK_MAX_OUTPUT_TOKEN_DEFAULTS['quick_cleanup'], minimum=1),
+        "max_output_tokens_structure_only": max_output_tokens_structure_only,
+        "max_output_tokens_quick_cleanup": max_output_tokens_quick_cleanup,
+        "max_output_tokens_cleanup_zh": max_output_tokens_cleanup_zh,
         "max_output_tokens_translate_only": parse_int_field('max_output_tokens_translate_only', TASK_MAX_OUTPUT_TOKEN_DEFAULTS['translate_only'], minimum=1),
         "max_output_tokens_summarize": parse_int_field('max_output_tokens_summarize', TASK_MAX_OUTPUT_TOKEN_DEFAULTS['summarize'], minimum=1),
         "enable_token_count_probe": _parse_bool(config.get('enable_token_count_probe'), DEFAULT_ENABLE_TOKEN_COUNT_PROBE),

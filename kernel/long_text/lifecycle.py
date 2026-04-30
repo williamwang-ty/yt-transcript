@@ -83,6 +83,7 @@ def _new_chunk_manifest_entry(chunk_id: int, chunk_content: str, budget: dict,
         "attempt_logs": [],
         "recovery_attempts": 0,
         "recovery_logs": [],
+        "reasoning_recovery_attempts": 0,
         "last_error": "",
         "last_error_type": "",
         "error_type": "",
@@ -128,6 +129,7 @@ def _ensure_chunk_runtime_defaults(manifest: dict, runtime: dict, plan: dict,
         chunk_info.setdefault("attempt_logs", [])
         chunk_info.setdefault("recovery_attempts", 0)
         chunk_info.setdefault("recovery_logs", [])
+        chunk_info.setdefault("reasoning_recovery_attempts", 0)
         chunk_info.setdefault("last_error", "")
         chunk_info.setdefault("last_error_type", "")
         chunk_info.setdefault("error_type", chunk_info.get("last_error_type", ""))

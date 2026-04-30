@@ -37,8 +37,8 @@ That full process includes:
 - state synchronization and normalization
 - text optimization
 - long-text chunk processing when needed
-- final assembly
 - quality gates and runtime inspection
+- final assembly and final state validation
 
 In this full system, **long-text transformation is a core subsystem**, but it is still only one part of the whole project.
 
@@ -139,8 +139,8 @@ YouTube URL
   -> state synchronization and normalized document creation
   -> optimization planning
   -> short-path direct transformation OR long-text transformation subsystem
-  -> final assembly
   -> quality verification
+  -> final assembly and final state validation
   -> final Markdown output + inspectable artifacts
 ```
 
@@ -305,14 +305,15 @@ The project keeps text optimization narrow and path-aware:
 
 #### Problem to solve
 
-Even if source acquisition and text transformation succeed, the project still needs a reliable way to produce final output and decide whether that output is acceptable.
+Even if source acquisition and text transformation succeed, the project still needs a reliable way to decide whether the optimized output is acceptable, produce the final Markdown wrapper, and validate the final artifact reference.
 
 #### Solution
 
 The system separates:
 
-- **assembly**: building the final Markdown file and document wrapper
 - **quality verification**: checking whether the output meets minimum structural and content expectations
+- **assembly**: building the final Markdown file and document wrapper after verification passes
+- **final state validation**: confirming the recorded artifact path and filename conventions, including `yyyy-mm-dd` date fragments in final filenames
 
 This makes output packaging and output judgment explicit final stages rather than hidden side effects of generation.
 
@@ -892,7 +893,7 @@ Before describing the logic in detail, it helps to state the layered implementat
 - **LLM request layer**: `kernel/long_text/llm.py`
   - owns retries, timeout behavior, and streaming fallback
 - **Processing-control layer**: `kernel/long_text/processing.py`
-  - owns the main chunk loop, repair decisions, autotune, abort / pause / replan behavior, and manifest updates
+  - owns the main chunk loop, reasoning-metadata stream decisions, repair decisions, autotune, abort / pause / replan behavior, and manifest updates
 - **Boundary surface layer**: `kernel/long_text/chunking.py`, `kernel/long_text/merge.py`, `kernel/long_text/execution.py`
   - exposes chunking, merge, resume, and replan command surfaces to the rest of the project
 
@@ -1170,8 +1171,8 @@ It is a local transcript production system whose full workflow is designed aroun
 - 状态同步与标准化
 - 文本优化
 - 必要时进入长文本 chunk 处理
-- 最终装配
 - 质量门禁与运行时检查
+- 最终装配与 final state 校验
 
 在这个完整系统里，**长文本变换是核心子系统之一**，但它仍然只是整个项目的一部分。
 
@@ -1272,8 +1273,8 @@ YouTube URL
   -> 状态同步与标准化文档生成
   -> 优化计划制定
   -> 短路径直接变换 或 长文本变换子系统
-  -> 最终装配
   -> 质量校验
+  -> 最终装配与 final state 校验
   -> Markdown 成品 + 可检查的中间产物
 ```
 
@@ -1438,14 +1439,15 @@ YouTube URL
 
 #### 要解决的问题
 
-即使 source acquisition 和 text transformation 都成功了，项目仍然需要一种可靠方式来生成最终输出，并判断这个输出是否可接受。
+即使 source acquisition 和 text transformation 都成功了，项目仍然需要一种可靠方式先判断优化后的输出是否可接受，再生成最终 Markdown 包装，并校验最终产物引用。
 
 #### 解决方案
 
 系统把两件事显式拆开：
 
-- **装配**：构建最终 Markdown 文件和文档包装
 - **质量校验**：检查输出是否满足最低结构与内容要求
+- **装配**：在质量校验通过后构建最终 Markdown 文件和文档包装
+- **final state 校验**：确认记录的产物路径和文件名约定，包括最终文件名中的日期片段必须使用 `yyyy-mm-dd`
 
 这样，输出包装与输出判断就成为明确的最终阶段，而不是生成过程里隐含的副作用。
 
@@ -2026,7 +2028,7 @@ Article-like markdown output
 - **LLM request 层**：`kernel/long_text/llm.py`
   - 管理 retries、timeout 行为，以及 streaming fallback
 - **Processing control 层**：`kernel/long_text/processing.py`
-  - 管理主 chunk 循环、repair 决策、autotune、abort / pause / replan 行为，以及 manifest 更新
+  - 管理主 chunk 循环、reasoning 元数据驱动的 stream 决策、repair 决策、autotune、abort / pause / replan 行为，以及 manifest 更新
 - **边界命令层**：`kernel/long_text/chunking.py`、`kernel/long_text/merge.py`、`kernel/long_text/execution.py`
   - 向项目其它部分暴露 chunking、merge、resume、replan 这些命令接口
 

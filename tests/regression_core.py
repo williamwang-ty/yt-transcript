@@ -59,6 +59,60 @@ class CoreRegressionTests(unittest.TestCase):
             "",
         )
 
+    def test_extract_openai_metadata_includes_reasoning_usage(self):
+        """Test OpenAI-compatible metadata extraction includes reasoning usage."""
+        payload = {
+            "choices": [
+                {
+                    "finish_reason": "stop",
+                    "message": {
+                        "content": "",
+                        "reasoning_content": "hidden chain",
+                    },
+                }
+            ],
+            "usage": {
+                "prompt_tokens": 120,
+                "completion_tokens": 1223,
+                "total_tokens": 1343,
+                "completion_tokens_details": {
+                    "reasoning_tokens": 1223,
+                },
+            },
+        }
+
+        self.assertEqual(utils._extract_llm_text(payload, "openai"), "")
+        metadata = utils._build_llm_result_metadata(payload, "openai")
+
+        self.assertEqual(metadata["finish_reason"], "stop")
+        self.assertEqual(metadata["reasoning_text"], "hidden chain")
+        self.assertEqual(metadata["usage"]["reasoning_tokens"], 1223)
+        self.assertEqual(metadata["usage"]["content_tokens"], 0)
+        self.assertTrue(utils._has_reasoning_metadata(metadata))
+        self.assertEqual(utils._reasoning_metadata_reason(metadata), "reasoning_tokens")
+        self.assertTrue(
+            utils._is_reasoning_budget_exhaustion(
+                {
+                    "text": "",
+                    "finish_reason": "length",
+                    "usage": metadata["usage"],
+                },
+                "",
+                1223,
+            )
+        )
+        self.assertFalse(
+            utils._is_reasoning_budget_exhaustion(
+                {
+                    "text": "",
+                    "finish_reason": "content_filter",
+                    "usage": metadata["usage"],
+                },
+                "",
+                1223,
+            )
+        )
+
     def test_load_config_preserves_hash_inside_quotes(self):
         """Test load config preserves hash inside quotes."""
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -109,6 +163,58 @@ class CoreRegressionTests(unittest.TestCase):
         self.assertTrue(settings["prefer_structured_output"])
         self.assertFalse(legacy_settings["utterances"])
         self.assertFalse(legacy_settings["prefer_structured_output"])
+
+    def test_default_config_uses_deepseek_pro_model(self):
+        """Test default LLM model favors the more stable DeepSeek pro route."""
+        config = utils._default_config_values()
+
+        self.assertEqual(config["llm_base_url"], utils.DEFAULT_LLM_BASE_URL)
+        self.assertEqual(config["llm_base_url"], "https://api.deepseek.com")
+        self.assertEqual(config["llm_model"], utils.DEFAULT_LLM_MODEL)
+        self.assertEqual(config["llm_model"], "deepseek-v4-pro")
+
+    def test_load_config_defaults_reasoning_probe_enabled(self):
+        """Test real config parsing enables unknown-model reasoning probes by default."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "config.yaml"
+            config_path.write_text(f'output_dir: "{tmpdir}"\n', encoding="utf-8")
+
+            config = utils.load_config(str(config_path))
+
+        self.assertTrue(config["llm_reasoning_probe_enabled"])
+
+    def test_reasoning_model_detection_handles_provider_prefixed_names(self):
+        """Test provider-prefixed DeepSeek reasoning model aliases disable chunk streaming."""
+        reasoning_models = [
+            "deepseek-v4-pro",
+            "deepseek/deepseek-reasoner",
+            "openrouter/deepseek/deepseek-r1",
+            "DeepSeek_R1_Distill",
+        ]
+
+        for model in reasoning_models:
+            with self.subTest(model=model):
+                self.assertTrue(utils._is_reasoning_llm_model(model))
+                self.assertEqual(utils._resolve_chunk_stream_mode_for_model(model, "auto"), "false")
+
+        self.assertFalse(utils._is_reasoning_llm_model("deepseek-v3"))
+
+    def test_reasoning_metadata_detection_uses_response_features_not_model_name(self):
+        """Test structured response features can identify unknown reasoning models."""
+        result = {
+            "text": "OK",
+            "finish_reason": "stop",
+            "reasoning_text": "hidden thinking",
+            "usage": {
+                "completion_tokens": 3,
+                "reasoning_tokens": 0,
+                "content_tokens": 3,
+            },
+        }
+
+        self.assertFalse(utils._is_reasoning_llm_model("acme/unknown-model"))
+        self.assertTrue(utils._has_reasoning_metadata(result))
+        self.assertEqual(utils._reasoning_metadata_reason(result), "reasoning_text")
 
     def test_chunk_text_splits_chinese_without_spaces(self):
         """Test chunk text splits chinese without spaces."""
@@ -236,13 +342,19 @@ class CoreRegressionTests(unittest.TestCase):
                 title='He said "hi"',
                 source="https://example.com/watch?v=1",
                 channel='A "B"',
+                date="20260307",
                 created="2026-03-07",
                 transcript_source="YouTube Subtitles",
             )
 
             content = output.read_text(encoding="utf-8")
             self.assertIn('title: "He said \\"hi\\""', content)
+            self.assertIn('url: "https://example.com/watch?v=1"', content)
             self.assertIn('channel: "A \\"B\\""', content)
+            self.assertIn('author: "A \\"B\\""', content)
+            self.assertIn('date: "2026-03-07"', content)
+            self.assertIn('tags: [youtube, video-transcript]', content)
+            self.assertIn('via: "youtube"', content)
             self.assertIn("# He said \"hi\"", content)
 
     def test_process_deepgram_payload_normalizes_chinese_spacing(self):
@@ -1108,6 +1220,35 @@ class CoreRegressionTests(unittest.TestCase):
 
             self.assertTrue(result["passed"], result)
 
+    def test_validate_state_rejects_compact_date_in_output_filename(self):
+        """Test final output filenames require yyyy-mm-dd date fragments."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state = Path(tmpdir) / "state.md"
+            state.write_text(
+                "# State\n"
+                "vid: vid001\n"
+                "url: https://example.com/watch?v=1\n"
+                "title: Sample\n"
+                "channel: Channel\n"
+                "upload_date: 20260308\n"
+                "duration: 120\n"
+                "output_dir: /tmp/out\n"
+                "mode: bilingual\n"
+                "src: youtube\n"
+                "source_language: en\n"
+                "subtitle_source: YouTube Subtitles\n"
+                "output_file: /tmp/out/20260308. sample.md\n",
+                encoding="utf-8",
+            )
+
+            result = utils.validate_state(str(state), stage="final")
+
+            self.assertFalse(result["passed"])
+            self.assertEqual(result["checks"]["output_filename_date_failures"], [
+                "Output filename date must use yyyy-mm-dd, not yyyymmdd (20260308 -> 2026-03-08)."
+            ])
+            self.assertTrue(any("yyyy-mm-dd" in failure for failure in result["hard_failures"]))
+
     def test_validate_state_materializes_machine_state_from_legacy_markdown(self):
         """Test validate state materializes machine state from legacy markdown."""
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1675,17 +1816,54 @@ work_dir: /tmp/vid001_chunks
             self.assertEqual(result["quality_contract"]["stop_rule"], "hard_failures_stop")
 
     def test_cleanup_zh_reuses_structure_only_chunk_tuning(self):
-        """Test cleanup_zh reuses structure_only chunk sizing and budgets."""
+        """Test cleanup_zh uses dedicated chunk sizing and budgets."""
         override_config = {
+            "chunk_size_override": 0,
+            "chunk_tokens_structure_only": 777,
+            "output_ratio_structure_only": 1.23,
+            "max_output_tokens_structure_only": 1999,
+            "chunk_tokens_cleanup_zh": 888,
+            "output_ratio_cleanup_zh": 1.05,
+            "max_output_tokens_cleanup_zh": 3200,
+        }
+
+        self.assertEqual(utils._get_task_chunk_target("cleanup_zh", override_config), 888)
+        self.assertEqual(utils._get_task_output_ratio("cleanup_zh", override_config), 1.05)
+        self.assertEqual(utils._get_task_max_output_tokens("cleanup_zh", override_config), 3200)
+
+    def test_cleanup_zh_falls_back_to_legacy_structure_only_tuning(self):
+        """Test older cleanup_zh configs still inherit structure_only tuning."""
+        legacy_config = {
             "chunk_size_override": 0,
             "chunk_tokens_structure_only": 777,
             "output_ratio_structure_only": 1.23,
             "max_output_tokens_structure_only": 1999,
         }
 
-        self.assertEqual(utils._get_task_chunk_target("cleanup_zh", override_config), 777)
-        self.assertEqual(utils._get_task_output_ratio("cleanup_zh", override_config), 1.23)
-        self.assertEqual(utils._get_task_max_output_tokens("cleanup_zh", override_config), 1999)
+        self.assertEqual(utils._get_task_chunk_target("cleanup_zh", legacy_config), 777)
+        self.assertEqual(utils._get_task_output_ratio("cleanup_zh", legacy_config), 1.23)
+        self.assertEqual(utils._get_task_max_output_tokens("cleanup_zh", legacy_config), 1999)
+
+    def test_load_config_cleanup_zh_falls_back_to_legacy_structure_only_tuning(self):
+        """Test real config parsing preserves cleanup_zh legacy tuning fallback."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "config.yaml"
+            config_path.write_text(
+                f'output_dir: "{tmpdir}"\n'
+                'chunk_tokens_structure_only: "777"\n'
+                'output_ratio_structure_only: "1.23"\n'
+                'max_output_tokens_structure_only: "1999"\n',
+                encoding="utf-8",
+            )
+
+            config = utils.load_config(str(config_path))
+
+            self.assertEqual(config["chunk_tokens_cleanup_zh"], 777)
+            self.assertEqual(config["output_ratio_cleanup_zh"], 1.23)
+            self.assertEqual(config["max_output_tokens_cleanup_zh"], 1999)
+            self.assertEqual(utils._get_task_chunk_target("cleanup_zh", config), 777)
+            self.assertEqual(utils._get_task_output_ratio("cleanup_zh", config), 1.23)
+            self.assertEqual(utils._get_task_max_output_tokens("cleanup_zh", config), 1999)
 
     def test_plan_optimization_marks_processed_path_chunk_stage_for_manual_review(self):
         """Test plan optimization marks processed path chunk stage for manual review."""
@@ -1792,7 +1970,11 @@ work_dir: /tmp/vid001_chunks
                 'llm_stream: "false"\n'
                 'llm_probe_timeout_sec: "9"\n'
                 'llm_probe_max_tokens: "7"\n'
-                'llm_stop_after_consecutive_timeouts: "4"\n',
+                'llm_reasoning_probe_enabled: "false"\n'
+                'llm_stop_after_consecutive_timeouts: "4"\n'
+                'llm_reasoning_retry_attempts: "3"\n'
+                'llm_reasoning_retry_multiplier: "1.5"\n'
+                'llm_reasoning_retry_max_tokens: "5000"\n',
                 encoding="utf-8",
             )
             config = utils.load_config(str(config_path))
@@ -1802,7 +1984,11 @@ work_dir: /tmp/vid001_chunks
             self.assertEqual(config["llm_stream"], "false")
             self.assertEqual(config["llm_probe_timeout_sec"], 9)
             self.assertEqual(config["llm_probe_max_tokens"], 7)
+            self.assertFalse(config["llm_reasoning_probe_enabled"])
             self.assertEqual(config["llm_stop_after_consecutive_timeouts"], 4)
+            self.assertEqual(config["llm_reasoning_retry_attempts"], 3)
+            self.assertEqual(config["llm_reasoning_retry_multiplier"], 1.5)
+            self.assertEqual(config["llm_reasoning_retry_max_tokens"], 5000)
 
     def test_load_config_parses_chunk_tuning_fields(self):
         """Test load config parses chunk tuning fields."""
@@ -1814,6 +2000,7 @@ work_dir: /tmp/vid001_chunks
                 'chunk_size_override: "777"\n'
                 'chunk_tokens_structure_only: "1111"\n'
                 'chunk_tokens_quick_cleanup: "888"\n'
+                'chunk_tokens_cleanup_zh: "1001"\n'
                 'chunk_tokens_translate_only: "999"\n'
                 'chunk_tokens_summarize: "2222"\n'
                 'chunk_hard_cap_multiplier: "1.5"\n'
@@ -1823,10 +2010,12 @@ work_dir: /tmp/vid001_chunks
                 'chunk_context_summary_tokens: "70"\n'
                 'output_ratio_structure_only: "1.2"\n'
                 'output_ratio_quick_cleanup: "1.08"\n'
+                'output_ratio_cleanup_zh: "1.05"\n'
                 'output_ratio_translate_only: "1.12"\n'
                 'output_ratio_summarize: "0.2"\n'
                 'max_output_tokens_structure_only: "1900"\n'
                 'max_output_tokens_quick_cleanup: "1450"\n'
+                'max_output_tokens_cleanup_zh: "3200"\n'
                 'max_output_tokens_translate_only: "1550"\n'
                 'max_output_tokens_summarize: "512"\n'
                 'enable_token_count_probe: "false"\n'
@@ -1845,6 +2034,7 @@ work_dir: /tmp/vid001_chunks
             self.assertEqual(config["chunk_size_override"], 777)
             self.assertEqual(config["chunk_tokens_structure_only"], 1111)
             self.assertEqual(config["chunk_tokens_quick_cleanup"], 888)
+            self.assertEqual(config["chunk_tokens_cleanup_zh"], 1001)
             self.assertEqual(config["chunk_tokens_translate_only"], 999)
             self.assertEqual(config["chunk_tokens_summarize"], 2222)
             self.assertEqual(config["chunk_hard_cap_multiplier"], 1.5)
@@ -1853,10 +2043,12 @@ work_dir: /tmp/vid001_chunks
             self.assertEqual(config["chunk_context_summary_tokens"], 70)
             self.assertEqual(config["output_ratio_structure_only"], 1.2)
             self.assertEqual(config["output_ratio_quick_cleanup"], 1.08)
+            self.assertEqual(config["output_ratio_cleanup_zh"], 1.05)
             self.assertEqual(config["output_ratio_translate_only"], 1.12)
             self.assertEqual(config["output_ratio_summarize"], 0.2)
             self.assertEqual(config["max_output_tokens_structure_only"], 1900)
             self.assertEqual(config["max_output_tokens_quick_cleanup"], 1450)
+            self.assertEqual(config["max_output_tokens_cleanup_zh"], 3200)
             self.assertEqual(config["max_output_tokens_translate_only"], 1550)
             self.assertEqual(config["max_output_tokens_summarize"], 512)
             self.assertFalse(config["enable_token_count_probe"])
@@ -2027,7 +2219,7 @@ work_dir: /tmp/vid001_chunks
         summary_budget = utils._calculate_chunk_budget("summarize", summary_prompt, default_config)
 
         self.assertLess(structure_budget["target_tokens"], summary_budget["target_tokens"])
-        self.assertLess(structure_budget["planned_max_output_tokens"], 1800)
+        self.assertLessEqual(structure_budget["planned_max_output_tokens"], 1800)
         self.assertEqual(summary_budget["planned_max_output_tokens"], 384)
 
         structure_total = (

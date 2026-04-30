@@ -240,6 +240,12 @@ def build_chunk_verification_contract(prompt_name: str, *, applicable: bool = Tr
     retryable_checks = []
     if prompt_name != "summarize":
         retryable_checks.append({
+            "id": "empty_output",
+            "severity": "repairable_warning",
+            "retry_action": "retry_same_chunk_same_plan",
+            "min_output_chars": 1,
+        })
+        retryable_checks.append({
             "id": "short_output",
             "severity": "repairable_warning",
             "retry_action": "retry_same_chunk_same_plan",

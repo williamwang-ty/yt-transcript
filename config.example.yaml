@@ -50,8 +50,8 @@ yt_dlp_cookies_file: ""
 llm_api_format: "openai"
 llm_api_key: "your_llm_api_key_here"
 # Can be either provider root URL or a /v1 URL; the tool normalizes both.
-llm_base_url: "https://api.openai.com"
-llm_model: "gpt-4o-mini"
+llm_base_url: "https://api.deepseek.com"
+llm_model: "deepseek-v4-pro"
 # Request hardening for chunk processing
 llm_timeout_sec: 180
 llm_max_retries: 3
@@ -61,11 +61,21 @@ llm_stream: "auto"
 # Small probe used by preflight.sh --require-llm
 llm_probe_timeout_sec: 20
 llm_probe_max_tokens: 16
+# In auto streaming mode, process-chunks sends one non-streaming "OK" probe for
+# unknown OpenAI-compatible models. If the response exposes reasoning metadata,
+# later chunk calls run non-streaming so usage/reasoning tokens remain visible.
+llm_reasoning_probe_enabled: true
 # Stop batch if provider times out repeatedly
 llm_stop_after_consecutive_timeouts: 2
 # Re-run suspiciously short / malformed chunk outputs before surfacing warnings
 llm_chunk_recovery_attempts: 1
 llm_chunk_recovery_backoff_sec: 1.0
+# DeepSeek v4 reasoning models count hidden reasoning tokens against max_tokens.
+# If a chunk returns empty content after spending its budget on reasoning,
+# process-chunks retries that chunk with an expanded completion budget.
+llm_reasoning_retry_attempts: 2
+llm_reasoning_retry_multiplier: 2.0
+llm_reasoning_retry_max_tokens: 4096
 
 # Chunk planning
 # Default mode is token-aware. Set to "chars" for legacy character chunking.
@@ -74,6 +84,7 @@ chunk_mode: "tokens"
 chunk_size_override: 0
 chunk_tokens_structure_only: 1200
 chunk_tokens_quick_cleanup: 1000
+chunk_tokens_cleanup_zh: 1000
 chunk_tokens_translate_only: 900
 chunk_tokens_summarize: 2500
 # Soft target * multiplier for forced split guardrail. Valid range: 1.0-2.0.
@@ -86,10 +97,12 @@ chunk_context_tail_sentences: 1
 chunk_context_summary_tokens: 60
 output_ratio_structure_only: 1.15
 output_ratio_quick_cleanup: 1.05
+output_ratio_cleanup_zh: 1.05
 output_ratio_translate_only: 1.10
 output_ratio_summarize: 0.15
 max_output_tokens_structure_only: 1800
-max_output_tokens_quick_cleanup: 1400
+max_output_tokens_quick_cleanup: 3200
+max_output_tokens_cleanup_zh: 3200
 max_output_tokens_translate_only: 1500
 max_output_tokens_summarize: 384
 enable_token_count_probe: true

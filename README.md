@@ -58,12 +58,13 @@ pip install yt-dlp
    # Format: "openai" or "anthropic"
    llm_api_format: "openai"
    llm_api_key: "your_llm_api_key"
-   llm_base_url: "https://api.openai.com"
-   llm_model: "gpt-4o-mini"
+   llm_base_url: "https://api.deepseek.com"
+   llm_model: "deepseek-v4-pro"
    llm_timeout_sec: 180
    llm_max_retries: 3
    llm_backoff_sec: 1.5
    llm_stream: "auto"
+   llm_reasoning_probe_enabled: true
    llm_chunk_recovery_attempts: 1
    llm_chunk_recovery_backoff_sec: 1.0
 
@@ -120,6 +121,7 @@ pip install yt-dlp
    > - LLM API config is only needed for long video chunk processing, or when bilingual translation is required.
    > - `llm_base_url` can be either a provider root URL or a `/v1` URL. The tool normalizes both.
    > - `llm_stream: "auto"` prefers SSE streaming when the provider supports it.
+   > - With `llm_reasoning_probe_enabled: true`, unknown OpenAI-compatible models get one non-streaming `OK` probe; if the response exposes reasoning metadata, chunk calls switch to non-streaming for recovery telemetry.
    > - `bash scripts/preflight.sh --require-llm` now performs a real low-cost LLM probe and reports latency.
 
 ### 🚀 Usage
@@ -157,6 +159,7 @@ After completion, a summary table will be provided with status and output paths 
 - `plan-optimization` still records the raw `duration_bucket` (`short` vs `long`).
 - If a short-duration transcript is too large for reliable single-pass prompting, the planner now escalates it to chunked processing and returns `video_path=long` with `routing_reason=oversized_short_input`.
 - Workflow callers should follow `video_path`, `operations`, and `routing_reason` from the planner rather than duration alone.
+- Final output filenames must format date fragments as `yyyy-mm-dd`; do not use raw metadata `upload_date` (`yyyymmdd`) in filenames.
 
 ### 📁 Project Structure
 
@@ -475,12 +478,13 @@ pip install yt-dlp
    # 格式: "openai" 或 "anthropic"
    llm_api_format: "openai"
    llm_api_key: "your_llm_api_key"
-   llm_base_url: "https://api.openai.com"
-   llm_model: "gpt-4o-mini"
+   llm_base_url: "https://api.deepseek.com"
+   llm_model: "deepseek-v4-pro"
    llm_timeout_sec: 180
    llm_max_retries: 3
    llm_backoff_sec: 1.5
    llm_stream: "auto"
+   llm_reasoning_probe_enabled: true
    llm_chunk_recovery_attempts: 1
    llm_chunk_recovery_backoff_sec: 1.0
    ```
@@ -491,6 +495,7 @@ pip install yt-dlp
    > - LLM API 配置仅用于长视频 chunk 处理，或需要双语翻译时。
    > - `llm_base_url` 可以填写服务根地址或带 `/v1` 的地址，工具会自动归一化。
    > - `llm_stream: "auto"` 会在 provider 支持时优先走流式响应。
+   > - `llm_reasoning_probe_enabled: true` 时，未知 OpenAI-compatible 模型会先走一次非流式 `OK` 探测；如果响应里有 reasoning 元数据，后续 chunk 调用会切到非流式以保留恢复所需的 usage 信息。
    > - `bash scripts/preflight.sh --require-llm` 现在会执行一次低成本真实探活并输出延迟。
 
 ### 🚀 使用方法
@@ -715,6 +720,7 @@ bash scripts/preflight.sh --require-llm
 - `质量门禁`：读取 `verify-quality` 的 JSON；`hard_failures` 表示必须 STOP，`warnings` 表示需要人工复核，`checks` 则给出这些告警背后的可读性指标。有 work_dir 或现成 glossary 时，建议额外传 `--work-dir` 或 `--glossary-path` 打开 glossary drift 检查。
 - `源路径路由`：规划层决定当前 subtitle / Deepgram 源是否继续沿用。`routing_reason` 负责解释时长/输入体积路由，`source_route_reason` 负责解释源质量路由。
 - `运行时 reroute 动作`：当 `plan-optimization` / `verify-quality` 返回 `reroute_recommended=true` 且 `reroute_target=deepgram` 时，runtime contract 会把它标准化为 `recommended_action=fallback_to_deepgram`，这样 policy、evaluator、decision 三层动作口径保持一致
+- `输出文件命名`：最终 Markdown 文件名里的日期片段必须使用 `yyyy-mm-dd`，不要把 metadata 的原始 `upload_date`（`yyyymmdd`）直接放进文件名。
 
 ### 🧪 验证矩阵
 

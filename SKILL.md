@@ -9,6 +9,11 @@ Transcribe YouTube videos into formatted Markdown articles with optional bilingu
 
 > [!IMPORTANT]
 > This skill uses script-first workflows. Prefer the helper scripts' JSON output over manual parsing or ad-hoc shell heuristics.
+> In InfoHub, this skill owns the full YouTube path: fetch metadata/subtitles,
+> optimize transcript text, run quality checks, and assemble the final Markdown
+> article directly into the configured `output_dir`. Do not send its output
+> through a separate generic digest pass unless the user explicitly asks for
+> reformatting or metadata repair.
 
 > [!NOTE]
 > Intentional product decisions:
@@ -28,6 +33,7 @@ Transcribe YouTube videos into formatted Markdown articles with optional bilingu
 5. Do not read large optimized files into context; use utility scripts instead
 6. Use `validate-state` and `verify-quality` JSON output for stop/go decisions
 7. Use `plan-optimization` for text-processing decisions instead of re-deriving prompt branches in the workflow
+8. Final output filenames must use `yyyy-mm-dd` for any date fragment; convert metadata `upload_date` from `yyyymmdd` before constructing `${DATE}`
 
 ---
 
@@ -61,6 +67,7 @@ last_action: got metadata
 # Rules
 - On error: STOP and report
 - Always trust state over memory
+- Final output filenames must format dates as yyyy-mm-dd
 ```
 
 ---
@@ -133,6 +140,11 @@ Quick Mode is an optional fast path inside the broader short-duration bucket. `p
    - If `resolved_mode=bilingual`, first run `prompts/structure_only.md` to `/tmp/${VIDEO_ID}_structured.txt`, then `prompts/translate_only.md` to `/tmp/${VIDEO_ID}_optimized.txt`
 
 10. Assemble final file:
+   Set `DATE` to `yyyy-mm-dd` before constructing the output filename.
+   Do not use raw `upload_date` (`yyyymmdd`) in filenames.
+   `assemble-final` also normalizes compact `yyyymmdd` date metadata in YAML
+   frontmatter when older workflow state still provides it.
+
    ```bash
    python3 <skill-root>/yt_transcript_utils.py assemble-final \
        /tmp/${VIDEO_ID}_optimized.txt \
@@ -246,6 +258,9 @@ Warnings are advisory only and should trigger manual review, not an automatic st
 ### Step 5: Assemble and Save Final File
 
 Read all metadata from state, not from memory.
+
+Set `DATE` to `yyyy-mm-dd` before constructing the output filename.
+Do not use raw `upload_date` (`yyyymmdd`) in filenames.
 
 Before assembling:
 
