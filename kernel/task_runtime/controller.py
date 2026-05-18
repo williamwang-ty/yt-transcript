@@ -1,5 +1,7 @@
 """Generic runtime-controller helpers for owned mutations and replan loops."""
 
+from __future__ import annotations
+
 from . import runtime as kernel_runtime
 
 

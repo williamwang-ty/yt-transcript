@@ -1,5 +1,7 @@
 """Machine-readable contracts and control-state builders for long-text runs."""
 
+from __future__ import annotations
+
 import random
 import time
 

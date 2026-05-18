@@ -1,5 +1,7 @@
 """Deterministic merge and chapter-plan helpers for processed chunk output."""
 
+from __future__ import annotations
+
 import json
 import math
 import sys

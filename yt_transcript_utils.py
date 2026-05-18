@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 """
-yt-transcript utility script
 Provides VTT parsing, Deepgram result processing, audio splitting, filename sanitization, etc.
 
 This module also owns the script-first workflow checkpoints:
@@ -52,6 +51,8 @@ Commands:
 Global flags:
     --api-envelope               Emit stable `yt_transcript.command_result/v1` envelopes for kernel commands
 """
+
+from __future__ import annotations
 
 import argparse
 import bisect

@@ -1,5 +1,7 @@
 """Autotune helpers for adaptive chunk sizing and token-source summaries."""
 
+from __future__ import annotations
+
 import math
 
 

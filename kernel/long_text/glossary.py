@@ -1,5 +1,7 @@
 """Glossary extraction and terminology-consistency helpers for long-text jobs."""
 
+from __future__ import annotations
+
 import json
 import re
 import time
