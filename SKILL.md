@@ -219,6 +219,8 @@ Load and follow [workflows/subtitle_download.md](workflows/subtitle_download.md)
 
 ### Step 3B: Deepgram Path
 
+Deepgram transcription defaults to `nova-3`; legacy `nova-2` / `nova-2-*` settings are upgraded to `nova-3` before requests are sent.
+
 Before entering this path:
 
 ```bash

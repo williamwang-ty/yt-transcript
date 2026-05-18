@@ -123,7 +123,8 @@ class CoreRegressionTests(unittest.TestCase):
                 'llm_base_url: "https://api.openai.com/v1"\n',
                 encoding="utf-8",
             )
-            config = utils.load_config(str(config_path))
+            with mock.patch("sys.stderr", new=io.StringIO()):
+                config = utils.load_config(str(config_path))
             self.assertTrue(config["output_dir"].endswith("Downloads #1"))
             self.assertEqual(config["deepgram_api_key"], "dg#key")
             self.assertEqual(config["llm_base_url"], "https://api.openai.com/v1")
@@ -133,18 +134,36 @@ class CoreRegressionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             config_path = Path(tmpdir) / "config.yaml"
             config_path.write_text(
-                'output_dir: "~/Downloads"\n'
-                'deepgram_model: "nova-2-meeting"\n'
+                f'output_dir: "{tmpdir}"\n'
+                'deepgram_model: "nova-3-medical"\n'
                 'deepgram_enable_utterances: true\n'
                 'deepgram_prefer_structured_output: yes\n',
                 encoding="utf-8",
             )
 
-            config = utils.load_config(str(config_path))
+            with mock.patch("sys.stderr", new=io.StringIO()):
+                config = utils.load_config(str(config_path))
 
-            self.assertEqual(config["deepgram_model"], "nova-2-meeting")
+            self.assertEqual(config["deepgram_model"], "nova-3-medical")
             self.assertTrue(config["deepgram_enable_utterances"])
             self.assertTrue(config["deepgram_prefer_structured_output"])
+
+    def test_load_config_upgrades_legacy_nova2_models_to_nova3(self):
+        """Test load config upgrades legacy Nova 2 model names to the Nova 3 default."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "config.yaml"
+            config_path.write_text(
+                f'output_dir: "{tmpdir}"\n'
+                'deepgram_model: "nova-2-meeting"\n',
+                encoding="utf-8",
+            )
+
+            with mock.patch("sys.stderr", new=io.StringIO()):
+                config = utils.load_config(str(config_path))
+
+            self.assertEqual(utils.DEFAULT_DEEPGRAM_MODEL, "nova-3")
+            self.assertEqual(config["deepgram_model"], "nova-3")
+            self.assertTrue(any("nova-2-meeting" in warning for warning in config["config_warnings"]))
 
     def test_resolve_deepgram_request_settings_defaults_to_structured_output(self):
         """Test Deepgram request settings now default to structured output."""
@@ -164,10 +183,22 @@ class CoreRegressionTests(unittest.TestCase):
         self.assertFalse(legacy_settings["utterances"])
         self.assertFalse(legacy_settings["prefer_structured_output"])
 
+    def test_resolve_deepgram_request_settings_blocks_nova2_override(self):
+        """Test direct Deepgram Nova 2 overrides are upgraded before requests are built."""
+        settings = utils._resolve_deepgram_request_settings(
+            {"deepgram_model": "nova-3"},
+            language="en",
+            model="nova-2-general",
+        )
+
+        self.assertEqual(settings["model"], "nova-3")
+        self.assertIn("nova-2-general", settings["model_warning"])
+
     def test_default_config_uses_deepseek_pro_model(self):
         """Test default LLM model favors the more stable DeepSeek pro route."""
         config = utils._default_config_values()
 
+        self.assertEqual(config["deepgram_model"], "nova-3")
         self.assertEqual(config["llm_base_url"], utils.DEFAULT_LLM_BASE_URL)
         self.assertEqual(config["llm_base_url"], "https://api.deepseek.com")
         self.assertEqual(config["llm_model"], utils.DEFAULT_LLM_MODEL)
@@ -2853,6 +2884,43 @@ work_dir: /tmp/vid001_chunks
 
             self.assertEqual(result, payload)
             self.assertEqual(mocked_call.call_count, 2)
+
+    def test_call_deepgram_api_once_upgrades_nova2_url_to_nova3(self):
+        """Test Deepgram requests never send disabled Nova 2 model names."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            audio_path = Path(tmpdir) / "sample.mp3"
+            audio_path.write_bytes(b"audio")
+            captured = {}
+
+            class FakeResponse:
+                """Minimal urlopen context manager."""
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, exc_type, exc, traceback):
+                    return False
+
+                def read(self):
+                    return b'{"ok": true}'
+
+            def fake_urlopen(req, timeout=0):
+                captured["url"] = req.full_url
+                return FakeResponse()
+
+            with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen), mock.patch(
+                "sys.stderr",
+                new=io.StringIO(),
+            ):
+                result = utils._call_deepgram_api_once(
+                    str(audio_path),
+                    api_key="key",
+                    language="en",
+                    model="nova-2-meeting",
+                )
+
+            self.assertEqual(result, {"ok": True})
+            self.assertIn("model=nova-3", captured["url"])
+            self.assertNotIn("nova-2", captured["url"])
 
     def test_chunk_segments_merges_tiny_chapter_boundary_fragment_forward(self):
         """Test chunk segments merges tiny chapter boundary fragment forward."""

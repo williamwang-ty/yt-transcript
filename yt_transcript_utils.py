@@ -375,7 +375,8 @@ DEFAULT_LLM_CHUNK_RECOVERY_BACKOFF_SEC = 1.0
 DEFAULT_YT_DLP_SOCKET_TIMEOUT_SEC = 15
 DEFAULT_YT_DLP_RETRIES = 1
 DEFAULT_YT_DLP_EXTRACTOR_RETRIES = 1
-DEFAULT_DEEPGRAM_MODEL = "nova-2"
+DEFAULT_DEEPGRAM_MODEL = "nova-3"
+DISABLED_DEEPGRAM_MODEL_PREFIXES = ("nova-2",)
 DEFAULT_DEEPGRAM_ENABLE_UTTERANCES = True
 DEFAULT_DEEPGRAM_PREFER_STRUCTURED_OUTPUT = True
 DEFAULT_DEEPGRAM_REQUEST_RETRIES = 2
@@ -432,6 +433,28 @@ def _normalize_chunk_mode(value) -> str:
     if text in {"tokens", "chars"}:
         return text
     return DEFAULT_CHUNK_MODE
+
+
+def _is_disabled_deepgram_model(model: str = "") -> bool:
+    """Return whether a Deepgram model is disabled for this workflow."""
+    normalized = str(model or "").strip().lower().replace("_", "-")
+    return any(
+        normalized == prefix or normalized.startswith(f"{prefix}-")
+        for prefix in DISABLED_DEEPGRAM_MODEL_PREFIXES
+    )
+
+
+def _resolve_deepgram_model(model: str = "") -> tuple[str, str]:
+    """Resolve the Deepgram model, upgrading disabled Nova 2 variants to Nova 3."""
+    requested = str(model or "").strip()
+    if not requested:
+        return DEFAULT_DEEPGRAM_MODEL, ""
+    if _is_disabled_deepgram_model(requested):
+        return (
+            DEFAULT_DEEPGRAM_MODEL,
+            f"deepgram_model={requested!r} is disabled for this skill; using {DEFAULT_DEEPGRAM_MODEL}",
+        )
+    return requested, ""
 
 
 def _default_config_values(config_path: str = "") -> dict:
@@ -3292,7 +3315,7 @@ def test_deepgram_api(api_key: str) -> dict:
     import urllib.request
     import urllib.error
     
-    url = "https://api.deepgram.com/v1/listen?model=nova-2&language=en"
+    url = f"https://api.deepgram.com/v1/listen?model={urllib.parse.quote(DEFAULT_DEEPGRAM_MODEL)}&language=en"
     headers = {
         "Authorization": f"Token {api_key}",
         "Content-Type": "audio/wav"
@@ -4934,7 +4957,9 @@ def _resolve_deepgram_request_settings(config: dict | None = None, *, language: 
                                        prefer_structured_output: bool | None = None) -> dict:
     """Resolve Deepgram request and transcript strategy settings."""
     config = config or {}
-    request_model = str(model or config.get("deepgram_model", DEFAULT_DEEPGRAM_MODEL) or "").strip() or DEFAULT_DEEPGRAM_MODEL
+    request_model, model_warning = _resolve_deepgram_model(
+        model or config.get("deepgram_model", DEFAULT_DEEPGRAM_MODEL),
+    )
 
     if enable_utterances is None:
         utterances_enabled = _parse_bool(
@@ -4952,7 +4977,7 @@ def _resolve_deepgram_request_settings(config: dict | None = None, *, language: 
     else:
         structured_output_enabled = bool(prefer_structured_output)
 
-    return {
+    settings = {
         "model": request_model,
         "language": language,
         "diarize": True,
@@ -4962,6 +4987,9 @@ def _resolve_deepgram_request_settings(config: dict | None = None, *, language: 
         "utterances": utterances_enabled,
         "prefer_structured_output": structured_output_enabled,
     }
+    if model_warning:
+        settings["model_warning"] = model_warning
+    return settings
 
 
 def _call_deepgram_api_once(audio_path: str, api_key: str, language: str,
@@ -4975,8 +5003,12 @@ def _call_deepgram_api_once(audio_path: str, api_key: str, language: str,
         print(f"Error: Audio file not found: {audio_path}", file=sys.stderr)
         sys.exit(1)
 
+    request_model, model_warning = _resolve_deepgram_model(model)
+    if model_warning:
+        print(f"Warning: {model_warning}", file=sys.stderr)
+
     params = (
-        f"model={urllib.parse.quote(str(model or DEFAULT_DEEPGRAM_MODEL))}&language={urllib.parse.quote(str(language or ''))}"
+        f"model={urllib.parse.quote(request_model)}&language={urllib.parse.quote(str(language or ''))}"
         "&diarize=true&punctuate=true&paragraphs=true&smart_format=true"
     )
     if enable_utterances:
@@ -5241,6 +5273,8 @@ def transcribe_deepgram(audio_path: str, language: str, config_path: str = None,
     total_timed_sentence_count = 0
     total_word_count = 0
     total_utterance_count = 0
+    if request_settings.get("model_warning"):
+        warnings.append(str(request_settings["model_warning"]))
 
     for idx, chunk_path in enumerate(chunk_paths):
         chunk_json_path = _deepgram_chunk_json_path(output_json, len(chunk_paths), idx)
@@ -7225,6 +7259,7 @@ def load_config(config_path: str = None, allow_missing: bool = False) -> dict:
                 config[key] = value
 
     config_warnings = []
+    config_issue_warnings = []
 
     def parse_int_field(key: str, default: int, minimum: int | None = None, maximum: int | None = None) -> int:
         """Parse an integer config field with warnings and range enforcement."""
@@ -7274,7 +7309,12 @@ def load_config(config_path: str = None, allow_missing: bool = False) -> dict:
         if not os.path.isdir(output_dir):
             print(f"Warning: output_dir does not exist: {output_dir}", file=sys.stderr)
 
-    deepgram_model = str(config.get('deepgram_model', DEFAULT_DEEPGRAM_MODEL) or '').strip() or DEFAULT_DEEPGRAM_MODEL
+    deepgram_model, deepgram_model_warning = _resolve_deepgram_model(
+        config.get('deepgram_model', DEFAULT_DEEPGRAM_MODEL),
+    )
+    if deepgram_model_warning:
+        config_warnings.append(deepgram_model_warning)
+        config_issue_warnings.append(deepgram_model_warning)
     deepgram_enable_utterances = _parse_bool(
         config.get('deepgram_enable_utterances', DEFAULT_DEEPGRAM_ENABLE_UTTERANCES),
         DEFAULT_DEEPGRAM_ENABLE_UTTERANCES,
@@ -7480,9 +7520,15 @@ def load_config(config_path: str = None, allow_missing: bool = False) -> dict:
         "config_warnings": config_warnings,
     })
     if config_warnings:
-        print(f"Warning: Invalid numeric config values in {path}:", file=sys.stderr)
-        for warning in config_warnings:
+        numeric_warnings = [warning for warning in config_warnings if warning not in config_issue_warnings]
+        if numeric_warnings:
+            print(f"Warning: Invalid numeric config values in {path}:", file=sys.stderr)
+        for warning in numeric_warnings:
             print(f"  - {warning}", file=sys.stderr)
+        if config_issue_warnings:
+            print(f"Warning: Config issues in {path}:", file=sys.stderr)
+            for warning in config_issue_warnings:
+                print(f"  - {warning}", file=sys.stderr)
     return parsed
 
 
@@ -7553,7 +7599,8 @@ def main():
     tdg_parser.add_argument('--output-json', default='', help='Optional JSON output path; split mode also writes sibling chunk payload files')
     tdg_parser.add_argument('--output-text', default='', help='Optional path to write merged transcript text')
     tdg_parser.add_argument('--output-segments', default='', help='Optional path to write aligned source segments JSON')
-    tdg_parser.add_argument('--model', default='', help='Optional Deepgram model override')
+    tdg_parser.add_argument('--model', default='',
+                            help='Optional Deepgram model override; nova-2 variants are upgraded to nova-3')
     tdg_parser.add_argument('--resume-existing-chunks', action='store_true',
                             help='Reuse existing sibling *_chunk_XXX.json payloads when resuming a split Deepgram run')
     tdg_parser.set_defaults(enable_utterances_override=None, prefer_structured_output_override=None)

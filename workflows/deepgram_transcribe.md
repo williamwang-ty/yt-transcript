@@ -68,7 +68,7 @@ python3 <skill-root>/yt_transcript_utils.py transcribe-deepgram \
     > /tmp/${VIDEO_ID}_deepgram_result.json
 ```
 
-This now defaults to utterance-first / structured transcript assembly. When you need a parity check against the older flat path, callers may explicitly opt out with:
+This now defaults to Deepgram `nova-3` plus utterance-first / structured transcript assembly. Legacy `nova-2` / `nova-2-*` model settings are upgraded to `nova-3` before any request is sent. When you need a parity check against the older flat path, callers may explicitly opt out with:
 
 ```bash
 python3 <skill-root>/yt_transcript_utils.py transcribe-deepgram \

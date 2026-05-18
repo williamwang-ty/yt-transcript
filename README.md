@@ -15,7 +15,7 @@ Start here:
 ### ✨ Features
 
 - 🎯 **Smart Subtitle Fetching**: Prioritizes YouTube official/auto-generated subtitles
-- 🎙️ **Speech-to-Text**: Auto-transcribes via Deepgram Nova-2 when no subtitles available
+- 🎙️ **Speech-to-Text**: Auto-transcribes via Deepgram Nova-3 when no subtitles available
 - 👥 **Multi-speaker Recognition**: Automatically distinguishes different speakers
 - 🌐 **Bilingual Support**: Auto-translate and side-by-side formatting
 - 🤖 **AI Enhancement**: Auto punctuation, paragraph splitting, error correction
@@ -49,7 +49,7 @@ pip install yt-dlp
 2. Edit `config.yaml` with your settings:
    ```yaml
    deepgram_api_key: "your_api_key_here"
-   deepgram_model: "nova-2"
+   deepgram_model: "nova-3"
    deepgram_enable_utterances: true
    deepgram_prefer_structured_output: true
    output_dir: "~/Downloads"
@@ -116,6 +116,7 @@ pip install yt-dlp
 
    > **Note**:
    > - `deepgram_api_key` is only required when the video has no usable subtitles and audio transcription is needed.
+   > - Deepgram transcription defaults to `nova-3`. Legacy `nova-2` / `nova-2-*` settings are automatically upgraded to `nova-3` before any request is sent.
    > - `deepgram_enable_utterances` and `deepgram_prefer_structured_output` now default to `true`; set either to `false` only when you need to compare against the legacy flat-transcript path.
    > - Deepgram requests now use bounded automatic retries for transient timeout/network failures before surfacing an error.
    > - LLM API config is only needed for long video chunk processing, or when bilingual translation is required.
@@ -315,6 +316,7 @@ Current policy is intentional and explicit:
 - `chunk-document` is now the canonical long-video chunking entrypoint when `normalized_document.json` exists; it follows `preferred_chunk_source` instead of blindly preferring timed segments, so Chinese YouTube-subtitle long paths now chunk from cleaned `text` while still retaining `segments` for timing metadata
 - `chunk-text` force-splits very long unpunctuated passages to stay within downstream LLM chunk budgets
 - `download.sh metadata` now prefers a single `yt-dlp -J` fetch when available, and subtitle/audio modes reuse metadata-derived video IDs before falling back to extra probes
+- `transcribe-deepgram` defaults to Deepgram `nova-3`; legacy `nova-2` / `nova-2-*` model settings are upgraded to `nova-3` at runtime
 - `transcribe-deepgram --output-segments` can emit time-aligned segments for downstream timed chunking + YouTube chapter mapping
 - `transcribe-deepgram` now defaults to utterance-first transcript assembly; `--disable-utterances --legacy-flat-output` remains available for compatibility/debugging checks
 - `transcribe-deepgram` now also reports lightweight observability fields such as paragraph/sentence/word counts, per-chunk transcript metadata, and fallback warnings in its result JSON
@@ -435,7 +437,7 @@ MIT License
 ### ✨ 功能特点
 
 - 🎯 **智能字幕获取**：优先使用 YouTube 官方/自动字幕
-- 🎙️ **语音转录**：无字幕时自动使用 Deepgram Nova-2 转录
+- 🎙️ **语音转录**：无字幕时自动使用 Deepgram Nova-3 转录
 - 👥 **多说话者识别**：自动区分不同讲者
 - 🌐 **中英双语支持**：自动翻译并对照排版
 - 🤖 **AI 智能优化**：自动添加标点、分段、纠错
@@ -469,7 +471,7 @@ pip install yt-dlp
 2. 编辑 `config.yaml`，填入你的配置：
    ```yaml
    deepgram_api_key: "your_api_key_here"
-   deepgram_model: "nova-2"
+   deepgram_model: "nova-3"
    deepgram_enable_utterances: true
    deepgram_prefer_structured_output: true
    output_dir: "~/Downloads"
@@ -491,6 +493,7 @@ pip install yt-dlp
 
    > **注意**：
    > - `deepgram_api_key` 仅在没有可用字幕、需要音频转录时才必需。
+   > - Deepgram 转录默认使用 `nova-3`。旧版 `nova-2` / `nova-2-*` 配置会在发起请求前自动提升为 `nova-3`。
    > - `deepgram_enable_utterances` 和 `deepgram_prefer_structured_output` 现在默认都是 `true`；只有在需要和旧的 flat transcript 路径做对照排查时，才建议改成 `false`。
    > - LLM API 配置仅用于长视频 chunk 处理，或需要双语翻译时。
    > - `llm_base_url` 可以填写服务根地址或带 `/v1` 的地址，工具会自动归一化。
@@ -676,6 +679,7 @@ bash scripts/preflight.sh --require-llm
 - `chunk-document` 现在是 `normalized_document.json` 已存在时的规范长视频分块入口；它会遵循 `preferred_chunk_source`，而不是在有 timed segments 时一律偏向 `segments`；因此中文字幕长路径现在会优先使用清洗后的 `text` 做正文分块，同时保留 `segments` 供时间轴 / 章节映射使用
 - `chunk-text` 会对超长且缺少标点的段落做强制切分，并在提供 `--prompt` 时默认启用 token-aware 规划
 - `download.sh metadata` 现在会优先走单次 `yt-dlp -J` 获取；字幕/音频模式也会先复用 metadata 里的 video id，再回退到额外探测
+- `transcribe-deepgram` 默认使用 Deepgram `nova-3`；旧版 `nova-2` / `nova-2-*` 模型配置会在运行时提升为 `nova-3`
 - `transcribe-deepgram --output-segments` 可选输出带时间戳的对齐 segments，用于后续 timed chunk 与 YouTube 章节映射
 - `transcribe-deepgram` 现在默认就是 utterance-first 组装；仍保留 `--disable-utterances --legacy-flat-output` 作为兼容/排障回退
 - `transcribe-deepgram` 现在还会在结果 JSON 中输出轻量可观测字段，例如 paragraph/sentence/word 计数、逐 chunk 的 transcript 元数据，以及 structured-output 回退 warning
