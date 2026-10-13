@@ -6952,6 +6952,7 @@ def find_unfinished_runs(tmp_dir: str = "/tmp", video_id: str = "") -> dict:
         sys.exit(2)
     base = Path(tmp_dir).expanduser()
     pattern = f"{video_id}_state.md" if video_id else "*_state.md"
+    skill_root = _skill_root()
     unfinished = []
     completed = []
     for state_path in sorted(base.glob(pattern)):
@@ -6962,7 +6963,10 @@ def find_unfinished_runs(tmp_dir: str = "/tmp", video_id: str = "") -> dict:
         except Exception as e:
             unfinished.append({"state_path": str(state_path), "error": f"Cannot read state file: {e}"})
             continue
-        vid = state.get("vid", "") or state_path.name[:-len("_state.md")]
+        vid = state.get("vid", "")
+        if not vid:
+            # Other tools also leave *_state.md files in /tmp; only workflow states record a vid.
+            continue
         work_dir = state.get("work_dir", "") or f"{base}/{vid}_chunks"
         chunks = _summarize_chunk_manifest(work_dir)
         entry = {
@@ -6977,12 +6981,13 @@ def find_unfinished_runs(tmp_dir: str = "/tmp", video_id: str = "") -> dict:
             "chunks": chunks,
         }
         if _state_output_file_exists(state):
-            entry["next_action"] = f"bash scripts/cleanup.sh {vid}"
+            entry["next_action"] = f"bash {skill_root}/scripts/cleanup.sh {vid}"
             completed.append(entry)
             continue
         if chunks["has_manifest"] and chunks["total_chunks"] and chunks["done_chunks"] < chunks["total_chunks"]:
             entry["resume_from_step"] = 4
-            entry["next_action"] = f"python3 yt_transcript_utils.py prepare-resume {work_dir}, then continue Step 4"
+            entry["next_action"] = (f"python3 {skill_root}/yt_transcript_utils.py prepare-resume {work_dir}, "
+                                    "then continue Step 4")
         elif chunks["has_manifest"] and chunks["total_chunks"]:
             entry["resume_from_step"] = 4
             entry["next_action"] = "All chunks are done; merge them, then continue with verify-quality and Step 5"

@@ -192,7 +192,7 @@ Before creating the state file, check for an interrupted earlier run of the same
 python3 <skill-root>/yt_transcript_utils.py find-unfinished --video-id "$VIDEO_ID"
 ```
 
-If `unfinished` is non-empty, reuse its state file instead of creating a new one and continue from `resume_from_step` as described by `next_action` (for chunked runs this is `prepare-resume` on the existing `work_dir`, so finished chunks are not reprocessed). Start fresh only when the user asks; then discard the old run with `cleanup.sh "$VIDEO_ID" --force` first. When the user asks what was left unfinished, run `find-unfinished` without `--video-id` to list every interrupted run.
+If `unfinished` is non-empty, reuse its state file instead of creating a new one and continue from `resume_from_step` as described by `next_action` (for chunked runs this is `prepare-resume` on the existing `work_dir`, so finished chunks are not reprocessed). Start fresh only when the user asks; then discard the old run with `cleanup.sh "$VIDEO_ID" --force` first. If the video only appears under `completed`, an earlier run finished without cleanup: run `cleanup.sh "$VIDEO_ID"` before starting, so its old work files are not mixed into the new run. When the user asks what was left unfinished, run `find-unfinished` without `--video-id` to list every interrupted run.
 
 Otherwise, create the state file immediately with:
 

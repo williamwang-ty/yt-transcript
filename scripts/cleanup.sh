@@ -45,6 +45,8 @@ for arg in "$@"; do
     esac
 done
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 STATE_FILE="/tmp/${VIDEO_ID}_state.md"
 MACHINE_STATE_FILE="/tmp/${VIDEO_ID}_machine_state.json"
 KEEP_DIR=""
@@ -69,8 +71,8 @@ has_resumable_artifacts() {
 if [ "$FORCE" != true ] && ! run_is_complete && has_resumable_artifacts; then
     echo "⏸️  Run for $VIDEO_ID is not finished (no final output_file recorded in $STATE_FILE)." >&2
     echo "   Keeping state and work files so the run can be resumed." >&2
-    echo "   Inspect: python3 yt_transcript_utils.py find-unfinished --video-id $VIDEO_ID" >&2
-    echo "   Discard anyway: bash scripts/cleanup.sh $VIDEO_ID --force" >&2
+    echo "   Inspect: python3 $ROOT_DIR/yt_transcript_utils.py find-unfinished --video-id $VIDEO_ID" >&2
+    echo "   Discard anyway: bash $SCRIPT_DIR/cleanup.sh $VIDEO_ID --force" >&2
     exit 3
 fi
 

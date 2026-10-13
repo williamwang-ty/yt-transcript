@@ -130,6 +130,7 @@ class WorkflowRegressionTests(unittest.TestCase):
                 encoding="utf-8",
             )
             (tmp / "early1_state.md").write_text("vid: early1\nstep: 2\noutput_file:\n", encoding="utf-8")
+            (tmp / "othertool_state.md").write_text("unrelated: true\n", encoding="utf-8")
 
             result = utils.find_unfinished_runs(str(tmp))
             self.assertTrue(result["has_unfinished"])
@@ -139,7 +140,7 @@ class WorkflowRegressionTests(unittest.TestCase):
             self.assertEqual(unfinished["mid1"]["chunks"]["total_chunks"], 3)
             self.assertEqual(unfinished["mid1"]["chunks"]["done_chunks"], 1)
             self.assertEqual(unfinished["mid1"]["resume_from_step"], 4)
-            self.assertIn("prepare-resume", unfinished["mid1"]["next_action"])
+            self.assertIn(f"{PROJECT_ROOT}/yt_transcript_utils.py prepare-resume", unfinished["mid1"]["next_action"])
             self.assertEqual(unfinished["early1"]["resume_from_step"], 2)
 
             only = utils.find_unfinished_runs(str(tmp), video_id="early1")
