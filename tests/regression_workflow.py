@@ -6,15 +6,79 @@ from tests._support import *
 class WorkflowRegressionTests(unittest.TestCase):
     """Regression coverage for workflow state, normalization, and planning paths."""
     def test_cleanup_script_removes_state_by_default(self):
-        """Test cleanup script removes state by default."""
+        """Test cleanup script removes state by default once the run is complete."""
         video_id = "cleanup_state_test"
         state_file = Path(f"/tmp/{video_id}_state.md")
         machine_state_file = Path(f"/tmp/{video_id}_machine_state.json")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_file = Path(tmpdir) / "2026-01-01. Done.md"
+            output_file.write_text("final", encoding="utf-8")
+            try:
+                state_file.write_text(f"vid: {video_id}\noutput_file: {output_file}\n", encoding="utf-8")
+                machine_state_file.write_text("{}", encoding="utf-8")
+                subprocess.run(
+                    ["bash", str(PROJECT_ROOT / "scripts/cleanup.sh"), video_id],
+                    cwd=PROJECT_ROOT,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertFalse(state_file.exists())
+                self.assertFalse(machine_state_file.exists())
+                self.assertTrue(output_file.exists())
+            finally:
+                state_file.unlink(missing_ok=True)
+                machine_state_file.unlink(missing_ok=True)
+
+    def test_cleanup_script_can_keep_state(self):
+        """Test cleanup script can keep state."""
+        video_id = "cleanup_keep_state_test"
+        state_file = Path(f"/tmp/{video_id}_state.md")
+        machine_state_file = Path(f"/tmp/{video_id}_machine_state.json")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_file = Path(tmpdir) / "2026-01-01. Done.md"
+            output_file.write_text("final", encoding="utf-8")
+            try:
+                state_file.write_text(f"vid: {video_id}\noutput_file: {output_file}\n", encoding="utf-8")
+                machine_state_file.write_text("{}", encoding="utf-8")
+                subprocess.run(
+                    ["bash", str(PROJECT_ROOT / "scripts/cleanup.sh"), video_id, "--keep-state"],
+                    cwd=PROJECT_ROOT,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertTrue(state_file.exists())
+                self.assertTrue(machine_state_file.exists())
+            finally:
+                state_file.unlink(missing_ok=True)
+                machine_state_file.unlink(missing_ok=True)
+
+    def test_cleanup_script_keeps_unfinished_run(self):
+        """Test cleanup script refuses to delete state and chunks of an unfinished run."""
+        video_id = "cleanup_unfinished_test"
+        state_file = Path(f"/tmp/{video_id}_state.md")
+        machine_state_file = Path(f"/tmp/{video_id}_machine_state.json")
+        work_dir = Path(f"/tmp/{video_id}_chunks")
         try:
-            state_file.write_text("state", encoding="utf-8")
+            state_file.write_text(f"vid: {video_id}\noutput_file:\nstep: 4\n", encoding="utf-8")
             machine_state_file.write_text("{}", encoding="utf-8")
-            subprocess.run(
+            work_dir.mkdir(exist_ok=True)
+            (work_dir / "manifest.json").write_text('{"chunks": []}', encoding="utf-8")
+            result = subprocess.run(
                 ["bash", str(PROJECT_ROOT / "scripts/cleanup.sh"), video_id],
+                cwd=PROJECT_ROOT,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(result.returncode, 3)
+            self.assertIn("not finished", result.stderr)
+            self.assertTrue(state_file.exists())
+            self.assertTrue(machine_state_file.exists())
+            self.assertTrue((work_dir / "manifest.json").exists())
+
+            subprocess.run(
+                ["bash", str(PROJECT_ROOT / "scripts/cleanup.sh"), video_id, "--force"],
                 cwd=PROJECT_ROOT,
                 check=True,
                 capture_output=True,
@@ -22,30 +86,64 @@ class WorkflowRegressionTests(unittest.TestCase):
             )
             self.assertFalse(state_file.exists())
             self.assertFalse(machine_state_file.exists())
+            self.assertFalse(work_dir.exists())
         finally:
             state_file.unlink(missing_ok=True)
             machine_state_file.unlink(missing_ok=True)
+            shutil.rmtree(work_dir, ignore_errors=True)
 
-    def test_cleanup_script_can_keep_state(self):
-        """Test cleanup script can keep state."""
-        video_id = "cleanup_keep_state_test"
-        state_file = Path(f"/tmp/{video_id}_state.md")
-        machine_state_file = Path(f"/tmp/{video_id}_machine_state.json")
+    def test_cleanup_script_cleans_downloads_without_state(self):
+        """Test cleanup script still clears plain temp files when nothing is resumable."""
+        video_id = "cleanup_no_state_test"
+        raw_text = Path(f"/tmp/{video_id}_raw_text.txt")
         try:
-            state_file.write_text("state", encoding="utf-8")
-            machine_state_file.write_text("{}", encoding="utf-8")
+            raw_text.write_text("raw", encoding="utf-8")
             subprocess.run(
-                ["bash", str(PROJECT_ROOT / "scripts/cleanup.sh"), video_id, "--keep-state"],
+                ["bash", str(PROJECT_ROOT / "scripts/cleanup.sh"), video_id],
                 cwd=PROJECT_ROOT,
                 check=True,
                 capture_output=True,
                 text=True,
             )
-            self.assertTrue(state_file.exists())
-            self.assertTrue(machine_state_file.exists())
+            self.assertFalse(raw_text.exists())
         finally:
-            state_file.unlink(missing_ok=True)
-            machine_state_file.unlink(missing_ok=True)
+            raw_text.unlink(missing_ok=True)
+
+    def test_find_unfinished_reports_chunk_progress_and_completed_runs(self):
+        """Test find-unfinished separates interrupted runs from completed ones."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            output_file = tmp / "2026-01-01. Done.md"
+            output_file.write_text("final", encoding="utf-8")
+            (tmp / "done1_state.md").write_text(f"vid: done1\noutput_file: {output_file}\n", encoding="utf-8")
+
+            work_dir = tmp / "mid1_chunks"
+            work_dir.mkdir()
+            (work_dir / "manifest.json").write_text(json.dumps({"chunks": [
+                {"id": 0, "status": "done"},
+                {"id": 1, "status": "interrupted"},
+                {"id": 2, "status": "pending"},
+                {"id": 3, "status": "superseded"},
+            ]}), encoding="utf-8")
+            (tmp / "mid1_state.md").write_text(
+                f"vid: mid1\nurl: https://youtu.be/mid1\nstep: 4\noutput_file:\nwork_dir: {work_dir}\n",
+                encoding="utf-8",
+            )
+            (tmp / "early1_state.md").write_text("vid: early1\nstep: 2\noutput_file:\n", encoding="utf-8")
+
+            result = utils.find_unfinished_runs(str(tmp))
+            self.assertTrue(result["has_unfinished"])
+            self.assertEqual([entry["vid"] for entry in result["completed"]], ["done1"])
+            unfinished = {entry["vid"]: entry for entry in result["unfinished"]}
+            self.assertEqual(set(unfinished), {"mid1", "early1"})
+            self.assertEqual(unfinished["mid1"]["chunks"]["total_chunks"], 3)
+            self.assertEqual(unfinished["mid1"]["chunks"]["done_chunks"], 1)
+            self.assertEqual(unfinished["mid1"]["resume_from_step"], 4)
+            self.assertIn("prepare-resume", unfinished["mid1"]["next_action"])
+            self.assertEqual(unfinished["early1"]["resume_from_step"], 2)
+
+            only = utils.find_unfinished_runs(str(tmp), video_id="early1")
+            self.assertEqual([entry["vid"] for entry in only["unfinished"]], ["early1"])
 
     def test_cleanup_script_rejects_unsafe_video_id(self):
         """Test cleanup script rejects unsafe video id."""
