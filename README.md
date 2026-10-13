@@ -300,6 +300,10 @@ For long-video chunking, `plan-optimization` now also emits a canonical `chunkin
 
 The current design also has explicit resume semantics: `prepare-resume` repairs stale manifest state manually, while `process-chunks` runs the same repair step automatically before execution continues.
 
+Unfinished runs keep their files: `scripts/cleanup.sh` only cleans once the state file records an `output_file` that exists, and otherwise exits with code `3` without deleting anything (`--force` discards the run on purpose). `python3 yt_transcript_utils.py find-unfinished [--video-id ID]` lists interrupted runs with their step, chunk progress and the next action to resume them.
+
+Known limitation: all state and work files live under `/tmp`, which macOS empties on restart (many Linux systems do too). Resume therefore only works within the same boot; after a reboot an interrupted run starts over. Interrupted runs also keep their downloaded audio in `/tmp` until they finish or are discarded with `cleanup.sh <VIDEO_ID> --force`, which can take hundreds of MB. Moving the work directory to a persistent location (for example `~/.cache/yt-transcript`) is deferred for now.
+
 Current policy is intentional and explicit:
 
 - `raw_path` chunk stages use `process-chunks --auto-replan`
@@ -662,6 +666,10 @@ bash scripts/preflight.sh --require-llm
 对于长视频分块，`plan-optimization` 现在还会输出显式的 `chunking` 契约；一旦 normalization 已存在，优先使用 `chunk-document`，并把 chunk 边界 / continuity 假设显式记录到 `manifest.json`。
 
 当前设计还包含显式的 resume 语义：`prepare-resume` 用于手动修复 stale manifest，而 `process-chunks` 在继续执行前会自动做同样的修复。
+
+未完成的任务会保留文件：只有当 state 记录的 `output_file` 确实存在时，`scripts/cleanup.sh` 才会清理，否则以退出码 `3` 结束且不删除任何东西（`--force` 用于明确放弃该任务）。`python3 yt_transcript_utils.py find-unfinished [--video-id ID]` 会列出中断的任务、所在步骤、分块进度以及续跑的下一步。
+
+已知限制：所有 state 和中间文件都放在 `/tmp` 下，macOS 重启时会清空 `/tmp`（不少 Linux 系统也是如此）。因此续跑只在同一次开机内有效，重启后中断的任务需要从头开始。中断的任务还会把已下载的音频一直留在 `/tmp`，直到任务完成或用 `cleanup.sh <VIDEO_ID> --force` 放弃，可能占用几百 MB。把工作目录迁到持久位置（例如 `~/.cache/yt-transcript`）暂时搁置。
 
 当前约定是明确固定的：
 

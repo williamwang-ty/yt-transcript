@@ -34,6 +34,7 @@ Transcribe YouTube videos into formatted Markdown articles with optional bilingu
 6. Use `validate-state` and `verify-quality` JSON output for stop/go decisions
 7. Use `plan-optimization` for text-processing decisions instead of re-deriving prompt branches in the workflow
 8. Final output filenames must use `yyyy-mm-dd` for any date fragment; convert metadata `upload_date` from `yyyymmdd` before constructing `${DATE}`
+9. Never delete state or work files of an unfinished run; `cleanup.sh` refuses (exit code `3`) until `output_file` exists, and `--force` is only for an explicit user request to discard the run
 
 ---
 
@@ -65,7 +66,7 @@ total: 0
 last_action: got metadata
 
 # Rules
-- On error: STOP and report
+- On error: STOP and report; do not run cleanup.sh
 - Always trust state over memory
 - Final output filenames must format dates as yyyy-mm-dd
 ```
@@ -101,7 +102,7 @@ Quick Mode is an optional fast path inside the broader short-duration bucket. `p
    ```
    Record `output_dir`.
 
-4. Create state file using the schema above.
+4. Run `find-unfinished --video-id "$VIDEO_ID"` (see Step 1 of the Full Workflow); resume an unfinished run instead of starting over. Otherwise create the state file using the schema above.
 
 5. Inspect subtitles:
    ```bash
@@ -159,6 +160,8 @@ Quick Mode is an optional fast path inside the broader short-duration bucket. `p
    ```
    Add `--bilingual` if `resolved_mode=bilingual`.
 
+   Write `output_file` to state; cleanup refuses to run until it points at the assembled file.
+
 11. Cleanup:
    ```bash
    bash <skill-root>/scripts/cleanup.sh "$VIDEO_ID"
@@ -183,7 +186,15 @@ META_JSON=$(bash <skill-root>/scripts/download.sh "$VIDEO_URL" metadata)
 CONFIG_JSON=$(python3 <skill-root>/yt_transcript_utils.py load-config)
 ```
 
-Create the state file immediately with:
+Before creating the state file, check for an interrupted earlier run of the same video:
+
+```bash
+python3 <skill-root>/yt_transcript_utils.py find-unfinished --video-id "$VIDEO_ID"
+```
+
+If `unfinished` is non-empty, reuse its state file instead of creating a new one and continue from `resume_from_step` as described by `next_action` (for chunked runs this is `prepare-resume` on the existing `work_dir`, so finished chunks are not reprocessed). Start fresh only when the user asks; then discard the old run with `cleanup.sh "$VIDEO_ID" --force` first. If the video only appears under `completed`, an earlier run finished without cleanup: run `cleanup.sh "$VIDEO_ID"` before starting, so its old work files are not mixed into the new run. When the user asks what was left unfinished, run `find-unfinished` without `--video-id` to list every interrupted run.
+
+Otherwise, create the state file immediately with:
 
 - `vid`
 - `url`
@@ -302,6 +313,7 @@ bash <skill-root>/scripts/cleanup.sh "$VIDEO_ID"
 ```
 
 No separate `rm` is needed; the cleanup script removes the state file by default.
+Cleanup only proceeds after Step 5 wrote `output_file` to state and that file exists. If it exits with code `3`, the run is unfinished: go back and finish it instead of forcing cleanup.
 
 ### Step 7: Report Success
 
@@ -322,13 +334,14 @@ Return:
 When processing multiple URLs:
 
 1. Process serially
-2. Complete cleanup between videos
+2. Complete cleanup between videos; a video that failed keeps its state for a later resume and is reported as unfinished
 3. Track results in a table
 
 ---
 
 ## Error Handling Policy
 
+- Any failure below leaves state and work files in place; resume later via `find-unfinished`
 - `yt-dlp` failure: stop and report
 - Deepgram failure: stop and ask whether to retry
 - Missing state fields: stop and repair state before continuing
@@ -349,3 +362,5 @@ When processing multiple URLs:
 | `verify-quality` returns non-empty `hard_failures` | Hard structural gate failed | Do not assemble final output; fix the optimization step |
 | `verify-quality` returns only `warnings` | Soft quality concern | Review the warnings, then decide whether to proceed |
 | State file is missing or fields are empty | Interrupted run or incomplete manual recovery | Rebuild the state from metadata/config before resuming |
+| `cleanup.sh` exits with code `3` | Run is not finished (no existing `output_file` in state) | Run `find-unfinished --video-id "$VIDEO_ID"` and resume; use `--force` only if the user wants to discard the run |
+| `find-unfinished` no longer lists a run that was interrupted earlier | State and work files live under `/tmp`, which is emptied on restart, so resume only survives within the same boot | Tell the user the run must start over; this is a known limitation, not a bug |

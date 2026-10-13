@@ -46,6 +46,7 @@ Commands:
     sync-state <state_ref>         Sync legacy state.md and authoritative machine_state.json
     normalize-document <state_ref> Materialize normalized_document.json from raw text or segments
     validate-state <state_path>    Validate workflow state fields for a given stage
+    find-unfinished                List interrupted runs whose state and work files are kept for resume
     plan-optimization <state_path> Generate a structured optimization plan from workflow state
 
 Global flags:
@@ -6904,6 +6905,108 @@ def validate_state(state_path: str, stage: str = "", require: list[str] | None =
     }
 
 
+def _state_output_file_exists(state: dict) -> bool:
+    """Return whether the state records an assembled final output that exists on disk."""
+    output_file = str(state.get("output_file", "") or "").strip()
+    if not output_file or output_file.lower() == "unknown":
+        return False
+    return Path(output_file).expanduser().is_file()
+
+
+def _summarize_chunk_manifest(work_dir: str) -> dict:
+    """Summarize chunk progress from a work_dir manifest without mutating it."""
+    manifest_path = Path(str(work_dir or "").strip()) / "manifest.json" if str(work_dir or "").strip() else None
+    summary = {"manifest_path": str(manifest_path) if manifest_path else "", "has_manifest": False,
+               "total_chunks": 0, "done_chunks": 0, "status_counts": {}}
+    if not manifest_path or not manifest_path.is_file():
+        return summary
+    summary["has_manifest"] = True
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except Exception as e:
+        summary["error"] = f"Cannot read manifest: {e}"
+        return summary
+    chunks = manifest.get("chunks", []) if isinstance(manifest, dict) else []
+    active_chunks = [chunk for chunk in chunks if isinstance(chunk, dict)
+                     and chunk.get("status") != SUPERSEDED_CHUNK_STATUS]
+    status_counts = {}
+    for chunk in active_chunks:
+        status = str(chunk.get("status", "pending")).strip() or "pending"
+        status_counts[status] = status_counts.get(status, 0) + 1
+    summary["total_chunks"] = len(active_chunks)
+    summary["done_chunks"] = status_counts.get("done", 0)
+    summary["status_counts"] = status_counts
+    return summary
+
+
+def find_unfinished_runs(tmp_dir: str = "/tmp", video_id: str = "") -> dict:
+    """
+    Scan workflow state files and report runs that never produced their final output.
+
+    A run is complete only when its state records `output_file` and that file
+    exists. Everything else is unfinished and keeps its temp artifacts so it can
+    be inspected and resumed. Read-only: no state or manifest is rewritten.
+    """
+    if video_id and not re.fullmatch(r"[A-Za-z0-9_-]+", video_id):
+        print(f"Error: VIDEO_ID contains unsafe characters: {video_id}", file=sys.stderr)
+        sys.exit(2)
+    base = Path(tmp_dir).expanduser()
+    pattern = f"{video_id}_state.md" if video_id else "*_state.md"
+    skill_root = _skill_root()
+    unfinished = []
+    completed = []
+    for state_path in sorted(base.glob(pattern)):
+        if not state_path.is_file():
+            continue
+        try:
+            state = _parse_legacy_state_content(state_path.read_text(encoding="utf-8"))
+        except Exception as e:
+            unfinished.append({"state_path": str(state_path), "error": f"Cannot read state file: {e}"})
+            continue
+        vid = state.get("vid", "")
+        if not vid:
+            # Other tools also leave *_state.md files in /tmp; only workflow states record a vid.
+            continue
+        work_dir = state.get("work_dir", "") or f"{base}/{vid}_chunks"
+        chunks = _summarize_chunk_manifest(work_dir)
+        entry = {
+            "vid": vid,
+            "url": state.get("url", ""),
+            "title": state.get("title", ""),
+            "state_path": str(state_path),
+            "step": state.get("step", ""),
+            "last_action": state.get("last_action", ""),
+            "output_file": state.get("output_file", ""),
+            "work_dir": work_dir,
+            "chunks": chunks,
+        }
+        if _state_output_file_exists(state):
+            entry["next_action"] = f"bash {skill_root}/scripts/cleanup.sh {vid}"
+            completed.append(entry)
+            continue
+        if chunks["has_manifest"] and chunks["total_chunks"] and chunks["done_chunks"] < chunks["total_chunks"]:
+            entry["resume_from_step"] = 4
+            entry["next_action"] = (f"python3 {skill_root}/yt_transcript_utils.py prepare-resume {work_dir}, "
+                                    "then continue Step 4")
+        elif chunks["has_manifest"] and chunks["total_chunks"]:
+            entry["resume_from_step"] = 4
+            entry["next_action"] = "All chunks are done; merge them, then continue with verify-quality and Step 5"
+        else:
+            try:
+                step = int(str(state.get("step", "") or "1").strip())
+            except ValueError:
+                step = 1
+            entry["resume_from_step"] = max(step, 1)
+            entry["next_action"] = f"Re-run Step {max(step, 1)} using the values recorded in {state_path}"
+        unfinished.append(entry)
+    return {
+        "tmp_dir": str(base),
+        "has_unfinished": bool(unfinished),
+        "unfinished": unfinished,
+        "completed": completed,
+    }
+
+
 def _estimate_single_pass_input_tokens(normalized_document_path: str, raw_text_path: str,
                                        config: dict | None = None) -> tuple[int, int]:
     """Estimate normalized input size for short-video single-pass routing."""
@@ -8007,6 +8110,14 @@ def main():
         help='Additional required field name (can be repeated)',
     )
 
+    # find-unfinished command
+    unfinished_parser = subparsers.add_parser(
+        'find-unfinished',
+        help='List interrupted runs whose state and work files are kept for resume'
+    )
+    unfinished_parser.add_argument('--video-id', default='', help='Only check this video id')
+    unfinished_parser.add_argument('--tmp-dir', default='/tmp', help='Directory holding <VIDEO_ID>_state.md files')
+
     # plan-optimization command
     plan_parser = subparsers.add_parser(
         'plan-optimization',
@@ -8421,6 +8532,10 @@ def main():
         print(json.dumps(envelope if args.api_envelope else result, ensure_ascii=False))
         if not result['passed']:
             sys.exit(1)
+
+    elif args.command == 'find-unfinished':
+        result = find_unfinished_runs(args.tmp_dir, video_id=args.video_id)
+        print(json.dumps(result, ensure_ascii=False))
 
     elif args.command == 'validate-state':
         envelope = run_kernel_command(
