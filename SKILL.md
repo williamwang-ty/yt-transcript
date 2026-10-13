@@ -363,3 +363,4 @@ When processing multiple URLs:
 | `verify-quality` returns only `warnings` | Soft quality concern | Review the warnings, then decide whether to proceed |
 | State file is missing or fields are empty | Interrupted run or incomplete manual recovery | Rebuild the state from metadata/config before resuming |
 | `cleanup.sh` exits with code `3` | Run is not finished (no existing `output_file` in state) | Run `find-unfinished --video-id "$VIDEO_ID"` and resume; use `--force` only if the user wants to discard the run |
+| `find-unfinished` no longer lists a run that was interrupted earlier | State and work files live under `/tmp`, which is emptied on restart, so resume only survives within the same boot | Tell the user the run must start over; this is a known limitation, not a bug |
