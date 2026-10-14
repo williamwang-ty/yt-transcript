@@ -22,6 +22,18 @@ that language, or `auto` detection when the metadata has none.
 `tests/fixtures/subtitle_language_metadata.json` keeps a trimmed copy of each
 video's yt-dlp metadata so the unit tests cover the same cases offline.
 
+The selected source is not fully deterministic. When YouTube rate-limits a
+preferred track, `download.sh` falls back to the next trusted one (for example
+nmgFG7PUHfo from manual `en` to the English ASR track). The Notes column lists
+blocked tracks, and `--compare` labels a source change as flaky when a track
+was blocked in either run.
+
+When `plan-optimization` rates the subtitles critical and recommends Deepgram,
+the full stage follows it like the skill does: it transcribes the audio and plans again, and Notes says
+`rerouted from ...`. With `--no-deepgram` the video stops with status
+`rerouted` instead of sending those subtitles to the LLM. The plan stage only
+records the recommendation.
+
 ## Running
 
 Run from the skill root, with a working `config.yaml` (LLM key, and a
@@ -39,7 +51,11 @@ python3 scripts/run_regression.py --only H_peyIigkkc --compare /tmp/yt_regressio
 ```
 
 Each run writes `/tmp/yt_regression/<timestamp>/report.md`, `report.json`, and
-one folder per video with every intermediate file and a log per command. The
+one folder per video with every intermediate file (including a copy of the
+selected subtitle track) and a log per command. `download.sh` itself still
+downloads into `/tmp/<video_id>_downloads` and clears that folder first, so
+don't run the regression set while a real transcription of one of these
+videos is in progress. The
 exit code is non-zero when any video errors or fails `verify-quality`.
 
 The full stage always uses the chunked path (`process-chunks` + `merge-content`),

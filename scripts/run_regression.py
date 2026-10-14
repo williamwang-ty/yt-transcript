@@ -58,6 +58,10 @@ TRACKED_CHECKS = (
 )
 
 
+class UnsupportedLanguage(RuntimeError):
+    """The video is spoken in a language the pipeline does not support yet."""
+
+
 class StepError(RuntimeError):
     """A pipeline step failed; the message is shown in the report."""
 
@@ -72,7 +76,7 @@ def run_cmd(args: list[str], log_path: Path, timeout: int, ok_codes: tuple[int, 
     except subprocess.TimeoutExpired as exc:
         stderr = exc.stderr.decode("utf-8", "replace") if isinstance(exc.stderr, bytes) else (exc.stderr or "")
         log_path.write_text(f"$ {' '.join(args)}\nTIMEOUT after {timeout}s\n{stderr}", encoding="utf-8")
-        raise StepError(f"{Path(args[1]).name if len(args) > 1 else args[0]} timed out after {timeout}s")
+        raise StepError(f"{log_path.stem} timed out after {timeout}s")
     elapsed = time.monotonic() - started
     log_path.write_text(
         f"$ {' '.join(args)}\n# exit={proc.returncode} elapsed={elapsed:.1f}s\n"
@@ -148,6 +152,39 @@ def run_video(video: dict, out_dir: Path, stage: str, allow_deepgram: bool, time
         name = result.pop("_step")
         result["timings_sec"][name] = round(time.monotonic() - result.pop("_t0"), 1)
 
+    raw_text = vdir / f"{vid}_raw_text.txt"
+    segments = vdir / f"{vid}_segments.json"
+
+    def transcribe_audio(language: str) -> None:
+        """Download audio and transcribe it with Deepgram into raw_text/segments.
+
+        `language` is subtitle-info's source_language, or "auto" to let Deepgram
+        detect it (same rule as workflows/deepgram_transcribe.md).
+        """
+        step("audio")
+        audio = run_json(download(url, "audio"), logs / "audio.log", timeout)
+        done()
+        step("deepgram")
+        dg = run_json(
+            utils("transcribe-deepgram", audio["audio_file"], "--language", language,
+                  "--output-json", str(vdir / f"{vid}_deepgram.json"),
+                  "--output-text", str(raw_text),
+                  "--output-segments", str(segments)),
+            logs / "deepgram.log", max(timeout, 900),
+        )
+        language = dg.get("language") or language
+        if not (language.startswith("zh") or language.startswith("en")):
+            raise UnsupportedLanguage(f"Deepgram detected unsupported language {language!r}")
+        result["source"] = {
+            "src": "deepgram",
+            "language": language,
+            "kind": "audio",
+            "mode": "chinese" if language.startswith("zh") else "bilingual",
+            "speaker_count": dg.get("speaker_count"),
+            "chunk_count": dg.get("chunk_count"),
+        }
+        done()
+
     try:
         step("metadata")
         meta = run_json(download(url, "metadata"), logs / "metadata.log", timeout)
@@ -163,14 +200,9 @@ def run_video(video: dict, out_dir: Path, stage: str, allow_deepgram: bool, time
                       "source_language", "source_language_signal", "source_language_supported")
         }
         done()
-
         if not sub_info.get("has_any") and sub_info.get("source_language_supported") is False:
-            result["status"] = "unsupported"
-            result["error"] = sub_info.get("unsupported_reason", "") or "unsupported spoken language"
-            return result
-
-        raw_text = vdir / f"{vid}_raw_text.txt"
-        segments = vdir / f"{vid}_segments.json"
+            raise UnsupportedLanguage(sub_info.get("unsupported_reason") or "unsupported spoken language")
+        audio_language = sub_info.get("source_language") or "auto"
 
         if sub_info.get("has_any"):
             step("subtitles")
@@ -178,6 +210,10 @@ def run_video(video: dict, out_dir: Path, stage: str, allow_deepgram: bool, time
             vtt = subs.get("selected_source_vtt") or ""
             if not vtt:
                 raise StepError("subtitles: no selected_source_vtt")
+            # download.sh reuses /tmp/<vid>_downloads, so keep our own copy of the track.
+            source_vtt = vdir / Path(vtt).name
+            shutil.copyfile(vtt, source_vtt)
+            vtt = str(source_vtt)
             language = subs.get("selected_source_language") or ""
             mode = subs.get("resolved_mode") or sub_info.get("mode") or ""
             result["source"] = {
@@ -185,8 +221,14 @@ def run_video(video: dict, out_dir: Path, stage: str, allow_deepgram: bool, time
                 "language": language,
                 "kind": subs.get("selected_source_kind", ""),
                 "mode": mode,
+                "preferred_language": subs.get("preferred_source_language", ""),
                 "fallback_used": subs.get("fallback_used"),
-                "blocked_candidates": subs.get("blocked_candidates", []),
+                # e.g. "zh-Hans:rate_limited"; a non-empty list means YouTube refused a
+                # preferred track this run, so the selected source can differ between runs.
+                "blocked": [
+                    f"{c.get('language', '')}:{c.get('failure_reason', 'blocked')}"
+                    for c in subs.get("blocked_candidates", []) or []
+                ],
             }
             done()
 
@@ -199,45 +241,13 @@ def run_video(video: dict, out_dir: Path, stage: str, allow_deepgram: bool, time
             subtitle_source = "YouTube Subtitles"
             src = "youtube"
         else:
-            # Same rule as workflows/deepgram_transcribe.md: use the detected spoken
-            # language, or let Deepgram detect it when the metadata had no signal.
-            language = sub_info.get("source_language") or "auto"
-            result["source"] = {"src": "deepgram", "language": language, "kind": "audio", "mode": ""}
             if not allow_deepgram:
+                result["source"] = {"src": "deepgram", "language": audio_language, "kind": "audio", "mode": ""}
                 result["status"] = "skipped"
                 result["error"] = "no usable subtitles and --no-deepgram set"
                 return result
-
-            step("audio")
-            audio = run_json(download(url, "audio"), logs / "audio.log", timeout)
-            done()
-
-            step("deepgram")
-            dg = run_json(
-                utils("transcribe-deepgram", audio["audio_file"], "--language", language,
-                      "--output-json", str(vdir / f"{vid}_deepgram.json"),
-                      "--output-text", str(raw_text),
-                      "--output-segments", str(segments)),
-                logs / "deepgram.log", max(timeout, 900),
-            )
-            language = dg.get("language") or language
-            if language.startswith("zh"):
-                mode = "chinese"
-            elif language.startswith("en"):
-                mode = "bilingual"
-            else:
-                result["status"] = "unsupported"
-                result["error"] = f"Deepgram detected unsupported language {language!r}"
-                return result
-            result["source"] = {
-                "src": "deepgram",
-                "language": language,
-                "kind": "audio",
-                "mode": mode,
-                "speaker_count": dg.get("speaker_count"),
-                "chunk_count": dg.get("chunk_count"),
-            }
-            done()
+            transcribe_audio(audio_language)
+            mode = result["source"]["mode"]
             subtitle_source = "Deepgram Transcription"
             src = "deepgram"
 
@@ -248,41 +258,59 @@ def run_video(video: dict, out_dir: Path, stage: str, allow_deepgram: bool, time
 
         state_path = vdir / f"{vid}_state.md"
         chunks_dir = vdir / "chunks"
-        write_state(state_path, {
-            "vid": vid,
-            "url": url,
-            "title": str(meta.get("title", "")).replace("\n", " "),
-            "channel": str(meta.get("channel", "")).replace("\n", " "),
-            "upload_date": meta.get("upload_date", ""),
-            "duration": meta.get("duration", 0),
-            "output_dir": str(vdir),
-            "mode": mode,
-            "src": src,
-            "source_language": language,
-            "subtitle_source": subtitle_source,
-            "language_mode": mode,
-            "work_dir": str(chunks_dir),
-            "raw_text": str(raw_text),
-            "segments_path": str(segments),
-        })
 
-        step("plan")
-        validation = run_json(utils("validate-state", str(state_path), "--stage", "post-source"),
-                              logs / "validate_state.log", timeout)
-        if validation.get("hard_failures"):
-            raise StepError(f"validate-state: {validation['hard_failures']}")
-        plan = run_json(utils("plan-optimization", str(state_path)), logs / "plan.log", timeout)
-        (vdir / "plan.json").write_text(json.dumps(plan, ensure_ascii=False, indent=2), encoding="utf-8")
-        if plan.get("hard_failures"):
-            raise StepError(f"plan-optimization: {plan['hard_failures']}")
-        result["plan"] = {
-            k: plan.get(k)
-            for k in ("video_path", "routing_reason", "subtitle_quality_score",
-                      "subtitle_quality_band", "reroute_recommended", "reroute_target")
-        }
-        result["plan"]["prompts"] = [op.get("prompt") for op in plan.get("operations", [])]
-        result["plan"]["warnings"] = plan.get("warnings", [])
-        done()
+        def make_plan(log_name: str) -> dict:
+            write_state(state_path, {
+                "vid": vid,
+                "url": url,
+                "title": str(meta.get("title", "")).replace("\n", " "),
+                "channel": str(meta.get("channel", "")).replace("\n", " "),
+                "upload_date": meta.get("upload_date", ""),
+                "duration": meta.get("duration", 0),
+                "output_dir": str(vdir),
+                "mode": mode,
+                "src": src,
+                "source_language": language,
+                "subtitle_source": subtitle_source,
+                "language_mode": mode,
+                "work_dir": str(chunks_dir),
+                "raw_text": str(raw_text),
+                "segments_path": str(segments),
+            })
+
+            step(log_name)
+            validation = run_json(utils("validate-state", str(state_path), "--stage", "post-source"),
+                                  logs / "validate_state.log", timeout)
+            if validation.get("hard_failures"):
+                raise StepError(f"validate-state: {validation['hard_failures']}")
+            plan = run_json(utils("plan-optimization", str(state_path)), logs / f"{log_name}.log", timeout)
+            (vdir / f"{log_name}.json").write_text(json.dumps(plan, ensure_ascii=False, indent=2), encoding="utf-8")
+            if plan.get("hard_failures"):
+                raise StepError(f"plan-optimization: {plan['hard_failures']}")
+            result["plan"] = {
+                k: plan.get(k)
+                for k in ("video_path", "routing_reason", "subtitle_quality_score",
+                          "subtitle_quality_band", "reroute_recommended", "reroute_target")
+            }
+            result["plan"]["prompts"] = [op.get("prompt") for op in plan.get("operations", [])]
+            result["plan"]["warnings"] = plan.get("warnings", [])
+            done()
+            return plan
+
+        plan = make_plan("plan")
+        if plan.get("reroute_recommended") and plan.get("reroute_target") == "deepgram" and stage == "full":
+            # The skill stops the subtitle path here and transcribes audio instead;
+            # sending critical-quality subtitles to the LLM would only waste calls.
+            rerouted_from = observed_case(result)
+            if not allow_deepgram:
+                result["status"] = "rerouted"
+                result["error"] = "subtitle quality is critical; plan reroutes to Deepgram but --no-deepgram is set"
+                return result
+            transcribe_audio(audio_language)
+            result["source"]["rerouted_from"] = rerouted_from
+            mode, src, language = result["source"]["mode"], "deepgram", result["source"]["language"]
+            subtitle_source = "Deepgram Transcription"
+            plan = make_plan("plan_after_reroute")
 
         if stage == "plan":
             result["status"] = "ok"
@@ -344,6 +372,9 @@ def run_video(video: dict, out_dir: Path, stage: str, allow_deepgram: bool, time
         }
         done()
         result["status"] = "ok" if vq.get("passed") else "quality_failed"
+    except UnsupportedLanguage as exc:
+        result["status"] = "unsupported"
+        result["error"] = str(exc)
     except StepError as exc:
         result["status"] = "error"
         result["failed_step"] = result.get("_step", "")
@@ -368,6 +399,20 @@ def observed_case(item: dict) -> str:
     return f"{family}_{kind}" if kind else family
 
 
+def source_notes(item: dict) -> str:
+    """Short explanation of why a source may differ from what was preferred."""
+    source = item.get("source") or {}
+    notes = []
+    if source.get("blocked"):
+        notes.append("blocked " + ", ".join(source["blocked"]))
+    if source.get("rerouted_from"):
+        notes.append(f"rerouted from {source['rerouted_from']}")
+    plan = item.get("plan") or {}
+    if plan.get("reroute_recommended") and not source.get("rerouted_from"):
+        notes.append(f"plan recommends {plan.get('reroute_target') or 'reroute'}")
+    return "; ".join(notes)
+
+
 def source_mismatch(item: dict) -> bool:
     """True when the pipeline picked a different source than the set expects."""
     expected, observed = item.get("expected_case", ""), observed_case(item)
@@ -388,7 +433,11 @@ def compare(current: dict, baseline: dict) -> list[str]:
             if item.get(key) != old.get(key):
                 diffs.append(f"{key} {old.get(key)!r} -> {item.get(key)!r}")
         if observed_case(item) != observed_case(old):
-            diffs.append(f"source {observed_case(old)!r} -> {observed_case(item)!r}")
+            new_src, old_src = item.get("source") or {}, old.get("source") or {}
+            flaky = (new_src.get("blocked") or old_src.get("blocked")) and not (
+                new_src.get("rerouted_from") or old_src.get("rerouted_from"))
+            diffs.append(f"source {observed_case(old)!r} -> {observed_case(item)!r}"
+                         + (" (flaky: a preferred track was blocked by YouTube)" if flaky else ""))
         for key in ("video_path", "subtitle_quality_score", "reroute_recommended"):
             a, b = (old.get("plan") or {}).get(key), (item.get("plan") or {}).get(key)
             if a != b:
@@ -417,8 +466,8 @@ def render_markdown(report: dict, diff_lines: list[str] | None) -> str:
         f"{report['summary']['ok']}/{report['summary']['total']} ok · "
         f"{report['summary']['source_mismatch']} source mismatch (⚠)",
         "",
-        "| Video | Expected | Observed | Mode | Path | Sub quality | Verify | HF | Warn | Size ratio | Status |",
-        "|---|---|---|---|---|---|---|---|---|---|---|",
+        "| Video | Expected | Observed | Mode | Path | Sub quality | Verify | HF | Warn | Size ratio | Status | Notes |",
+        "|---|---|---|---|---|---|---|---|---|---|---|---|",
     ]
     for item in report["videos"]:
         plan = item.get("plan") or {}
@@ -429,10 +478,10 @@ def render_markdown(report: dict, diff_lines: list[str] | None) -> str:
         out.append(
             f"| {item['id']} | {item.get('expected_case', '')} | {observed_case(item)}{' ⚠' if source_mismatch(item) else ''} | "
             f"{(item.get('source') or {}).get('mode', '')} | {plan.get('video_path', '')} | "
-            f"{plan.get('subtitle_quality_band', '')} {plan.get('subtitle_quality_score', '') if plan else ''} | "
+            f"{plan.get('subtitle_quality_band') or ''} {'' if plan.get('subtitle_quality_score') is None else plan['subtitle_quality_score']} | "
             f"{'' if not verify else ('pass' if verify.get('passed') else 'fail')} | "
             f"{len(verify.get('hard_failures', [])) if verify else ''} | {len(verify.get('warnings', [])) if verify else ''} | "
-            f"{f'{ratio:.2f}' if isinstance(ratio, (int, float)) else ''} | {status} |"
+            f"{f'{ratio:.2f}' if isinstance(ratio, (int, float)) else ''} | {status} | {source_notes(item)} |"
         )
     problems = [i for i in report["videos"] if i.get("error") or (i.get("verify") or {}).get("hard_failures") or (i.get("verify") or {}).get("warnings")]
     if problems:
@@ -503,6 +552,7 @@ def main() -> int:
             "quality_failed": sum(1 for r in results if r["status"] == "quality_failed"),
             "error": sum(1 for r in results if r["status"] == "error"),
             "skipped": sum(1 for r in results if r["status"] == "skipped"),
+            "rerouted": sum(1 for r in results if r["status"] == "rerouted"),
             "unsupported": sum(1 for r in results if r["status"] == "unsupported"),
             "source_mismatch": sum(1 for r in results if source_mismatch(r)),
         },

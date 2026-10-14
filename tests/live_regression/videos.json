@@ -31,7 +31,8 @@
       "id": "ijFSEb2W6_8",
       "label": "English, auto captions only (Linus Tech Tips)",
       "expected_case": "en_auto",
-      "duration_sec": 832
+      "duration_sec": 832,
+      "audio_language": "en"
     },
     {
       "id": "nmgFG7PUHfo",
