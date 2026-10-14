@@ -62,7 +62,7 @@ class StepError(RuntimeError):
     """A pipeline step failed; the message is shown in the report."""
 
 
-def run_cmd(args: list[str], log_path: Path, timeout: int) -> str:
+def run_cmd(args: list[str], log_path: Path, timeout: int, ok_codes: tuple[int, ...] = (0,)) -> str:
     """Run a command, save stdout/stderr to log_path, return stdout."""
     started = time.monotonic()
     try:
@@ -70,7 +70,8 @@ def run_cmd(args: list[str], log_path: Path, timeout: int) -> str:
             args, cwd=ROOT_DIR, capture_output=True, text=True, timeout=timeout,
         )
     except subprocess.TimeoutExpired as exc:
-        log_path.write_text(f"$ {' '.join(args)}\nTIMEOUT after {timeout}s\n{exc.stderr or ''}", encoding="utf-8")
+        stderr = exc.stderr.decode("utf-8", "replace") if isinstance(exc.stderr, bytes) else (exc.stderr or "")
+        log_path.write_text(f"$ {' '.join(args)}\nTIMEOUT after {timeout}s\n{stderr}", encoding="utf-8")
         raise StepError(f"{Path(args[1]).name if len(args) > 1 else args[0]} timed out after {timeout}s")
     elapsed = time.monotonic() - started
     log_path.write_text(
@@ -78,15 +79,15 @@ def run_cmd(args: list[str], log_path: Path, timeout: int) -> str:
         f"## stdout\n{proc.stdout}\n## stderr\n{proc.stderr}",
         encoding="utf-8",
     )
-    if proc.returncode != 0:
+    if proc.returncode not in ok_codes:
         tail = (proc.stderr or proc.stdout).strip().splitlines()[-3:]
         raise StepError(f"{log_path.stem} exited {proc.returncode}: {' | '.join(tail)}")
     return proc.stdout
 
 
-def run_json(args: list[str], log_path: Path, timeout: int) -> dict:
+def run_json(args: list[str], log_path: Path, timeout: int, ok_codes: tuple[int, ...] = (0,)) -> dict:
     """Run a command whose stdout ends with a JSON object."""
-    out = run_cmd(args, log_path, timeout).strip()
+    out = run_cmd(args, log_path, timeout, ok_codes).strip()
     start = out.find("{")
     if start < 0:
         raise StepError(f"{log_path.stem} printed no JSON")
@@ -314,7 +315,8 @@ def run_video(video: dict, out_dir: Path, stage: str, allow_deepgram: bool, time
         vq_args = utils("verify-quality", str(optimized), "--raw-text", str(raw_text), "--work-dir", str(chunks_dir))
         if mode == "bilingual":
             vq_args.append("--bilingual")
-        vq = run_json(vq_args, logs / "verify_quality.log", timeout)
+        # verify-quality exits 1 when it fails; that is a result to report, not a crash.
+        vq = run_json(vq_args, logs / "verify_quality.log", timeout, ok_codes=(0, 1))
         (vdir / "verify_quality.json").write_text(json.dumps(vq, ensure_ascii=False, indent=2), encoding="utf-8")
         checks = vq.get("checks", {})
         result["verify"] = {
