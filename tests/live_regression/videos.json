@@ -1,0 +1,66 @@
+{
+  "description": "Live regression set for scripts/run_regression.py. expected_case is the source the pipeline SHOULD pick (<lang>_<manual|auto> or deepgram); observed_case in the report is what it actually picked. Subtitle tracks were checked with yt-dlp 2026.08.19 on 2026-10-13.",
+  "videos": [
+    {
+      "id": "H_peyIigkkc",
+      "label": "Chinese, manual zh-Hans + zh-TW (stalled LLM run on 2026-10-11)",
+      "expected_case": "zh_manual",
+      "duration_sec": 1137
+    },
+    {
+      "id": "wu0zS1AuI_E",
+      "label": "Chinese, manual zh only (小Lin说)",
+      "expected_case": "zh_manual",
+      "duration_sec": 834
+    },
+    {
+      "id": "JkMWjp5AXhM",
+      "label": "Chinese speech, no manual subs; only auto track is en-orig speech translation, zh tracks are translations of that",
+      "expected_case": "deepgram",
+      "audio_language": "zh",
+      "duration_sec": 1468,
+      "notes": "Currently picks zh-Hans/auto (machine translation of an English speech translation)."
+    },
+    {
+      "id": "CIatbV3_Rjg",
+      "label": "English, manual en, no Chinese track (Lex Clips)",
+      "expected_case": "en_manual",
+      "duration_sec": 437
+    },
+    {
+      "id": "ijFSEb2W6_8",
+      "label": "English, auto captions only (Linus Tech Tips)",
+      "expected_case": "en_auto",
+      "duration_sec": 832,
+      "notes": "Currently picks zh-Hans/auto (auto-translation target) and routes to chinese mode."
+    },
+    {
+      "id": "nmgFG7PUHfo",
+      "label": "English, manual en + fr plus full auto-translation list (Veritasium)",
+      "expected_case": "en_manual",
+      "duration_sec": 1593,
+      "notes": "Currently prefers zh-Hans/auto over the manual English track."
+    },
+    {
+      "id": "tGVSOK3PNUI",
+      "label": "Japanese, auto ja-orig only",
+      "expected_case": "deepgram",
+      "audio_language": "ja",
+      "duration_sec": 1078,
+      "notes": "Current policy only uses zh/en subtitles, so other languages should go to Deepgram; today it picks zh-Hans/auto instead."
+    },
+    {
+      "id": "DQGrPstFRVI",
+      "label": "Chinese speech, no subtitles at all (老高與小茉)",
+      "expected_case": "deepgram",
+      "audio_language": "zh",
+      "duration_sec": 1174
+    },
+    {
+      "id": "Fhx_qNS2P8g",
+      "label": "Long Chinese podcast, manual zh-Hans (硅谷101 E255)",
+      "expected_case": "zh_manual",
+      "duration_sec": 2773
+    }
+  ]
+}

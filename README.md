@@ -380,6 +380,8 @@ Current policy is intentional and explicit:
 | Video without usable subtitles | `preflight.sh` → `download.sh metadata` → `download.sh subtitle-info` → `preflight.sh --require-deepgram` → `transcribe-deepgram` → `validate-state --stage post-source` → optimize → `verify-quality` | Stop on any command failure or non-empty `hard_failures` |
 | Long video | `validate-state --stage post-source` → `plan-optimization` → if `requires_llm_preflight=true`, run `preflight.sh --require-llm` → chunk → raw-path `process-chunks --auto-replan` → optional processed-path translation → merge → `verify-quality` → `validate-state --stage pre-assemble` | `warnings` alone do not block; `hard_failures` block |
 
+Live regression: `python3 scripts/run_regression.py` runs the pipeline on a fixed set of real videos and reports `verify-quality` results; see [tests/live_regression/README.md](tests/live_regression/README.md).
+
 ### 🛠️ Minimum Commands
 
 ```bash
@@ -741,6 +743,8 @@ bash scripts/preflight.sh --require-llm
 | 有字幕短视频 | `preflight.sh` → `download.sh metadata` → 创建 state → `validate-state --stage metadata` → `download.sh subtitle-info` → `download.sh subtitles` → `validate-state --stage post-source` → 优化 → `verify-quality` | 只有 `validate-state` 或 `verify-quality` 返回非空 `hard_failures` 才停止 |
 | 无可用字幕视频 | `preflight.sh` → `download.sh metadata` → `download.sh subtitle-info` → `preflight.sh --require-deepgram` → `transcribe-deepgram` → `validate-state --stage post-source` → 优化 → `verify-quality` | 任一命令失败或 `hard_failures` 非空都必须停止 |
 | 长视频 | `validate-state --stage post-source` → `plan-optimization` → 若 `requires_llm_preflight=true` 则执行 `preflight.sh --require-llm` → 分块 → `raw_path` 阶段使用 `process-chunks --auto-replan` → 需要时执行 `processed_path` 翻译阶段 → 合并 → `verify-quality` → `validate-state --stage pre-assemble` | `warnings` 不自动阻断，`hard_failures` 阻断 |
+
+真实视频回归：`python3 scripts/run_regression.py` 会在一组固定的真实视频上跑完整流程并汇总 `verify-quality` 结果，详见 [tests/live_regression/README.md](tests/live_regression/README.md)。
 
 ### 🛠️ 最小命令集
 
