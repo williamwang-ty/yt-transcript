@@ -19,7 +19,7 @@
       "expected_case": "deepgram",
       "audio_language": "zh",
       "duration_sec": 1468,
-      "notes": "Currently picks zh-Hans/auto (machine translation of an English speech translation)."
+      "notes": "Currently picks zh-Hans/auto (machine translation of an English speech translation); when YouTube rate-limits zh-Hans/zh-Hant it falls back to en-orig/auto."
     },
     {
       "id": "CIatbV3_Rjg",
@@ -32,14 +32,15 @@
       "label": "English, auto captions only (Linus Tech Tips)",
       "expected_case": "en_auto",
       "duration_sec": 832,
-      "notes": "Currently picks zh-Hans/auto (auto-translation target) and routes to chinese mode."
+      "notes": "Currently picks zh-Hans/auto (auto-translation target) and routes to chinese mode; plan-optimization rates it critical and recommends Deepgram.",
+      "audio_language": "en"
     },
     {
       "id": "nmgFG7PUHfo",
       "label": "English, manual en + fr plus full auto-translation list (Veritasium)",
       "expected_case": "en_manual",
       "duration_sec": 1593,
-      "notes": "Currently prefers zh-Hans/auto over the manual English track."
+      "notes": "Currently prefers zh-Hans/auto over the manual English track; when YouTube rate-limits zh-Hans it falls back to en/manual, so the observed source varies between runs."
     },
     {
       "id": "tGVSOK3PNUI",
@@ -47,7 +48,7 @@
       "expected_case": "deepgram",
       "audio_language": "ja",
       "duration_sec": 1078,
-      "notes": "Current policy only uses zh/en subtitles, so other languages should go to Deepgram; today it picks zh-Hans/auto instead."
+      "notes": "Current policy only uses zh/en subtitles, so other languages should go to Deepgram; today it picks zh-Hans/auto, which plan-optimization rates critical and reroutes to Deepgram. The skill's Deepgram workflow only defines zh and en."
     },
     {
       "id": "DQGrPstFRVI",
