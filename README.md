@@ -312,7 +312,9 @@ Current policy is intentional and explicit:
 ### 🧭 Intentional Design Decisions
 
 - `bilingual` means English source text plus Chinese translation, not subtitle file merging
-- If Chinese subtitles exist, they take precedence as the single subtitle source track; English is used only when no usable Chinese subtitle track can be downloaded
+- `subtitle-info` decides the spoken language first (original audio track, metadata `language`, ASR track, then manual tracks) and only trusts human subtitles and the ASR track in that language; YouTube's auto-translated tracks are never used
+- Human Chinese subtitles take precedence as the single subtitle source track for any video; otherwise Chinese videos use Chinese subtitles and English videos use English subtitles
+- Videos spoken in other languages are reported as unsupported (`source_language_supported=false`) instead of being transcribed; Deepgram runs use the detected language, or `--language auto` when the metadata has no language signal
 - Chinese-source monolingual optimization now uses a dedicated `cleanup_zh` prompt that preserves meaning while repairing punctuation, paragraphing, duplicate subtitle fragments, and obvious spacing artifacts
 - `config.yaml` is intentionally limited to flat top-level key/value entries; nested or multi-line YAML is not supported
 - YAML frontmatter values are always quoted on purpose to favor safe parsing over prettier formatting
@@ -681,7 +683,9 @@ bash scripts/preflight.sh --require-llm
 ### 🧭 设计上的刻意取舍
 
 - `bilingual` 表示“英文源文本 + 中文翻译”，不是直接合并双字幕文件
-- 如果存在可用中文字幕，会优先把其中一个中文字幕轨作为唯一源文本；只有在中文字幕不可用时才回退到英文字幕
+- `subtitle-info` 先判断视频说的是什么语言（依次看原声音轨、metadata 的 `language`、自动识别字幕轨、人工字幕轨），只信任人工字幕和该语言的自动识别字幕；YouTube 的自动翻译字幕一律不用
+- 任何视频只要有人工中文字幕，就优先用它作为唯一源文本；否则中文视频用中文字幕，英文视频用英文字幕
+- 其他语言的视频会报告为暂不支持（`source_language_supported=false`），不会继续转录；Deepgram 路径使用判定出的语言，metadata 没有语言信息时用 `--language auto` 让 Deepgram 自己识别
 - 中文单语优化现在使用专门的 `cleanup_zh` prompt，在不改变原意的前提下修复标点、分段、重复字幕碎片和明显的中文空格问题
 - `config.yaml` 被刻意限制为扁平的顶层键值配置，不支持嵌套结构或多行 YAML
 - YAML frontmatter 的值会统一加引号，优先保证解析安全，而不是追求最简洁的展示

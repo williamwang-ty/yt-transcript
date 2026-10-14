@@ -1,5 +1,5 @@
 {
-  "description": "Live regression set for scripts/run_regression.py. expected_case is the source the pipeline SHOULD pick (<lang>_<manual|auto> or deepgram); observed_case in the report is what it actually picked. Subtitle tracks were checked with yt-dlp 2026.08.19 on 2026-10-13.",
+  "description": "Live regression set for scripts/run_regression.py. expected_case is the source the pipeline SHOULD pick (<lang>_<manual|auto>, deepgram, or unsupported); observed_case in the report is what it actually picked. Subtitle tracks were checked with yt-dlp 2026.08.19 on 2026-10-13.",
   "videos": [
     {
       "id": "H_peyIigkkc",
@@ -19,7 +19,7 @@
       "expected_case": "deepgram",
       "audio_language": "zh",
       "duration_sec": 1468,
-      "notes": "Currently picks zh-Hans/auto (machine translation of an English speech translation)."
+      "notes": "The en ASR track does not match the original zh-Hant audio track, so no subtitle track is trusted and the run goes to Deepgram with zh."
     },
     {
       "id": "CIatbV3_Rjg",
@@ -31,23 +31,21 @@
       "id": "ijFSEb2W6_8",
       "label": "English, auto captions only (Linus Tech Tips)",
       "expected_case": "en_auto",
-      "duration_sec": 832,
-      "notes": "Currently picks zh-Hans/auto (auto-translation target) and routes to chinese mode."
+      "duration_sec": 832
     },
     {
       "id": "nmgFG7PUHfo",
       "label": "English, manual en + fr plus full auto-translation list (Veritasium)",
       "expected_case": "en_manual",
-      "duration_sec": 1593,
-      "notes": "Currently prefers zh-Hans/auto over the manual English track."
+      "duration_sec": 1593
     },
     {
       "id": "tGVSOK3PNUI",
       "label": "Japanese, auto ja-orig only",
-      "expected_case": "deepgram",
+      "expected_case": "unsupported",
       "audio_language": "ja",
       "duration_sec": 1078,
-      "notes": "Current policy only uses zh/en subtitles, so other languages should go to Deepgram; today it picks zh-Hans/auto instead."
+      "notes": "Spoken language is ja, which the pipeline does not support yet, so subtitle-info stops with unsupported_reason instead of picking a translated track or running Deepgram."
     },
     {
       "id": "DQGrPstFRVI",

@@ -957,7 +957,7 @@ exit 1
                 text=True,
             )
             self.assertNotEqual(result.returncode, 0)
-            self.assertIn("supports English or Chinese subtitle tracks only", result.stderr)
+            self.assertIn("Spoken language 'es' is not supported yet", result.stderr)
             self.assertNotIn("unexpected subtitle download", result.stderr)
 
     def test_preflight_treats_update_check_as_best_effort(self):

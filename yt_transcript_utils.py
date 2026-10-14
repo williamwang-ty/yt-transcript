@@ -47,6 +47,7 @@ Commands:
     normalize-document <state_ref> Materialize normalized_document.json from raw text or segments
     validate-state <state_path>    Validate workflow state fields for a given stage
     find-unfinished                List interrupted runs whose state and work files are kept for resume
+    subtitle-info                  Detect the spoken language and pick subtitle candidates from yt-dlp metadata on stdin
     plan-optimization <state_path> Generate a structured optimization plan from workflow state
 
 Global flags:
@@ -90,6 +91,7 @@ from kernel.long_text import lifecycle as kernel_lifecycle
 from kernel.long_text import prompting as kernel_prompting
 from kernel.long_text import llm as kernel_llm
 from kernel.long_text import processing as kernel_processing
+from kernel import subtitle_language as kernel_subtitle_language
 
 
 def _skill_root() -> Path:
@@ -4988,9 +4990,24 @@ def _resolve_deepgram_request_settings(config: dict | None = None, *, language: 
         "utterances": utterances_enabled,
         "prefer_structured_output": structured_output_enabled,
     }
+    if _deepgram_detects_language(language):
+        settings["detect_language"] = True
     if model_warning:
         settings["model_warning"] = model_warning
     return settings
+
+
+def _deepgram_detects_language(language: str) -> bool:
+    """Return whether a Deepgram request should detect the language itself."""
+    return str(language or "").strip().lower() in {"", "auto"}
+
+
+def _deepgram_detected_language(payload: dict) -> str:
+    """Return the language Deepgram detected for a payload, if it reported one."""
+    channels = ((payload or {}).get("results") or {}).get("channels") or []
+    if channels and isinstance(channels[0], dict):
+        return str(channels[0].get("detected_language") or "").strip()
+    return ""
 
 
 def _call_deepgram_api_once(audio_path: str, api_key: str, language: str,
@@ -5008,8 +5025,12 @@ def _call_deepgram_api_once(audio_path: str, api_key: str, language: str,
     if model_warning:
         print(f"Warning: {model_warning}", file=sys.stderr)
 
+    if _deepgram_detects_language(language):
+        language_param = "detect_language=true"
+    else:
+        language_param = f"language={urllib.parse.quote(str(language))}"
     params = (
-        f"model={urllib.parse.quote(request_model)}&language={urllib.parse.quote(str(language or ''))}"
+        f"model={urllib.parse.quote(request_model)}&{language_param}"
         "&diarize=true&punctuate=true&paragraphs=true&smart_format=true"
     )
     if enable_utterances:
@@ -5274,6 +5295,7 @@ def transcribe_deepgram(audio_path: str, language: str, config_path: str = None,
     total_timed_sentence_count = 0
     total_word_count = 0
     total_utterance_count = 0
+    detected_languages = []
     if request_settings.get("model_warning"):
         warnings.append(str(request_settings["model_warning"]))
 
@@ -5326,6 +5348,9 @@ def transcribe_deepgram(audio_path: str, language: str, config_path: str = None,
                 enable_utterances=request_settings["utterances"],
             )
         raw_payloads.append(payload)
+        chunk_detected_language = _deepgram_detected_language(payload)
+        if chunk_detected_language:
+            detected_languages.append(chunk_detected_language)
         processed = process_deepgram_payload(
             payload,
             prefer_structured_output=request_settings["prefer_structured_output"],
@@ -5394,6 +5419,8 @@ def transcribe_deepgram(audio_path: str, language: str, config_path: str = None,
 
     transcript = "\n\n".join(t for t in transcripts if t).strip()
     used_split_mode = len(chunk_paths) > 1
+    detected_language = Counter(detected_languages).most_common(1)[0][0] if detected_languages else ""
+    effective_language = detected_language if _deepgram_detects_language(language) else language
     transcript_sources = {report.get("transcript_source", "alternative.transcript") for report in chunk_reports}
     transcript_source = transcript_sources.pop() if len(transcript_sources) == 1 else "mixed"
     warnings = list(dict.fromkeys(warnings))
@@ -5435,7 +5462,7 @@ def transcribe_deepgram(audio_path: str, language: str, config_path: str = None,
                 {
                     "source": "deepgram",
                     "deepgram_request": request_settings,
-                    "language": language,
+                    "language": effective_language,
                     "used_split_mode": used_split_mode,
                     "chunk_count": len(chunk_paths),
                     "split_points": split_points,
@@ -5452,6 +5479,8 @@ def transcribe_deepgram(audio_path: str, language: str, config_path: str = None,
     return {
         "transcript": transcript,
         "speaker_count": speaker_count,
+        "language": effective_language,
+        "detected_language": detected_language,
         "deepgram_request": request_settings,
         "transcript_source": transcript_source,
         "chunk_count": len(chunk_paths),
@@ -7691,7 +7720,8 @@ def main():
         help='Call Deepgram API and merge split chunks automatically'
     )
     tdg_parser.add_argument('audio_path', help='Audio file path')
-    tdg_parser.add_argument('--language', required=True, help='Transcription language code')
+    tdg_parser.add_argument('--language', required=True,
+                            help="Transcription language code, or 'auto' to let Deepgram detect it (reported as detected_language)")
     tdg_parser.add_argument('--config-path', default=None, help='Optional path to config.yaml')
     tdg_parser.add_argument('--api-key', default='', help='Optional Deepgram API key override')
     tdg_parser.add_argument('--max-size', type=float, default=10.0,
@@ -8118,6 +8148,17 @@ def main():
     unfinished_parser.add_argument('--video-id', default='', help='Only check this video id')
     unfinished_parser.add_argument('--tmp-dir', default='/tmp', help='Directory holding <VIDEO_ID>_state.md files')
 
+    # subtitle-info command
+    subtitle_info_parser = subparsers.add_parser(
+        'subtitle-info',
+        help='Detect the spoken language and pick subtitle candidates from yt-dlp metadata on stdin'
+    )
+    subtitle_info_parser.add_argument('--video-id', default='', help='Video id to report when metadata lacks one')
+    subtitle_info_parser.add_argument('--from-list-subs', action='store_true',
+                                      help='Read `yt-dlp --list-subs` output instead of `yt-dlp -J` JSON')
+    subtitle_info_parser.add_argument('--yt-dlp-runtime-json', default='',
+                                      help='yt-dlp runtime JSON to echo back in the result')
+
     # plan-optimization command
     plan_parser = subparsers.add_parser(
         'plan-optimization',
@@ -8535,6 +8576,23 @@ def main():
 
     elif args.command == 'find-unfinished':
         result = find_unfinished_runs(args.tmp_dir, video_id=args.video_id)
+        print(json.dumps(result, ensure_ascii=False))
+
+    elif args.command == 'subtitle-info':
+        raw = sys.stdin.read()
+        if args.from_list_subs:
+            payload = kernel_subtitle_language.metadata_from_list_subs(raw, video_id=args.video_id)
+        else:
+            try:
+                payload = json.loads(raw)
+            except json.JSONDecodeError as error:
+                print(f"Error: subtitle-info expects yt-dlp -J metadata on stdin: {error}", file=sys.stderr)
+                sys.exit(1)
+        try:
+            runtime = json.loads(args.yt_dlp_runtime_json) if args.yt_dlp_runtime_json else {}
+        except json.JSONDecodeError:
+            runtime = {}
+        result = kernel_subtitle_language.build_subtitle_info(payload, video_id=args.video_id, yt_dlp_runtime=runtime)
         print(json.dumps(result, ensure_ascii=False))
 
     elif args.command == 'validate-state':

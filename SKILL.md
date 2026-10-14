@@ -18,8 +18,10 @@ Transcribe YouTube videos into formatted Markdown articles with optional bilingu
 > [!NOTE]
 > Intentional product decisions:
 > - `bilingual` always means English source text plus Chinese translation
-> - If usable Chinese subtitles exist, they take precedence as the single source text track
-> - English subtitles are used only when no usable Chinese subtitle track can be downloaded
+> - `subtitle-info` first decides the spoken language (`source_language`); only human subtitles and the spoken-language ASR track are trusted, never YouTube's auto-translated tracks
+> - Human (manual) Chinese subtitles take precedence as the single source text track for any video
+> - Otherwise Chinese videos use Chinese subtitles and English videos use English subtitles
+> - Videos spoken in other languages are not supported yet (`source_language_supported=false`); stop and report instead of transcribing them
 > - `scripts/preflight.sh` is intentionally staged so subtitle-only paths do not require Deepgram or LLM credentials
 
 ---
@@ -113,8 +115,9 @@ Quick Mode is an optional fast path inside the broader short-duration bucket. `p
    - `mode` (`chinese` or `bilingual`; provisional before actual download)
    - `listed_candidates`
    - `preferred_source_language`
+   - `source_language`, `source_language_supported`
 
-   Exit Quick Mode if `has_any=false`.
+   Exit Quick Mode if `has_any=false`, and handle it as in Step 2 of the Full Workflow.
 
 6. Download subtitles:
    ```bash
@@ -220,7 +223,8 @@ SUB_INFO_JSON=$(bash <skill-root>/scripts/download.sh "$VIDEO_URL" subtitle-info
 Decision:
 
 - `has_any=true` → Step 3A Subtitle Path
-- `has_any=false` → Step 3B Deepgram Path
+- `has_any=false` and `source_language_supported=false` → STOP and report `unsupported_reason` (the video is spoken in a language other than Chinese or English); do not run Deepgram
+- `has_any=false` otherwise → Step 3B Deepgram Path; pass `source_language` along (empty means unknown)
 
 Write `step: 2` to state.
 
@@ -357,7 +361,8 @@ When processing multiple URLs:
 | `download.sh metadata` or `subtitle-info` fails | `yt-dlp` unavailable, outdated, or video unavailable | Run `bash <skill-root>/scripts/preflight.sh`, then retry once |
 | `yt-dlp` says "Sign in to confirm you’re not a bot" | YouTube requires cookies/login for this IP or video | Let `download.sh` auto-retry with Chrome (up to 3 attempts); if it still fails, export a Netscape `cookies.txt`, set `yt_dlp_cookies_file`, then retry |
 | Automatic Chrome cookies retry failed | Chrome is unavailable, not logged in, or inaccessible in this environment | Export `youtube.com` cookies from a logged-in browser, copy the file here, set `yt_dlp_cookies_file` or `YT_DLP_COOKIES_FILE`, then retry |
-| `subtitle-info` returns `has_any=false` | No usable Chinese or English subtitle source exists | Switch to Deepgram path and run `bash <skill-root>/scripts/preflight.sh --require-deepgram` |
+| `subtitle-info` returns `has_any=false` and `source_language_supported=false` | The video is spoken in another language (for example `ja`) and has no human Chinese subtitles | Stop and tell the user this language is not supported yet |
+| `subtitle-info` returns `has_any=false` otherwise | No trusted subtitle track in the spoken language (auto-translated tracks are ignored on purpose) | Switch to Deepgram path and run `bash <skill-root>/scripts/preflight.sh --require-deepgram` |
 | Deepgram transcription fails | Invalid key, network issue, or API rejection | Stop, surface the error, and ask whether to retry |
 | `verify-quality` returns non-empty `hard_failures` | Hard structural gate failed | Do not assemble final output; fix the optimization step |
 | `verify-quality` returns only `warnings` | Soft quality concern | Review the warnings, then decide whether to proceed |

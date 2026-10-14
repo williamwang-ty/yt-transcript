@@ -41,18 +41,18 @@ If `audio_file` is missing, STOP.
 
 ## Step 2: Determine Source Language
 
-Set:
+Take the language from `subtitle-info`; do not guess it from the title:
 
-- `LANGUAGE=zh` for primarily Chinese audio
-- `LANGUAGE=en` for primarily English audio
+- `source_language=zh` → `LANGUAGE=zh`
+- `source_language=en` → `LANGUAGE=en`
+- `source_language` empty (no language signal in the metadata) → `LANGUAGE=auto`; Deepgram detects the language and Step 3 reports it
+- any other `source_language` → STOP; this language is not supported yet (Step 2 of `SKILL.md` should already have stopped)
 
-Then write to state:
+Write to state:
 
 - `src: deepgram`
-- `source_language: $LANGUAGE`
-- `mode: chinese` if `LANGUAGE=zh`
-- `mode: bilingual` if `LANGUAGE=en`
 - `subtitle_source: Deepgram Transcription`
+- when `LANGUAGE` is `zh` or `en`: `source_language: $LANGUAGE`, and `mode: chinese` for `zh` or `mode: bilingual` for `en`
 
 ---
 
@@ -112,6 +112,12 @@ Read `/tmp/${VIDEO_ID}_deepgram_result.json` and record:
 - `segment_count` (should be > 0 when `--output-segments` is enabled)
 - `segments_output` (path to the segments JSON file, or empty)
 - `warnings` (review especially when any chunk reports a structured-output fallback)
+
+If `LANGUAGE=auto`, read `language` from the result (the language Deepgram detected):
+
+- `zh` (or `zh-*`) → write `source_language: zh` and `mode: chinese`
+- `en` (or `en-*`) → write `source_language: en` and `mode: bilingual`
+- anything else, or empty → STOP and report that the spoken language is not supported yet
 
 Write to state:
 
