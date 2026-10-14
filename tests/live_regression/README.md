@@ -18,8 +18,21 @@ before it.
 `en_auto`, `deepgram`, ...). The report marks a video with ⚠ when the source
 it actually picked differs. As of 2026-10-13, `subtitle-info` counts YouTube's
 auto-translation targets (about 157 languages, including zh-Hans) as real
-tracks, so JkMWjp5AXhM, ijFSEb2W6_8, nmgFG7PUHfo and tGVSOK3PNUI pick a
+tracks, so JkMWjp5AXhM, ijFSEb2W6_8, nmgFG7PUHfo and tGVSOK3PNUI can pick a
 machine-translated `zh-Hans/auto` track and show ⚠.
+
+The selected source is not fully deterministic. When YouTube rate-limits a
+preferred track, `download.sh` falls back to the next one (nmgFG7PUHfo and
+JkMWjp5AXhM drop to English this way). The Notes column lists blocked tracks,
+and `--compare` labels a source change as flaky when a track was blocked in
+either run.
+
+When `plan-optimization` rates the subtitles critical and recommends Deepgram
+(ijFSEb2W6_8 and tGVSOK3PNUI today), the full stage follows it like the skill
+does: it transcribes the audio and plans again, and Notes says
+`rerouted from ...`. With `--no-deepgram` the video stops with status
+`rerouted` instead of sending those subtitles to the LLM. The plan stage only
+records the recommendation.
 
 ## Running
 
@@ -38,7 +51,11 @@ python3 scripts/run_regression.py --only H_peyIigkkc --compare /tmp/yt_regressio
 ```
 
 Each run writes `/tmp/yt_regression/<timestamp>/report.md`, `report.json`, and
-one folder per video with every intermediate file and a log per command. The
+one folder per video with every intermediate file (including a copy of the
+selected subtitle track) and a log per command. `download.sh` itself still
+downloads into `/tmp/<video_id>_downloads` and clears that folder first, so
+don't run the regression set while a real transcription of one of these
+videos is in progress. The
 exit code is non-zero when any video errors or fails `verify-quality`.
 
 The full stage always uses the chunked path (`process-chunks` + `merge-content`),
