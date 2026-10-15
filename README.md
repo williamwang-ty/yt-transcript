@@ -335,7 +335,8 @@ Current policy is intentional and explicit:
 - `chunk-segments --chapters` can force chunk boundaries at YouTube chapter starts to reduce heading drift
 - `chunk-text` now defaults to token-aware planning when `--prompt` is provided, while an explicit `--chunk-size` without `--prompt` keeps legacy character sizing for workflow compatibility
 - prompt names are validated eagerly for chunk planning, so typos fail fast instead of silently falling back to generic budgets
-- `process-chunks` now assigns prompt-specific `max_output_tokens` from the same planning budget instead of using one large shared default
+- `process-chunks` sends `max_tokens` as a stop line (default 8192 per task, only bounded by the context window) instead of carving it out of the input budget, so reasoning tokens no longer squeeze the answer
+- a chunk response cut off at `max_tokens` (`finish_reason` = `length` / `max_tokens` / `max_output_tokens`, any provider) is retried with a larger ceiling (`llm_output_retry_*`, formerly `llm_reasoning_retry_*`); one still cut off after that is flagged `truncated_output`
 - `manifest.json` now records explicit `plan.chunk_contract` and `plan.continuity`; `process-chunks` follows that plan-owned continuity policy instead of silently drifting with later config changes
 - chunk execution now also has explicit resume semantics: stale `running` / missing-output checkpoints are repaired deterministically into `done` or `interrupted` before work resumes
 - `process-chunks` also injects a short continuity context from the previous chunk (tail sentence + optional section title) without enabling body overlap, and chunk budgeting now reserves a small token allowance for that carry-over context
@@ -711,7 +712,8 @@ bash scripts/preflight.sh --require-llm
 - `chunk-segments --chapters` 可选在 YouTube 章节起点强制切 chunk，减少章节标题漂移
 - 如果只传显式 `--chunk-size` 而不传 `--prompt`，`chunk-text` 会继续按 legacy 字符大小解释，避免现有 workflow 被静默改变
 - 分块阶段会提前校验 prompt 名称，避免因为 prompt 拼写错误而静默回退到通用预算
-- `process-chunks` 现在按 prompt 预算单独设置 `max_output_tokens`，不再复用单一的大默认值
+- `process-chunks` 把 `max_tokens` 当作停止线（每个任务默认 8192，只受上下文窗口约束），不再从输入预算里切一块给输出，思考 token 不会再挤掉正文
+- 分块响应如果停在 `max_tokens`（任何厂商的 `finish_reason` = `length` / `max_tokens` / `max_output_tokens`），会加大上限重试（`llm_output_retry_*`，旧名 `llm_reasoning_retry_*`）；重试后仍被截断的块会标记为 `truncated_output`
 - `manifest.json` 现在会显式记录 `plan.chunk_contract` 与 `plan.continuity`；`process-chunks` 会遵循 plan-own 的 continuity 策略，而不是被后续 config 漂移静默改变
 - chunk 执行现在也有显式 resume 语义：在继续执行前，stale 的 `running` / 缺失输出 checkpoint 会被确定性修复为 `done` 或 `interrupted`
 - `process-chunks` 还会注入上一块的轻量 continuity context（尾句 + 可选 section title），但不会启用正文 overlap；同时分块预算也会为这段 carry-over context 预留一小段 token 成本

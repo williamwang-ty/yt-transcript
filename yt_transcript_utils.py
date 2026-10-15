@@ -279,24 +279,6 @@ def _normalize_stream_mode(value) -> str:
     return "auto"
 
 
-def _is_reasoning_llm_model(model: str = "") -> bool:
-    """Return whether the configured model exposes hidden reasoning tokens."""
-    normalized = str(model or "").strip().lower().replace("_", "-")
-    return (
-        "deepseek-v4" in normalized
-        or "deepseek-reasoner" in normalized
-        or "deepseek-r1" in normalized
-    )
-
-
-def _resolve_chunk_stream_mode_for_model(model: str = "", stream_mode: str = "auto") -> str:
-    """Resolve chunk request streaming mode for models that require usage telemetry."""
-    normalized_stream = _normalize_stream_mode(stream_mode)
-    if _is_reasoning_llm_model(model) and normalized_stream in {"auto", "true"}:
-        return "false"
-    return normalized_stream
-
-
 def _llm_reasoning_probe_enabled(config: dict | None = None) -> bool:
     """Return whether chunk processing may probe unknown models for reasoning metadata."""
     config = config or {}
@@ -336,12 +318,16 @@ TASK_OUTPUT_RATIO_DEFAULTS = {
     "summarize": 0.15,
 }
 
+# max_tokens is a stop line, not a cost: an unused ceiling is free, while a
+# tight one truncates output (and reasoning models spend part of it on hidden
+# reasoning). Chunk size, not this ceiling, controls how much a request writes.
+DEFAULT_MAX_OUTPUT_TOKENS = 8192
 TASK_MAX_OUTPUT_TOKEN_DEFAULTS = {
-    "structure_only": 1800,
-    "quick_cleanup": 3200,
-    "cleanup_zh": 3200,
-    "translate_only": 1500,
-    "summarize": 384,
+    "structure_only": DEFAULT_MAX_OUTPUT_TOKENS,
+    "quick_cleanup": DEFAULT_MAX_OUTPUT_TOKENS,
+    "cleanup_zh": DEFAULT_MAX_OUTPUT_TOKENS,
+    "translate_only": DEFAULT_MAX_OUTPUT_TOKENS,
+    "summarize": DEFAULT_MAX_OUTPUT_TOKENS,
 }
 
 TASK_REQUEST_CAP_DEFAULTS = {
@@ -352,9 +338,19 @@ TASK_REQUEST_CAP_DEFAULTS = {
     "summarize": 4500,
 }
 
-DEFAULT_REASONING_RETRY_ATTEMPTS = 2
-DEFAULT_REASONING_RETRY_MULTIPLIER = 2.0
-DEFAULT_REASONING_RETRY_MAX_TOKENS = 4096
+# Largest input (tokens) sent as one non-chunked prompt; longer text is chunked.
+# Kept separate from the max_tokens ceiling, which no longer sizes anything.
+SINGLE_PASS_TOKEN_LIMITS = {
+    "structure_only": 4800,
+    "translate_only": 4100,
+}
+
+DEFAULT_OUTPUT_RETRY_ATTEMPTS = 2
+DEFAULT_OUTPUT_RETRY_MULTIPLIER = 2.0
+DEFAULT_OUTPUT_RETRY_MAX_TOKENS = 16384
+# finish_reason values that mean "stopped at max_tokens" across providers
+# (OpenAI-compatible, Anthropic, Gemini).
+TRUNCATED_FINISH_REASONS = {"length", "max_tokens", "max_output_tokens"}
 DEFAULT_LLM_MODEL = "deepseek-v4-pro"
 DEFAULT_LLM_BASE_URL = "https://api.deepseek.com"
 
@@ -418,7 +414,7 @@ RUNTIME_OWNER_FILENAME = kernel_runtime.RUNTIME_OWNER_FILENAME
 DEFAULT_UNKNOWN_CHUNK_TOKENS = 900
 CHUNK_SEPARATOR = "\n\n"
 DEFAULT_UNKNOWN_OUTPUT_RATIO = 1.0
-DEFAULT_UNKNOWN_MAX_OUTPUT_TOKENS = 1400
+DEFAULT_UNKNOWN_MAX_OUTPUT_TOKENS = DEFAULT_MAX_OUTPUT_TOKENS
 DEFAULT_UNKNOWN_REQUEST_CAP = 2600
 DEFAULT_UNKNOWN_LEGACY_CHARS = 8000
 SUPERSEDED_CHUNK_STATUS = "superseded"
@@ -491,9 +487,9 @@ def _default_config_values(config_path: str = "") -> dict:
         "llm_stop_after_consecutive_timeouts": 2,
         "llm_chunk_recovery_attempts": DEFAULT_LLM_CHUNK_RECOVERY_ATTEMPTS,
         "llm_chunk_recovery_backoff_sec": DEFAULT_LLM_CHUNK_RECOVERY_BACKOFF_SEC,
-        "llm_reasoning_retry_attempts": DEFAULT_REASONING_RETRY_ATTEMPTS,
-        "llm_reasoning_retry_multiplier": DEFAULT_REASONING_RETRY_MULTIPLIER,
-        "llm_reasoning_retry_max_tokens": DEFAULT_REASONING_RETRY_MAX_TOKENS,
+        "llm_output_retry_attempts": DEFAULT_OUTPUT_RETRY_ATTEMPTS,
+        "llm_output_retry_multiplier": DEFAULT_OUTPUT_RETRY_MULTIPLIER,
+        "llm_output_retry_max_tokens": DEFAULT_OUTPUT_RETRY_MAX_TOKENS,
         "llm_backend": kernel_agent_cli.DEFAULT_LLM_BACKEND,
         "llm_agent_cli": "",
         "llm_cli_timeout_sec": kernel_agent_cli.DEFAULT_CLI_TIMEOUT_SEC,
@@ -962,13 +958,15 @@ def _calculate_chunk_budget(prompt_name: str, prompt_template: str,
         expected_output_tokens = min(task_max_output_tokens, int(math.ceil(target_tokens * output_ratio)))
 
     available_input_tokens = max(1, effective_budget - prompt_tokens - expected_output_tokens - safety_buffer_tokens)
-    planned_max_output_tokens = max(
-        expected_output_tokens,
-        min(task_max_output_tokens, effective_budget - prompt_tokens - target_tokens - safety_buffer_tokens),
-    )
     hard_cap_tokens = max(target_tokens, int(math.ceil(target_tokens * hard_cap_multiplier)))
     hard_cap_tokens = min(hard_cap_tokens, available_input_tokens)
     hard_cap_tokens = max(target_tokens, hard_cap_tokens)
+    # The request budget above only sizes the input chunk. The output ceiling
+    # is a stop line bounded by the context window, not carved out of it.
+    planned_max_output_tokens = max(
+        expected_output_tokens,
+        min(task_max_output_tokens, context_window - prompt_tokens - hard_cap_tokens - safety_buffer_tokens),
+    )
 
     return {
         "prompt_name": prompt_name,
@@ -1541,14 +1539,20 @@ def _reasoning_usage_stats(llm_result: dict | None) -> dict:
     }
 
 
-def _is_reasoning_budget_exhaustion(llm_result: dict | None, result_text: str,
-                                    requested_max_tokens: int) -> bool:
-    """Detect the DeepSeek-style case where reasoning consumes the whole budget."""
-    if result_text.strip():
-        return False
+def _is_output_budget_exhausted(llm_result: dict | None, result_text: str,
+                                requested_max_tokens: int) -> bool:
+    """Return whether the response stopped at max_tokens instead of finishing.
+
+    The primary signal is the provider's finish_reason, which every API
+    reports, streaming included. Usage-based detection only covers gateways
+    that return empty content with a normal finish_reason after spending the
+    whole budget on reasoning.
+    """
     result = llm_result if isinstance(llm_result, dict) else {}
     finish_reason = str(result.get("finish_reason", "") or "").strip().lower()
-    if finish_reason not in {"stop", "end_turn", "length", "max_tokens"}:
+    if finish_reason in TRUNCATED_FINISH_REASONS:
+        return True
+    if result_text.strip() or finish_reason not in {"stop", "end_turn"}:
         return False
     stats = _reasoning_usage_stats(result)
     if stats["reasoning_tokens"] <= 0:
@@ -1559,33 +1563,52 @@ def _is_reasoning_budget_exhaustion(llm_result: dict | None, result_text: str,
     return stats["reasoning_ratio"] >= 0.95 and stats["content_tokens"] == 0
 
 
-def _next_reasoning_retry_max_tokens(current_max_tokens: int, config: dict | None = None) -> int:
-    """Increase completion budget for a reasoning-token exhaustion retry."""
-    config = config or {}
+def _output_retry_setting(config: dict | None, name: str, default):
+    """Read one llm_output_retry_* setting."""
+    value = (config or {}).get(f"llm_output_retry_{name}")
+    if value is None or str(value).strip() == "":
+        return default
+    return value
+
+
+def _next_output_retry_max_tokens(current_max_tokens: int, config: dict | None = None,
+                                  observed_reasoning_tokens: int = 0) -> int:
+    """Raise max_tokens for a retry after the response was cut off.
+
+    The new ceiling is at least the old one plus any reasoning tokens the
+    provider reported, so the retry keeps the original room for the answer.
+    """
     current = max(1, _parse_int(current_max_tokens, 1))
     multiplier = _parse_float_range(
-        config.get("llm_reasoning_retry_multiplier"),
-        DEFAULT_REASONING_RETRY_MULTIPLIER,
+        _output_retry_setting(config, "multiplier", DEFAULT_OUTPUT_RETRY_MULTIPLIER),
+        DEFAULT_OUTPUT_RETRY_MULTIPLIER,
         1.01,
         4.0,
     )
     cap = max(
         current,
         _parse_int_min(
-            config.get("llm_reasoning_retry_max_tokens"),
-            DEFAULT_REASONING_RETRY_MAX_TOKENS,
+            _output_retry_setting(config, "max_tokens", DEFAULT_OUTPUT_RETRY_MAX_TOKENS),
+            DEFAULT_OUTPUT_RETRY_MAX_TOKENS,
             current,
         ),
     )
-    return min(cap, max(current + 1, int(math.ceil(current * multiplier))))
+    observed = max(0, _parse_int(observed_reasoning_tokens, 0))
+    return min(cap, max(current + 1, int(math.ceil(current * multiplier)), current + observed))
 
 
-def _build_reasoning_exhaustion_warning(chunk_id: int, stats: dict, requested_max_tokens: int) -> str:
-    """Build a concise warning for reasoning-heavy empty chunk responses."""
+def _build_output_budget_warning(chunk_id: int, stats: dict, finish_reason: str,
+                                 requested_max_tokens: int) -> str:
+    """Build a concise warning for a chunk response cut off at max_tokens."""
+    reasoning_note = ""
+    if stats.get("reasoning_tokens", 0) > 0:
+        reasoning_note = (
+            f", {stats['reasoning_tokens']}/{max(1, stats['completion_tokens'])} "
+            "completion tokens spent on reasoning"
+        )
     return (
-        f"⚠️ Chunk {chunk_id}: LLM returned empty content after spending "
-        f"{stats['reasoning_tokens']}/{max(1, stats['completion_tokens'])} completion tokens on reasoning "
-        f"(max_tokens={requested_max_tokens}). Retrying with a larger completion budget."
+        f"⚠️ Chunk {chunk_id}: output stopped at max_tokens={requested_max_tokens} "
+        f"(finish_reason={finish_reason or 'n/a'}{reasoning_note}). Retrying with a larger ceiling."
     )
 
 
@@ -1881,9 +1904,9 @@ def _append_chunk_recovery_log(chunk_info: dict, *, action: str, reasons: list[s
     if action == "retry":
         chunk_info["recovery_attempts"] = max(0, _parse_int(chunk_info.get("recovery_attempts"), 0)) + 1
     elif action == "expand_max_tokens":
-        chunk_info["reasoning_recovery_attempts"] = max(
+        chunk_info["budget_recovery_attempts"] = max(
             0,
-            _parse_int(chunk_info.get("reasoning_recovery_attempts"), 0),
+            _parse_int(chunk_info.get("budget_recovery_attempts"), 0),
         ) + 1
 
 
@@ -2221,7 +2244,13 @@ def _read_streaming_response(response, api_format: str) -> dict:
             continue
         if api_format == "anthropic":
             text = _extract_anthropic_stream_text(payload)
-            finish_reason = finish_reason or _extract_llm_finish_reason(payload, api_format)
+            # Anthropic streams stop_reason in the message_delta event's delta.
+            delta = payload.get("delta") if isinstance(payload.get("delta"), dict) else {}
+            finish_reason = (
+                str(delta.get("stop_reason") or "")
+                or finish_reason
+                or _extract_llm_finish_reason(payload, api_format)
+            )
         else:
             text = _extract_openai_stream_text(payload)
             choices = payload.get("choices") or []
@@ -7072,9 +7101,9 @@ def _estimate_single_pass_input_tokens(normalized_document_path: str, raw_text_p
 
 def _single_pass_token_limit(mode: str, source: str, config: dict | None = None) -> int:
     """Return the largest input we should still send through one non-chunked prompt."""
-    config = config or {}
-    structure_limit = _get_task_request_cap('structure_only') + _get_task_max_output_tokens('structure_only', config)
-    translate_limit = _get_task_request_cap('translate_only') + _get_task_max_output_tokens('translate_only', config)
+    del config
+    structure_limit = SINGLE_PASS_TOKEN_LIMITS['structure_only']
+    translate_limit = SINGLE_PASS_TOKEN_LIMITS['translate_only']
     limit = structure_limit
     if str(mode or '').strip() == 'bilingual':
         limit = min(limit, translate_limit)
@@ -7505,20 +7534,32 @@ def load_config(config_path: str = None, allow_missing: bool = False) -> dict:
         DEFAULT_LLM_CHUNK_RECOVERY_BACKOFF_SEC,
         minimum=0.0,
     )
-    llm_reasoning_retry_attempts = parse_int_field(
-        'llm_reasoning_retry_attempts',
-        DEFAULT_REASONING_RETRY_ATTEMPTS,
+    # llm_reasoning_retry_* was the old name for these settings; a value set
+    # only under the old name still applies, with a rename warning.
+    for suffix in ('attempts', 'multiplier', 'max_tokens'):
+        legacy_key = f'llm_reasoning_retry_{suffix}'
+        new_key = f'llm_output_retry_{suffix}'
+        if not str(config.get(legacy_key, '') or '').strip():
+            continue
+        if not str(config.get(new_key, '') or '').strip():
+            config[new_key] = config[legacy_key]
+        legacy_warning = f"{legacy_key} has been renamed to {new_key}; please update config.yaml"
+        config_warnings.append(legacy_warning)
+        config_issue_warnings.append(legacy_warning)
+    llm_output_retry_attempts = parse_int_field(
+        'llm_output_retry_attempts',
+        DEFAULT_OUTPUT_RETRY_ATTEMPTS,
         minimum=0,
     )
-    llm_reasoning_retry_multiplier = parse_float_field(
-        'llm_reasoning_retry_multiplier',
-        DEFAULT_REASONING_RETRY_MULTIPLIER,
+    llm_output_retry_multiplier = parse_float_field(
+        'llm_output_retry_multiplier',
+        DEFAULT_OUTPUT_RETRY_MULTIPLIER,
         minimum=1.01,
         maximum=4.0,
     )
-    llm_reasoning_retry_max_tokens = parse_int_field(
-        'llm_reasoning_retry_max_tokens',
-        DEFAULT_REASONING_RETRY_MAX_TOKENS,
+    llm_output_retry_max_tokens = parse_int_field(
+        'llm_output_retry_max_tokens',
+        DEFAULT_OUTPUT_RETRY_MAX_TOKENS,
         minimum=1,
     )
 
@@ -7618,9 +7659,9 @@ def load_config(config_path: str = None, allow_missing: bool = False) -> dict:
         "llm_stop_after_consecutive_timeouts": llm_stop_after_consecutive_timeouts,
         "llm_chunk_recovery_attempts": llm_chunk_recovery_attempts,
         "llm_chunk_recovery_backoff_sec": llm_chunk_recovery_backoff_sec,
-        "llm_reasoning_retry_attempts": llm_reasoning_retry_attempts,
-        "llm_reasoning_retry_multiplier": llm_reasoning_retry_multiplier,
-        "llm_reasoning_retry_max_tokens": llm_reasoning_retry_max_tokens,
+        "llm_output_retry_attempts": llm_output_retry_attempts,
+        "llm_output_retry_multiplier": llm_output_retry_multiplier,
+        "llm_output_retry_max_tokens": llm_output_retry_max_tokens,
         "llm_backend": kernel_agent_cli.normalize_backend_mode(config.get('llm_backend', kernel_agent_cli.DEFAULT_LLM_BACKEND)),
         "llm_agent_cli": str(config.get('llm_agent_cli', '') or '').strip(),
         "llm_cli_timeout_sec": parse_int_field('llm_cli_timeout_sec', kernel_agent_cli.DEFAULT_CLI_TIMEOUT_SEC, minimum=1),

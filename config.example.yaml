@@ -85,12 +85,16 @@ llm_stop_after_consecutive_timeouts: 2
 # Re-run suspiciously short / malformed chunk outputs before surfacing warnings
 llm_chunk_recovery_attempts: 1
 llm_chunk_recovery_backoff_sec: 1.0
-# DeepSeek v4 reasoning models count hidden reasoning tokens against max_tokens.
-# If a chunk returns empty content after spending its budget on reasoning,
-# process-chunks retries that chunk with an expanded completion budget.
-llm_reasoning_retry_attempts: 2
-llm_reasoning_retry_multiplier: 2.0
-llm_reasoning_retry_max_tokens: 4096
+# When a chunk response stops at max_tokens (finish_reason length / max_tokens /
+# max_output_tokens, from any provider), process-chunks retries it with a larger
+# ceiling: at least multiplier x the old one, and at least old + the reasoning
+# tokens the model reported, up to llm_output_retry_max_tokens. If the provider
+# rejects the larger value, the run keeps the last accepted one. A chunk still
+# cut off after that is flagged truncated_output instead of being accepted.
+# (Formerly llm_reasoning_retry_*; the old names still work but print a warning.)
+llm_output_retry_attempts: 2
+llm_output_retry_multiplier: 2.0
+llm_output_retry_max_tokens: 16384
 
 # Chunk planning
 # Default mode is token-aware. Set to "chars" for legacy character chunking.
@@ -115,11 +119,15 @@ output_ratio_quick_cleanup: 1.05
 output_ratio_cleanup_zh: 1.05
 output_ratio_translate_only: 1.10
 output_ratio_summarize: 0.15
-max_output_tokens_structure_only: 1800
-max_output_tokens_quick_cleanup: 3200
-max_output_tokens_cleanup_zh: 3200
-max_output_tokens_translate_only: 1500
-max_output_tokens_summarize: 384
+# max_tokens ceiling per chunk request. It is a stop line, not a budget: chunk
+# size decides how much a request writes, and an unused ceiling costs nothing.
+# Only the model's context window (minus prompt and input) can lower it. Set a
+# smaller value only if your model rejects 8192.
+max_output_tokens_structure_only: 8192
+max_output_tokens_quick_cleanup: 8192
+max_output_tokens_cleanup_zh: 8192
+max_output_tokens_translate_only: 8192
+max_output_tokens_summarize: 8192
 enable_token_count_probe: true
 enable_chunk_autotune: false
 autotune_reduce_percent: 0.25

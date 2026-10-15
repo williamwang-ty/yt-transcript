@@ -56,20 +56,12 @@ def _process_chunks_impl(work_dir: str, prompt_name: str, extra_instruction: str
     max_retries = config.get("llm_max_retries", 3)
     backoff_sec = config.get("llm_backoff_sec", 1.5)
     stream_mode = _normalize_stream_mode(config.get("llm_stream", "auto"))
-    model_reasoning_hint = _is_reasoning_llm_model(model)
-    request_stream_mode = _resolve_chunk_stream_mode_for_model(model, stream_mode)
-    stream_decision_reason = "configured"
-    if stream_mode == "false":
-        stream_decision_reason = "configured_false"
-    elif model_reasoning_hint and request_stream_mode == "false":
-        stream_decision_reason = "model_name_hint"
-    reasoning_stream_disabled = stream_decision_reason == "model_name_hint"
+    request_stream_mode = stream_mode
+    stream_decision_reason = "configured_false" if stream_mode == "false" else "configured"
     reasoning_probe = _build_reasoning_probe_record(model, api_format)
     reasoning_probe["enabled"] = _llm_reasoning_probe_enabled(config)
     if stream_decision_reason == "configured_false":
         reasoning_probe["reason"] = "streaming_forced_false"
-    elif stream_decision_reason == "model_name_hint":
-        reasoning_probe["reason"] = "model_name_hint"
     stop_after_timeouts = config.get("llm_stop_after_consecutive_timeouts", 2)
     chunk_recovery_attempt_limit = _parse_int_min(
         config.get("llm_chunk_recovery_attempts"),
@@ -81,11 +73,13 @@ def _process_chunks_impl(work_dir: str, prompt_name: str, extra_instruction: str
         DEFAULT_LLM_CHUNK_RECOVERY_BACKOFF_SEC,
         0.0,
     )
-    reasoning_retry_attempt_limit = _parse_int_min(
-        config.get("llm_reasoning_retry_attempts"),
-        DEFAULT_REASONING_RETRY_ATTEMPTS,
+    output_retry_attempt_limit = _parse_int_min(
+        config.get("llm_output_retry_attempts"),
+        DEFAULT_OUTPUT_RETRY_ATTEMPTS,
         0,
     )
+    # Set when the provider rejects a larger max_tokens; later retries stay below it.
+    output_retry_ceiling = None
     operation_control = _build_operation_control_contract(
         "chunk",
         prompt_name,
@@ -180,14 +174,6 @@ def _process_chunks_impl(work_dir: str, prompt_name: str, extra_instruction: str
         )
     elif backend_decision["mode"] == "auto" and backend_decision["fallback_reason"]:
         print(f"ℹ️ Chunk requests use the configured API: {backend_decision['fallback_reason']}", file=sys.stderr)
-    if reasoning_stream_disabled and not use_cli:
-        setup_warning = (
-            f"ℹ️ Streaming disabled for reasoning model '{model}' during chunk processing "
-            "so provider usage can be inspected for empty-content recovery."
-        )
-        setup_warnings.append(setup_warning)
-        print(setup_warning, file=sys.stderr)
-
     if manifest_chunk_mode == "tokens":
         if plan_target_tokens > prompt_budget["target_tokens"]:
             setup_warning = (
@@ -233,7 +219,6 @@ def _process_chunks_impl(work_dir: str, prompt_name: str, extra_instruction: str
         "configured_stream_mode": stream_mode,
         "request_stream_mode": request_stream_mode,
         "reason": stream_decision_reason,
-        "model_reasoning_hint": model_reasoning_hint,
     }
     runtime["reasoning_probe"] = reasoning_probe
     runtime["llm_backend"] = backend_decision
@@ -336,7 +321,6 @@ def _process_chunks_impl(work_dir: str, prompt_name: str, extra_instruction: str
             "configured_stream_mode": stream_mode,
             "request_stream_mode": request_stream_mode,
             "reason": stream_decision_reason,
-            "model_reasoning_hint": model_reasoning_hint,
         }
         runtime["reasoning_probe"] = reasoning_probe
 
@@ -360,7 +344,7 @@ def _process_chunks_impl(work_dir: str, prompt_name: str, extra_instruction: str
             stream_decision_reason = "reasoning_metadata_probe"
             setup_warning = (
                 f"ℹ️ Streaming disabled after reasoning metadata probe for model '{model}' "
-                "so provider usage can be inspected for empty-content recovery."
+                "so truncation retries can see how many tokens went to reasoning."
             )
             warnings.append(setup_warning)
             print(setup_warning, file=sys.stderr)
@@ -684,6 +668,7 @@ def _process_chunks_impl(work_dir: str, prompt_name: str, extra_instruction: str
         )
 
         chunk_attempt_logs = []
+        pre_expansion_max_tokens = None
         while True:
             try:
                 llm_result = call_chunk_llm(prompt, planned_max_output_tokens)
@@ -709,24 +694,33 @@ def _process_chunks_impl(work_dir: str, prompt_name: str, extra_instruction: str
                     )
                     warnings.append(reasoning_warning)
                     print(reasoning_warning, file=sys.stderr)
-                if (
-                    _is_reasoning_budget_exhaustion(llm_result, result_text, planned_max_output_tokens)
-                    and chunk_info.get("reasoning_recovery_attempts", 0) < reasoning_retry_attempt_limit
-                ):
-                    expanded_max_tokens = _next_reasoning_retry_max_tokens(planned_max_output_tokens, config)
+                # Any provider that stops at max_tokens reports it in
+                # finish_reason; retry with a higher ceiling so the answer has
+                # room even after the model's reasoning spends part of it.
+                output_truncated = _is_output_budget_exhausted(llm_result, result_text, planned_max_output_tokens)
+                pre_expansion_max_tokens = None
+                if output_truncated and chunk_info.get("budget_recovery_attempts", 0) < output_retry_attempt_limit:
+                    expanded_max_tokens = _next_output_retry_max_tokens(
+                        planned_max_output_tokens,
+                        config,
+                        observed_reasoning_tokens=reasoning_stats["reasoning_tokens"],
+                    )
+                    if output_retry_ceiling is not None:
+                        expanded_max_tokens = min(expanded_max_tokens, output_retry_ceiling)
                     if expanded_max_tokens > planned_max_output_tokens:
-                        reasoning_warning = _build_reasoning_exhaustion_warning(
+                        budget_warning = _build_output_budget_warning(
                             chunk_id,
                             reasoning_stats,
+                            chunk_info["finish_reason"],
                             planned_max_output_tokens,
                         )
-                        warnings.append(reasoning_warning)
-                        print(reasoning_warning, file=sys.stderr)
+                        warnings.append(budget_warning)
+                        print(budget_warning, file=sys.stderr)
                         _append_chunk_recovery_log(
                             chunk_info,
                             action="expand_max_tokens",
-                            reasons=["reasoning_budget_exhausted"],
-                            details=[reasoning_warning],
+                            reasons=["output_budget_exhausted"],
+                            details=[budget_warning],
                             request_attempts=request_attempts,
                             request_url=llm_result.get("request_url", request_url),
                             latency_ms=llm_result.get("latency_ms"),
@@ -735,13 +729,14 @@ def _process_chunks_impl(work_dir: str, prompt_name: str, extra_instruction: str
                             to_max_tokens=expanded_max_tokens,
                         )
                         runtime_control["repair_attempted_count"] = runtime_control.get("repair_attempted_count", 0) + 1
+                        pre_expansion_max_tokens = planned_max_output_tokens
                         planned_max_output_tokens = expanded_max_tokens
                         chunk_info["planned_max_output_tokens"] = planned_max_output_tokens
                         manifest["autotune"]["current_planned_max_output_tokens"] = planned_max_output_tokens
                         chunk_info["status"] = "pending"
-                        chunk_info["last_error"] = reasoning_warning
-                        chunk_info["last_error_type"] = "reasoning_budget_exhausted"
-                        chunk_info["error_type"] = "reasoning_budget_exhausted"
+                        chunk_info["last_error"] = budget_warning
+                        chunk_info["last_error_type"] = "output_budget_exhausted"
+                        chunk_info["error_type"] = "output_budget_exhausted"
                         chunk_info["request_url"] = llm_result.get("request_url", request_url)
                         chunk_info["latency_ms"] = llm_result.get("latency_ms")
                         chunk_info["streaming_used"] = bool(llm_result.get("streaming_used", False))
@@ -752,12 +747,6 @@ def _process_chunks_impl(work_dir: str, prompt_name: str, extra_instruction: str
                         if chunk_recovery_backoff_sec > 0:
                             time.sleep(chunk_recovery_backoff_sec)
                         continue
-                    cap_warning = (
-                        f"⚠️ Chunk {chunk_id}: reasoning budget was exhausted, but "
-                        f"max_tokens is already at the configured retry cap ({planned_max_output_tokens})."
-                    )
-                    warnings.append(cap_warning)
-                    print(cap_warning, file=sys.stderr)
                 actual_output_tokens = _estimate_tokens(result_text, "tokens", config)
                 output_health = _evaluate_chunk_output_health(
                     prompt_name,
@@ -769,10 +758,21 @@ def _process_chunks_impl(work_dir: str, prompt_name: str, extra_instruction: str
                     glossary_max_terms=max(0, _parse_int_min(config.get("chunk_glossary_max_prompt_terms"), 8, 0)),
                 )
                 consecutive_timeouts = 0
+                if output_truncated:
+                    truncation_warning = (
+                        f"⚠️ Chunk {chunk_id}: output is still cut off at max_tokens={planned_max_output_tokens} "
+                        f"(finish_reason={chunk_info['finish_reason'] or 'n/a'}) after "
+                        f"{chunk_info.get('budget_recovery_attempts', 0)} larger-ceiling retries; the chunk is incomplete."
+                    )
+                    output_health["warnings"].insert(0, truncation_warning)
+                    output_health["retry_reasons"].insert(0, "truncated_output")
+                # Repeating the same request cannot fix truncation, so only the
+                # other reasons trigger a same-budget retry.
+                quality_retry_reasons = [reason for reason in output_health["retry_reasons"] if reason != "truncated_output"]
 
                 # Verification-triggered repair stays inside the current plan: we
                 # retry the same chunk before escalating to full replanning.
-                if output_health["retry_reasons"] and chunk_info.get("recovery_attempts", 0) < chunk_recovery_attempt_limit:
+                if quality_retry_reasons and chunk_info.get("recovery_attempts", 0) < chunk_recovery_attempt_limit:
                     _append_chunk_recovery_log(
                         chunk_info,
                         action="retry",
@@ -812,7 +812,9 @@ def _process_chunks_impl(work_dir: str, prompt_name: str, extra_instruction: str
                         time.sleep(chunk_recovery_backoff_sec)
                     continue
 
-                repair_exhausted = bool(output_health["retry_reasons"]) and chunk_info.get("recovery_attempts", 0) >= chunk_recovery_attempt_limit
+                repair_exhausted = output_truncated or (
+                    bool(quality_retry_reasons) and chunk_info.get("recovery_attempts", 0) >= chunk_recovery_attempt_limit
+                )
                 if output_health["warnings"]:
                     runtime_control["verification_warning_count"] = runtime_control.get("verification_warning_count", 0) + len(output_health["warnings"])
                 if repair_exhausted:
@@ -924,6 +926,25 @@ def _process_chunks_impl(work_dir: str, prompt_name: str, extra_instruction: str
                 attempt_logs = _collect_attempt_logs(error)
                 request_attempts = max(len(attempt_logs), _parse_int(getattr(error, "attempts", 1), 1))
                 chunk_attempt_logs.extend(attempt_logs)
+                if pre_expansion_max_tokens is not None and getattr(error, "status_code", None) in {400, 422}:
+                    # The provider rejected the larger ceiling: keep the last
+                    # accepted one as this run's limit and redo the chunk at it.
+                    rejected_max_tokens = planned_max_output_tokens
+                    output_retry_ceiling = pre_expansion_max_tokens
+                    planned_max_output_tokens = pre_expansion_max_tokens
+                    pre_expansion_max_tokens = None
+                    chunk_info["attempts"] = chunk_info.get("attempts", 0) + request_attempts
+                    chunk_info["attempt_logs"] = list(chunk_info.get("attempt_logs", [])) + attempt_logs
+                    chunk_info["planned_max_output_tokens"] = planned_max_output_tokens
+                    manifest["autotune"]["current_planned_max_output_tokens"] = planned_max_output_tokens
+                    rejected_warning = (
+                        f"⚠️ Chunk {chunk_id}: provider rejected max_tokens={rejected_max_tokens} "
+                        f"({error.error_type}); keeping max_tokens={planned_max_output_tokens} for this run."
+                    )
+                    warnings.append(rejected_warning)
+                    print(rejected_warning, file=sys.stderr)
+                    _write_manifest(manifest_path, manifest)
+                    continue
                 failed_count += 1
                 chunk_info["status"] = "failed"
                 chunk_info["attempts"] = chunk_info.get("attempts", 0) + request_attempts

@@ -1871,9 +1871,9 @@ class RuntimeRegressionTests(unittest.TestCase):
 
             manifest = json.loads((work_dir / "manifest.json").read_text(encoding="utf-8"))
             self.assertTrue(result["success"])
-            self.assertEqual(mocked_call.call_args.kwargs["max_tokens"], 384)
-            self.assertEqual(manifest["planned_max_output_tokens"], 384)
-            self.assertEqual(manifest["chunks"][0]["planned_max_output_tokens"], 384)
+            self.assertEqual(mocked_call.call_args.kwargs["max_tokens"], utils.TASK_MAX_OUTPUT_TOKEN_DEFAULTS["summarize"])
+            self.assertEqual(manifest["planned_max_output_tokens"], utils.TASK_MAX_OUTPUT_TOKEN_DEFAULTS["summarize"])
+            self.assertEqual(manifest["chunks"][0]["planned_max_output_tokens"], utils.TASK_MAX_OUTPUT_TOKEN_DEFAULTS["summarize"])
 
     def test_process_chunks_injects_continuity_context(self):
         """Test process chunks injects continuity context."""
@@ -2463,61 +2463,64 @@ chunk_context_summary_tokens: 20
             self.assertEqual(manifest["runtime"]["reasoning_probe"]["reason"], "reasoning_tokens")
             self.assertEqual(manifest["runtime"]["llm_stream_decision"]["reason"], "reasoning_metadata_probe")
 
-    def test_process_chunks_expands_max_tokens_after_reasoning_empty_output(self):
-        """Test DeepSeek-style reasoning exhaustion retries with a larger budget."""
+    def _write_truncation_fixture(self, tmpdir: str, max_tokens: int, **config_overrides) -> tuple[Path, dict]:
+        """Build a one-chunk cleanup_zh work dir pinned to one max_tokens ceiling."""
+        source = Path(tmpdir) / "raw.txt"
+        work_dir = Path(tmpdir) / "chunks"
+        source.write_text("第一句。" * 40, encoding="utf-8")
+        utils.chunk_text(str(source), str(work_dir), 1000, "cleanup_zh")
+
+        config = utils._default_config_values()
+        config.update({
+            "llm_api_key": "key",
+            "llm_base_url": "https://api.example.com",
+            "llm_model": "acme/any-model",
+            "llm_api_format": "openai",
+            "llm_stream": "false",
+            "llm_chunk_recovery_attempts": 1,
+            "llm_chunk_recovery_backoff_sec": 0.0,
+        })
+        config.update(config_overrides)
+        manifest_path = work_dir / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["plan"]["planned_max_output_tokens"] = max_tokens
+        manifest["planned_max_output_tokens"] = max_tokens
+        manifest["chunks"][0]["planned_max_output_tokens"] = max_tokens
+        manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+        return work_dir, config
+
+    @staticmethod
+    def _llm_response(text: str, finish_reason: str, reasoning_tokens: int = 0,
+                      completion_tokens: int = 0) -> dict:
+        """Build one mocked chunk LLM response."""
+        return {
+            "text": text,
+            "finish_reason": finish_reason,
+            "usage": {
+                "completion_tokens": completion_tokens,
+                "reasoning_tokens": reasoning_tokens,
+                "content_tokens": max(0, completion_tokens - reasoning_tokens),
+            },
+            "latency_ms": 10,
+            "request_url": "https://api.example.com/v1/chat/completions",
+            "streaming_used": False,
+            "attempts": 1,
+        }
+
+    def test_process_chunks_retries_truncated_output_with_room_for_reasoning(self):
+        """Test a non-empty response cut off at max_tokens is retried with a larger ceiling, for any model."""
+        full_text = "## Done\n\n" + ("处理完成，保留原始信息。\n" * 12)
         with tempfile.TemporaryDirectory() as tmpdir:
-            source = Path(tmpdir) / "raw.txt"
-            work_dir = Path(tmpdir) / "chunks"
-            source.write_text("第一句。" * 40, encoding="utf-8")
-            utils.chunk_text(str(source), str(work_dir), 1000, "cleanup_zh")
-
-            config = utils._default_config_values()
-            config.update({
-                "llm_api_key": "key",
-                "llm_base_url": "https://api.example.com",
-                "llm_model": "deepseek-v4-flash",
-                "llm_api_format": "openai",
-                "llm_chunk_recovery_attempts": 1,
-                "llm_chunk_recovery_backoff_sec": 0.0,
-                "llm_reasoning_retry_attempts": 2,
-                "llm_reasoning_retry_multiplier": 2.0,
-                "llm_reasoning_retry_max_tokens": 4096,
-                "max_output_tokens_cleanup_zh": 1223,
-            })
-            manifest_path = work_dir / "manifest.json"
-            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-            manifest["plan"]["planned_max_output_tokens"] = 1223
-            manifest["planned_max_output_tokens"] = 1223
-            manifest["chunks"][0]["planned_max_output_tokens"] = 1223
-            manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
-
+            work_dir, config = self._write_truncation_fixture(
+                tmpdir,
+                2000,
+                llm_output_retry_attempts=2,
+                llm_output_retry_multiplier=1.5,
+                llm_output_retry_max_tokens=16384,
+            )
             responses = [
-                {
-                    "text": "",
-                    "finish_reason": "length",
-                    "usage": {
-                        "completion_tokens": 1223,
-                        "reasoning_tokens": 1223,
-                        "content_tokens": 0,
-                    },
-                    "latency_ms": 10,
-                    "request_url": "https://api.example.com/v1/chat/completions",
-                    "streaming_used": False,
-                    "attempts": 1,
-                },
-                {
-                    "text": "## Done\n\n" + ("处理完成，保留原始信息。\n" * 12),
-                    "finish_reason": "stop",
-                    "usage": {
-                        "completion_tokens": 900,
-                        "reasoning_tokens": 100,
-                        "content_tokens": 800,
-                    },
-                    "latency_ms": 12,
-                    "request_url": "https://api.example.com/v1/chat/completions",
-                    "streaming_used": False,
-                    "attempts": 1,
-                },
+                self._llm_response(full_text[:60], "length", reasoning_tokens=1500, completion_tokens=2000),
+                self._llm_response(full_text, "stop", reasoning_tokens=1400, completion_tokens=2100),
             ]
 
             with mock.patch.object(utils, "load_config", return_value=config), \
@@ -2527,82 +2530,86 @@ chunk_context_summary_tokens: 20
 
             manifest = json.loads((work_dir / "manifest.json").read_text(encoding="utf-8"))
             first_chunk = manifest["chunks"][0]
+            output_text = (work_dir / first_chunk["processed_path"]).read_text(encoding="utf-8")
 
-            self.assertTrue(result["success"], result)
-            self.assertEqual(mocked_call.call_count, 2)
-            self.assertEqual(mocked_call.call_args_list[0].kwargs["max_tokens"], 1223)
-            self.assertEqual(mocked_call.call_args_list[1].kwargs["max_tokens"], 2446)
-            self.assertEqual(mocked_call.call_args_list[0].kwargs["stream_mode"], "false")
-            self.assertEqual(mocked_call.call_args_list[1].kwargs["stream_mode"], "false")
-            self.assertEqual(first_chunk["reasoning_recovery_attempts"], 1)
-            self.assertEqual(first_chunk["recovery_logs"][0]["action"], "expand_max_tokens")
-            self.assertEqual(first_chunk["recovery_logs"][0]["reasons"], ["reasoning_budget_exhausted"])
-            self.assertEqual(first_chunk["reasoning_tokens"], 100)
-            self.assertEqual(first_chunk["content_tokens"], 800)
-            self.assertEqual(first_chunk["planned_max_output_tokens"], 2446)
-            self.assertEqual(first_chunk["status"], "done")
+        self.assertTrue(result["success"], result)
+        self.assertEqual(mocked_call.call_count, 2)
+        self.assertEqual(mocked_call.call_args_list[0].kwargs["max_tokens"], 2000)
+        # 2000 + 1500 reasoning tokens beats the 1.5x step, so the answer keeps its room.
+        self.assertEqual(mocked_call.call_args_list[1].kwargs["max_tokens"], 3500)
+        self.assertEqual(first_chunk["budget_recovery_attempts"], 1)
+        self.assertEqual(first_chunk["recovery_logs"][0]["action"], "expand_max_tokens")
+        self.assertEqual(first_chunk["recovery_logs"][0]["reasons"], ["output_budget_exhausted"])
+        self.assertEqual(first_chunk["planned_max_output_tokens"], 3500)
+        self.assertEqual(first_chunk["status"], "done")
+        self.assertNotIn("truncated_output", first_chunk["control"]["retry_reasons"])
+        self.assertEqual(output_text, full_text)
 
-    def test_process_chunks_does_not_expand_reasoning_budget_at_retry_cap(self):
-        """Test reasoning exhaustion at cap falls through without a fake expansion retry."""
+    def test_process_chunks_flags_output_still_truncated_at_retry_cap(self):
+        """Test output cut off at the retry cap is flagged truncated_output instead of accepted silently."""
+        partial_text = "## Done\n\n" + ("处理完成，保留原始信息。\n" * 12)
         with tempfile.TemporaryDirectory() as tmpdir:
-            source = Path(tmpdir) / "raw.txt"
-            work_dir = Path(tmpdir) / "chunks"
-            source.write_text("第一句。" * 40, encoding="utf-8")
-            utils.chunk_text(str(source), str(work_dir), 1000, "cleanup_zh")
-
-            config = utils._default_config_values()
-            config.update({
-                "llm_api_key": "key",
-                "llm_base_url": "https://api.example.com",
-                "llm_model": "deepseek/deepseek-reasoner",
-                "llm_api_format": "openai",
-                "llm_chunk_recovery_attempts": 0,
-                "llm_chunk_recovery_backoff_sec": 0.0,
-                "llm_reasoning_retry_attempts": 2,
-                "llm_reasoning_retry_multiplier": 2.0,
-                "llm_reasoning_retry_max_tokens": 1223,
-                "max_output_tokens_cleanup_zh": 1223,
-            })
-            manifest_path = work_dir / "manifest.json"
-            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-            manifest["plan"]["planned_max_output_tokens"] = 1223
-            manifest["planned_max_output_tokens"] = 1223
-            manifest["chunks"][0]["planned_max_output_tokens"] = 1223
-            manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
-
+            work_dir, config = self._write_truncation_fixture(
+                tmpdir,
+                1223,
+                llm_output_retry_attempts=2,
+                llm_output_retry_max_tokens=1223,
+            )
             with mock.patch.object(utils, "load_config", return_value=config), \
                 mock.patch.object(
                     utils,
                     "_call_llm_api",
-                    return_value={
-                        "text": "",
-                        "finish_reason": "length",
-                        "usage": {
-                            "completion_tokens": 1223,
-                            "reasoning_tokens": 1223,
-                            "content_tokens": 0,
-                        },
-                        "latency_ms": 10,
-                        "request_url": "https://api.example.com/v1/chat/completions",
-                        "streaming_used": False,
-                        "attempts": 1,
-                    },
+                    return_value=self._llm_response(partial_text, "length", completion_tokens=1223),
                 ) as mocked_call:
                 result = utils.process_chunks(str(work_dir), "cleanup_zh")
 
             manifest = json.loads((work_dir / "manifest.json").read_text(encoding="utf-8"))
             first_chunk = manifest["chunks"][0]
 
-            self.assertTrue(result["success"], result)
-            self.assertEqual(mocked_call.call_count, 1)
-            self.assertEqual(mocked_call.call_args.kwargs["max_tokens"], 1223)
-            self.assertEqual(mocked_call.call_args.kwargs["stream_mode"], "false")
-            self.assertEqual(first_chunk["reasoning_recovery_attempts"], 0)
-            self.assertFalse(first_chunk.get("recovery_logs", []))
-            self.assertEqual(first_chunk["planned_max_output_tokens"], 1223)
-            self.assertEqual(first_chunk["control"]["verification_status"], "warning")
-            self.assertTrue(first_chunk["control"]["repair_exhausted"])
-            self.assertIn("empty_output", first_chunk["control"]["retry_reasons"])
+        self.assertTrue(result["success"], result)
+        # Neither a larger ceiling (already at the cap) nor a same-budget quality retry.
+        self.assertEqual(mocked_call.call_count, 1)
+        self.assertEqual(mocked_call.call_args.kwargs["max_tokens"], 1223)
+        self.assertEqual(first_chunk["budget_recovery_attempts"], 0)
+        self.assertEqual(first_chunk["planned_max_output_tokens"], 1223)
+        self.assertEqual(first_chunk["control"]["verification_status"], "warning")
+        self.assertTrue(first_chunk["control"]["repair_exhausted"])
+        self.assertEqual(first_chunk["control"]["retry_reasons"][0], "truncated_output")
+        self.assertTrue(any("still cut off" in warning for warning in result["warnings"]))
+
+    def test_process_chunks_keeps_last_accepted_ceiling_when_provider_rejects_larger(self):
+        """Test a 400 on the larger max_tokens rolls back to the last accepted ceiling for the run."""
+        partial_text = "## Done\n\n" + ("处理完成，保留原始信息。\n" * 12)
+        rejected = utils.LLMRequestError(
+            "HTTP 400: max_tokens is too large",
+            error_type="http_400",
+            status_code=400,
+            request_url="https://api.example.com/v1/chat/completions",
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            work_dir, config = self._write_truncation_fixture(tmpdir, 2000, llm_output_retry_attempts=2)
+            responses = [
+                self._llm_response(partial_text, "length", completion_tokens=2000),
+                rejected,
+                self._llm_response(partial_text, "length", completion_tokens=2000),
+            ]
+            with mock.patch.object(utils, "load_config", return_value=config), \
+                mock.patch.object(utils, "_call_llm_api", side_effect=responses) as mocked_call, \
+                mock.patch("time.sleep"):
+                result = utils.process_chunks(str(work_dir), "cleanup_zh")
+
+            manifest = json.loads((work_dir / "manifest.json").read_text(encoding="utf-8"))
+            first_chunk = manifest["chunks"][0]
+
+        self.assertTrue(result["success"], result)
+        self.assertEqual(
+            [call.kwargs["max_tokens"] for call in mocked_call.call_args_list],
+            [2000, 4000, 2000],
+        )
+        self.assertEqual(first_chunk["status"], "done")
+        self.assertEqual(first_chunk["planned_max_output_tokens"], 2000)
+        self.assertEqual(first_chunk["control"]["retry_reasons"][0], "truncated_output")
+        self.assertTrue(any("rejected max_tokens=4000" in warning for warning in result["warnings"]))
 
     def test_process_chunks_marks_repair_exhausted_when_retries_disabled(self):
         """Test process chunks marks repair exhausted when retries disabled."""
