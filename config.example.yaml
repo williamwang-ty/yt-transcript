@@ -71,12 +71,16 @@ llm_stop_after_consecutive_timeouts: 2
 # Re-run suspiciously short / malformed chunk outputs before surfacing warnings
 llm_chunk_recovery_attempts: 1
 llm_chunk_recovery_backoff_sec: 1.0
-# DeepSeek v4 reasoning models count hidden reasoning tokens against max_tokens.
-# If a chunk returns empty content after spending its budget on reasoning,
+# Thinking during chunk processing. Chunk prompts are mechanical rewrites, and
+# reasoning tokens count against max_tokens, so a long reasoning trace can leave
+# no room for the chunk text. DeepSeek V4 thinks by default; with false,
+# process-chunks sends `thinking: {type: disabled}` to DeepSeek endpoints.
+llm_chunk_thinking: false
+# If reasoning still eats the budget (empty or truncated chunk output),
 # process-chunks retries that chunk with an expanded completion budget.
 llm_reasoning_retry_attempts: 2
 llm_reasoning_retry_multiplier: 2.0
-llm_reasoning_retry_max_tokens: 4096
+llm_reasoning_retry_max_tokens: 16384
 
 # Chunk planning
 # Default mode is token-aware. Set to "chars" for legacy character chunking.

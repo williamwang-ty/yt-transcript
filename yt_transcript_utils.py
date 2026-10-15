@@ -295,6 +295,30 @@ def _resolve_chunk_stream_mode_for_model(model: str = "", stream_mode: str = "au
     return normalized_stream
 
 
+def _is_deepseek_llm_target(base_url: str = "", model: str = "") -> bool:
+    """Return whether the request goes to DeepSeek (which accepts the `thinking` field)."""
+    return "deepseek" in str(base_url or "").lower() or "deepseek" in str(model or "").lower()
+
+
+def _resolve_chunk_thinking_body(base_url: str = "", model: str = "", api_format: str = "openai",
+                                 config: dict | None = None) -> dict:
+    """Return extra request-body fields that control thinking for chunk calls.
+
+    Chunk prompts are mechanical rewrites (cleanup / translate / structure), so
+    a reasoning trace adds cost and, because providers count reasoning tokens
+    against max_tokens, can leave no room for the actual chunk output. DeepSeek
+    V4 thinks by default, so unless `llm_chunk_thinking` is on we switch it off.
+    """
+    config = config or {}
+    if _parse_bool(config.get("llm_chunk_thinking", DEFAULT_LLM_CHUNK_THINKING), DEFAULT_LLM_CHUNK_THINKING):
+        return {}
+    if api_format == "anthropic":
+        return {}
+    if _is_deepseek_llm_target(base_url, model):
+        return {"thinking": {"type": "disabled"}}
+    return {}
+
+
 def _llm_reasoning_probe_enabled(config: dict | None = None) -> bool:
     """Return whether chunk processing may probe unknown models for reasoning metadata."""
     config = config or {}
@@ -352,7 +376,8 @@ TASK_REQUEST_CAP_DEFAULTS = {
 
 DEFAULT_REASONING_RETRY_ATTEMPTS = 2
 DEFAULT_REASONING_RETRY_MULTIPLIER = 2.0
-DEFAULT_REASONING_RETRY_MAX_TOKENS = 4096
+DEFAULT_REASONING_RETRY_MAX_TOKENS = 16384
+DEFAULT_LLM_CHUNK_THINKING = False
 DEFAULT_LLM_MODEL = "deepseek-v4-pro"
 DEFAULT_LLM_BASE_URL = "https://api.deepseek.com"
 
@@ -492,6 +517,7 @@ def _default_config_values(config_path: str = "") -> dict:
         "llm_reasoning_retry_attempts": DEFAULT_REASONING_RETRY_ATTEMPTS,
         "llm_reasoning_retry_multiplier": DEFAULT_REASONING_RETRY_MULTIPLIER,
         "llm_reasoning_retry_max_tokens": DEFAULT_REASONING_RETRY_MAX_TOKENS,
+        "llm_chunk_thinking": DEFAULT_LLM_CHUNK_THINKING,
         "chunk_mode": DEFAULT_CHUNK_MODE,
         "chunk_size_override": 0,
         "chunk_tokens_structure_only": TASK_CHUNK_TOKEN_DEFAULTS["structure_only"],
@@ -1536,15 +1562,19 @@ def _reasoning_usage_stats(llm_result: dict | None) -> dict:
 
 def _is_reasoning_budget_exhaustion(llm_result: dict | None, result_text: str,
                                     requested_max_tokens: int) -> bool:
-    """Detect the DeepSeek-style case where reasoning consumes the whole budget."""
-    if result_text.strip():
-        return False
+    """Detect the DeepSeek-style case where reasoning consumes the budget.
+
+    Covers both an empty answer and an answer that was cut off (finish_reason
+    length) because reasoning tokens used up most of max_tokens.
+    """
     result = llm_result if isinstance(llm_result, dict) else {}
     finish_reason = str(result.get("finish_reason", "") or "").strip().lower()
-    if finish_reason not in {"stop", "end_turn", "length", "max_tokens"}:
-        return False
     stats = _reasoning_usage_stats(result)
     if stats["reasoning_tokens"] <= 0:
+        return False
+    if result_text.strip():
+        return finish_reason in {"length", "max_tokens"}
+    if finish_reason not in {"stop", "end_turn", "length", "max_tokens"}:
         return False
     requested = max(1, _parse_int(requested_max_tokens, 1))
     if stats["completion_tokens"] >= max(1, int(math.floor(requested * 0.95))):
@@ -1552,8 +1582,13 @@ def _is_reasoning_budget_exhaustion(llm_result: dict | None, result_text: str,
     return stats["reasoning_ratio"] >= 0.95 and stats["content_tokens"] == 0
 
 
-def _next_reasoning_retry_max_tokens(current_max_tokens: int, config: dict | None = None) -> int:
-    """Increase completion budget for a reasoning-token exhaustion retry."""
+def _next_reasoning_retry_max_tokens(current_max_tokens: int, config: dict | None = None,
+                                     observed_reasoning_tokens: int = 0) -> int:
+    """Increase completion budget for a reasoning-token exhaustion retry.
+
+    The new budget is at least the old one plus the reasoning tokens just
+    observed, so the retry leaves the original answer budget free.
+    """
     config = config or {}
     current = max(1, _parse_int(current_max_tokens, 1))
     multiplier = _parse_float_range(
@@ -1570,13 +1605,14 @@ def _next_reasoning_retry_max_tokens(current_max_tokens: int, config: dict | Non
             current,
         ),
     )
-    return min(cap, max(current + 1, int(math.ceil(current * multiplier))))
+    observed = max(0, _parse_int(observed_reasoning_tokens, 0))
+    return min(cap, max(current + 1, int(math.ceil(current * multiplier)), current + observed))
 
 
 def _build_reasoning_exhaustion_warning(chunk_id: int, stats: dict, requested_max_tokens: int) -> str:
     """Build a concise warning for reasoning-heavy empty chunk responses."""
     return (
-        f"⚠️ Chunk {chunk_id}: LLM returned empty content after spending "
+        f"⚠️ Chunk {chunk_id}: LLM returned empty or truncated content after spending "
         f"{stats['reasoning_tokens']}/{max(1, stats['completion_tokens'])} completion tokens on reasoning "
         f"(max_tokens={requested_max_tokens}). Retrying with a larger completion budget."
     )
@@ -2232,7 +2268,8 @@ def _read_streaming_response(response, api_format: str) -> dict:
 
 def _build_llm_request(api_key: str, base_url: str, model: str, messages: list,
                        api_format: str = "openai", max_tokens: int = 8192,
-                       temperature: float = 0.3, use_stream: bool = False) -> tuple[str, dict, bytes]:
+                       temperature: float = 0.3, use_stream: bool = False,
+                       extra_body: dict | None = None) -> tuple[str, dict, bytes]:
     """Build llm request."""
     if api_format == "anthropic":
         url = _build_api_url(base_url, api_format)
@@ -2264,6 +2301,8 @@ def _build_llm_request(api_key: str, base_url: str, model: str, messages: list,
 
     if use_stream:
         body["stream"] = True
+    if extra_body:
+        body.update(extra_body)
 
     return url, headers, json.dumps(body).encode("utf-8")
 
@@ -2271,7 +2310,7 @@ def _build_llm_request(api_key: str, base_url: str, model: str, messages: list,
 def _execute_llm_request(api_key: str, base_url: str, model: str, messages: list,
                          api_format: str = "openai", max_tokens: int = 8192,
                          temperature: float = 0.3, timeout_sec: int = 120,
-                         use_stream: bool = False) -> dict:
+                         use_stream: bool = False, extra_body: dict | None = None) -> dict:
     """Execute llm request."""
     import urllib.error
     import urllib.request
@@ -2285,6 +2324,7 @@ def _execute_llm_request(api_key: str, base_url: str, model: str, messages: list
         max_tokens=max_tokens,
         temperature=temperature,
         use_stream=use_stream,
+        extra_body=extra_body,
     )
     req = urllib.request.Request(url, data=data, headers=headers, method="POST")
 
@@ -4580,7 +4620,7 @@ def _call_llm_api(api_key: str, base_url: str, model: str, messages: list,
                   api_format: str = "openai", max_tokens: int = 8192,
                   temperature: float = 0.3, timeout_sec: int = 120,
                   max_retries: int = 3, backoff_sec: float = 1.5,
-                  stream_mode: str = "auto") -> dict:
+                  stream_mode: str = "auto", extra_body: dict | None = None) -> dict:
     """Delegate LLM request orchestration to `kernel.long_text.llm`."""
     return kernel_llm._call_llm_api(
         api_key,
@@ -4594,6 +4634,7 @@ def _call_llm_api(api_key: str, base_url: str, model: str, messages: list,
         max_retries=max_retries,
         backoff_sec=backoff_sec,
         stream_mode=stream_mode,
+        extra_body=extra_body,
     )
 
 
@@ -7514,6 +7555,10 @@ def load_config(config_path: str = None, allow_missing: bool = False) -> dict:
         DEFAULT_REASONING_RETRY_MAX_TOKENS,
         minimum=1,
     )
+    llm_chunk_thinking = _parse_bool(
+        config.get('llm_chunk_thinking', DEFAULT_LLM_CHUNK_THINKING),
+        DEFAULT_LLM_CHUNK_THINKING,
+    )
 
     def has_config_value(key: str) -> bool:
         """Return whether a config key is explicitly set to a non-empty value."""
@@ -7614,6 +7659,7 @@ def load_config(config_path: str = None, allow_missing: bool = False) -> dict:
         "llm_reasoning_retry_attempts": llm_reasoning_retry_attempts,
         "llm_reasoning_retry_multiplier": llm_reasoning_retry_multiplier,
         "llm_reasoning_retry_max_tokens": llm_reasoning_retry_max_tokens,
+        "llm_chunk_thinking": llm_chunk_thinking,
         "chunk_mode": _normalize_chunk_mode(config.get('chunk_mode', DEFAULT_CHUNK_MODE)),
         "chunk_size_override": parse_int_field('chunk_size_override', 0, minimum=0),
         "chunk_tokens_structure_only": chunk_tokens_structure_only,

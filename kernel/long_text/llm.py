@@ -22,7 +22,7 @@ def _call_llm_api(api_key: str, base_url: str, model: str, messages: list,
                   api_format: str = "openai", max_tokens: int = 8192,
                   temperature: float = 0.3, timeout_sec: int = 120,
                   max_retries: int = 3, backoff_sec: float = 1.5,
-                  stream_mode: str = "auto") -> dict:
+                  stream_mode: str = "auto", extra_body: dict | None = None) -> dict:
     """Call the configured LLM API with retries and streaming fallback."""
     _bind_utils_globals()
     stream_mode = _normalize_stream_mode(stream_mode)
@@ -42,6 +42,7 @@ def _call_llm_api(api_key: str, base_url: str, model: str, messages: list,
                 temperature=temperature,
                 timeout_sec=timeout_sec,
                 use_stream=use_stream,
+                extra_body=extra_body,
             )
             result["attempts"] = attempt
             result["stream_mode"] = stream_mode
@@ -65,6 +66,16 @@ def _call_llm_api(api_key: str, base_url: str, model: str, messages: list,
                     file=sys.stderr,
                 )
                 use_stream = False
+                continue
+
+            # A gateway that rejects the thinking switch should still work:
+            # drop the field once and resend the same request.
+            if extra_body and "thinking" in extra_body and error.status_code in {400, 422} and "thinking" in response_hint:
+                print(
+                    f"ℹ️ Provider rejected the thinking switch at {error.request_url or _build_api_url(base_url, api_format)}; retrying once without it.",
+                    file=sys.stderr,
+                )
+                extra_body = {key: value for key, value in extra_body.items() if key != "thinking"}
                 continue
 
             if not error.retryable or attempt > max_retries:

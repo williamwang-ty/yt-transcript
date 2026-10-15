@@ -2542,6 +2542,80 @@ chunk_context_summary_tokens: 20
             self.assertEqual(first_chunk["planned_max_output_tokens"], 2446)
             self.assertEqual(first_chunk["status"], "done")
 
+    def test_process_chunks_retries_truncated_output_and_disables_thinking(self):
+        """Test reasoning that cuts off chunk text triggers a bigger budget, with thinking off."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source = Path(tmpdir) / "raw.txt"
+            work_dir = Path(tmpdir) / "chunks"
+            source.write_text("第一句。" * 40, encoding="utf-8")
+            utils.chunk_text(str(source), str(work_dir), 1000, "cleanup_zh")
+
+            config = utils._default_config_values()
+            config.update({
+                "llm_api_key": "key",
+                "llm_base_url": "https://api.deepseek.com",
+                "llm_model": "deepseek-v4-pro",
+                "llm_api_format": "openai",
+                "llm_chunk_recovery_attempts": 0,
+                "llm_chunk_recovery_backoff_sec": 0.0,
+                "llm_reasoning_retry_attempts": 2,
+                "llm_reasoning_retry_multiplier": 2.0,
+                "llm_reasoning_retry_max_tokens": 16384,
+                "max_output_tokens_cleanup_zh": 1223,
+            })
+            manifest_path = work_dir / "manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["plan"]["planned_max_output_tokens"] = 1223
+            manifest["planned_max_output_tokens"] = 1223
+            manifest["chunks"][0]["planned_max_output_tokens"] = 1223
+            manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+
+            responses = [
+                {
+                    "text": "## Done\n\n处理到一半",
+                    "finish_reason": "length",
+                    "usage": {
+                        "completion_tokens": 1223,
+                        "reasoning_tokens": 1150,
+                        "content_tokens": 73,
+                    },
+                    "latency_ms": 10,
+                    "request_url": "https://api.deepseek.com/v1/chat/completions",
+                    "streaming_used": False,
+                    "attempts": 1,
+                },
+                {
+                    "text": "## Done\n\n" + ("处理完成，保留原始信息。\n" * 12),
+                    "finish_reason": "stop",
+                    "usage": {
+                        "completion_tokens": 900,
+                        "reasoning_tokens": 0,
+                        "content_tokens": 900,
+                    },
+                    "latency_ms": 12,
+                    "request_url": "https://api.deepseek.com/v1/chat/completions",
+                    "streaming_used": False,
+                    "attempts": 1,
+                },
+            ]
+
+            with mock.patch.object(utils, "load_config", return_value=config), \
+                mock.patch.object(utils, "_call_llm_api", side_effect=responses) as mocked_call, \
+                mock.patch("time.sleep"):
+                result = utils.process_chunks(str(work_dir), "cleanup_zh")
+
+            manifest = json.loads((work_dir / "manifest.json").read_text(encoding="utf-8"))
+            first_chunk = manifest["chunks"][0]
+
+            self.assertTrue(result["success"], result)
+            self.assertEqual(mocked_call.call_count, 2)
+            for call in mocked_call.call_args_list:
+                self.assertEqual(call.kwargs["extra_body"], {"thinking": {"type": "disabled"}})
+            self.assertEqual(mocked_call.call_args_list[0].kwargs["max_tokens"], 1223)
+            self.assertEqual(mocked_call.call_args_list[1].kwargs["max_tokens"], 2446)
+            self.assertEqual(first_chunk["recovery_logs"][0]["reasons"], ["reasoning_budget_exhausted"])
+            self.assertEqual(first_chunk["status"], "done")
+
     def test_process_chunks_does_not_expand_reasoning_budget_at_retry_cap(self):
         """Test reasoning exhaustion at cap falls through without a fake expansion retry."""
         with tempfile.TemporaryDirectory() as tmpdir:

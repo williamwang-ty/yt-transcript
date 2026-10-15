@@ -2352,6 +2352,82 @@ work_dir: /tmp/vid001_chunks
 
             self.assertEqual(mocked_request.call_count, 1)
 
+    def test_chunk_thinking_body_disables_deepseek_thinking_by_default(self):
+        """Test chunk calls switch DeepSeek thinking off unless llm_chunk_thinking is on."""
+        disabled = {"thinking": {"type": "disabled"}}
+        self.assertEqual(utils._resolve_chunk_thinking_body("https://api.deepseek.com", "deepseek-v4-pro", "openai", {}), disabled)
+        self.assertEqual(utils._resolve_chunk_thinking_body("https://gateway.example.com", "deepseek-v4-flash", "openai", {}), disabled)
+        self.assertEqual(utils._resolve_chunk_thinking_body("https://api.openai.com", "gpt-5", "openai", {}), {})
+        self.assertEqual(utils._resolve_chunk_thinking_body("https://api.anthropic.com", "claude", "anthropic", {}), {})
+        self.assertEqual(
+            utils._resolve_chunk_thinking_body("https://api.deepseek.com", "deepseek-v4-pro", "openai", {"llm_chunk_thinking": True}),
+            {},
+        )
+
+    def test_build_llm_request_merges_extra_body(self):
+        """Test extra body fields reach the request JSON."""
+        _url, _headers, data = utils._build_llm_request(
+            api_key="key",
+            base_url="https://api.deepseek.com",
+            model="deepseek-v4-pro",
+            messages=[{"role": "user", "content": "hello"}],
+            extra_body={"thinking": {"type": "disabled"}},
+        )
+        body = json.loads(data.decode("utf-8"))
+        self.assertEqual(body["thinking"], {"type": "disabled"})
+        self.assertEqual(body["max_tokens"], 8192)
+
+    def test_call_llm_api_drops_rejected_thinking_field_once(self):
+        """Test a gateway that rejects the thinking switch still gets a request."""
+        with mock.patch.object(utils, "_execute_llm_request") as mocked_request, mock.patch("time.sleep"):
+            mocked_request.side_effect = [
+                utils.LLMRequestError(
+                    "bad request",
+                    error_type="http_400",
+                    status_code=400,
+                    retryable=False,
+                    request_url="https://gw.example.com/v1/chat/completions",
+                    response_body='{"error": "unknown parameter: thinking"}',
+                ),
+                {"text": "ok", "latency_ms": 5, "request_url": "https://gw.example.com/v1/chat/completions", "streaming_used": False},
+            ]
+
+            result = utils._call_llm_api(
+                api_key="key",
+                base_url="https://gw.example.com",
+                model="deepseek-v4-pro",
+                messages=[{"role": "user", "content": "hello"}],
+                stream_mode="false",
+                extra_body={"thinking": {"type": "disabled"}},
+            )
+
+            self.assertEqual(result["text"], "ok")
+            self.assertEqual(mocked_request.call_count, 2)
+            self.assertEqual(mocked_request.call_args_list[0].kwargs["extra_body"], {"thinking": {"type": "disabled"}})
+            self.assertEqual(mocked_request.call_args_list[1].kwargs["extra_body"], {})
+
+    def test_reasoning_budget_exhaustion_detects_truncated_content(self):
+        """Test reasoning that leaves only a cut-off answer counts as exhaustion."""
+        truncated = {
+            "finish_reason": "length",
+            "usage": {"completion_tokens": 3200, "reasoning_tokens": 2900, "content_tokens": 300},
+        }
+        self.assertTrue(utils._is_reasoning_budget_exhaustion(truncated, "部分输出", 3200))
+        finished = dict(truncated, finish_reason="stop")
+        self.assertFalse(utils._is_reasoning_budget_exhaustion(finished, "完整输出", 3200))
+        no_reasoning = {
+            "finish_reason": "length",
+            "usage": {"completion_tokens": 3200, "reasoning_tokens": 0, "content_tokens": 3200},
+        }
+        self.assertFalse(utils._is_reasoning_budget_exhaustion(no_reasoning, "长输出", 3200))
+
+    def test_next_reasoning_retry_budget_covers_observed_reasoning(self):
+        """Test the retry budget leaves the original answer budget free."""
+        config = {"llm_reasoning_retry_multiplier": 1.5, "llm_reasoning_retry_max_tokens": 16384}
+        self.assertEqual(utils._next_reasoning_retry_max_tokens(3200, config), 4800)
+        self.assertEqual(utils._next_reasoning_retry_max_tokens(3200, config, observed_reasoning_tokens=3000), 6200)
+        self.assertEqual(utils._next_reasoning_retry_max_tokens(3200, config, observed_reasoning_tokens=20000), 16384)
+
     def test_merge_content_supports_multiple_chapters_per_chunk(self):
         """Test merge content supports multiple chapters per chunk."""
         with tempfile.TemporaryDirectory() as tmpdir:

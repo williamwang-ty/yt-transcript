@@ -123,6 +123,7 @@ pip install yt-dlp
    > - `llm_base_url` can be either a provider root URL or a `/v1` URL. The tool normalizes both.
    > - `llm_stream: "auto"` prefers SSE streaming when the provider supports it.
    > - With `llm_reasoning_probe_enabled: true`, unknown OpenAI-compatible models get one non-streaming `OK` probe; if the response exposes reasoning metadata, chunk calls switch to non-streaming for recovery telemetry.
+   > - `llm_chunk_thinking` defaults to `false`: chunk requests to DeepSeek send `thinking: {type: disabled}`, because reasoning tokens count against `max_tokens` and can leave no room for the chunk text. If a thinking model still returns an empty or cut-off chunk, that chunk is retried with a larger budget (up to `llm_reasoning_retry_max_tokens`, default 16384).
    > - `bash scripts/preflight.sh --require-llm` now performs a real low-cost LLM probe and reports latency.
 
 ### 🚀 Usage
@@ -507,6 +508,7 @@ pip install yt-dlp
    > - `llm_base_url` 可以填写服务根地址或带 `/v1` 的地址，工具会自动归一化。
    > - `llm_stream: "auto"` 会在 provider 支持时优先走流式响应。
    > - `llm_reasoning_probe_enabled: true` 时，未知 OpenAI-compatible 模型会先走一次非流式 `OK` 探测；如果响应里有 reasoning 元数据，后续 chunk 调用会切到非流式以保留恢复所需的 usage 信息。
+   > - `llm_chunk_thinking` 默认 `false`：发往 DeepSeek 的 chunk 请求会带 `thinking: {type: disabled}`，因为思考 token 也算在 `max_tokens` 里，会把分块正文的输出空间挤掉。如果思考模型仍然返回空的或被截断的分块，会自动加大预算重试（上限 `llm_reasoning_retry_max_tokens`，默认 16384）。
    > - `bash scripts/preflight.sh --require-llm` 现在会执行一次低成本真实探活并输出延迟。
 
 ### 🚀 使用方法

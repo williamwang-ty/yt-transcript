@@ -57,6 +57,7 @@ def _process_chunks_impl(work_dir: str, prompt_name: str, extra_instruction: str
     backoff_sec = config.get("llm_backoff_sec", 1.5)
     stream_mode = _normalize_stream_mode(config.get("llm_stream", "auto"))
     model_reasoning_hint = _is_reasoning_llm_model(model)
+    thinking_body = _resolve_chunk_thinking_body(base_url, model, api_format, config)
     request_stream_mode = _resolve_chunk_stream_mode_for_model(model, stream_mode)
     stream_decision_reason = "configured"
     if stream_mode == "false":
@@ -157,6 +158,14 @@ def _process_chunks_impl(work_dir: str, prompt_name: str, extra_instruction: str
         setup_warning = (
             f"ℹ️ Streaming disabled for reasoning model '{model}' during chunk processing "
             "so provider usage can be inspected for empty-content recovery."
+        )
+        setup_warnings.append(setup_warning)
+        print(setup_warning, file=sys.stderr)
+
+    if thinking_body.get("thinking", {}).get("type") == "disabled":
+        setup_warning = (
+            f"ℹ️ Thinking disabled for chunk requests to '{model}' so the output budget goes to chunk text "
+            "(set llm_chunk_thinking: true to keep it)."
         )
         setup_warnings.append(setup_warning)
         print(setup_warning, file=sys.stderr)
@@ -626,6 +635,7 @@ def _process_chunks_impl(work_dir: str, prompt_name: str, extra_instruction: str
                     backoff_sec=backoff_sec,
                     stream_mode=request_stream_mode,
                     max_tokens=planned_max_output_tokens,
+                    extra_body=thinking_body,
                 )
                 attempt_logs = _collect_attempt_logs(llm_result)
                 request_attempts = max(len(attempt_logs), _parse_int(llm_result.get("attempts"), 1))
@@ -653,7 +663,11 @@ def _process_chunks_impl(work_dir: str, prompt_name: str, extra_instruction: str
                     _is_reasoning_budget_exhaustion(llm_result, result_text, planned_max_output_tokens)
                     and chunk_info.get("reasoning_recovery_attempts", 0) < reasoning_retry_attempt_limit
                 ):
-                    expanded_max_tokens = _next_reasoning_retry_max_tokens(planned_max_output_tokens, config)
+                    expanded_max_tokens = _next_reasoning_retry_max_tokens(
+                        planned_max_output_tokens,
+                        config,
+                        observed_reasoning_tokens=reasoning_stats["reasoning_tokens"],
+                    )
                     if expanded_max_tokens > planned_max_output_tokens:
                         reasoning_warning = _build_reasoning_exhaustion_warning(
                             chunk_id,
