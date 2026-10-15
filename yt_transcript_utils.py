@@ -32,6 +32,7 @@ Commands:
     apply-control <work_dir>       Apply pause or cancel through the stable runtime-facing API
     finalize-run <work_dir>        Finalize a run summary and optionally materialize merged output
     process-chunks <work_dir> --prompt <name>  Compatibility helper for direct chunk processing (--input-key for chained processing)
+    resolve-llm-backend            Show whether chunks go to the calling agent's CLI or the configured API
     prepare-resume <work_dir>      Repair stale chunk/runtime state before resuming a run
     replan-remaining <work_dir>    Re-plan unfinished raw chunks after canary/autotune aborts
     runtime-status <work_dir>      Inspect manifest runtime, ownership, and local runtime-control status
@@ -90,6 +91,7 @@ from kernel.long_text import autotune as kernel_autotune
 from kernel.long_text import lifecycle as kernel_lifecycle
 from kernel.long_text import prompting as kernel_prompting
 from kernel.long_text import llm as kernel_llm
+from kernel.long_text import agent_cli as kernel_agent_cli
 from kernel.long_text import processing as kernel_processing
 from kernel import subtitle_language as kernel_subtitle_language
 
@@ -492,6 +494,11 @@ def _default_config_values(config_path: str = "") -> dict:
         "llm_reasoning_retry_attempts": DEFAULT_REASONING_RETRY_ATTEMPTS,
         "llm_reasoning_retry_multiplier": DEFAULT_REASONING_RETRY_MULTIPLIER,
         "llm_reasoning_retry_max_tokens": DEFAULT_REASONING_RETRY_MAX_TOKENS,
+        "llm_backend": kernel_agent_cli.DEFAULT_LLM_BACKEND,
+        "llm_agent_cli": "",
+        "llm_cli_timeout_sec": kernel_agent_cli.DEFAULT_CLI_TIMEOUT_SEC,
+        "llm_cli_max_retries": kernel_agent_cli.DEFAULT_CLI_MAX_RETRIES,
+        "llm_cli_probe_timeout_sec": kernel_agent_cli.DEFAULT_CLI_PROBE_TIMEOUT_SEC,
         "chunk_mode": DEFAULT_CHUNK_MODE,
         "chunk_size_override": 0,
         "chunk_tokens_structure_only": TASK_CHUNK_TOKEN_DEFAULTS["structure_only"],
@@ -7614,6 +7621,11 @@ def load_config(config_path: str = None, allow_missing: bool = False) -> dict:
         "llm_reasoning_retry_attempts": llm_reasoning_retry_attempts,
         "llm_reasoning_retry_multiplier": llm_reasoning_retry_multiplier,
         "llm_reasoning_retry_max_tokens": llm_reasoning_retry_max_tokens,
+        "llm_backend": kernel_agent_cli.normalize_backend_mode(config.get('llm_backend', kernel_agent_cli.DEFAULT_LLM_BACKEND)),
+        "llm_agent_cli": str(config.get('llm_agent_cli', '') or '').strip(),
+        "llm_cli_timeout_sec": parse_int_field('llm_cli_timeout_sec', kernel_agent_cli.DEFAULT_CLI_TIMEOUT_SEC, minimum=1),
+        "llm_cli_max_retries": parse_int_field('llm_cli_max_retries', kernel_agent_cli.DEFAULT_CLI_MAX_RETRIES, minimum=0),
+        "llm_cli_probe_timeout_sec": parse_int_field('llm_cli_probe_timeout_sec', kernel_agent_cli.DEFAULT_CLI_PROBE_TIMEOUT_SEC, minimum=1),
         "chunk_mode": _normalize_chunk_mode(config.get('chunk_mode', DEFAULT_CHUNK_MODE)),
         "chunk_size_override": parse_int_field('chunk_size_override', 0, minimum=0),
         "chunk_tokens_structure_only": chunk_tokens_structure_only,
@@ -7767,6 +7779,15 @@ def main():
     llm_api_parser.add_argument('--api-format', default='', help='Optional API format override')
     llm_api_parser.add_argument('--timeout', type=int, default=0, help='Probe timeout in seconds')
     llm_api_parser.add_argument('--stream', default='', help='Streaming mode override: auto|true|false')
+
+    backend_parser = subparsers.add_parser(
+        'resolve-llm-backend',
+        help='Show which backend chunk processing will use (agent CLI or API)'
+    )
+    backend_parser.add_argument('--config-path', default=None, help='Optional path to config.yaml')
+    backend_parser.add_argument('--agent-cli', default='',
+                                help='Agent name (claude-code, codex, opencode, pi, gemini, cursor) or a non-interactive command')
+    backend_parser.add_argument('--no-probe', action='store_true', help='Skip the CLI probe call')
 
     token_probe_parser = subparsers.add_parser(
         'test-token-count',
@@ -7955,6 +7976,8 @@ def main():
                            help='Validate setup without calling API')
     pc_parser.add_argument('--force', action='store_true',
                            help='Reprocess chunks even if manifest status is done and output exists')
+    pc_parser.add_argument('--agent-cli', default='',
+                           help='With llm_backend=auto: the calling agent\'s name or its non-interactive command')
     pc_parser.add_argument('--auto-replan', action='store_true',
                            help='Automatically run replan-remaining and resume until the plan stabilizes')
     pc_parser.add_argument('--max-replans', type=int, default=3,
@@ -8226,6 +8249,16 @@ def main():
         if not result['valid']:
             sys.exit(1)
 
+    elif args.command == 'resolve-llm-backend':
+        result = kernel_agent_cli.resolve_llm_backend(
+            load_config(args.config_path, allow_missing=True),
+            override=args.agent_cli,
+            probe=not args.no_probe,
+        )
+        print(json.dumps(result, ensure_ascii=False))
+        if result['backend'] == 'none':
+            sys.exit(1)
+
     elif args.command == 'test-token-count':
         result = test_token_count(
             config_path=args.config_path,
@@ -8394,6 +8427,8 @@ def main():
             sys.exit(1)
 
     elif args.command == 'process-chunks':
+        if args.agent_cli:
+            os.environ[kernel_agent_cli.AGENT_CLI_ENV_VAR] = args.agent_cli
         envelope = run_kernel_command(
             'process-chunks',
             work_dir=args.work_dir,

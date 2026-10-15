@@ -44,9 +44,23 @@ yt_dlp_extractor_retries: 1
 yt_dlp_cookies_from_browser: ""
 yt_dlp_cookies_file: ""
 
+# Chunk LLM backend for long videos: auto | api
+# auto: send chunks to the calling agent's own CLI (Claude Code `claude -p`,
+#       Codex `codex exec`, OpenCode, pi, Gemini CLI, Cursor), detected from the
+#       environment or passed with `process-chunks --agent-cli`. The CLI must
+#       answer a short probe first; if it can't, or fails mid-run, the API
+#       below is used instead.
+# api:  always use the API below.
+llm_backend: "auto"
+# Optional fixed agent for auto mode: a name above or a full non-interactive
+# command (use {prompt} where the prompt goes; otherwise it is sent on stdin).
+llm_agent_cli: ""
+llm_cli_timeout_sec: 600
+llm_cli_max_retries: 1
+llm_cli_probe_timeout_sec: 120
+
 # LLM API Configuration
-# Required only when plan-optimization selects long-video chunk processing,
-# or when bilingual translation is needed.
+# Fallback for llm_backend=auto, and the only backend for llm_backend=api.
 # Format: "openai" (OpenAI-compatible) or "anthropic" (Anthropic Messages API)
 llm_api_format: "openai"
 llm_api_key: "your_llm_api_key_here"
