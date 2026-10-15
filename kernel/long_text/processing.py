@@ -95,9 +95,26 @@ def _process_chunks_impl(work_dir: str, prompt_name: str, extra_instruction: str
         bilingual=prompt_name == "translate_only",
     )
 
-    request_url = _build_api_url(base_url, api_format) if base_url else ""
-    if not dry_run and (not api_key or not base_url or not model):
-        print("Error: LLM API not configured. Set llm_api_key, llm_base_url, llm_model in config.yaml", file=sys.stderr)
+    api_request_url = _build_api_url(base_url, api_format) if base_url else ""
+    previous_runtime = manifest.get("runtime", {}) if isinstance(manifest.get("runtime", {}), dict) else {}
+    # llm_backend=auto sends chunks to the calling agent's own CLI when one is
+    # found and answers a probe; the configured API is the fallback.
+    backend_decision = kernel_agent_cli.resolve_llm_backend(
+        config,
+        probe=not dry_run,
+        previous=previous_runtime.get("llm_backend"),
+    )
+    use_cli = backend_decision["backend"] == "cli"
+    cli_timeout_sec = _parse_int_min(config.get("llm_cli_timeout_sec"), kernel_agent_cli.DEFAULT_CLI_TIMEOUT_SEC, 1)
+    cli_max_retries = _parse_int_min(config.get("llm_cli_max_retries"), kernel_agent_cli.DEFAULT_CLI_MAX_RETRIES, 0)
+    request_url = f"cli:{backend_decision['agent']}" if use_cli else api_request_url
+    if not dry_run and backend_decision["backend"] == "none":
+        print(
+            "Error: no LLM backend available. "
+            f"{backend_decision['fallback_reason'] or 'Agent CLI unavailable'}; "
+            "and the fallback API is not configured (set llm_api_key, llm_base_url, llm_model in config.yaml)",
+            file=sys.stderr,
+        )
         sys.exit(1)
 
     is_summary = (prompt_name == "summarize")
@@ -154,7 +171,17 @@ def _process_chunks_impl(work_dir: str, prompt_name: str, extra_instruction: str
     else:
         recommended_chunk_size = _get_task_chunk_target(prompt_name, config)
     setup_warnings = []
-    if reasoning_stream_disabled:
+    # Backend choice is informational (stderr + runtime.llm_backend), not a warning.
+    if use_cli:
+        fallback_note = "the configured API is the fallback" if backend_decision["api_configured"] else "no API fallback is configured"
+        print(
+            f"ℹ️ Chunk requests use the {backend_decision['agent']} CLI "
+            f"({' '.join(backend_decision['command'])}); {fallback_note}.",
+            file=sys.stderr,
+        )
+    elif backend_decision["mode"] == "auto" and backend_decision["fallback_reason"]:
+        print(f"ℹ️ Chunk requests use the configured API: {backend_decision['fallback_reason']}", file=sys.stderr)
+    if reasoning_stream_disabled and not use_cli:
         setup_warning = (
             f"ℹ️ Streaming disabled for reasoning model '{model}' during chunk processing "
             "so provider usage can be inspected for empty-content recovery."
@@ -162,7 +189,7 @@ def _process_chunks_impl(work_dir: str, prompt_name: str, extra_instruction: str
         setup_warnings.append(setup_warning)
         print(setup_warning, file=sys.stderr)
 
-    if thinking_body.get("thinking", {}).get("type") == "disabled":
+    if thinking_body.get("thinking", {}).get("type") == "disabled" and not use_cli:
         setup_warning = (
             f"ℹ️ Thinking disabled for chunk requests to '{model}' so the output budget goes to chunk text "
             "(set llm_chunk_thinking: true to keep it)."
@@ -218,6 +245,7 @@ def _process_chunks_impl(work_dir: str, prompt_name: str, extra_instruction: str
         "model_reasoning_hint": model_reasoning_hint,
     }
     runtime["reasoning_probe"] = reasoning_probe
+    runtime["llm_backend"] = backend_decision
     runtime_control = _ensure_runtime_control_state(runtime)
     runtime_control["verification_warning_count"] = 0
     runtime_control["repair_attempted_count"] = 0
@@ -259,6 +287,7 @@ def _process_chunks_impl(work_dir: str, prompt_name: str, extra_instruction: str
             "model": model,
             "api_format": api_format,
             "request_url": request_url,
+            "llm_backend": backend_decision,
             "chunk_mode": manifest_chunk_mode,
             "recommended_chunk_size": recommended_chunk_size,
             "planned_max_output_tokens": planned_max_output_tokens,
@@ -323,7 +352,7 @@ def _process_chunks_impl(work_dir: str, prompt_name: str, extra_instruction: str
     def ensure_reasoning_stream_decision() -> None:
         """Probe unknown models once before the first live chunk request."""
         nonlocal request_stream_mode, stream_decision_reason, reasoning_probe
-        if request_stream_mode == "false" or stream_mode not in {"auto", "true"}:
+        if use_cli or request_stream_mode == "false" or stream_mode not in {"auto", "true"}:
             return
         if reasoning_probe.get("attempted", False) or reasoning_probe.get("reason") != "not_attempted":
             return
@@ -355,6 +384,49 @@ def _process_chunks_impl(work_dir: str, prompt_name: str, extra_instruction: str
             stream_decision_reason = "configured"
         record_stream_decision()
         _write_manifest(manifest_path, manifest)
+
+    def call_chunk_llm(prompt_text: str, max_output_tokens: int) -> dict:
+        """Send one chunk prompt to the agent CLI, or to the API as fallback."""
+        nonlocal use_cli, request_url
+        if use_cli:
+            try:
+                return kernel_agent_cli.call_cli_llm(
+                    backend_decision["command"],
+                    prompt_text,
+                    timeout_sec=cli_timeout_sec,
+                    max_retries=cli_max_retries,
+                    strip_env=backend_decision.get("strip_env", []),
+                    agent=backend_decision["agent"],
+                )
+            except LLMRequestError as error:
+                if not backend_decision["api_configured"]:
+                    raise
+                use_cli = False
+                request_url = api_request_url
+                backend_decision["backend"] = "api"
+                backend_decision["fallback_reason"] = f"Agent CLI failed mid-run: {error}"
+                runtime["llm_backend"] = backend_decision
+                runtime["last_request_url"] = request_url
+                fallback_warning = (
+                    f"⚠️ {backend_decision['agent']} CLI failed ({error.error_type}); "
+                    "switching the remaining chunks to the configured API."
+                )
+                warnings.append(fallback_warning)
+                print(fallback_warning, file=sys.stderr)
+                ensure_reasoning_stream_decision()
+        return _call_llm_api(
+            api_key=api_key,
+            base_url=base_url,
+            model=model,
+            messages=[{"role": "user", "content": prompt_text}],
+            api_format=api_format,
+            timeout_sec=timeout_sec,
+            max_retries=max_retries,
+            backoff_sec=backoff_sec,
+            stream_mode=request_stream_mode,
+            max_tokens=max_output_tokens,
+            extra_body=thinking_body,
+        )
 
     def maybe_abort_for_cancellation() -> bool:
         """Stop at a safe chunk boundary when a cancel signal is present."""
@@ -617,26 +689,14 @@ def _process_chunks_impl(work_dir: str, prompt_name: str, extra_instruction: str
             f"input_chars={chunk_char_count} estimated_input_tokens={estimated_input_tokens} input_tokens={estimated_input_tokens} "
             f"est_source={token_count_source} prompt_tokens={actual_prompt_tokens} continuity_tokens={continuity_context['token_count']} "
             f"planned_max_output_tokens={planned_max_output_tokens} autotune_target_tokens={autotune_state['current_target_tokens']} "
-            f"model={model} url={request_url}",
+            f"model={backend_decision['agent'] if use_cli else model} url={request_url}",
             file=sys.stderr,
         )
 
         chunk_attempt_logs = []
         while True:
             try:
-                llm_result = _call_llm_api(
-                    api_key=api_key,
-                    base_url=base_url,
-                    model=model,
-                    messages=[{"role": "user", "content": prompt}],
-                    api_format=api_format,
-                    timeout_sec=timeout_sec,
-                    max_retries=max_retries,
-                    backoff_sec=backoff_sec,
-                    stream_mode=request_stream_mode,
-                    max_tokens=planned_max_output_tokens,
-                    extra_body=thinking_body,
-                )
+                llm_result = call_chunk_llm(prompt, planned_max_output_tokens)
                 attempt_logs = _collect_attempt_logs(llm_result)
                 request_attempts = max(len(attempt_logs), _parse_int(llm_result.get("attempts"), 1))
                 chunk_attempt_logs.extend(attempt_logs)
@@ -1005,6 +1065,7 @@ def _process_chunks_impl(work_dir: str, prompt_name: str, extra_instruction: str
         "semantic_verification": plan.get("semantic_verification", {}),
         "control": _build_process_control_summary(runtime, operation_control),
         "request_url": request_url,
+        "llm_backend": backend_decision,
         "cancellation": cancellation,
         "pause": kernel_state.summarize_runtime_pause_request(work_dir),
     }

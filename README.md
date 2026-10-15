@@ -125,6 +125,7 @@ pip install yt-dlp
    > - With `llm_reasoning_probe_enabled: true`, unknown OpenAI-compatible models get one non-streaming `OK` probe; if the response exposes reasoning metadata, chunk calls switch to non-streaming for recovery telemetry.
    > - `llm_chunk_thinking` defaults to `false`: chunk requests to DeepSeek send `thinking: {type: disabled}`, because reasoning tokens count against `max_tokens` and can leave no room for the chunk text. If a thinking model still returns an empty or cut-off chunk, that chunk is retried with a larger budget (up to `llm_reasoning_retry_max_tokens`, default 16384).
    > - `bash scripts/preflight.sh --require-llm` now performs a real low-cost LLM probe and reports latency.
+   > - `llm_backend: "auto"` (default) sends long-video chunks to the calling agent's own CLI (Claude Code, Codex, OpenCode, pi, Gemini CLI, Cursor), detected from the environment or passed with `process-chunks --agent-cli`. The CLI must answer a short probe; if it can't, or fails mid-run, the LLM API above is used. `llm_backend: "api"` always uses the API. `python3 yt_transcript_utils.py resolve-llm-backend` shows which one a run would use.
 
 ### 🚀 Usage
 
@@ -510,6 +511,7 @@ pip install yt-dlp
    > - `llm_reasoning_probe_enabled: true` 时，未知 OpenAI-compatible 模型会先走一次非流式 `OK` 探测；如果响应里有 reasoning 元数据，后续 chunk 调用会切到非流式以保留恢复所需的 usage 信息。
    > - `llm_chunk_thinking` 默认 `false`：发往 DeepSeek 的 chunk 请求会带 `thinking: {type: disabled}`，因为思考 token 也算在 `max_tokens` 里，会把分块正文的输出空间挤掉。如果思考模型仍然返回空的或被截断的分块，会自动加大预算重试（上限 `llm_reasoning_retry_max_tokens`，默认 16384）。
    > - `bash scripts/preflight.sh --require-llm` 现在会执行一次低成本真实探活并输出延迟。
+   > - `llm_backend: "auto"`（默认）会把长视频的分块交给正在调用 skill 的 agent 自己的 CLI（Claude Code、Codex、OpenCode、pi、Gemini CLI、Cursor）处理，宿主从环境变量自动识别，也可以用 `process-chunks --agent-cli` 指定。CLI 要先通过一次简短试调；试调失败或中途失败时改用上面的 LLM API。`llm_backend: "api"` 始终走 API。`python3 yt_transcript_utils.py resolve-llm-backend` 可以查看本次会用哪一个。
 
 ### 🚀 使用方法
 
