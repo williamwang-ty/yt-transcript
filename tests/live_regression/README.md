@@ -11,25 +11,25 @@ before it.
 | Chinese speech, only a translated auto track | JkMWjp5AXhM |
 | English, manual subs | CIatbV3_Rjg, nmgFG7PUHfo (also has the full auto-translation list) |
 | English, auto captions only | ijFSEb2W6_8 |
-| Japanese, auto captions only | tGVSOK3PNUI |
+| Japanese, auto captions only (unsupported language) | tGVSOK3PNUI |
 | No subtitles | DQGrPstFRVI |
 
 `expected_case` is the source the pipeline should pick (`zh_manual`,
-`en_auto`, `deepgram`, ...). The report marks a video with ⚠ when the source
-it actually picked differs. As of 2026-10-13, `subtitle-info` counts YouTube's
-auto-translation targets (about 157 languages, including zh-Hans) as real
-tracks, so JkMWjp5AXhM, ijFSEb2W6_8, nmgFG7PUHfo and tGVSOK3PNUI can pick a
-machine-translated `zh-Hans/auto` track and show ⚠.
+`en_auto`, `deepgram`, `unsupported`, ...). The report marks a video with ⚠
+when the source it actually picked differs. `subtitle-info` ignores YouTube's
+auto-translation targets and reports the spoken language; Deepgram runs use
+that language, or `auto` detection when the metadata has none.
+`tests/fixtures/subtitle_language_metadata.json` keeps a trimmed copy of each
+video's yt-dlp metadata so the unit tests cover the same cases offline.
 
 The selected source is not fully deterministic. When YouTube rate-limits a
-preferred track, `download.sh` falls back to the next one (nmgFG7PUHfo and
-JkMWjp5AXhM drop to English this way). The Notes column lists blocked tracks,
-and `--compare` labels a source change as flaky when a track was blocked in
-either run.
+preferred track, `download.sh` falls back to the next trusted one (for example
+nmgFG7PUHfo from manual `en` to the English ASR track). The Notes column lists
+blocked tracks, and `--compare` labels a source change as flaky when a track
+was blocked in either run.
 
-When `plan-optimization` rates the subtitles critical and recommends Deepgram
-(ijFSEb2W6_8 and tGVSOK3PNUI today), the full stage follows it like the skill
-does: it transcribes the audio and plans again, and Notes says
+When `plan-optimization` rates the subtitles critical and recommends Deepgram,
+the full stage follows it like the skill does: it transcribes the audio and plans again, and Notes says
 `rerouted from ...`. With `--no-deepgram` the video stops with status
 `rerouted` instead of sending those subtitles to the LLM. The plan stage only
 records the recommendation.

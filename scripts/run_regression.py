@@ -58,6 +58,10 @@ TRACKED_CHECKS = (
 )
 
 
+class UnsupportedLanguage(RuntimeError):
+    """The video is spoken in a language the pipeline does not support yet."""
+
+
 class StepError(RuntimeError):
     """A pipeline step failed; the message is shown in the report."""
 
@@ -152,7 +156,11 @@ def run_video(video: dict, out_dir: Path, stage: str, allow_deepgram: bool, time
     segments = vdir / f"{vid}_segments.json"
 
     def transcribe_audio(language: str) -> None:
-        """Download audio and transcribe it with Deepgram into raw_text/segments."""
+        """Download audio and transcribe it with Deepgram into raw_text/segments.
+
+        `language` is subtitle-info's source_language, or "auto" to let Deepgram
+        detect it (same rule as workflows/deepgram_transcribe.md).
+        """
         step("audio")
         audio = run_json(download(url, "audio"), logs / "audio.log", timeout)
         done()
@@ -164,6 +172,9 @@ def run_video(video: dict, out_dir: Path, stage: str, allow_deepgram: bool, time
                   "--output-segments", str(segments)),
             logs / "deepgram.log", max(timeout, 900),
         )
+        language = dg.get("language") or language
+        if not (language.startswith("zh") or language.startswith("en")):
+            raise UnsupportedLanguage(f"Deepgram detected unsupported language {language!r}")
         result["source"] = {
             "src": "deepgram",
             "language": language,
@@ -185,9 +196,13 @@ def run_video(video: dict, out_dir: Path, stage: str, allow_deepgram: bool, time
         result["subtitle_info"] = {
             k: sub_info.get(k)
             for k in ("has_any", "has_manual", "has_auto", "chinese_available",
-                      "english_available", "preferred_source_language", "mode")
+                      "english_available", "preferred_source_language", "mode",
+                      "source_language", "source_language_signal", "source_language_supported")
         }
         done()
+        if not sub_info.get("has_any") and sub_info.get("source_language_supported") is False:
+            raise UnsupportedLanguage(sub_info.get("unsupported_reason") or "unsupported spoken language")
+        audio_language = sub_info.get("source_language") or "auto"
 
         if sub_info.get("has_any"):
             step("subtitles")
@@ -227,11 +242,11 @@ def run_video(video: dict, out_dir: Path, stage: str, allow_deepgram: bool, time
             src = "youtube"
         else:
             if not allow_deepgram:
+                result["source"] = {"src": "deepgram", "language": audio_language, "kind": "audio", "mode": ""}
                 result["status"] = "skipped"
                 result["error"] = "no usable subtitles and --no-deepgram set"
                 return result
-            language = video.get("audio_language") or "en"
-            transcribe_audio(language)
+            transcribe_audio(audio_language)
             mode = result["source"]["mode"]
             subtitle_source = "Deepgram Transcription"
             src = "deepgram"
@@ -291,7 +306,7 @@ def run_video(video: dict, out_dir: Path, stage: str, allow_deepgram: bool, time
                 result["status"] = "rerouted"
                 result["error"] = "subtitle quality is critical; plan reroutes to Deepgram but --no-deepgram is set"
                 return result
-            transcribe_audio(video.get("audio_language") or "en")
+            transcribe_audio(audio_language)
             result["source"]["rerouted_from"] = rerouted_from
             mode, src, language = result["source"]["mode"], "deepgram", result["source"]["language"]
             subtitle_source = "Deepgram Transcription"
@@ -357,6 +372,9 @@ def run_video(video: dict, out_dir: Path, stage: str, allow_deepgram: bool, time
         }
         done()
         result["status"] = "ok" if vq.get("passed") else "quality_failed"
+    except UnsupportedLanguage as exc:
+        result["status"] = "unsupported"
+        result["error"] = str(exc)
     except StepError as exc:
         result["status"] = "error"
         result["failed_step"] = result.get("_step", "")
@@ -368,6 +386,8 @@ def run_video(video: dict, out_dir: Path, stage: str, allow_deepgram: bool, time
 
 
 def observed_case(item: dict) -> str:
+    if item.get("status") == "unsupported":
+        return "unsupported"
     source = item.get("source") or {}
     if source.get("src") == "deepgram":
         return "deepgram"
@@ -533,6 +553,7 @@ def main() -> int:
             "error": sum(1 for r in results if r["status"] == "error"),
             "skipped": sum(1 for r in results if r["status"] == "skipped"),
             "rerouted": sum(1 for r in results if r["status"] == "rerouted"),
+            "unsupported": sum(1 for r in results if r["status"] == "unsupported"),
             "source_mismatch": sum(1 for r in results if source_mismatch(r)),
         },
     }

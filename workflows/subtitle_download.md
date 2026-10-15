@@ -32,18 +32,21 @@ Record from JSON:
 - `listed_candidates`
 - `preferred_source_language`
 - `mode`
+- `source_language` (spoken language family, empty when unknown) and `source_language_signal`
+- `source_language_supported`
+
+`subtitle-info` decides the spoken language before choosing tracks, from the audio track YouTube marks as original, the metadata `language` field, the original ASR caption track, or the manual tracks, in that order. Only human subtitles and the ASR track in the spoken language are candidates; YouTube's auto-translated tracks (about 150 `tlang` targets, including `zh-Hans`) never are.
 
 Rules:
 
-- If Chinese subtitles are available, prefer a Chinese subtitle track as the source text
-- Else if English subtitles are available, set `mode=bilingual` and use English as the source text
-- Else STOP
-- If only unsupported subtitle languages exist, `subtitle-info` reports `has_any=false` and the workflow must switch to audio transcription
+- Follow `listed_candidates` in order; do not pick tracks yourself
+- If `has_any=false` and `source_language_supported=false`, STOP and report `unsupported_reason`
+- If `has_any=false` otherwise, switch to audio transcription and pass `source_language` along
 
 Explicit product rule:
 
-- If Chinese subtitles exist, they take precedence as the single subtitle source track
-- Only when no usable Chinese subtitle track exists do we fall back to a single English subtitle source track
+- Human (manual) Chinese subtitles take precedence as the single subtitle source track for any video
+- Otherwise the source track is in the spoken language: Chinese for Chinese videos, English (`mode=bilingual`) for English videos
 - Bilingual output is produced only when the selected source track is English; subtitle files are never merged together
 
 Write to state:

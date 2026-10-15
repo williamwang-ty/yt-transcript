@@ -1,0 +1,668 @@
+{
+ "description": "Trimmed yt-dlp 2026.08.19 metadata (yt-dlp -J, 2026-10-14) for the live regression videos: caption maps keep only the URL query fields that matter (lang, kind, tlang) and a sample of the ~155 auto-translation targets.",
+ "videos": {
+  "H_peyIigkkc": {
+   "id": "H_peyIigkkc",
+   "language": "zh-Hant",
+   "subtitles": {
+    "zh-Hans": [
+     {
+      "ext": "vtt",
+      "name": "Chinese (Simplified)",
+      "url": "https://www.youtube.com/api/timedtext?v=H_peyIigkkc&lang=zh-Hans&fmt=vtt"
+     }
+    ],
+    "zh-TW": [
+     {
+      "ext": "vtt",
+      "name": "Chinese (Taiwan)",
+      "url": "https://www.youtube.com/api/timedtext?v=H_peyIigkkc&lang=zh-TW&fmt=vtt"
+     }
+    ]
+   },
+   "automatic_captions": {
+    "zh-Hans": [
+     {
+      "ext": "vtt",
+      "url": "https://www.youtube.com/api/timedtext?v=H_peyIigkkc&fmt=vtt"
+     }
+    ],
+    "zh-TW": [
+     {
+      "ext": "vtt",
+      "url": "https://www.youtube.com/api/timedtext?v=H_peyIigkkc&fmt=vtt"
+     }
+    ],
+    "en-orig": [
+     {
+      "ext": "vtt",
+      "url": "https://www.youtube.com/api/timedtext?v=H_peyIigkkc&lang=en&kind=asr&fmt=vtt",
+      "name": "English (Original)"
+     }
+    ],
+    "en": [
+     {
+      "ext": "vtt",
+      "url": "https://www.youtube.com/api/timedtext?v=H_peyIigkkc&lang=en&kind=asr&fmt=vtt",
+      "name": "English"
+     }
+    ],
+    "zh-Hant": [
+     {
+      "ext": "vtt",
+      "url": "https://www.youtube.com/api/timedtext?v=H_peyIigkkc&lang=en&kind=asr&tlang=zh-Hant&fmt=vtt",
+      "name": "Chinese (Traditional)"
+     }
+    ],
+    "ab": [
+     {
+      "ext": "vtt",
+      "url": "https://www.youtube.com/api/timedtext?v=H_peyIigkkc&lang=en&kind=asr&tlang=ab&fmt=vtt",
+      "name": "Abkhazian"
+     }
+    ],
+    "aa": [
+     {
+      "ext": "vtt",
+      "url": "https://www.youtube.com/api/timedtext?v=H_peyIigkkc&lang=en&kind=asr&tlang=aa&fmt=vtt",
+      "name": "Afar"
+     }
+    ],
+    "af": [
+     {
+      "ext": "vtt",
+      "url": "https://www.youtube.com/api/timedtext?v=H_peyIigkkc&lang=en&kind=asr&tlang=af&fmt=vtt",
+      "name": "Afrikaans"
+     }
+    ]
+   },
+   "formats": [
+    {
+     "format_id": "a0",
+     "vcodec": "none",
+     "acodec": "opus",
+     "language": "zh-Hant",
+     "language_preference": 10,
+     "format_note": "Chinese (Traditional) original (default), low"
+    },
+    {
+     "format_id": "a1",
+     "vcodec": "none",
+     "acodec": "opus",
+     "language": "zh-Hant",
+     "language_preference": 10,
+     "format_note": "Chinese (Traditional) original (default), medium"
+    }
+   ]
+  },
+  "wu0zS1AuI_E": {
+   "id": "wu0zS1AuI_E",
+   "language": null,
+   "subtitles": {
+    "zh": [
+     {
+      "ext": "vtt",
+      "name": "Chinese",
+      "url": "https://www.youtube.com/api/timedtext?v=wu0zS1AuI_E&lang=zh&fmt=vtt"
+     }
+    ]
+   },
+   "automatic_captions": {
+    "zh": [
+     {
+      "ext": "vtt",
+      "url": "https://www.youtube.com/api/timedtext?v=wu0zS1AuI_E&fmt=vtt"
+     }
+    ]
+   },
+   "formats": [
+    {
+     "format_id": "a0",
+     "vcodec": "none",
+     "acodec": "opus",
+     "language": null,
+     "language_preference": -1,
+     "format_note": "low"
+    },
+    {
+     "format_id": "a1",
+     "vcodec": "none",
+     "acodec": "opus",
+     "language": null,
+     "language_preference": -1,
+     "format_note": "low, DRC"
+    },
+    {
+     "format_id": "a2",
+     "vcodec": "none",
+     "acodec": "opus",
+     "language": null,
+     "language_preference": -1,
+     "format_note": "medium"
+    },
+    {
+     "format_id": "a3",
+     "vcodec": "none",
+     "acodec": "opus",
+     "language": null,
+     "language_preference": -1,
+     "format_note": "medium, DRC"
+    }
+   ]
+  },
+  "JkMWjp5AXhM": {
+   "id": "JkMWjp5AXhM",
+   "language": "zh-Hant",
+   "subtitles": {},
+   "automatic_captions": {
+    "en-orig": [
+     {
+      "ext": "vtt",
+      "url": "https://www.youtube.com/api/timedtext?v=JkMWjp5AXhM&lang=en&kind=asr&fmt=vtt",
+      "name": "English (Original)"
+     }
+    ],
+    "en": [
+     {
+      "ext": "vtt",
+      "url": "https://www.youtube.com/api/timedtext?v=JkMWjp5AXhM&lang=en&kind=asr&fmt=vtt",
+      "name": "English"
+     }
+    ],
+    "zh-Hans": [
+     {
+      "ext": "vtt",
+      "url": "https://www.youtube.com/api/timedtext?v=JkMWjp5AXhM&lang=en&kind=asr&tlang=zh-Hans&fmt=vtt",
+      "name": "Chinese (Simplified)"
+     }
+    ],
+    "zh-Hant": [
+     {
+      "ext": "vtt",
+      "url": "https://www.youtube.com/api/timedtext?v=JkMWjp5AXhM&lang=en&kind=asr&tlang=zh-Hant&fmt=vtt",
+      "name": "Chinese (Traditional)"
+     }
+    ],
+    "ab": [
+     {
+      "ext": "vtt",
+      "url": "https://www.youtube.com/api/timedtext?v=JkMWjp5AXhM&lang=en&kind=asr&tlang=ab&fmt=vtt",
+      "name": "Abkhazian"
+     }
+    ],
+    "aa": [
+     {
+      "ext": "vtt",
+      "url": "https://www.youtube.com/api/timedtext?v=JkMWjp5AXhM&lang=en&kind=asr&tlang=aa&fmt=vtt",
+      "name": "Afar"
+     }
+    ],
+    "af": [
+     {
+      "ext": "vtt",
+      "url": "https://www.youtube.com/api/timedtext?v=JkMWjp5AXhM&lang=en&kind=asr&tlang=af&fmt=vtt",
+      "name": "Afrikaans"
+     }
+    ]
+   },
+   "formats": [
+    {
+     "format_id": "a0",
+     "vcodec": "none",
+     "acodec": "opus",
+     "language": "en-US",
+     "language_preference": -1,
+     "format_note": "English (US), low"
+    },
+    {
+     "format_id": "a1",
+     "vcodec": "none",
+     "acodec": "opus",
+     "language": "en-US",
+     "language_preference": -1,
+     "format_note": "English (US), medium"
+    },
+    {
+     "format_id": "a2",
+     "vcodec": "none",
+     "acodec": "opus",
+     "language": "zh-Hant",
+     "language_preference": 10,
+     "format_note": "Chinese (Traditional) original (default), low"
+    },
+    {
+     "format_id": "a3",
+     "vcodec": "none",
+     "acodec": "opus",
+     "language": "zh-Hant",
+     "language_preference": 10,
+     "format_note": "Chinese (Traditional) original (default), medium"
+    }
+   ]
+  },
+  "CIatbV3_Rjg": {
+   "id": "CIatbV3_Rjg",
+   "language": "en-US",
+   "subtitles": {
+    "en": [
+     {
+      "ext": "vtt",
+      "name": "English",
+      "url": "https://www.youtube.com/api/timedtext?v=CIatbV3_Rjg&lang=en&fmt=vtt"
+     }
+    ]
+   },
+   "automatic_captions": {
+    "en": [
+     {
+      "ext": "vtt",
+      "url": "https://www.youtube.com/api/timedtext?v=CIatbV3_Rjg&fmt=vtt"
+     }
+    ]
+   },
+   "formats": [
+    {
+     "format_id": "a0",
+     "vcodec": "none",
+     "acodec": "opus",
+     "language": "en-US",
+     "language_preference": 10,
+     "format_note": "English (US) original (default), low"
+    },
+    {
+     "format_id": "a1",
+     "vcodec": "none",
+     "acodec": "opus",
+     "language": "en-US",
+     "language_preference": 10,
+     "format_note": "English (US) original (default), medium"
+    }
+   ]
+  },
+  "ijFSEb2W6_8": {
+   "id": "ijFSEb2W6_8",
+   "language": "en",
+   "subtitles": {},
+   "automatic_captions": {
+    "en-orig": [
+     {
+      "ext": "vtt",
+      "url": "https://www.youtube.com/api/timedtext?v=ijFSEb2W6_8&lang=en&kind=asr&fmt=vtt",
+      "name": "English (Original)"
+     }
+    ],
+    "en": [
+     {
+      "ext": "vtt",
+      "url": "https://www.youtube.com/api/timedtext?v=ijFSEb2W6_8&lang=en&kind=asr&fmt=vtt",
+      "name": "English"
+     }
+    ],
+    "zh-Hans": [
+     {
+      "ext": "vtt",
+      "url": "https://www.youtube.com/api/timedtext?v=ijFSEb2W6_8&lang=en&kind=asr&tlang=zh-Hans&fmt=vtt",
+      "name": "Chinese (Simplified)"
+     }
+    ],
+    "zh-Hant": [
+     {
+      "ext": "vtt",
+      "url": "https://www.youtube.com/api/timedtext?v=ijFSEb2W6_8&lang=en&kind=asr&tlang=zh-Hant&fmt=vtt",
+      "name": "Chinese (Traditional)"
+     }
+    ],
+    "ab": [
+     {
+      "ext": "vtt",
+      "url": "https://www.youtube.com/api/timedtext?v=ijFSEb2W6_8&lang=en&kind=asr&tlang=ab&fmt=vtt",
+      "name": "Abkhazian"
+     }
+    ],
+    "aa": [
+     {
+      "ext": "vtt",
+      "url": "https://www.youtube.com/api/timedtext?v=ijFSEb2W6_8&lang=en&kind=asr&tlang=aa&fmt=vtt",
+      "name": "Afar"
+     }
+    ],
+    "af": [
+     {
+      "ext": "vtt",
+      "url": "https://www.youtube.com/api/timedtext?v=ijFSEb2W6_8&lang=en&kind=asr&tlang=af&fmt=vtt",
+      "name": "Afrikaans"
+     }
+    ]
+   },
+   "formats": [
+    {
+     "format_id": "a0",
+     "vcodec": "none",
+     "acodec": "opus",
+     "language": "en",
+     "language_preference": -1,
+     "format_note": "low"
+    },
+    {
+     "format_id": "a1",
+     "vcodec": "none",
+     "acodec": "opus",
+     "language": "en",
+     "language_preference": -1,
+     "format_note": "low, DRC"
+    },
+    {
+     "format_id": "a2",
+     "vcodec": "none",
+     "acodec": "opus",
+     "language": "en",
+     "language_preference": -1,
+     "format_note": "medium"
+    },
+    {
+     "format_id": "a3",
+     "vcodec": "none",
+     "acodec": "opus",
+     "language": "en",
+     "language_preference": -1,
+     "format_note": "medium, DRC"
+    }
+   ]
+  },
+  "nmgFG7PUHfo": {
+   "id": "nmgFG7PUHfo",
+   "language": "en",
+   "subtitles": {
+    "en": [
+     {
+      "ext": "vtt",
+      "name": "English",
+      "url": "https://www.youtube.com/api/timedtext?v=nmgFG7PUHfo&lang=en&fmt=vtt"
+     }
+    ],
+    "fr": [
+     {
+      "ext": "vtt",
+      "name": "French",
+      "url": "https://www.youtube.com/api/timedtext?v=nmgFG7PUHfo&lang=fr&fmt=vtt"
+     }
+    ]
+   },
+   "automatic_captions": {
+    "en": [
+     {
+      "ext": "vtt",
+      "url": "https://www.youtube.com/api/timedtext?v=nmgFG7PUHfo&fmt=vtt"
+     }
+    ],
+    "fr": [
+     {
+      "ext": "vtt",
+      "url": "https://www.youtube.com/api/timedtext?v=nmgFG7PUHfo&fmt=vtt"
+     }
+    ],
+    "en-orig": [
+     {
+      "ext": "vtt",
+      "url": "https://www.youtube.com/api/timedtext?v=nmgFG7PUHfo&lang=en&kind=asr&fmt=vtt",
+      "name": "English (Original)"
+     }
+    ],
+    "zh-Hans": [
+     {
+      "ext": "vtt",
+      "url": "https://www.youtube.com/api/timedtext?v=nmgFG7PUHfo&lang=en&kind=asr&tlang=zh-Hans&fmt=vtt",
+      "name": "Chinese (Simplified)"
+     }
+    ],
+    "zh-Hant": [
+     {
+      "ext": "vtt",
+      "url": "https://www.youtube.com/api/timedtext?v=nmgFG7PUHfo&lang=en&kind=asr&tlang=zh-Hant&fmt=vtt",
+      "name": "Chinese (Traditional)"
+     }
+    ],
+    "ab": [
+     {
+      "ext": "vtt",
+      "url": "https://www.youtube.com/api/timedtext?v=nmgFG7PUHfo&lang=en&kind=asr&tlang=ab&fmt=vtt",
+      "name": "Abkhazian"
+     }
+    ],
+    "aa": [
+     {
+      "ext": "vtt",
+      "url": "https://www.youtube.com/api/timedtext?v=nmgFG7PUHfo&lang=en&kind=asr&tlang=aa&fmt=vtt",
+      "name": "Afar"
+     }
+    ],
+    "af": [
+     {
+      "ext": "vtt",
+      "url": "https://www.youtube.com/api/timedtext?v=nmgFG7PUHfo&lang=en&kind=asr&tlang=af&fmt=vtt",
+      "name": "Afrikaans"
+     }
+    ]
+   },
+   "formats": [
+    {
+     "format_id": "a0",
+     "vcodec": "none",
+     "acodec": "opus",
+     "language": "en",
+     "language_preference": -1,
+     "format_note": "low"
+    },
+    {
+     "format_id": "a1",
+     "vcodec": "none",
+     "acodec": "opus",
+     "language": "en",
+     "language_preference": -1,
+     "format_note": "low, DRC"
+    },
+    {
+     "format_id": "a2",
+     "vcodec": "none",
+     "acodec": "opus",
+     "language": "en",
+     "language_preference": -1,
+     "format_note": "medium"
+    },
+    {
+     "format_id": "a3",
+     "vcodec": "none",
+     "acodec": "opus",
+     "language": "en",
+     "language_preference": -1,
+     "format_note": "medium, DRC"
+    }
+   ]
+  },
+  "tGVSOK3PNUI": {
+   "id": "tGVSOK3PNUI",
+   "language": "ja",
+   "subtitles": {},
+   "automatic_captions": {
+    "ja-orig": [
+     {
+      "ext": "vtt",
+      "url": "https://www.youtube.com/api/timedtext?v=tGVSOK3PNUI&lang=ja&kind=asr&fmt=vtt",
+      "name": "Japanese (Original)"
+     }
+    ],
+    "ja": [
+     {
+      "ext": "vtt",
+      "url": "https://www.youtube.com/api/timedtext?v=tGVSOK3PNUI&lang=ja&kind=asr&fmt=vtt",
+      "name": "Japanese"
+     }
+    ],
+    "zh-Hans": [
+     {
+      "ext": "vtt",
+      "url": "https://www.youtube.com/api/timedtext?v=tGVSOK3PNUI&lang=ja&kind=asr&tlang=zh-Hans&fmt=vtt",
+      "name": "Chinese (Simplified)"
+     }
+    ],
+    "zh-Hant": [
+     {
+      "ext": "vtt",
+      "url": "https://www.youtube.com/api/timedtext?v=tGVSOK3PNUI&lang=ja&kind=asr&tlang=zh-Hant&fmt=vtt",
+      "name": "Chinese (Traditional)"
+     }
+    ],
+    "ab": [
+     {
+      "ext": "vtt",
+      "url": "https://www.youtube.com/api/timedtext?v=tGVSOK3PNUI&lang=ja&kind=asr&tlang=ab&fmt=vtt",
+      "name": "Abkhazian"
+     }
+    ],
+    "aa": [
+     {
+      "ext": "vtt",
+      "url": "https://www.youtube.com/api/timedtext?v=tGVSOK3PNUI&lang=ja&kind=asr&tlang=aa&fmt=vtt",
+      "name": "Afar"
+     }
+    ],
+    "af": [
+     {
+      "ext": "vtt",
+      "url": "https://www.youtube.com/api/timedtext?v=tGVSOK3PNUI&lang=ja&kind=asr&tlang=af&fmt=vtt",
+      "name": "Afrikaans"
+     }
+    ]
+   },
+   "formats": [
+    {
+     "format_id": "a0",
+     "vcodec": "none",
+     "acodec": "opus",
+     "language": "ja",
+     "language_preference": -1,
+     "format_note": "low"
+    },
+    {
+     "format_id": "a1",
+     "vcodec": "none",
+     "acodec": "opus",
+     "language": "ja",
+     "language_preference": -1,
+     "format_note": "low, DRC"
+    },
+    {
+     "format_id": "a2",
+     "vcodec": "none",
+     "acodec": "opus",
+     "language": "ja",
+     "language_preference": -1,
+     "format_note": "medium"
+    },
+    {
+     "format_id": "a3",
+     "vcodec": "none",
+     "acodec": "opus",
+     "language": "ja",
+     "language_preference": -1,
+     "format_note": "medium, DRC"
+    }
+   ]
+  },
+  "DQGrPstFRVI": {
+   "id": "DQGrPstFRVI",
+   "language": null,
+   "subtitles": {},
+   "automatic_captions": {},
+   "formats": [
+    {
+     "format_id": "a0",
+     "vcodec": "none",
+     "acodec": "opus",
+     "language": null,
+     "language_preference": -1,
+     "format_note": "low"
+    },
+    {
+     "format_id": "a1",
+     "vcodec": "none",
+     "acodec": "opus",
+     "language": null,
+     "language_preference": -1,
+     "format_note": "low, DRC"
+    },
+    {
+     "format_id": "a2",
+     "vcodec": "none",
+     "acodec": "opus",
+     "language": null,
+     "language_preference": -1,
+     "format_note": "medium"
+    },
+    {
+     "format_id": "a3",
+     "vcodec": "none",
+     "acodec": "opus",
+     "language": null,
+     "language_preference": -1,
+     "format_note": "medium, DRC"
+    }
+   ]
+  },
+  "Fhx_qNS2P8g": {
+   "id": "Fhx_qNS2P8g",
+   "language": null,
+   "subtitles": {
+    "zh-Hans": [
+     {
+      "ext": "vtt",
+      "name": "Chinese (Simplified)",
+      "url": "https://www.youtube.com/api/timedtext?v=Fhx_qNS2P8g&lang=zh-Hans&fmt=vtt"
+     }
+    ]
+   },
+   "automatic_captions": {
+    "zh-Hans": [
+     {
+      "ext": "vtt",
+      "url": "https://www.youtube.com/api/timedtext?v=Fhx_qNS2P8g&fmt=vtt"
+     }
+    ]
+   },
+   "formats": [
+    {
+     "format_id": "a0",
+     "vcodec": "none",
+     "acodec": "opus",
+     "language": null,
+     "language_preference": -1,
+     "format_note": "low"
+    },
+    {
+     "format_id": "a1",
+     "vcodec": "none",
+     "acodec": "opus",
+     "language": null,
+     "language_preference": -1,
+     "format_note": "low, DRC"
+    },
+    {
+     "format_id": "a2",
+     "vcodec": "none",
+     "acodec": "opus",
+     "language": null,
+     "language_preference": -1,
+     "format_note": "medium"
+    },
+    {
+     "format_id": "a3",
+     "vcodec": "none",
+     "acodec": "opus",
+     "language": null,
+     "language_preference": -1,
+     "format_note": "medium, DRC"
+    }
+   ]
+  }
+ }
+}

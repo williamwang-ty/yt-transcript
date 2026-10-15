@@ -457,181 +457,22 @@ reset_download_dir() {
 # Derive structured subtitle availability information from `yt-dlp --dump-json` output.
 emit_subtitle_info_from_metadata_json() {
     local video_id="$1"
-    local metadata_json ytdlp_runtime_json
-    metadata_json=$(cat)
+    local ytdlp_runtime_json
     ytdlp_runtime_json=$(current_ytdlp_runtime_json)
-    VIDEO_ID="$video_id" METADATA_JSON="$metadata_json" YTDLP_RUNTIME_JSON="$ytdlp_runtime_json" python3 - <<'PY'
-import json
-import os
-
-video_id = os.environ.get('VIDEO_ID', '')
-payload = json.loads(os.environ['METADATA_JSON'])
-manual_map = payload.get('subtitles') if isinstance(payload.get('subtitles'), dict) else {}
-auto_map = payload.get('automatic_captions') if isinstance(payload.get('automatic_captions'), dict) else {}
-manual = [lang for lang, entries in manual_map.items() if entries]
-automatic = [lang for lang, entries in auto_map.items() if entries]
-if not manual and not automatic:
-    raise SystemExit(1)
-
-all_langs = manual + [lang for lang in automatic if lang not in manual]
-english_like = [lang for lang in all_langs if lang == 'en' or lang.startswith('en-')]
-chinese_like = [lang for lang in all_langs if lang == 'zh' or lang.startswith('zh-')]
-
-def family_candidates(languages, family):
-    return [lang for lang in languages if lang == family or lang.startswith(f'{family}-')]
-
-
-def ordered_family_candidates(family, mode_name):
-    ordered = []
-    seen = set()
-    for source_kind, languages in (('manual', manual), ('auto', automatic)):
-        for lang in family_candidates(languages, family):
-            normalized = str(lang or '').strip()
-            if not normalized or normalized in seen:
-                continue
-            seen.add(normalized)
-            ordered.append({
-                'language': normalized,
-                'mode': mode_name,
-                'source_kind': source_kind,
-            })
-    return ordered
-
-
-listed_candidates = []
-if chinese_like:
-    listed_candidates.extend(ordered_family_candidates('zh', 'chinese'))
-if english_like:
-    listed_candidates.extend(ordered_family_candidates('en', 'bilingual'))
-
-preferred_source_language = ''
-preferred_source_kind = ''
-mode = ''
-if chinese_like:
-    preferred_source_language = chinese_like[0]
-    preferred_source_kind = 'manual' if preferred_source_language in manual else 'auto'
-    mode = 'chinese'
-elif english_like:
-    preferred_source_language = english_like[0]
-    preferred_source_kind = 'manual' if preferred_source_language in manual else 'auto'
-    mode = 'bilingual'
-
-print(json.dumps({
-    'video_id': payload.get('id') or video_id,
-    'has_manual': bool(manual),
-    'has_auto': bool(automatic),
-    'has_any': bool(chinese_like or english_like),
-    'manual_languages': manual,
-    'automatic_languages': automatic,
-    'english_available': bool(english_like),
-    'chinese_available': bool(chinese_like),
-    'listed_candidates': listed_candidates,
-    'preferred_source_language': preferred_source_language,
-    'preferred_source_kind': preferred_source_kind,
-    'mode': mode,
-    'yt_dlp_runtime': json.loads(os.environ.get('YTDLP_RUNTIME_JSON', '{}') or '{}'),
-}, ensure_ascii=False))
-PY
+    python3 "$ROOT_DIR/yt_transcript_utils.py" subtitle-info \
+        --video-id "$video_id" \
+        --yt-dlp-runtime-json "$ytdlp_runtime_json"
 }
 
 # Fallback parser for subtitle listings when full metadata JSON is unavailable.
 emit_subtitle_info_from_list_output() {
     local video_id="$1"
-    local list_output ytdlp_runtime_json
-    list_output=$(cat)
+    local ytdlp_runtime_json
     ytdlp_runtime_json=$(current_ytdlp_runtime_json)
-    VIDEO_ID="$video_id" LIST_OUTPUT="$list_output" YTDLP_RUNTIME_JSON="$ytdlp_runtime_json" python3 - <<'PY'
-import json
-import os
-import re
-
-video_id = os.environ.get('VIDEO_ID', '')
-text = os.environ.get('LIST_OUTPUT', '')
-section = None
-manual = []
-automatic = []
-
-for raw_line in text.splitlines():
-    line = raw_line.strip()
-    if not line:
-        continue
-    lower = line.lower()
-    if 'available subtitles' in lower and 'automatic' not in lower:
-        section = 'manual'
-        continue
-    if 'available automatic captions' in lower:
-        section = 'auto'
-        continue
-    if line.startswith('Language') or line.startswith('[info]'):
-        continue
-    match = re.match(r'^([A-Za-z0-9-]+)\s+', line)
-    if not match or section is None:
-        continue
-    lang = match.group(1)
-    if section == 'manual' and lang not in manual:
-        manual.append(lang)
-    elif section == 'auto' and lang not in automatic:
-        automatic.append(lang)
-
-all_langs = manual + [lang for lang in automatic if lang not in manual]
-english_like = [lang for lang in all_langs if lang == 'en' or lang.startswith('en-')]
-chinese_like = [lang for lang in all_langs if lang == 'zh' or lang.startswith('zh-')]
-
-def family_candidates(languages, family):
-    return [lang for lang in languages if lang == family or lang.startswith(f'{family}-')]
-
-
-def ordered_family_candidates(family, mode_name):
-    ordered = []
-    seen = set()
-    for source_kind, languages in (('manual', manual), ('auto', automatic)):
-        for lang in family_candidates(languages, family):
-            normalized = str(lang or '').strip()
-            if not normalized or normalized in seen:
-                continue
-            seen.add(normalized)
-            ordered.append({
-                'language': normalized,
-                'mode': mode_name,
-                'source_kind': source_kind,
-            })
-    return ordered
-
-
-listed_candidates = []
-if chinese_like:
-    listed_candidates.extend(ordered_family_candidates('zh', 'chinese'))
-if english_like:
-    listed_candidates.extend(ordered_family_candidates('en', 'bilingual'))
-
-preferred_source_language = ''
-preferred_source_kind = ''
-mode = ''
-if chinese_like:
-    preferred_source_language = chinese_like[0]
-    preferred_source_kind = 'manual' if preferred_source_language in manual else 'auto'
-    mode = 'chinese'
-elif english_like:
-    preferred_source_language = english_like[0]
-    preferred_source_kind = 'manual' if preferred_source_language in manual else 'auto'
-    mode = 'bilingual'
-
-print(json.dumps({
-    'video_id': video_id,
-    'has_manual': bool(manual),
-    'has_auto': bool(automatic),
-    'has_any': bool(chinese_like or english_like),
-    'manual_languages': manual,
-    'automatic_languages': automatic,
-    'english_available': bool(english_like),
-    'chinese_available': bool(chinese_like),
-    'listed_candidates': listed_candidates,
-    'preferred_source_language': preferred_source_language,
-    'preferred_source_kind': preferred_source_kind,
-    'mode': mode,
-    'yt_dlp_runtime': json.loads(os.environ.get('YTDLP_RUNTIME_JSON', '{}') or '{}'),
-}, ensure_ascii=False))
-PY
+    python3 "$ROOT_DIR/yt_transcript_utils.py" subtitle-info \
+        --from-list-subs \
+        --video-id "$video_id" \
+        --yt-dlp-runtime-json "$ytdlp_runtime_json"
 }
 
 # Choose the best available audio-only format from `yt-dlp` metadata JSON.
@@ -784,6 +625,7 @@ PY
         if ! SUBTITLE_PLAN_JSON=$(SUB_INFO_JSON="$SUB_INFO_JSON" python3 - <<'PY'
 import json
 import os
+import sys
 
 sub_info = json.loads(os.environ['SUB_INFO_JSON'])
 candidates = []
@@ -799,6 +641,9 @@ for candidate in sub_info.get('listed_candidates', []):
         })
 
 if not candidates:
+    reason = str(sub_info.get('unsupported_reason', '') or '').strip()
+    if reason:
+        print(f"❌ Error: {reason}", file=sys.stderr)
     raise SystemExit(1)
 
 print(json.dumps({
@@ -806,7 +651,7 @@ print(json.dumps({
 }, ensure_ascii=False))
 PY
 ); then
-            echo "❌ Error: Subtitle workflow supports English or Chinese subtitle tracks only; use audio transcription fallback for other languages" >&2
+            echo "❌ Error: No trusted Chinese or English subtitle track for this video" >&2
             exit 1
         fi
 
