@@ -170,17 +170,16 @@ def _process_chunks_impl(work_dir: str, prompt_name: str, extra_instruction: str
     else:
         recommended_chunk_size = _get_task_chunk_target(prompt_name, config)
     setup_warnings = []
+    # Backend choice is informational (stderr + runtime.llm_backend), not a warning.
     if use_cli:
-        setup_warning = (
+        fallback_note = "the configured API is the fallback" if backend_decision["api_configured"] else "no API fallback is configured"
+        print(
             f"ℹ️ Chunk requests use the {backend_decision['agent']} CLI "
-            f"({' '.join(backend_decision['command'])}); the configured API is the fallback."
+            f"({' '.join(backend_decision['command'])}); {fallback_note}.",
+            file=sys.stderr,
         )
-        setup_warnings.append(setup_warning)
-        print(setup_warning, file=sys.stderr)
     elif backend_decision["mode"] == "auto" and backend_decision["fallback_reason"]:
-        setup_warning = f"ℹ️ Chunk requests use the configured API: {backend_decision['fallback_reason']}"
-        setup_warnings.append(setup_warning)
-        print(setup_warning, file=sys.stderr)
+        print(f"ℹ️ Chunk requests use the configured API: {backend_decision['fallback_reason']}", file=sys.stderr)
     if reasoning_stream_disabled and not use_cli:
         setup_warning = (
             f"ℹ️ Streaming disabled for reasoning model '{model}' during chunk processing "

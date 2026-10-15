@@ -63,10 +63,9 @@ KNOWN_AGENTS = (
         "name": "cursor",
         "aliases": ("cursor", "cursor-agent", "cursor-cli"),
         "env": ("CURSOR_AGENT", "CURSOR_SANDBOX"),
-        "commands": (
-            ["cursor-agent", "-p", "--output-format", "text", PROMPT_PLACEHOLDER],
-            ["agent", "-p", "--output-format", "text", PROMPT_PLACEHOLDER],
-        ),
+        # --trust: headless runs refuse untrusted directories otherwise. Only the
+        # `cursor-agent` name is used: a bare `agent` can belong to other tools.
+        "commands": (["cursor-agent", "-p", "--trust", "--output-format", "text", PROMPT_PLACEHOLDER],),
     },
 )
 
