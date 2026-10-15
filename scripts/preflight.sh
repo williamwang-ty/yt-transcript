@@ -183,7 +183,32 @@ else
 fi
 
 # 8. LLM checks only when required
-if [ "$REQUIRE_LLM" = true ]; then
+# With llm_backend=auto, a working agent CLI (claude -p, codex exec, ...) is
+# enough for chunk processing; the API is then only the fallback.
+LLM_BACKEND=$(printf '%s' "$CONFIG_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin).get('llm_backend', 'auto'))")
+LLM_CLI_OK=false
+if [ "$REQUIRE_LLM" = true ] && [ "$LLM_BACKEND" = "auto" ]; then
+    echo "🤖 Checking the calling agent's CLI for chunk processing..."
+    BACKEND_JSON=$(python3 "$ROOT_DIR/yt_transcript_utils.py" resolve-llm-backend --config-path "$CONFIG_FILE" 2>/dev/null || true)
+    BACKEND_KIND=$(printf '%s' "$BACKEND_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin).get('backend', ''))" 2>/dev/null || true)
+    if [ "$BACKEND_KIND" = "cli" ]; then
+        LLM_CLI_OK=true
+        BACKEND_AGENT=$(printf '%s' "$BACKEND_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin).get('agent', ''))")
+        BACKEND_CMD=$(printf '%s' "$BACKEND_JSON" | python3 -c "import sys,json; print(' '.join(json.load(sys.stdin).get('command', [])))")
+        echo "✅ Chunks will use the ${BACKEND_AGENT} CLI (${BACKEND_CMD})"
+    else
+        BACKEND_REASON=$(printf '%s' "$BACKEND_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin).get('fallback_reason', ''))" 2>/dev/null || true)
+        echo "ℹ️  Agent CLI not used: ${BACKEND_REASON:-unknown reason}; falling back to the LLM API"
+    fi
+fi
+
+if [ "$LLM_CLI_OK" = true ]; then
+    if [ -n "$LLM_API_KEY" ] && [ -n "$LLM_BASE_URL" ] && [ -n "$LLM_MODEL" ]; then
+        echo "✅ LLM API fallback configured (not probed)"
+    else
+        echo "ℹ️  No LLM API fallback configured; chunks stop if the agent CLI fails"
+    fi
+elif [ "$REQUIRE_LLM" = true ]; then
     if [ -z "$LLM_API_KEY" ] || [ -z "$LLM_BASE_URL" ] || [ -z "$LLM_MODEL" ]; then
         echo "❌ Error: LLM API is not fully configured in config.yaml"
         exit 1

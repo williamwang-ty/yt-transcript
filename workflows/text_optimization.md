@@ -52,8 +52,15 @@ If `reroute_recommended=true` and `reroute_target=deepgram`, STOP this subtitle 
 If `requires_llm_preflight=true`, ensure:
 
 ```bash
-bash <skill-root>/scripts/preflight.sh --require-llm
+YT_TRANSCRIPT_AGENT_CLI=<your-agent> bash <skill-root>/scripts/preflight.sh --require-llm
 ```
+
+Chunk LLM backend (`llm_backend`, default `auto`): `process-chunks` sends chunks to your own CLI so long videos use the same model family as you, and falls back to the configured API when that CLI is missing, fails its probe, or fails mid-run. Tell it who you are:
+
+- Built-in agents: `claude-code` (`claude -p`), `codex` (`codex exec`), `opencode` (`opencode run`), `pi` (`pi -p`), `gemini` (`gemini -p`), `cursor` (`cursor-agent -p`). Set `YT_TRANSCRIPT_AGENT_CLI=<name>` or pass `--agent-cli <name>` to `process-chunks`.
+- Any other agent: pass your own non-interactive command instead, e.g. `--agent-cli "mytool run {prompt}"` (`{prompt}` marks where the prompt goes; without it the prompt is sent on stdin). The command must print only the answer text.
+- If you pass nothing, the host is detected from its environment variables; when nothing is detected the API is used.
+- `llm_backend: api` in config.yaml always uses the API.
 
 `plan-optimization` is the canonical router here. It still reports the raw `duration_bucket` (`short` for `< 1800s`, `long` for `>= 1800s`), but `video_path` may escalate a short-duration transcript to chunked execution when the normalized input is too large for reliable single-pass prompting. The separate Quick Mode from `SKILL.md` is a narrower `< 900` second shortcut inside the short-duration bucket.
 
@@ -194,6 +201,7 @@ Canonical command shape:
   python3 <skill-root>/yt_transcript_utils.py process-chunks \
       /tmp/${VIDEO_ID}_chunks \
       --prompt <RAW_STAGE_PROMPT> \
+      --agent-cli <your-agent> \
       --auto-replan
   ```
 - Processed translation stage (when present):
@@ -201,6 +209,7 @@ Canonical command shape:
   python3 <skill-root>/yt_transcript_utils.py process-chunks \
       /tmp/${VIDEO_ID}_chunks \
       --prompt translate_only \
+      --agent-cli <your-agent> \
       --input-key processed_path
   ```
 
