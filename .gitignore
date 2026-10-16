@@ -1,5 +1,7 @@
-# Local config (contains sensitive data)
-config.yaml
+# Local config holds API keys; also ignore any copy or backup of it
+config.yaml*
+*.bak
+.env
 
 # Local workspace artifacts
 .claude/
