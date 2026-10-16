@@ -1615,7 +1615,10 @@ class RuntimeRegressionTests(unittest.TestCase):
             self.assertEqual(result["ownership"]["recovered_stale_owner"]["stale_reason"], "dead_process")
             self.assertFalse(owner_path.exists())
 
-    def test_process_chunks_with_replans_shares_runtime_owner_across_steps(self):
+    # Pin the executor so a local config.yaml with long_text_mode: window
+    # does not route this chunk-executor test to the window path.
+    @mock.patch("kernel.long_text.window.resolve_long_text_mode", return_value="chunks")
+    def test_process_chunks_with_replans_shares_runtime_owner_across_steps(self, _mode):
         """Test process chunks with replans shares runtime owner across steps."""
         with tempfile.TemporaryDirectory() as tmpdir:
             source = Path(tmpdir) / "raw.txt"
@@ -2833,7 +2836,10 @@ chunk_context_summary_tokens: 20
             self.assertEqual(result["control"]["replan"]["auto_replan_count"], 1)
             self.assertEqual(result["control"]["replan"]["max_auto_replans"], 1)
 
-    def test_process_chunks_with_replans_stops_when_replan_step_fails(self):
+    # Pin the executor so a local config.yaml with long_text_mode: window
+    # does not route this chunk-executor test to the window path.
+    @mock.patch("kernel.long_text.window.resolve_long_text_mode", return_value="chunks")
+    def test_process_chunks_with_replans_stops_when_replan_step_fails(self, _mode):
         """Test process chunks with replans stops when replan step fails."""
         with tempfile.TemporaryDirectory() as tmpdir:
             source = Path(tmpdir) / "raw.txt"
