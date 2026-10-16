@@ -102,6 +102,14 @@ class WindowProtocolTests(unittest.TestCase):
         self.assertIn("transcript continues after it", prompt)
         self.assertIn("上一段结尾。", prompt)
 
+    def test_structure_prompt_keeps_speaker_turns_in_separate_paragraphs(self):
+        sentences = [_sentence(i) for i in range(1, 4)]
+        kwargs = dict(sentences=sentences, cursor=0, window_end=3, write_tokens=300)
+        structure = window.build_window_prompt("{RAW_TEXT}", prompt_name="structure_only", **kwargs)
+        cleanup = window.build_window_prompt("{RAW_TEXT}", prompt_name="cleanup_zh", **kwargs)
+        self.assertIn("whenever the speaker changes", structure)
+        self.assertNotIn("whenever the speaker changes", cleanup)
+
     def test_long_unpunctuated_sentences_are_split_into_numbered_units(self):
         text = "没有标点的自动字幕" * 80
         units = window.split_source_sentences(text, {}, max_sentence_tokens=60)

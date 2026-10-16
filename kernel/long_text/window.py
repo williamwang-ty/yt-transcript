@@ -112,6 +112,12 @@ The input below is one window of a longer transcript. Every source {unit} starts
 - Output only the processed text and the markers."""
 
 TASK_PROTOCOL_NOTES = {
+    # Window rounds see many sentences at once and tend to merge a whole
+    # exchange into one paragraph; keep dialogue readable.
+    "structure_only": (
+        "\n- Start a new paragraph whenever the speaker changes (for example where the source has `-` or `>>`): "
+        "each speaker's turn is its own paragraph, separated by a blank line and followed by its own marker."
+    ),
     "translate_only": (
         "\n- For each source paragraph, write the English paragraph unchanged, then its Chinese translation, "
         "then the marker. Copy `##` headers as they are."
