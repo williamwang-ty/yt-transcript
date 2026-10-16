@@ -94,6 +94,12 @@ class WindowProtocolTests(unittest.TestCase):
         missing = window.parse_window_output("没有任何编号的输出", cursor=0, window_end=10)
         self.assertEqual(missing["error_type"], "no_markers")
 
+    def test_parse_accepts_a_tag_repeated_across_a_paragraph_break(self):
+        text = "[S1] 甲[S2] 乙\n\n[S2] 丙。[S3] 丁。\n\n<!--END-->"
+        parsed = window.parse_window_output(text, cursor=0, window_end=10)
+        self.assertTrue(parsed["ok"], parsed)
+        self.assertEqual([(p["start"], p["end"]) for p in parsed["paragraphs"]], [(0, 0), (1, 2)])
+
     def test_parse_skipped_tags_count_toward_the_paragraph_before(self):
         text = "[S1] 甲[S2] 乙。\n\n[S5] 丙。\n\n<!--END-->"
         parsed = window.parse_window_output(text, cursor=0, window_end=10)
@@ -120,6 +126,16 @@ class WindowProtocolTests(unittest.TestCase):
         self.assertIn("<!--END-->", prompt)
         self.assertIn("transcript continues after it", prompt)
         self.assertIn("上一段结尾。", prompt)
+
+    def test_forced_split_does_not_leave_a_tiny_last_unit(self):
+        # Seen on a real video: the last forced piece was three characters, the
+        # model folded them into the paragraph before without the tag, and the
+        # executor ran two more rounds for it, duplicating the words.
+        text = "没有标点的自动字幕" * 60 + "的主题"
+        units = window.split_source_sentences(text, {}, max_sentence_tokens=60)
+        self.assertEqual("".join(units), text)
+        self.assertTrue(units[-1].endswith("的主题"))
+        self.assertGreater(len(units[-1]), len("的主题"))
 
     def test_structure_prompt_keeps_speaker_turns_in_separate_paragraphs(self):
         sentences = [_sentence(i) for i in range(1, 4)]

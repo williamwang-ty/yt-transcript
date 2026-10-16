@@ -61,6 +61,8 @@ DEFAULT_WINDOW_MARKER_RETRIES = 1
 # Raw sentences longer than this are split so one number never covers a huge
 # unpunctuated run (common in auto-generated Chinese captions).
 DEFAULT_WINDOW_SENTENCE_MAX_TOKENS = 120
+# A forced-split remainder smaller than this share of the cap joins the piece before it.
+MIN_SPLIT_PIECE_SHARE = 0.25
 # Processed-stage units are paragraphs; only very long ones are split.
 DEFAULT_WINDOW_PARAGRAPH_MAX_TOKENS = 600
 
@@ -109,7 +111,7 @@ The input below is one window of a longer transcript. Every source {unit} starts
 - Start at [S{first}].{done_note}
 - {write_note}
 - Keep every [S<n>] tag in the output: write it right before the text that comes from that source {unit}, even in the middle of a paragraph. Do not add, drop or reorder tags, and cover the {units} in order without skipping any.
-- Separate paragraphs with a blank line. Put `##` headers on their own line.{task_note}
+- Separate paragraphs with a blank line, and keep them as short as the task asks: split a long passage into several paragraphs rather than one block. Put `##` headers on their own line.{task_note}
 - When you stop, end the output with a line <!--END--> after the last complete paragraph.
 - Output only the processed text, the tags and that end line."""
 
@@ -254,11 +256,15 @@ def split_source_sentences(text: str, config: dict | None = None,
         if not sentence:
             continue
         if max_sentence_tokens > 0 and utils._estimate_tokens(sentence, "tokens", config) > max_sentence_tokens:
-            sentences.extend(
-                part.strip()
-                for part in utils._force_split_text_by_tokens(sentence, max_sentence_tokens, config)
-                if part.strip()
-            )
+            parts = [part.strip() for part in
+                     utils._force_split_text_by_tokens(sentence, max_sentence_tokens, config) if part.strip()]
+            # A forced split can leave a scrap of a few characters at the end;
+            # the model folds it into the paragraph before without its tag, so
+            # keep it with the previous piece instead of numbering it alone.
+            if len(parts) > 1 and utils._estimate_tokens(parts[-1], "tokens", config) < \
+                    max_sentence_tokens * MIN_SPLIT_PIECE_SHARE:
+                parts[-2:] = [parts[-2] + parts[-1]]
+            sentences.extend(parts)
         else:
             sentences.append(sentence)
     return sentences
@@ -446,7 +452,9 @@ def parse_window_output(text: str, cursor: int, window_end: int) -> dict:
     numbers = [int(n) for n in SOURCE_TAG_NUMBER.findall(raw)]
     previous = cursor
     for number in numbers:
-        if number <= previous:
+        # A repeated tag (one unit split across two paragraphs) is fine;
+        # going backwards or behind the cursor is not.
+        if number <= cursor or number < previous:
             return _invalid("non_monotonic", f"tag S{number} does not move past S{previous}")
         if number > window_end:
             return _invalid("out_of_window", f"tag S{number} is past the window end S{window_end}")
