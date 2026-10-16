@@ -688,12 +688,12 @@ def _build_result(work_dir: str, state: dict, outcome: dict, *, prompt_name: str
         "state_path": str(state_path_for(work_dir)),
         "warnings": warnings,
         "warning_count": len(warnings),
-        # Fields the chunk-path callers read.
-        "processed_count": len(paragraphs),
+        # Fields the chunk-path callers read; in window mode a "chunk" is one LLM request (round).
+        "processed_count": sum(1 for r in rounds if r.get("result") in {"ok", "fallback"}),
         "failed_count": 0 if success or status in {"aborted", "paused"} else 1,
         "skipped_count": 0,
         "superseded_count": 0,
-        "total_chunks": len(paragraphs),
+        "total_chunks": len(rounds),
         "output_files": [str(window_dir_for(work_dir) / p["file"]) for p in paragraphs],
         "aborted": status == "aborted",
         "aborted_reason": "Cancellation requested" if status == "aborted" else outcome.get("error", ""),
