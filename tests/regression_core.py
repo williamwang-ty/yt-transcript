@@ -91,7 +91,7 @@ class CoreRegressionTests(unittest.TestCase):
         self.assertTrue(utils._has_reasoning_metadata(metadata))
         self.assertEqual(utils._reasoning_metadata_reason(metadata), "reasoning_tokens")
         self.assertTrue(
-            utils._is_reasoning_budget_exhaustion(
+            utils._is_output_budget_exhausted(
                 {
                     "text": "",
                     "finish_reason": "length",
@@ -101,8 +101,11 @@ class CoreRegressionTests(unittest.TestCase):
                 1223,
             )
         )
+        # A gateway that spends the whole budget on reasoning but reports a
+        # normal stop is still treated as cut off.
+        self.assertTrue(utils._is_output_budget_exhausted(metadata, "", 1223))
         self.assertFalse(
-            utils._is_reasoning_budget_exhaustion(
+            utils._is_output_budget_exhausted(
                 {
                     "text": "",
                     "finish_reason": "content_filter",
@@ -112,6 +115,47 @@ class CoreRegressionTests(unittest.TestCase):
                 1223,
             )
         )
+
+    def test_output_budget_exhausted_uses_finish_reason_for_any_model(self):
+        """Test truncation is read from finish_reason, not from the model name or empty text."""
+        for finish_reason in ("length", "max_tokens", "MAX_OUTPUT_TOKENS"):
+            with self.subTest(finish_reason=finish_reason):
+                self.assertTrue(
+                    utils._is_output_budget_exhausted(
+                        {"text": "前 70% 的译文", "finish_reason": finish_reason, "usage": {}},
+                        "前 70% 的译文",
+                        2017,
+                    )
+                )
+        for finish_reason in ("stop", "end_turn", ""):
+            with self.subTest(finish_reason=finish_reason):
+                self.assertFalse(
+                    utils._is_output_budget_exhausted(
+                        {"text": "完整输出", "finish_reason": finish_reason, "usage": {}},
+                        "完整输出",
+                        2017,
+                    )
+                )
+
+    def test_next_output_retry_max_tokens_keeps_room_for_reasoning(self):
+        """Test a retry ceiling covers the reasoning spent last time and respects the cap."""
+        config = utils._default_config_values()
+        self.assertEqual(utils._next_output_retry_max_tokens(8192, config), 16384)
+        # Reasoning larger than the multiplier step: the answer keeps its full room.
+        self.assertEqual(
+            utils._next_output_retry_max_tokens(
+                2000,
+                {"llm_output_retry_multiplier": 1.5, "llm_output_retry_max_tokens": 20000},
+                observed_reasoning_tokens=3000,
+            ),
+            5000,
+        )
+        self.assertEqual(
+            utils._next_output_retry_max_tokens(12000, config, observed_reasoning_tokens=9000),
+            16384,
+        )
+        # Already at the cap: no larger ceiling is available.
+        self.assertEqual(utils._next_output_retry_max_tokens(16384, config), 16384)
 
     def test_load_config_preserves_hash_inside_quotes(self):
         """Test load config preserves hash inside quotes."""
@@ -214,22 +258,6 @@ class CoreRegressionTests(unittest.TestCase):
 
         self.assertTrue(config["llm_reasoning_probe_enabled"])
 
-    def test_reasoning_model_detection_handles_provider_prefixed_names(self):
-        """Test provider-prefixed DeepSeek reasoning model aliases disable chunk streaming."""
-        reasoning_models = [
-            "deepseek-v4-pro",
-            "deepseek/deepseek-reasoner",
-            "openrouter/deepseek/deepseek-r1",
-            "DeepSeek_R1_Distill",
-        ]
-
-        for model in reasoning_models:
-            with self.subTest(model=model):
-                self.assertTrue(utils._is_reasoning_llm_model(model))
-                self.assertEqual(utils._resolve_chunk_stream_mode_for_model(model, "auto"), "false")
-
-        self.assertFalse(utils._is_reasoning_llm_model("deepseek-v3"))
-
     def test_reasoning_metadata_detection_uses_response_features_not_model_name(self):
         """Test structured response features can identify unknown reasoning models."""
         result = {
@@ -243,7 +271,6 @@ class CoreRegressionTests(unittest.TestCase):
             },
         }
 
-        self.assertFalse(utils._is_reasoning_llm_model("acme/unknown-model"))
         self.assertTrue(utils._has_reasoning_metadata(result))
         self.assertEqual(utils._reasoning_metadata_reason(result), "reasoning_text")
 
@@ -2003,9 +2030,9 @@ work_dir: /tmp/vid001_chunks
                 'llm_probe_max_tokens: "7"\n'
                 'llm_reasoning_probe_enabled: "false"\n'
                 'llm_stop_after_consecutive_timeouts: "4"\n'
-                'llm_reasoning_retry_attempts: "3"\n'
-                'llm_reasoning_retry_multiplier: "1.5"\n'
-                'llm_reasoning_retry_max_tokens: "5000"\n',
+                'llm_output_retry_attempts: "3"\n'
+                'llm_output_retry_multiplier: "1.5"\n'
+                'llm_output_retry_max_tokens: "20000"\n',
                 encoding="utf-8",
             )
             config = utils.load_config(str(config_path))
@@ -2017,9 +2044,31 @@ work_dir: /tmp/vid001_chunks
             self.assertEqual(config["llm_probe_max_tokens"], 7)
             self.assertFalse(config["llm_reasoning_probe_enabled"])
             self.assertEqual(config["llm_stop_after_consecutive_timeouts"], 4)
-            self.assertEqual(config["llm_reasoning_retry_attempts"], 3)
-            self.assertEqual(config["llm_reasoning_retry_multiplier"], 1.5)
-            self.assertEqual(config["llm_reasoning_retry_max_tokens"], 5000)
+            self.assertEqual(config["llm_output_retry_attempts"], 3)
+            self.assertEqual(config["llm_output_retry_multiplier"], 1.5)
+            self.assertEqual(config["llm_output_retry_max_tokens"], 20000)
+
+    def test_load_config_accepts_legacy_reasoning_retry_keys(self):
+        """Test the old llm_reasoning_retry_* names still apply, with a rename warning."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "config.yaml"
+            config_path.write_text(
+                f'output_dir: "{tmpdir}"\n'
+                'llm_reasoning_retry_attempts: "1"\n'
+                'llm_reasoning_retry_max_tokens: "8192"\n'
+                'llm_output_retry_max_tokens: "12000"\n',
+                encoding="utf-8",
+            )
+            with mock.patch("sys.stderr", new_callable=io.StringIO) as fake_stderr:
+                config = utils.load_config(str(config_path))
+
+        self.assertEqual(config["llm_output_retry_attempts"], 1)
+        # The new key wins when both are set.
+        self.assertEqual(config["llm_output_retry_max_tokens"], 12000)
+        self.assertEqual(config["llm_output_retry_multiplier"], utils.DEFAULT_OUTPUT_RETRY_MULTIPLIER)
+        self.assertNotIn("llm_reasoning_retry_attempts", config)
+        self.assertIn("llm_reasoning_retry_attempts has been renamed to llm_output_retry_attempts", fake_stderr.getvalue())
+        self.assertIn("llm_reasoning_retry_max_tokens has been renamed", fake_stderr.getvalue())
 
     def test_load_config_parses_chunk_tuning_fields(self):
         """Test load config parses chunk tuning fields."""
@@ -2126,7 +2175,7 @@ work_dir: /tmp/vid001_chunks
             self.assertEqual(config["chunk_context_tail_sentences"], 1)
             self.assertEqual(config["chunk_context_summary_tokens"], 60)
             self.assertEqual(config["output_ratio_summarize"], 0.15)
-            self.assertEqual(config["max_output_tokens_summarize"], 384)
+            self.assertEqual(config["max_output_tokens_summarize"], utils.DEFAULT_MAX_OUTPUT_TOKENS)
             self.assertTrue(config["enable_token_count_probe"])
             self.assertFalse(config["enable_chunk_autotune"])
             self.assertEqual(config["autotune_reduce_percent"], 0.25)
@@ -2155,7 +2204,7 @@ work_dir: /tmp/vid001_chunks
             self.assertEqual(result["chunk_mode"], "tokens")
             self.assertEqual(manifest["chunk_mode"], "tokens")
             self.assertEqual(result["target_tokens"], manifest["target_tokens"])
-            self.assertLess(manifest["planned_max_output_tokens"], 1800)
+            self.assertEqual(manifest["planned_max_output_tokens"], utils.DEFAULT_MAX_OUTPUT_TOKENS)
             self.assertGreater(result["total_chunks"], 1)
 
     def test_chunk_text_chars_mode_preserves_legacy_prompt_default(self):
@@ -2250,13 +2299,15 @@ work_dir: /tmp/vid001_chunks
         summary_budget = utils._calculate_chunk_budget("summarize", summary_prompt, default_config)
 
         self.assertLess(structure_budget["target_tokens"], summary_budget["target_tokens"])
-        self.assertLessEqual(structure_budget["planned_max_output_tokens"], 1800)
-        self.assertEqual(summary_budget["planned_max_output_tokens"], 384)
+        # The output ceiling is a stop line, not a slice of the request budget.
+        self.assertEqual(structure_budget["planned_max_output_tokens"], utils.DEFAULT_MAX_OUTPUT_TOKENS)
+        self.assertEqual(summary_budget["planned_max_output_tokens"], utils.DEFAULT_MAX_OUTPUT_TOKENS)
 
+        # The request budget still sizes the input chunk from the expected output.
         structure_total = (
             structure_budget["prompt_tokens"]
             + structure_budget["target_tokens"]
-            + structure_budget["planned_max_output_tokens"]
+            + structure_budget["expected_output_tokens"]
             + structure_budget["safety_buffer_tokens"]
         )
         self.assertLessEqual(structure_total, structure_budget["effective_budget_tokens"])
@@ -2264,6 +2315,29 @@ work_dir: /tmp/vid001_chunks
         override_config = utils._default_config_values()
         override_config["chunk_size_override"] = 777
         self.assertEqual(utils._get_task_chunk_target("structure_only", override_config), 777)
+
+    def test_calculate_chunk_budget_output_ceiling_ignores_input_budget(self):
+        """Test a configured output ceiling is used as-is and only the context window bounds it."""
+        cleanup_prompt = (PROJECT_ROOT / "prompts" / "cleanup_zh.md").read_text(encoding="utf-8")
+        config = utils._default_config_values()
+        default_budget = utils._calculate_chunk_budget("cleanup_zh", cleanup_prompt, config)
+
+        config["max_output_tokens_cleanup_zh"] = 12000
+        override_budget = utils._calculate_chunk_budget("cleanup_zh", cleanup_prompt, config)
+        self.assertEqual(override_budget["planned_max_output_tokens"], 12000)
+        # Raising the output ceiling does not shrink the input chunk.
+        self.assertEqual(override_budget["target_tokens"], default_budget["target_tokens"])
+
+        small_window = utils._calculate_chunk_budget(
+            "cleanup_zh", cleanup_prompt, config, model_info={"context_window": 8000},
+        )
+        self.assertEqual(
+            small_window["planned_max_output_tokens"],
+            8000
+            - small_window["prompt_tokens"]
+            - small_window["hard_cap_tokens"]
+            - small_window["safety_buffer_tokens"],
+        )
 
     def test_calculate_chunk_budget_reserves_continuity_context(self):
         """Test calculate chunk budget reserves continuity context."""
