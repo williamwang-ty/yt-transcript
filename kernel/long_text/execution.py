@@ -8,6 +8,31 @@ from pathlib import Path
 from ..task_runtime import controller as kernel_controller
 from ..task_runtime import lifecycle as runtime_lifecycle
 from ..task_runtime import state as kernel_state
+from . import window as kernel_window
+
+
+def _route_long_text_mode(work_dir: str, prompt_name: str, input_key: str,
+                          config_path: str = None, dry_run: bool = False) -> str:
+    """Pick the executor for this run from `long_text_mode` (window | chunks).
+
+    Window mode covers the stages `kernel_window.window_supported` lists; any
+    other stage keeps the fixed-chunk executor. A raw-stage chunk run marks the
+    work dir as chunk-owned so merge-content reads the chunk outputs.
+    """
+    import yt_transcript_utils as utils
+
+    mode = kernel_window.resolve_long_text_mode(utils._load_optional_config(config_path))
+    if mode == "window" and kernel_window.window_supported(prompt_name, input_key):
+        return "window"
+    if mode == "window":
+        print(
+            f"ℹ️ long_text_mode=window does not cover prompt '{prompt_name}' "
+            f"({input_key}) yet; using fixed chunks.",
+            file=sys.stderr,
+        )
+    if not dry_run and (input_key or "raw_path") == "raw_path":
+        kernel_window.set_manifest_executor(work_dir, "chunks")
+    return "chunks"
 
 
 def runtime_status(work_dir: str) -> dict:
@@ -101,6 +126,17 @@ def process_chunks(work_dir: str, prompt_name: str, extra_instruction: str = "",
         print(f"Error: manifest.json not found in {work_dir}", file=sys.stderr)
         sys.exit(1)
 
+    if _route_long_text_mode(work_dir, prompt_name, input_key, config_path, dry_run) == "window":
+        return kernel_window.process_window(
+            work_dir,
+            prompt_name,
+            extra_instruction=extra_instruction,
+            config_path=config_path,
+            dry_run=dry_run,
+            force=force,
+            runtime_ownership=runtime_ownership,
+        )
+
     return runtime_lifecycle.execute_lifecycle_command(
         "process-chunks",
         lambda: kernel_controller.run_owned_mutation(
@@ -169,6 +205,17 @@ def process_chunks_with_replans(work_dir: str, prompt_name: str, extra_instructi
     if not manifest_path.exists():
         print(f"Error: manifest.json not found in {work_dir}", file=sys.stderr)
         sys.exit(1)
+
+    # The window executor has no fixed plan to replan; it just moves its cursor.
+    if _route_long_text_mode(work_dir, prompt_name, input_key, config_path) == "window":
+        return kernel_window.process_window(
+            work_dir,
+            prompt_name,
+            extra_instruction=extra_instruction,
+            config_path=config_path,
+            force=force,
+            runtime_ownership=runtime_ownership,
+        )
 
     return runtime_lifecycle.execute_lifecycle_command(
         "process-chunks-with-replans",
