@@ -22,14 +22,15 @@ def _route_long_text_mode(work_dir: str, prompt_name: str, input_key: str,
     import yt_transcript_utils as utils
 
     mode = kernel_window.resolve_long_text_mode(utils._load_optional_config(config_path))
-    if mode == "window" and kernel_window.window_supported(prompt_name, input_key):
+    if mode == "window" and kernel_window.window_supported(prompt_name, input_key, work_dir):
         return "window"
     if mode == "window":
-        print(
-            f"ℹ️ long_text_mode=window does not cover prompt '{prompt_name}' "
-            f"({input_key}) yet; using fixed chunks.",
-            file=sys.stderr,
-        )
+        if (input_key or "raw_path") == "processed_path" and \
+                prompt_name in kernel_window.WINDOW_PROMPTS[kernel_window.PROCESSED_STAGE]:
+            reason = "the raw stage did not finish in window mode"
+        else:
+            reason = f"long_text_mode=window does not cover prompt '{prompt_name}' ({input_key})"
+        print(f"ℹ️ {reason}; using fixed chunks.", file=sys.stderr)
     if not dry_run and (input_key or "raw_path") == "raw_path":
         kernel_window.set_manifest_executor(work_dir, "chunks")
     return "chunks"
@@ -135,6 +136,7 @@ def process_chunks(work_dir: str, prompt_name: str, extra_instruction: str = "",
             dry_run=dry_run,
             force=force,
             runtime_ownership=runtime_ownership,
+            input_key=input_key,
         )
 
     return runtime_lifecycle.execute_lifecycle_command(
@@ -215,6 +217,7 @@ def process_chunks_with_replans(work_dir: str, prompt_name: str, extra_instructi
             config_path=config_path,
             force=force,
             runtime_ownership=runtime_ownership,
+            input_key=input_key,
         )
 
     return runtime_lifecycle.execute_lifecycle_command(
