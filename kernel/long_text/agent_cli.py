@@ -12,6 +12,7 @@ import os
 import shlex
 import shutil
 import subprocess
+import tempfile
 import time
 
 LLM_BACKEND_MODES = ("auto", "api")
@@ -31,7 +32,9 @@ KNOWN_AGENTS = (
         "name": "claude-code",
         "aliases": ("claude", "claude-code", "claudecode"),
         "env": ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT"),
-        "commands": (["claude", "-p", "--output-format", "text"],),
+        # --tools "": a text-rewrite request needs no tools; without this the
+        # agent sometimes explores the working directory before answering.
+        "commands": (["claude", "-p", "--output-format", "text", "--tools", ""],),
         # A nested `claude -p` that inherits these can hang; drop them for the child.
         "strip_env": ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT"),
     },
@@ -180,14 +183,18 @@ def call_cli_llm(command: list, prompt: str, *, timeout_sec: int = DEFAULT_CLI_T
     for attempt in range(1, max(0, int(max_retries)) + 2):
         started = time.monotonic()
         try:
-            completed = runner(
-                argv,
-                input=stdin_text if stdin_text is not None else "",
-                capture_output=True,
-                text=True,
-                timeout=timeout_sec,
-                env=child_env,
-            )
+            # Run in an empty directory so the agent has no project files to
+            # read or act on; the prompt carries everything it needs.
+            with tempfile.TemporaryDirectory(prefix="yt-transcript-cli-") as scratch_dir:
+                completed = runner(
+                    argv,
+                    input=stdin_text if stdin_text is not None else "",
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout_sec,
+                    env=child_env,
+                    cwd=scratch_dir,
+                )
         except subprocess.TimeoutExpired:
             last_error = LLMRequestError(
                 f"{request_url} timed out after {timeout_sec}s",
