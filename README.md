@@ -337,6 +337,7 @@ Current policy is intentional and explicit:
 - prompt names are validated eagerly for chunk planning, so typos fail fast instead of silently falling back to generic budgets
 - `process-chunks` sends `max_tokens` as a stop line (default 8192 per task, only bounded by the context window) instead of carving it out of the input budget, so reasoning tokens no longer squeeze the answer
 - a chunk response cut off at `max_tokens` (`finish_reason` = `length` / `max_tokens` / `max_output_tokens`, any provider) is retried with a larger ceiling (`llm_output_retry_*`, formerly `llm_reasoning_retry_*`); one still cut off after that is flagged `truncated_output`
+- `long_text_mode: window` (experimental, default stays `chunks`) runs the Chinese cleanup stage (`cleanup_zh`) as a sliding window: numbered source sentences, a wide read window (`window_read_tokens`, ~6000) from a cursor, a soft write target (`window_write_tokens`, ~3000), and a `<!--S<n>-->` marker after each paragraph. Complete paragraphs are saved under `<work_dir>/window/`, a cut-off tail is dropped, and the cursor moves past the last marker, so truncation only means less progress. It works the same for the API and agent-CLI backends, resumes paragraph by paragraph, falls back to one fixed chunk when markers are missing twice, and reports source coverage. Other prompts keep fixed chunks for now; old half-finished chunk runs resume only in `chunks` mode
 - `manifest.json` now records explicit `plan.chunk_contract` and `plan.continuity`; `process-chunks` follows that plan-owned continuity policy instead of silently drifting with later config changes
 - chunk execution now also has explicit resume semantics: stale `running` / missing-output checkpoints are repaired deterministically into `done` or `interrupted` before work resumes
 - `process-chunks` also injects a short continuity context from the previous chunk (tail sentence + optional section title) without enabling body overlap, and chunk budgeting now reserves a small token allowance for that carry-over context
@@ -714,6 +715,7 @@ bash scripts/preflight.sh --require-llm
 - 分块阶段会提前校验 prompt 名称，避免因为 prompt 拼写错误而静默回退到通用预算
 - `process-chunks` 把 `max_tokens` 当作停止线（每个任务默认 8192，只受上下文窗口约束），不再从输入预算里切一块给输出，思考 token 不会再挤掉正文
 - 分块响应如果停在 `max_tokens`（任何厂商的 `finish_reason` = `length` / `max_tokens` / `max_output_tokens`），会加大上限重试（`llm_output_retry_*`，旧名 `llm_reasoning_retry_*`）；重试后仍被截断的块会标记为 `truncated_output`
+- `long_text_mode: window`（实验性，默认仍是 `chunks`）用滑动窗口处理中文整理阶段（`cleanup_zh`）：原文按句编号，从游标读一大段（`window_read_tokens`，约 6000），软目标写约 `window_write_tokens`（约 3000），每段后输出 `<!--S<n>-->` 标记。完整段落存到 `<work_dir>/window/`，被截断的半段丢弃，游标移到最后一个标记之后，所以截断只是少推进一点。API 和命令行后端用法一样，断点续跑精确到段落；连续两次没有标记就把这一段按固定分块处理，并输出原文覆盖率报告。其他 prompt 暂时仍走固定分块；旧的半截分块任务只能用 `chunks` 模式续跑
 - `manifest.json` 现在会显式记录 `plan.chunk_contract` 与 `plan.continuity`；`process-chunks` 会遵循 plan-own 的 continuity 策略，而不是被后续 config 漂移静默改变
 - chunk 执行现在也有显式 resume 语义：在继续执行前，stale 的 `running` / 缺失输出 checkpoint 会被确定性修复为 `done` 或 `interrupted`
 - `process-chunks` 还会注入上一块的轻量 continuity context（尾句 + 可选 section title），但不会启用正文 overlap；同时分块预算也会为这段 carry-over context 预留一小段 token 成本

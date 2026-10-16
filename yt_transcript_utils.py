@@ -93,6 +93,7 @@ from kernel.long_text import prompting as kernel_prompting
 from kernel.long_text import llm as kernel_llm
 from kernel.long_text import agent_cli as kernel_agent_cli
 from kernel.long_text import processing as kernel_processing
+from kernel.long_text import window as kernel_window
 from kernel import subtitle_language as kernel_subtitle_language
 
 
@@ -495,6 +496,11 @@ def _default_config_values(config_path: str = "") -> dict:
         "llm_cli_timeout_sec": kernel_agent_cli.DEFAULT_CLI_TIMEOUT_SEC,
         "llm_cli_max_retries": kernel_agent_cli.DEFAULT_CLI_MAX_RETRIES,
         "llm_cli_probe_timeout_sec": kernel_agent_cli.DEFAULT_CLI_PROBE_TIMEOUT_SEC,
+        "long_text_mode": kernel_window.DEFAULT_LONG_TEXT_MODE,
+        "window_read_tokens": kernel_window.DEFAULT_WINDOW_READ_TOKENS,
+        "window_write_tokens": kernel_window.DEFAULT_WINDOW_WRITE_TOKENS,
+        "window_tail_tokens": kernel_window.DEFAULT_WINDOW_TAIL_TOKENS,
+        "window_marker_retries": kernel_window.DEFAULT_WINDOW_MARKER_RETRIES,
         "chunk_mode": DEFAULT_CHUNK_MODE,
         "chunk_size_override": 0,
         "chunk_tokens_structure_only": TASK_CHUNK_TOKEN_DEFAULTS["structure_only"],
@@ -6134,6 +6140,19 @@ def verify_quality(optimized_text_path: str, raw_text_path: str = None,
         preview = ", ".join(Path(path).name for path in empty_processed_files[:5])
         suffix = "" if len(empty_processed_files) <= 5 else f", +{len(empty_processed_files) - 5} more"
         hard_failures.append(f"Empty processed chunk file(s) detected: {preview}{suffix}")
+
+    if work_dir and kernel_window.manifest_uses_window(work_dir):
+        window_coverage = kernel_window.coverage_report(kernel_window.load_window_state(work_dir))
+        checks["window_coverage_ratio"] = window_coverage["coverage_ratio"]
+        checks["window_uncovered_ranges"] = window_coverage["uncovered_ranges"]
+        checks["window_low_output_ratio_paragraphs"] = window_coverage["low_output_ratio_paragraphs"]
+        checks["window_fallback_paragraphs"] = window_coverage["fallback_paragraphs"]
+        if window_coverage["uncovered_ranges"]:
+            preview = ", ".join(window_coverage["uncovered_ranges"][:5])
+            warnings.append(f"Window run left source sentences without output: {preview}")
+        if window_coverage["low_output_ratio_paragraphs"]:
+            preview = ", ".join(item["sentences"] for item in window_coverage["low_output_ratio_paragraphs"][:5])
+            warnings.append(f"Window paragraphs much shorter than their source (possible skipped content): {preview}")
     
     # Overall result
     passed = len(hard_failures) == 0
@@ -7001,6 +7020,14 @@ def _summarize_chunk_manifest(work_dir: str) -> dict:
     summary["total_chunks"] = len(active_chunks)
     summary["done_chunks"] = status_counts.get("done", 0)
     summary["status_counts"] = status_counts
+    if isinstance(manifest, dict) and manifest.get(kernel_window.EXECUTOR_MANIFEST_KEY) == "window":
+        window_state = kernel_window.load_window_state(work_dir)
+        summary["long_text_mode"] = "window"
+        summary["window"] = {
+            "status": window_state.get("status", ""),
+            "cursor": window_state.get("cursor", 0),
+            "sentence_count": window_state.get("sentence_count", 0),
+        }
     return summary
 
 
@@ -7049,7 +7076,15 @@ def find_unfinished_runs(tmp_dir: str = "/tmp", video_id: str = "") -> dict:
             entry["next_action"] = f"bash {skill_root}/scripts/cleanup.sh {vid}"
             completed.append(entry)
             continue
-        if chunks["has_manifest"] and chunks["total_chunks"] and chunks["done_chunks"] < chunks["total_chunks"]:
+        window = chunks.get("window")
+        if window is not None:
+            entry["resume_from_step"] = 4
+            if window["status"] == "done":
+                entry["next_action"] = "The window run is done; merge it, then continue with verify-quality and Step 5"
+            else:
+                entry["next_action"] = (f"Re-run process-chunks on {work_dir} (long_text_mode: window) to resume "
+                                        f"at S{window['cursor'] + 1} of {window['sentence_count']}")
+        elif chunks["has_manifest"] and chunks["total_chunks"] and chunks["done_chunks"] < chunks["total_chunks"]:
             entry["resume_from_step"] = 4
             entry["next_action"] = (f"python3 {skill_root}/yt_transcript_utils.py prepare-resume {work_dir}, "
                                     "then continue Step 4")
@@ -7667,6 +7702,11 @@ def load_config(config_path: str = None, allow_missing: bool = False) -> dict:
         "llm_cli_timeout_sec": parse_int_field('llm_cli_timeout_sec', kernel_agent_cli.DEFAULT_CLI_TIMEOUT_SEC, minimum=1),
         "llm_cli_max_retries": parse_int_field('llm_cli_max_retries', kernel_agent_cli.DEFAULT_CLI_MAX_RETRIES, minimum=0),
         "llm_cli_probe_timeout_sec": parse_int_field('llm_cli_probe_timeout_sec', kernel_agent_cli.DEFAULT_CLI_PROBE_TIMEOUT_SEC, minimum=1),
+        "long_text_mode": kernel_window.resolve_long_text_mode(config),
+        "window_read_tokens": parse_int_field('window_read_tokens', kernel_window.DEFAULT_WINDOW_READ_TOKENS, minimum=200),
+        "window_write_tokens": parse_int_field('window_write_tokens', kernel_window.DEFAULT_WINDOW_WRITE_TOKENS, minimum=100),
+        "window_tail_tokens": parse_int_field('window_tail_tokens', kernel_window.DEFAULT_WINDOW_TAIL_TOKENS, minimum=0),
+        "window_marker_retries": parse_int_field('window_marker_retries', kernel_window.DEFAULT_WINDOW_MARKER_RETRIES, minimum=0),
         "chunk_mode": _normalize_chunk_mode(config.get('chunk_mode', DEFAULT_CHUNK_MODE)),
         "chunk_size_override": parse_int_field('chunk_size_override', 0, minimum=0),
         "chunk_tokens_structure_only": chunk_tokens_structure_only,

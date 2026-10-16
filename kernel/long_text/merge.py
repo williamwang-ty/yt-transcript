@@ -7,6 +7,7 @@ import math
 import sys
 from pathlib import Path
 
+from kernel.long_text import window as kernel_window
 from kernel.text_cleanup import post_merge as kernel_post_merge_cleanup
 
 
@@ -196,8 +197,22 @@ def merge_content(work_dir: str, output_file: str, header_content: str = "") -> 
     body_lines: list[str] = []
     chapters_inserted = 0
     missing_files: list[str] = []
+    window_summary = None
 
-    for chunk_info in manifest["chunks"]:
+    if kernel_window.manifest_uses_window(work_dir):
+        # long_text_mode=window: the output is the committed window paragraphs.
+        window_state = kernel_window.load_window_state(work_dir)
+        window_body, chapters_inserted = kernel_window.merged_window_text(
+            work_dir, window_state, chapter_starts
+        )
+        body_lines.append(window_body)
+        window_summary = {
+            "status": window_state.get("status", ""),
+            "paragraph_count": len(window_state.get("paragraphs", [])),
+            "coverage": kernel_window.coverage_report(window_state),
+        }
+
+    for chunk_info in ([] if window_summary is not None else manifest["chunks"]):
         chunk_id = chunk_info["id"]
         processed_path = work_path / chunk_info["processed_path"]
         status = str(chunk_info.get("status", "")).strip().lower()
@@ -249,7 +264,7 @@ def merge_content(work_dir: str, output_file: str, header_content: str = "") -> 
     final_content = "\n\n".join(section.strip() for section in sections if section.strip()).strip()
     output_path.write_text(final_content, encoding="utf-8")
 
-    return {
+    result = {
         "success": len(missing_files) == 0,
         "output_file": str(output_path),
         "total_lines": final_content.count("\n"),
@@ -259,3 +274,13 @@ def merge_content(work_dir: str, output_file: str, header_content: str = "") -> 
         "post_merge_cleanup_applied": cleanup_applied,
         "cleanup_diagnostics": cleanup_diagnostics,
     }
+    if window_summary is not None:
+        result["long_text_mode"] = "window"
+        result["window"] = window_summary
+        if window_summary["status"] != "done":
+            result["success"] = False
+            result["message"] = (
+                f"Window run is {window_summary['status'] or 'not started'}; "
+                "re-run process-chunks to finish it before merging"
+            )
+    return result
