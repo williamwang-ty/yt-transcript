@@ -92,8 +92,11 @@ STATE_SCHEMA_VERSION = 2
 EXECUTOR_MANIFEST_KEY = "long_text_executor"
 STAGE_MANIFEST_KEY = "long_text_window_stage"
 
+# Legacy per-paragraph markers; still stripped from output if a model writes them.
 MARKER_PATTERN = re.compile(r"<!--\s*S(\d+)\s*-->")
 SOURCE_TAG_PATTERN = re.compile(r"\[S\d+\]\s?")
+SOURCE_TAG_NUMBER = re.compile(r"\[S(\d+)\]")
+END_PATTERN = re.compile(r"<!--\s*END\s*-->")
 CODE_FENCE_LINE = re.compile(r"^```[\w-]*[ \t]*$", re.MULTILINE)
 # In the coverage report, a stretch keeping less than this share of the run's
 # typical output/source ratio is listed as a possible skip (advisory only).
@@ -105,22 +108,21 @@ The input below is one window of a longer transcript. Every source {unit} starts
 
 - Start at [S{first}].{done_note}
 - {write_note}
-- After every paragraph, put a marker on its own line: <!--S<n>-->, where n is the number of the last source {unit} that paragraph covers.
-- Markers must increase, and the paragraphs must cover the {units} in order without skipping any.
-- A `##` header belongs to the paragraph that follows it; do not put a marker after a header alone.
-- Do not copy the [S<n>] tags into the output.{task_note}
-- Output only the processed text and the markers."""
+- Keep every [S<n>] tag in the output: write it right before the text that comes from that source {unit}, even in the middle of a paragraph. Do not add, drop or reorder tags, and cover the {units} in order without skipping any.
+- Separate paragraphs with a blank line. Put `##` headers on their own line.{task_note}
+- When you stop, end the output with a line <!--END--> after the last complete paragraph.
+- Output only the processed text, the tags and that end line."""
 
 TASK_PROTOCOL_NOTES = {
     # Window rounds see many sentences at once and tend to merge a whole
     # exchange into one paragraph; keep dialogue readable.
     "structure_only": (
         "\n- Start a new paragraph whenever the speaker changes (for example where the source has `-` or `>>`): "
-        "each speaker's turn is its own paragraph, separated by a blank line and followed by its own marker."
+        "each speaker's turn is its own paragraph, separated by a blank line."
     ),
     "translate_only": (
-        "\n- For each source paragraph, write the English paragraph unchanged, then its Chinese translation, "
-        "then the marker. Copy `##` headers as they are."
+        "\n- For each source paragraph, write its tag and the English paragraph unchanged, then a blank line "
+        "and its Chinese translation. Copy `##` headers as they are."
     ),
 }
 
@@ -420,38 +422,96 @@ def build_fallback_prompt(prompt_template: str, chunk_text: str, *, tail_text: s
 
 
 def parse_window_output(text: str, cursor: int, window_end: int) -> dict:
-    """Split a window response into complete paragraphs and validate the markers.
+    """Split a window response into complete paragraphs from its inline [Sn] tags.
 
     `cursor` is the 0-based index of the first unit in the window and
-    `window_end` the exclusive end, so valid marker numbers are
-    `cursor + 1 .. window_end`. Paragraph ranges are contiguous by
-    construction; each one starts right after the previous marker.
+    `window_end` the exclusive end, so valid tag numbers are
+    `cursor + 1 .. window_end`. The model copies each unit's tag in front of
+    the text that comes from it; the program, not the model, works out where
+    each paragraph ends, which keeps the protocol cheap to follow.
+
+    Blocks are grouped so that a group starts at a block opening with a tag
+    (headers attach to the group after them, untagged blocks to the one
+    before). A group covers units up to the one before the next group's first
+    tag. Without the closing <!--END--> line the response may have been cut
+    off, so its last group is dropped.
     """
-    paragraphs = []
-    position = 0
-    previous_last = cursor  # 1-based number of the last unit already covered
-    for match in MARKER_PATTERN.finditer(text or ""):
-        number = int(match.group(1))
-        if number <= previous_last:
-            return _invalid("non_monotonic", f"marker S{number} does not move past S{previous_last}")
+    raw = text or ""
+    end_match = END_PATTERN.search(raw)
+    complete = end_match is not None
+    if complete:
+        raw = raw[:end_match.start()]
+    raw = MARKER_PATTERN.sub("", raw)
+
+    numbers = [int(n) for n in SOURCE_TAG_NUMBER.findall(raw)]
+    previous = cursor
+    for number in numbers:
+        if number <= previous:
+            return _invalid("non_monotonic", f"tag S{number} does not move past S{previous}")
         if number > window_end:
-            return _invalid("out_of_window", f"marker S{number} is past the window end S{window_end}")
-        body = SOURCE_TAG_PATTERN.sub("", text[position:match.start()]).strip()
-        position = match.end()
-        if not body:
-            # A marker with nothing before it (e.g. right after another marker)
-            # folds its units into the next paragraph.
+            return _invalid("out_of_window", f"tag S{number} is past the window end S{window_end}")
+        previous = number
+    if not numbers:
+        return _invalid("no_markers", "response has no [S<n>] tags")
+
+    groups = []  # each: {"blocks": [...], "first": int|None, "last": int|None}
+    pending_headers = []
+    for block in re.split(r"\n\s*\n", raw):
+        stripped = block.strip()
+        if not stripped:
             continue
-        paragraphs.append({"text": body, "start": previous_last, "end": number - 1})
-        previous_last = number
+        tags = [int(n) for n in SOURCE_TAG_NUMBER.findall(stripped)]
+        if stripped.startswith("#") and not tags:
+            pending_headers.append(stripped)
+            continue
+        if not groups or stripped.startswith("[S"):
+            groups.append({"blocks": pending_headers + [stripped], "first": tags[0] if tags else None,
+                           "last": tags[-1] if tags else None})
+            pending_headers = []
+            continue
+        group = groups[-1]
+        group["blocks"].extend(pending_headers + [stripped])
+        pending_headers = []
+        if tags:
+            group["first"] = group["first"] or tags[0]
+            group["last"] = tags[-1]
+    trailing_chars = sum(len(h) for h in pending_headers)
+
+    if not complete and groups:
+        trailing_chars += sum(len(b) for b in groups[-1]["blocks"])
+        cut_first = groups[-1]["first"]
+        groups = groups[:-1]
+    else:
+        cut_first = None
+
+    paragraphs = []
+    previous_last = cursor  # 1-based number of the last unit already covered
+    for position, group in enumerate(groups):
+        if position + 1 < len(groups):
+            next_first = groups[position + 1]["first"]
+        else:
+            next_first = cut_first
+        if next_first:
+            last = next_first - 1
+        else:
+            last = group["last"] or previous_last
+        if last <= previous_last:
+            # Nothing new in this group (e.g. a tagless lead-in); fold it into the next.
+            if position + 1 < len(groups):
+                groups[position + 1]["blocks"] = group["blocks"] + groups[position + 1]["blocks"]
+            continue
+        body = SOURCE_TAG_PATTERN.sub("", "\n\n".join(group["blocks"])).strip()
+        if body:
+            paragraphs.append({"text": body, "start": previous_last, "end": last - 1})
+            previous_last = last
     if not paragraphs:
-        return _invalid("no_markers", "response has no complete paragraph with a marker")
-    tail = (text or "")[position:].strip()
+        return _invalid("no_markers", "response has no complete paragraph")
     return {
         "ok": True,
         "paragraphs": paragraphs,
         "next_cursor": previous_last,
-        "dropped_tail_chars": len(tail),
+        "dropped_tail_chars": trailing_chars,
+        "complete": complete,
         "error_type": "",
         "error": "",
     }

@@ -101,9 +101,10 @@ llm_output_retry_max_tokens: 16384
 # window: experimental sliding window for cleanup_zh, quick_cleanup and the
 #         bilingual pair structure_only -> translate_only. Source units are
 #         numbered; each request reads from a cursor, aims to write about N
-#         tokens, and ends every paragraph with <!--S<n>-->. The cursor moves
-#         past the last complete marker, so a cut-off response just advances
-#         less. Sizes adapt per round: N starts at window_write_tokens (and
+#         tokens, and copies each unit's [S<n>] tag in front of its text,
+#         ending with <!--END-->. The program works out where each paragraph
+#         ends; without the end line the last paragraph is dropped, so a
+#         cut-off response just advances less. Sizes adapt per round: N starts at window_write_tokens (and
 #         never exceeds it), the read window is N divided by the measured
 #         output/source ratio plus 25% look-ahead, capped at window_read_tokens,
 #         and the last stretch is sent whole when one round can finish it.
@@ -113,7 +114,7 @@ window_read_tokens: 6000
 window_write_tokens: 3000
 # Tail of the already-written output sent as left context each round.
 window_tail_tokens: 400
-# Retries of a response without usable markers (or with far too little or too
+# Retries of a response without usable tags (or with far too little or too
 # much output for the source it claims) before that stretch is processed once
 # with the plain fixed-chunk prompt.
 window_marker_retries: 1

@@ -31,7 +31,10 @@ def _api_result(text: str, finish_reason: str = "stop") -> dict:
 
 
 def _marker_writer(per_paragraph: int = 2, paragraphs: int = 3, partial_tail: bool = True):
-    """Fake model: cleans sentences in groups, marks each group, then gets cut off mid-paragraph."""
+    """Fake model: copies each sentence's tag into paragraphs of a few sentences, then gets cut off.
+
+    Without a cut-off tail it ends with the <!--END--> line.
+    """
     prompts = []
 
     def respond(prompt: str) -> str:
@@ -43,43 +46,58 @@ def _marker_writer(per_paragraph: int = 2, paragraphs: int = 3, partial_tail: bo
             group = lines[index:index + per_paragraph]
             if not group:
                 break
-            out.append("".join(text for _, text in group))
-            out.append(f"<!--S{group[-1][0]}-->")
+            out.append("".join(f"[S{number}] {text}" for number, text in group))
             index += per_paragraph
         if partial_tail and index < len(lines):
-            out.append(lines[index][1][:4])  # cut off: no marker
+            out.append(f"[S{lines[index][0]}] " + lines[index][1][:4])  # cut off: no end line
+        else:
+            out.append("<!--END-->")
         return "\n\n".join(out)
 
     return respond, prompts
 
 
 class WindowProtocolTests(unittest.TestCase):
-    def test_parse_keeps_marked_paragraphs_and_drops_the_cut_off_tail(self):
-        text = "## 标题\n\n第一段。\n<!--S3-->\n\n第二段。\n<!-- S5 -->\n\n半截没写完"
+    def test_parse_groups_paragraphs_by_tags_and_drops_the_cut_off_tail(self):
+        text = "## 标题\n\n[S1] 第一段[S2] 接着[S3] 说完。\n\n[S4] 第二段[S5] 也完了。\n\n[S6] 半截没写完"
         parsed = window.parse_window_output(text, cursor=0, window_end=10)
         self.assertTrue(parsed["ok"], parsed)
+        self.assertFalse(parsed["complete"])
         self.assertEqual([(p["start"], p["end"]) for p in parsed["paragraphs"]], [(0, 2), (3, 4)])
-        self.assertEqual(parsed["paragraphs"][0]["text"], "## 标题\n\n第一段。")
+        self.assertEqual(parsed["paragraphs"][0]["text"], "## 标题\n\n第一段接着说完。")
         self.assertEqual(parsed["next_cursor"], 5)
-        self.assertEqual(parsed["dropped_tail_chars"], len("半截没写完"))
+        self.assertEqual(parsed["dropped_tail_chars"], len("[S6] 半截没写完"))
 
-    def test_parse_rejects_markers_that_go_backwards_or_leave_the_window(self):
-        backwards = window.parse_window_output("甲\n<!--S6-->\n乙\n<!--S5-->", cursor=3, window_end=10)
+    def test_parse_keeps_the_last_paragraph_when_the_end_line_is_there(self):
+        text = "[S4] 甲。\n\n[S5] 乙[S6] 丙。\n\n<!--END-->"
+        parsed = window.parse_window_output(text, cursor=3, window_end=10)
+        self.assertTrue(parsed["ok"], parsed)
+        self.assertTrue(parsed["complete"])
+        self.assertEqual([(p["start"], p["end"]) for p in parsed["paragraphs"]], [(3, 3), (4, 5)])
+        self.assertEqual(parsed["next_cursor"], 6)
+
+    def test_parse_attaches_untagged_blocks_to_the_paragraph_before(self):
+        # A sentence that spills into the next paragraph stays with its tag, so
+        # the cursor never lands in the middle of it.
+        text = "[S1] 甲乙\n\n丙丁。\n\n[S2] 戊。\n\n<!--END-->"
+        parsed = window.parse_window_output(text, cursor=0, window_end=10)
+        self.assertEqual([(p["start"], p["end"]) for p in parsed["paragraphs"]], [(0, 0), (1, 1)])
+        self.assertEqual(parsed["paragraphs"][0]["text"], "甲乙\n\n丙丁。")
+
+    def test_parse_rejects_tags_that_go_backwards_or_leave_the_window(self):
+        backwards = window.parse_window_output("[S6] 甲\n\n[S5] 乙\n<!--END-->", cursor=3, window_end=10)
         self.assertEqual(backwards["error_type"], "non_monotonic")
-        before_cursor = window.parse_window_output("甲\n<!--S3-->", cursor=3, window_end=10)
+        before_cursor = window.parse_window_output("[S3] 甲\n<!--END-->", cursor=3, window_end=10)
         self.assertEqual(before_cursor["error_type"], "non_monotonic")
-        past_end = window.parse_window_output("甲\n<!--S11-->", cursor=3, window_end=10)
+        past_end = window.parse_window_output("[S11] 甲\n<!--END-->", cursor=3, window_end=10)
         self.assertEqual(past_end["error_type"], "out_of_window")
-        missing = window.parse_window_output("没有任何标记的输出", cursor=0, window_end=10)
+        missing = window.parse_window_output("没有任何编号的输出", cursor=0, window_end=10)
         self.assertEqual(missing["error_type"], "no_markers")
 
-    def test_parse_folds_empty_marker_into_next_paragraph_and_strips_source_tags(self):
-        text = "<!--S2-->\n[S3] 甲乙。\n<!--S4-->"
+    def test_parse_skipped_tags_count_toward_the_paragraph_before(self):
+        text = "[S1] 甲[S2] 乙。\n\n[S5] 丙。\n\n<!--END-->"
         parsed = window.parse_window_output(text, cursor=0, window_end=10)
-        self.assertTrue(parsed["ok"], parsed)
-        self.assertEqual(len(parsed["paragraphs"]), 1)
-        self.assertEqual((parsed["paragraphs"][0]["start"], parsed["paragraphs"][0]["end"]), (0, 3))
-        self.assertEqual(parsed["paragraphs"][0]["text"], "甲乙。")
+        self.assertEqual([(p["start"], p["end"]) for p in parsed["paragraphs"]], [(0, 3), (4, 4)])
 
     def test_read_window_respects_budget_but_always_takes_one_sentence(self):
         sentences = ["a" * 10, "b" * 10, "c" * 10, "d" * 10]
@@ -98,7 +116,8 @@ class WindowProtocolTests(unittest.TestCase):
         self.assertNotIn("[S5]", prompt)
         self.assertNotIn("[S2]", prompt)
         self.assertIn("Start at [S3]", prompt)
-        self.assertIn("<!--S<n>-->", prompt)
+        self.assertIn("Keep every [S<n>] tag", prompt)
+        self.assertIn("<!--END-->", prompt)
         self.assertIn("transcript continues after it", prompt)
         self.assertIn("上一段结尾。", prompt)
 
@@ -244,7 +263,7 @@ class WindowExecutorTests(unittest.TestCase):
             prompt = kwargs["messages"][0]["content"]
             if calls["count"] <= 2:
                 last = _window_lines(prompt)[-1][0]
-                return _api_result(f"总之讲了测试。\n<!--S{last}-->")
+                return _api_result(f"[S{last}] 总之讲了测试。\n\n<!--END-->")
             if "Sliding-Window Protocol" not in prompt:
                 return _api_result(prompt.split("## Input Text", 1)[1].strip())
             return _api_result(respond(prompt))
@@ -452,8 +471,8 @@ class WindowBilingualTests(unittest.TestCase):
         out = []
         for index in range(0, min(len(lines), 6), 3):
             group = lines[index:index + 3]
-            out.append(" ".join(text for _, text in group))
-            out.append(f"<!--S{group[-1][0]}-->")
+            out.append(" ".join(f"[S{number}] {text}" for number, text in group))
+        out.append("<!--END-->")
         return "\n\n".join(out)
 
     @staticmethod
@@ -461,9 +480,9 @@ class WindowBilingualTests(unittest.TestCase):
         paragraphs = re.findall(r"^\[S(\d+)\] (.*)$", prompt, re.MULTILINE)
         out = []
         for number, text in paragraphs[:2]:
-            out.append(text)
+            out.append(f"[S{number}] {text}")
             out.append("【译】" + text)
-            out.append(f"<!--S{number}-->")
+        out.append("<!--END-->")
         return "\n\n".join(out)
 
     def test_bilingual_stages_both_run_as_windows_and_merge_the_translation(self):
