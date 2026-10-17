@@ -851,6 +851,17 @@ class WindowOutlineTests(unittest.TestCase):
         self.assertNotIn("黄仁勋", glossary)
         self.assertEqual(outline.round_terms_text(terms, "没有相关的词"), "")
 
+    def test_chapter_titles_replace_reworded_section_titles(self):
+        sections = [{"start": 1, "title": "开场"}, {"start": 11, "title": "军火暴利与杠杆"},
+                    {"start": 20, "title": "被细分的小节"}, {"start": 40, "title": "Gauss"}]
+        hints = [{"start": 1, "title": "<Untitled Chapter 1>"}, {"start": 12, "title": "军火暴利4451%？TransDigm"},
+                 {"start": 40, "title": "Gauss's Discovery"}]
+        restored = outline.restore_chapter_titles(sections, hints, "cleanup_zh")
+        # The placeholder and the English title (not the output language) keep the model's titles.
+        self.assertEqual([s["title"] for s in restored], ["开场", "军火暴利4451%？TransDigm", "被细分的小节", "Gauss"])
+        restored = outline.restore_chapter_titles(sections, hints, "structure_only")
+        self.assertEqual(restored[3]["title"], "Gauss's Discovery")
+
     def test_youtube_chapter_times_map_to_the_unit_holding_that_cue(self):
         cue_starts = [(0, 0.0), (10, 5.0), (20, 10.0), (30, 15.0)]
         unit_offsets = [0, 8, 20, 25]

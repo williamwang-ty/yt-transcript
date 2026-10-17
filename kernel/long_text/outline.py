@@ -368,6 +368,7 @@ def generate_outline(units: list[str], *, prompt_name: str, call_llm, max_output
         if len(parts) > 1:
             log(f"ℹ️ Outline part {number}/{len(parts)}: {len(parsed['sections'])} sections")
     merged = merge_parts(parsed_parts, max_terms)
+    merged["sections"] = restore_chapter_titles(merged["sections"], hints, prompt_name)
     record.update({"status": "ok", **merged})
     return record
 
@@ -375,6 +376,37 @@ def generate_outline(units: list[str], *, prompt_name: str, call_llm, max_output
 # ---------------------------------------------------------------------------
 # Chapter hints
 # ---------------------------------------------------------------------------
+
+def restore_chapter_titles(sections: list[dict], hints: list[dict] | None, prompt_name: str) -> list[dict]:
+    """Put the video's own chapter titles back on the sections that start at those chapters.
+
+    Models tend to reword chapter titles and drop numbers from them even when
+    told not to. A section within HEADING_TOLERANCE_UNITS of a chapter start
+    (the nearest one) takes the chapter's title, unless that title is not in
+    the output language (an English chapter title in a Chinese cleanup run),
+    where the model's translation is kept.
+    """
+    if not hints:
+        return sections
+    sections = [dict(section) for section in sections]
+    taken = set()
+    for hint in hints:
+        title = clean_title(hint.get("title"))
+        placeholder = "untitled chapter" in title.lower() or title.lower().startswith("<untitled")
+        if not title or placeholder or (OUTLINE_PROMPTS.get(prompt_name) == "zh" and not _has_cjk(title)):
+            continue
+        nearby = [(abs(section["start"] - int(hint["start"])), index) for index, section in enumerate(sections)
+                  if index not in taken and abs(section["start"] - int(hint["start"])) <= HEADING_TOLERANCE_UNITS]
+        if not nearby:
+            continue
+        index = min(nearby)[1]
+        taken.add(index)
+        if sections[index]["title"] != title:
+            sections[index]["title"] = title
+            if sections[index].get("title_zh") == title:
+                sections[index].pop("title_zh")
+    return sections
+
 
 def hints_from_times(chapters: list[dict], cue_starts: list[tuple[int, float]],
                      unit_offsets: list[int | None]) -> list[dict]:
