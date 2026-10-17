@@ -213,7 +213,7 @@ Canonical command shape:
       --input-key processed_path
   ```
 
-Sliding-window mode (`long_text_mode: window` in config.yaml, experimental): the commands above stay the same. For the `cleanup_zh` raw stage, `process-chunks` (with or without `--auto-replan`) runs the window executor instead of the fixed chunks: it reads the source from the chunk files, writes paragraphs to `<work_dir>/window/`, and JSON reports `long_text_mode=window`, `status`, and `coverage`. Re-running the same command resumes at the cursor. `merge-content` then merges the window paragraphs (chapter headings from `chapter_plan.json` still apply) and refuses an unfinished window run. Other prompts keep the fixed-chunk executor.
+Sliding-window mode (`long_text_mode: window` in config.yaml, experimental): the commands above stay the same. For the `cleanup_zh` / `quick_cleanup` / `structure_only` raw stage, `process-chunks` (with or without `--auto-replan`) runs the window executor instead of the fixed chunks: it reads the source from the chunk files, writes paragraphs to `<work_dir>/window/`, and JSON reports `long_text_mode=window`, `status`, `coverage` and `efficiency`. The `translate_only --input-key processed_path` stage then also runs as a window over that output (into `<work_dir>/window/processed/`); if the raw stage used fixed chunks, translation does too. Re-running the same command resumes at the cursor. `merge-content` merges the latest window stage (chapter headings from `chapter_plan.json` still apply) and refuses an unfinished window run.
 
 Current contract:
 
