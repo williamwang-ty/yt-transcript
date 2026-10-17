@@ -110,7 +110,8 @@ The input below is one window of a longer transcript. Every source {unit} starts
 
 - Start at [S{first}].{done_note}
 - {write_note}
-- Keep every [S<n>] tag in the output: write it right before the text that comes from that source {unit}, even in the middle of a paragraph. Do not add, drop or reorder tags, and cover the {units} in order without skipping any.
+- Keep every [S<n>] tag in the output: write it right before the text that comes from that source {unit}, even in the middle of a sentence or paragraph. Do not add, drop or reorder tags, and cover the {units} in order without skipping any.
+- The tags are bookkeeping only; source {units} may start mid-sentence. Break paragraphs and place headers by meaning, never just because a tag starts there.
 - Separate paragraphs with a blank line, and keep them as short as the task asks: split a long passage into several paragraphs rather than one block. Put `##` headers on their own line.{task_note}
 - When you stop, end the output with a line <!--END--> after the last complete paragraph.
 - Output only the processed text, the tags and that end line."""
