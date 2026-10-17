@@ -927,6 +927,17 @@ class WindowOutlineTests(unittest.TestCase):
         self.assertEqual(calls["outline"], [])
         self.assertEqual(result["outline"]["status"], "disabled")
 
+    def test_no_outline_when_one_round_covers_the_whole_source(self):
+        llm, calls = self._llm(_outline_json(self.SECTIONS))
+        with tempfile.TemporaryDirectory() as tmpdir:
+            work_dir = WindowExecutorTests._make_work_dir(self, tmpdir)
+            config = self._config(window_read_tokens=6000, window_write_tokens=3000)
+            result, _ = WindowExecutorTests._run(self, work_dir, config, llm)
+        self.assertTrue(result["success"], result)
+        self.assertEqual(calls["outline"], [])
+        self.assertEqual(result["outline"]["status"], "skipped")
+        self.assertIn("Put `##` headers on their own line.", calls["rounds"][0])
+
     def test_resumed_run_reuses_the_outline_without_repeating_headings(self):
         writer, _ = _headed_marker_writer()
         failures = {"round": 0}

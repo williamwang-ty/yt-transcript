@@ -1353,7 +1353,8 @@ def _prepare_outline(work_dir: str, prompt_name: str, state: dict, sentences: li
 
     A run that already wrote output keeps whatever outline it started with,
     so headings stay consistent across a resume; an outline that failed
-    before any output is retried.
+    before any output is retried. No outline is made when one round can
+    process the whole source, since that round sees all of it.
     """
     import yt_transcript_utils as utils
 
@@ -1367,6 +1368,11 @@ def _prepare_outline(work_dir: str, prompt_name: str, state: dict, sentences: li
         return
     if not kernel_outline.outline_enabled(config):
         state["outline"] = {"status": "disabled"}
+        return
+    total_tokens = sum(utils._estimate_tokens(sentence, "tokens", config) for sentence in sentences)
+    if plan_round(initial_sizing(state["params"]), state["params"], total_tokens)["finish"]:
+        # One round reads the whole source anyway; an outline would only add a request.
+        state["outline"] = {"status": "skipped", "error": "the whole source fits in one round"}
         return
 
     hints = load_chapter_hints(work_dir, unit_offsets, chunk_starts)
