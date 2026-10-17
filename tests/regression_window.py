@@ -534,3 +534,166 @@ class WindowBilingualTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             work_dir = WindowExecutorTests._make_work_dir(self, tmpdir)
             self.assertFalse(window.window_supported("translate_only", "processed_path", str(work_dir)))
+
+
+# Unpunctuated caption phrases; with 0.1s gaps inside a thought and 0.8s after
+# every third cue (the "real" pauses).
+CUE_PHRASES = ["我们今天来聊一聊", "这个滑动窗口的设计", "其实它的核心思想很简单",
+               "就是每一轮只往前推进一点", "然后根据模型的输出", "来决定下一轮从哪里开始"]
+
+
+def _cue_segments(repeat: int = 12) -> list[dict]:
+    segments, time = [], 0.0
+    for index, text in enumerate(CUE_PHRASES * repeat):
+        segments.append({"id": index, "text": text, "start_time": time, "end_time": time + 2.0})
+        time += 2.0 + (0.8 if index % 3 == 2 else 0.1)
+    return segments
+
+
+def _cue_ends(segments: list[dict]) -> set[int]:
+    ends, offset = set(), 0
+    for segment in segments:
+        offset += len(segment["text"])
+        ends.add(offset)
+    return ends
+
+
+class WindowCueSplitTests(unittest.TestCase):
+    def _work_dir(self, tmpdir: str, segments: list[dict], text: str | None = None) -> Path:
+        document = {
+            "source": {"type": "youtube"},
+            "workflow": {"mode": "chinese"},
+            "content": {"text": text if text is not None else "".join(s["text"] for s in segments),
+                        "preferred_chunk_source": "text"},
+            "segments": segments,
+        }
+        path = Path(tmpdir) / "normalized_document.json"
+        path.write_text(json.dumps(document, ensure_ascii=False), encoding="utf-8")
+        work_dir = Path(tmpdir) / "chunks"
+        with mock.patch("sys.stdout", new_callable=io.StringIO):
+            utils.chunk_document(str(path), str(work_dir), 0, "cleanup_zh")
+        return work_dir
+
+    def test_long_unpunctuated_units_end_at_cue_pauses(self):
+        segments = _cue_segments()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            work_dir = self._work_dir(tmpdir, segments)
+            units, chunk_starts, report = window.build_source_sentences(str(work_dir), {}, 60)
+
+        text = "".join(s["text"] for s in segments)
+        self.assertEqual("".join(units), text)
+        self.assertEqual(report["cue_alignment"], "full")
+        self.assertEqual(report["hard_cuts"], 0)
+        self.assertGreater(report["cue_cuts"], 5)
+        self.assertEqual(chunk_starts, {"0": 1})
+        offset, ends = 0, _cue_ends(segments)
+        for unit in units:
+            offset += len(unit)
+            self.assertIn(offset, ends, unit)
+            # The units cover whole thoughts: they end where the long pauses are.
+            self.assertTrue(unit.endswith("来决定下一轮从哪里开始") or unit.endswith("其实它的核心思想很简单"), unit)
+            self.assertLessEqual(utils._estimate_tokens(unit, "tokens", {}), 60)
+
+    def test_without_matching_cues_units_fall_back_to_fixed_cuts(self):
+        segments = _cue_segments()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # The text no longer matches the cues, so they cannot be used.
+            work_dir = self._work_dir(tmpdir, segments, text="另外一段完全不同的文字没有标点" * 40)
+            units, _, report = window.build_source_sentences(str(work_dir), {}, 60)
+        self.assertEqual(report["cue_alignment"], "failed")
+        self.assertEqual(report["cue_cuts"], 0)
+        self.assertGreater(report["hard_cuts"], 0)
+        self.assertEqual("".join(units), "另外一段完全不同的文字没有标点" * 40)
+
+    def test_work_dir_without_normalized_document_keeps_fixed_cuts(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source = Path(tmpdir) / "raw.txt"
+            source.write_text("没有标点的自动字幕" * 80, encoding="utf-8")
+            work_dir = Path(tmpdir) / "chunks"
+            with mock.patch("sys.stdout", new_callable=io.StringIO):
+                utils.chunk_text(str(source), str(work_dir), 0, "cleanup_zh")
+            units, _, report = window.build_source_sentences(str(work_dir), {}, 60)
+        self.assertEqual(report["cue_alignment"], "none")
+        self.assertEqual(units, window.split_source_sentences("没有标点的自动字幕" * 80, {}, 60))
+
+    def test_a_cue_longer_than_the_cap_is_cut_inside_only(self):
+        long_cue = "这一条字幕特别长中间完全没有停顿" * 12
+        segments = [
+            {"id": 0, "text": "开头一句", "start_time": 0.0, "end_time": 1.0},
+            {"id": 1, "text": long_cue, "start_time": 1.5, "end_time": 30.0},
+            {"id": 2, "text": "后面接着说别的事情", "start_time": 31.0, "end_time": 33.0},
+        ]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            work_dir = self._work_dir(tmpdir, segments)
+            units, _, report = window.build_source_sentences(str(work_dir), {}, 60)
+        text = "".join(s["text"] for s in segments)
+        self.assertEqual("".join(units), text)
+        self.assertGreater(report["hard_cuts"], 0)
+        # The hard cuts stay inside the long cue; nothing else is cut mid-cue.
+        self.assertEqual(units[0], "开头一句")
+        self.assertTrue(units[-1].endswith("后面接着说别的事情"))
+        self.assertTrue(all(len(unit) <= 75 for unit in units), units)
+
+    def test_cue_cuts_ignore_whitespace_and_punctuated_sentences(self):
+        sentences = "第一句话很短。" + " ".join(CUE_PHRASES * 4)
+        pauses = {}
+        offset = len("第一句话很短。")
+        for index, phrase in enumerate(CUE_PHRASES * 4):
+            offset += len(phrase)
+            pauses[offset] = 0.8 if index % 3 == 2 else 0.1
+        report = window._new_split_report()
+        units = window.split_source_sentences(sentences, {}, 60, pauses, report)
+        self.assertEqual(units[0], "第一句话很短。")
+        self.assertEqual("".join(units).replace(" ", ""), sentences.replace(" ", ""))
+        self.assertTrue(all(unit.endswith("来决定下一轮从哪里开始") or unit.endswith("其实它的核心思想很简单")
+                            for unit in units[1:]), units)
+        self.assertEqual(report["hard_cuts"], 0)
+
+    def test_chunk_boundary_inside_a_cue_is_cut_again_at_cue_ends(self):
+        # One unpunctuated run is longer than a chunk, so the chunker cuts it
+        # at a fixed width, inside a cue.
+        segments = _cue_segments(30)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            work_dir = self._work_dir(tmpdir, segments)
+            chunks = window.load_source_chunks(str(work_dir))
+            units, chunk_starts, report = window.build_source_sentences(str(work_dir), {}, 60)
+
+        self.assertGreater(len(chunks), 1)
+        ends = _cue_ends(segments)
+        first_chunk_end = len(re.sub(r"\s+", "", chunks[0][1]))
+        self.assertNotIn(first_chunk_end, ends)  # the chunker did cut mid-cue
+        offset = 0
+        for unit in units:
+            offset += len(re.sub(r"\s+", "", unit))
+            self.assertIn(offset, ends, unit)
+        self.assertEqual(report["hard_cuts"], 0)
+        # The second chunk starts in the unit holding its first character.
+        starts = [chunk_starts[str(chunk_id)] for chunk_id, _ in chunks]
+        self.assertEqual(starts[0], 1)
+        before = sum(len(re.sub(r"\s+", "", unit)) for unit in units[:starts[1] - 1])
+        self.assertLessEqual(before, first_chunk_end)
+        self.assertGreater(before + len(re.sub(r"\s+", "", units[starts[1] - 1])), first_chunk_end)
+
+    def test_chunk_boundary_at_a_cue_end_stays_a_unit_boundary(self):
+        phrases = [phrase + ("。" if index % 6 == 5 else "") for index, phrase in enumerate(CUE_PHRASES * 40)]
+        segments = [{"id": index, "text": text, "start_time": index * 2.0, "end_time": index * 2.0 + 1.9}
+                    for index, text in enumerate(phrases)]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            work_dir = self._work_dir(tmpdir, segments)
+            chunks = window.load_source_chunks(str(work_dir))
+            units, chunk_starts, _ = window.build_source_sentences(str(work_dir), {}, 60)
+        self.assertGreater(len(chunks), 1)
+        position = 0
+        unit_starts = {}
+        for number, unit in enumerate(units, start=1):
+            unit_starts[position] = number
+            position += len(re.sub(r"\s+", "", unit))
+        position = 0
+        for chunk_id, text in chunks:
+            self.assertEqual(chunk_starts[str(chunk_id)], unit_starts[position])
+            position += len(re.sub(r"\s+", "", text))
+
+    def test_dot_inside_a_domain_is_not_a_sentence_end(self):
+        # Seen on a real video: "Alibaba.com" split into "Alibaba." and "com...".
+        units = window.split_source_sentences("他们做了Alibaba.com这个网站。后来又做了别的", {}, 120)
+        self.assertEqual(units, ["他们做了Alibaba.com这个网站。", "后来又做了别的"])

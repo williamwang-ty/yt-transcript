@@ -63,6 +63,9 @@ DEFAULT_WINDOW_MARKER_RETRIES = 1
 DEFAULT_WINDOW_SENTENCE_MAX_TOKENS = 120
 # A forced-split remainder smaller than this share of the cap joins the piece before it.
 MIN_SPLIT_PIECE_SHARE = 0.25
+# A cut at a subtitle cue pause should leave at least this share of the cap,
+# unless no cue end in range does.
+MIN_CUE_PIECE_SHARE = 0.5
 # Processed-stage units are paragraphs; only very long ones are split.
 DEFAULT_WINDOW_PARAGRAPH_MAX_TOKENS = 600
 
@@ -246,17 +249,146 @@ def load_source_chunks(work_dir: str) -> list[tuple[int, str]]:
     return chunks
 
 
-def split_source_sentences(text: str, config: dict | None = None,
-                           max_sentence_tokens: int = DEFAULT_WINDOW_SENTENCE_MAX_TOKENS) -> list[str]:
-    """Split source text into the numbered units the window protocol works on."""
+def load_cue_stream(work_dir: str) -> dict | None:
+    """Read the subtitle cues behind the raw text, for cutting long units at cue pauses.
+
+    Returns the cues' text with all whitespace removed and, for each cue end
+    inside it, the silence before the next cue (0 when timings are missing or
+    the cues touch). None when the work dir has no timed segments.
+    """
+    path_value = str(_read_manifest(work_dir).get("normalized_document_path", "") or "").strip()
+    if not path_value:
+        return None
+    path = Path(path_value)
+    if not path.is_absolute():
+        path = Path(work_dir) / path
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    segments = payload.get("segments") if isinstance(payload, dict) else None
+    if not isinstance(segments, list):
+        return None
+
+    parts: list[str] = []
+    pauses: dict[int, float] = {}
+    offset = 0
+    previous_end = None
+    for segment in segments:
+        if not isinstance(segment, dict):
+            continue
+        text = re.sub(r"\s+", "", str(segment.get("text", "") or ""))
+        if not text:
+            continue
+        start, end = segment.get("start_time"), segment.get("end_time")
+        if parts:
+            pause = 0.0
+            if isinstance(start, (int, float)) and isinstance(previous_end, (int, float)):
+                pause = max(0.0, float(start) - float(previous_end))
+            pauses[offset] = round(pause, 1)
+        parts.append(text)
+        offset += len(text)
+        previous_end = end if isinstance(end, (int, float)) else None
+    if not pauses:
+        return None
+    return {"text": "".join(parts), "pauses": pauses}
+
+
+def _new_split_report() -> dict:
+    return {"cue_alignment": "none", "aligned_chunks": 0, "unaligned_chunks": 0,
+            "cue_cuts": 0, "hard_cuts": 0}
+
+
+def _split_at_cues(sentence: str, pauses: dict[int, float], max_tokens: int,
+                   config: dict | None, report: dict) -> list[str]:
+    """Cut an over-long unit only between subtitle cues, preferring the longest pauses.
+
+    `pauses` maps a cut position (counted in non-whitespace characters of
+    `sentence`) to the silence there. Each piece stays within `max_tokens`
+    except a single cue longer than that, which is hard-cut.
+    """
     import yt_transcript_utils as utils
 
+    def tokens(text: str) -> int:
+        return utils._estimate_tokens(text, "tokens", config)
+
+    visible = [index for index, char in enumerate(sentence) if not char.isspace()]
+    cuts = sorted((visible[offset], pause) for offset, pause in pauses.items() if 0 < offset < len(visible))
+    floor = max_tokens * MIN_CUE_PIECE_SHARE
+    pieces: list[str] = []
+    start = 0
+    last_cut = ""
+    while tokens(sentence[start:]) > max_tokens:
+        fitting = []
+        for cut, pause in cuts:
+            if cut <= start:
+                continue
+            size = tokens(sentence[start:cut])
+            if size > max_tokens:
+                break
+            fitting.append((cut, pause, size))
+        if not fitting:
+            # One cue alone is over the cap: hard-cut it. Its last piece is
+            # kept with what follows, so the next cut is at a cue end again.
+            next_cut = next((cut for cut, _ in cuts if cut > start), len(sentence))
+            hard = [part for part in utils._force_split_text_by_tokens(sentence[start:next_cut], max_tokens, config)
+                    if part]
+            if len(hard) < 2:
+                pieces.append(sentence[start:next_cut])
+                start = next_cut
+                if next_cut < len(sentence):
+                    last_cut = "cue_cuts"
+                    report["cue_cuts"] += 1
+                continue
+            pieces.extend(hard[:-1])
+            report["hard_cuts"] += len(hard) - 1
+            last_cut = "hard_cuts"
+            start = next_cut - len(hard[-1])
+            continue
+        # Prefer the longest pause among cuts that leave a reasonably sized
+        # piece; on equal pauses take the later cut so units stay large.
+        eligible = [item for item in fitting if item[2] >= floor] or fitting
+        cut = max(eligible, key=lambda item: (item[1], item[0]))[0]
+        pieces.append(sentence[start:cut])
+        report["cue_cuts"] += 1
+        last_cut = "cue_cuts"
+        start = cut
+    pieces.append(sentence[start:])
+    pieces = [piece for piece in pieces if piece.strip()]
+    if len(pieces) > 1 and tokens(pieces[-1]) < max_tokens * MIN_SPLIT_PIECE_SHARE:
+        pieces[-2:] = [pieces[-2] + pieces[-1]]
+        if last_cut:
+            report[last_cut] -= 1
+    return [piece.strip() for piece in pieces]
+
+
+def split_source_sentences(text: str, config: dict | None = None,
+                           max_sentence_tokens: int = DEFAULT_WINDOW_SENTENCE_MAX_TOKENS,
+                           cue_pauses: dict[int, float] | None = None,
+                           report: dict | None = None) -> list[str]:
+    """Split source text into the numbered units the window protocol works on.
+
+    A sentence over `max_sentence_tokens` is cut at subtitle cue ends when
+    `cue_pauses` (cue end -> pause, counted in non-whitespace characters of
+    `text`) is given, otherwise every `max_sentence_tokens` tokens.
+    """
+    import yt_transcript_utils as utils
+
+    report = report if report is not None else _new_split_report()
     sentences = []
+    offset = 0
     for sentence in utils._split_sentences(text):
         sentence = sentence.strip()
         if not sentence:
             continue
+        sentence_start = offset
+        offset += len(re.sub(r"\s+", "", sentence))
         if max_sentence_tokens > 0 and utils._estimate_tokens(sentence, "tokens", config) > max_sentence_tokens:
+            if cue_pauses:
+                local = {position - sentence_start: pause for position, pause in cue_pauses.items()
+                         if sentence_start < position < offset}
+                sentences.extend(_split_at_cues(sentence, local, max_sentence_tokens, config, report))
+                continue
             parts = [part.strip() for part in
                      utils._force_split_text_by_tokens(sentence, max_sentence_tokens, config) if part.strip()]
             # A forced split can leave a scrap of a few characters at the end;
@@ -265,6 +397,7 @@ def split_source_sentences(text: str, config: dict | None = None,
             if len(parts) > 1 and utils._estimate_tokens(parts[-1], "tokens", config) < \
                     max_sentence_tokens * MIN_SPLIT_PIECE_SHARE:
                 parts[-2:] = [parts[-2] + parts[-1]]
+            report["hard_cuts"] += len(parts) - 1
             sentences.extend(parts)
         else:
             sentences.append(sentence)
@@ -272,20 +405,73 @@ def split_source_sentences(text: str, config: dict | None = None,
 
 
 def build_source_sentences(work_dir: str, config: dict | None = None,
-                           max_sentence_tokens: int = DEFAULT_WINDOW_SENTENCE_MAX_TOKENS) -> tuple[list[str], dict]:
-    """Number the raw source; also return each raw chunk's first unit number.
+                           max_sentence_tokens: int = DEFAULT_WINDOW_SENTENCE_MAX_TOKENS
+                           ) -> tuple[list[str], dict, dict]:
+    """Number the raw source; also return each raw chunk's first unit number and a split report.
 
-    Chunks are split one by one, so a chunk boundary is always a sentence
-    boundary and chapter plans keyed by chunk id still map onto the output.
+    Each chunk is located in the subtitle cues (ignoring whitespace) so long
+    unpunctuated sentences can be cut at cue pauses; a chunk that cannot be
+    located falls back to fixed-size cuts. A chunk boundary stays a unit
+    boundary, except one the chunker put inside a cue: those chunks are
+    joined and cut again at cue ends, and the later chunk starts at the unit
+    holding its first character.
     """
+    report = _new_split_report()
+    cues = load_cue_stream(work_dir)
+    # Chunks split as one text. `members` holds (chunk_id, text, start offset
+    # in the run, whitespace ignored); `pauses` is None for an unaligned chunk.
+    runs: list[dict] = []
+    stream_position = 0
+    for chunk_id, text in load_source_chunks(work_dir):
+        compact = re.sub(r"\s+", "", text)
+        found = cues["text"].find(compact, stream_position) if cues else -1
+        if found < 0:
+            if cues:
+                report["unaligned_chunks"] += 1
+            runs.append({"members": [(chunk_id, text, 0)], "pauses": None})
+            continue
+        report["aligned_chunks"] += 1
+        end = found + len(compact)
+        pauses = {position - found: pause for position, pause in cues["pauses"].items() if found < position <= end}
+        run = runs[-1] if runs else None
+        if run and run["pauses"] is not None and run["end"] == found and found not in cues["pauses"]:
+            # The chunker cut inside a cue here: keep both chunks in one run.
+            offset = run["length"]
+            run["members"].append((chunk_id, text, offset))
+            run["pauses"].update({offset + position: pause for position, pause in pauses.items()})
+        else:
+            offset = 0
+            run = {"members": [(chunk_id, text, 0)], "pauses": pauses}
+            runs.append(run)
+        run["length"] = offset + len(compact)
+        run["end"] = end
+        stream_position = end
+
     sentences: list[str] = []
     chunk_starts: dict = {}
-    for chunk_id, text in load_source_chunks(work_dir):
-        chunk_sentences = split_source_sentences(text, config, max_sentence_tokens)
-        if chunk_sentences:
-            chunk_starts[str(chunk_id)] = len(sentences) + 1
-            sentences.extend(chunk_sentences)
-    return sentences, chunk_starts
+    for run in runs:
+        members = run["members"]
+        text = members[0][1]
+        for _, chunk_text, _ in members[1:]:
+            ascii_join = text[-1:].isascii() and text[-1:].isalnum() and \
+                chunk_text[:1].isascii() and chunk_text[:1].isalnum()
+            text += (" " if ascii_join else "") + chunk_text
+        run_units = split_source_sentences(text, config, max_sentence_tokens, run["pauses"], report)
+        if not run_units:
+            continue
+        unit_ends, total = [], 0
+        for unit in run_units:
+            total += len(re.sub(r"\s+", "", unit))
+            unit_ends.append(total)
+        for chunk_id, _, offset in members:
+            unit_index = next((index for index, unit_end in enumerate(unit_ends) if offset < unit_end),
+                              len(run_units) - 1)
+            chunk_starts.setdefault(str(chunk_id), len(sentences) + unit_index + 1)
+        sentences.extend(run_units)
+    if cues:
+        report["cue_alignment"] = "full" if not report["unaligned_chunks"] else (
+            "partial" if report["aligned_chunks"] else "failed")
+    return sentences, chunk_starts, report
 
 
 def split_paragraph_units(text: str, config: dict | None = None,
@@ -1136,9 +1322,10 @@ def _process_window_impl(work_dir: str, prompt_name: str, extra_instruction: str
     params = window_params(prompt_name, config)
     if stage == PROCESSED_STAGE:
         sentences, chunk_starts = build_processed_units(work_dir, config)
+        unit_split = {}
         missing = "no finished raw-stage window output to process"
     else:
-        sentences, chunk_starts = build_source_sentences(work_dir, config, params["sentence_max_tokens"])
+        sentences, chunk_starts, unit_split = build_source_sentences(work_dir, config, params["sentence_max_tokens"])
         missing = "no source text found in the raw chunks"
     if not sentences:
         print(f"Error: {missing} in {work_dir}", file=sys.stderr)
@@ -1146,6 +1333,8 @@ def _process_window_impl(work_dir: str, prompt_name: str, extra_instruction: str
 
     state, resumed = _prepare_state(work_dir, prompt_name, stage, sentences, params, force, log, dry_run=dry_run)
     state["chunk_starts"] = chunk_starts
+    if unit_split:
+        state["unit_split"] = unit_split
     previous_backend = state.get("llm_backend") or None
     backend_decision = kernel_agent_cli.resolve_llm_backend(config, probe=not dry_run, previous=previous_backend)
     api_request_url = utils._build_api_url(config.get("llm_base_url", ""), config.get("llm_api_format", "openai")) \
@@ -1161,6 +1350,7 @@ def _process_window_impl(work_dir: str, prompt_name: str, extra_instruction: str
             "prompt_name": prompt_name,
             "input_key": stage,
             "sentence_count": len(sentences),
+            "unit_split": unit_split,
             "cursor": state.get("cursor", 0),
             "resumed": resumed,
             "params": state.get("params", params),

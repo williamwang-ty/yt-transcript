@@ -2452,6 +2452,9 @@ def _split_sentences(text: str) -> list[str]:
                 continue
             if prev_char.isdigit() and next_char.isdigit():
                 boundary = False
+            elif prev_char.isascii() and prev_char.isalnum() and next_char.isascii() and next_char.isalnum():
+                # A dot inside a token such as "Alibaba.com" or "v2.x".
+                boundary = False
             elif prev_char.isalpha() and next_char.isalpha() and next_next_char == ".":
                 boundary = False
             elif acronym_before_period(i):

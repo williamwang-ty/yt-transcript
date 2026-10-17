@@ -6,6 +6,7 @@ from tests.regression_language import LanguageRegressionTests
 from tests.regression_runtime import RuntimeRegressionTests
 from tests.regression_window import (
     WindowBilingualTests,
+    WindowCueSplitTests,
     WindowExecutorTests,
     WindowProtocolTests,
     WindowSizingTests,
@@ -18,6 +19,7 @@ __all__ = [
     "LanguageRegressionTests",
     "RuntimeRegressionTests",
     "WindowBilingualTests",
+    "WindowCueSplitTests",
     "WindowExecutorTests",
     "WindowProtocolTests",
     "WindowSizingTests",
