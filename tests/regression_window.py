@@ -648,3 +648,47 @@ class WindowCueSplitTests(unittest.TestCase):
         self.assertTrue(all(unit.endswith("来决定下一轮从哪里开始") or unit.endswith("其实它的核心思想很简单")
                             for unit in units[1:]), units)
         self.assertEqual(report["hard_cuts"], 0)
+
+    def test_chunk_boundary_inside_a_cue_is_cut_again_at_cue_ends(self):
+        # One unpunctuated run is longer than a chunk, so the chunker cuts it
+        # at a fixed width, inside a cue.
+        segments = _cue_segments(30)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            work_dir = self._work_dir(tmpdir, segments)
+            chunks = window.load_source_chunks(str(work_dir))
+            units, chunk_starts, report = window.build_source_sentences(str(work_dir), {}, 60)
+
+        self.assertGreater(len(chunks), 1)
+        ends = _cue_ends(segments)
+        first_chunk_end = len(re.sub(r"\s+", "", chunks[0][1]))
+        self.assertNotIn(first_chunk_end, ends)  # the chunker did cut mid-cue
+        offset = 0
+        for unit in units:
+            offset += len(re.sub(r"\s+", "", unit))
+            self.assertIn(offset, ends, unit)
+        self.assertEqual(report["hard_cuts"], 0)
+        # The second chunk starts in the unit holding its first character.
+        starts = [chunk_starts[str(chunk_id)] for chunk_id, _ in chunks]
+        self.assertEqual(starts[0], 1)
+        before = sum(len(re.sub(r"\s+", "", unit)) for unit in units[:starts[1] - 1])
+        self.assertLessEqual(before, first_chunk_end)
+        self.assertGreater(before + len(re.sub(r"\s+", "", units[starts[1] - 1])), first_chunk_end)
+
+    def test_chunk_boundary_at_a_cue_end_stays_a_unit_boundary(self):
+        phrases = [phrase + ("。" if index % 6 == 5 else "") for index, phrase in enumerate(CUE_PHRASES * 40)]
+        segments = [{"id": index, "text": text, "start_time": index * 2.0, "end_time": index * 2.0 + 1.9}
+                    for index, text in enumerate(phrases)]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            work_dir = self._work_dir(tmpdir, segments)
+            chunks = window.load_source_chunks(str(work_dir))
+            units, chunk_starts, _ = window.build_source_sentences(str(work_dir), {}, 60)
+        self.assertGreater(len(chunks), 1)
+        position = 0
+        unit_starts = {}
+        for number, unit in enumerate(units, start=1):
+            unit_starts[position] = number
+            position += len(re.sub(r"\s+", "", unit))
+        position = 0
+        for chunk_id, text in chunks:
+            self.assertEqual(chunk_starts[str(chunk_id)], unit_starts[position])
+            position += len(re.sub(r"\s+", "", text))

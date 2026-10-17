@@ -409,33 +409,65 @@ def build_source_sentences(work_dir: str, config: dict | None = None,
                            ) -> tuple[list[str], dict, dict]:
     """Number the raw source; also return each raw chunk's first unit number and a split report.
 
-    Chunks are split one by one, so a chunk boundary is always a sentence
-    boundary and chapter plans keyed by chunk id still map onto the output.
     Each chunk is located in the subtitle cues (ignoring whitespace) so long
     unpunctuated sentences can be cut at cue pauses; a chunk that cannot be
-    located falls back to fixed-size cuts.
+    located falls back to fixed-size cuts. A chunk boundary stays a unit
+    boundary, except one the chunker put inside a cue: those chunks are
+    joined and cut again at cue ends, and the later chunk starts at the unit
+    holding its first character.
     """
-    sentences: list[str] = []
-    chunk_starts: dict = {}
     report = _new_split_report()
     cues = load_cue_stream(work_dir)
+    # Chunks split as one text. `members` holds (chunk_id, text, start offset
+    # in the run, whitespace ignored); `pauses` is None for an unaligned chunk.
+    runs: list[dict] = []
     stream_position = 0
     for chunk_id, text in load_source_chunks(work_dir):
-        chunk_pauses = None
-        if cues:
-            compact = re.sub(r"\s+", "", text)
-            found = cues["text"].find(compact, stream_position)
-            if found >= 0:
-                stream_position = found + len(compact)
-                chunk_pauses = {position - found: pause for position, pause in cues["pauses"].items()
-                                if found < position < stream_position}
-                report["aligned_chunks"] += 1
-            else:
+        compact = re.sub(r"\s+", "", text)
+        found = cues["text"].find(compact, stream_position) if cues else -1
+        if found < 0:
+            if cues:
                 report["unaligned_chunks"] += 1
-        chunk_sentences = split_source_sentences(text, config, max_sentence_tokens, chunk_pauses, report)
-        if chunk_sentences:
-            chunk_starts[str(chunk_id)] = len(sentences) + 1
-            sentences.extend(chunk_sentences)
+            runs.append({"members": [(chunk_id, text, 0)], "pauses": None})
+            continue
+        report["aligned_chunks"] += 1
+        end = found + len(compact)
+        pauses = {position - found: pause for position, pause in cues["pauses"].items() if found < position <= end}
+        run = runs[-1] if runs else None
+        if run and run["pauses"] is not None and run["end"] == found and found not in cues["pauses"]:
+            # The chunker cut inside a cue here: keep both chunks in one run.
+            offset = run["length"]
+            run["members"].append((chunk_id, text, offset))
+            run["pauses"].update({offset + position: pause for position, pause in pauses.items()})
+        else:
+            offset = 0
+            run = {"members": [(chunk_id, text, 0)], "pauses": pauses}
+            runs.append(run)
+        run["length"] = offset + len(compact)
+        run["end"] = end
+        stream_position = end
+
+    sentences: list[str] = []
+    chunk_starts: dict = {}
+    for run in runs:
+        members = run["members"]
+        text = members[0][1]
+        for _, chunk_text, _ in members[1:]:
+            ascii_join = text[-1:].isascii() and text[-1:].isalnum() and \
+                chunk_text[:1].isascii() and chunk_text[:1].isalnum()
+            text += (" " if ascii_join else "") + chunk_text
+        run_units = split_source_sentences(text, config, max_sentence_tokens, run["pauses"], report)
+        if not run_units:
+            continue
+        unit_ends, total = [], 0
+        for unit in run_units:
+            total += len(re.sub(r"\s+", "", unit))
+            unit_ends.append(total)
+        for chunk_id, _, offset in members:
+            unit_index = next((index for index, unit_end in enumerate(unit_ends) if offset < unit_end),
+                              len(run_units) - 1)
+            chunk_starts.setdefault(str(chunk_id), len(sentences) + unit_index + 1)
+        sentences.extend(run_units)
     if cues:
         report["cue_alignment"] = "full" if not report["unaligned_chunks"] else (
             "partial" if report["aligned_chunks"] else "failed")
