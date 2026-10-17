@@ -55,7 +55,7 @@ Return only one JSON object and nothing else:
 {{"sections": [{{"start": {first}, "title": "..."{title_zh_example}}}], "terms": [{{"term": "...", "variants": ["..."], "kind": "person"{zh_example}}}]}}
 
 - `sections`: the major topics in order. `start` is the number of the unit where the topic begins, and the numbers must increase.{first_note} Aim for {low} to {high} sections; start a section only at a real topic shift, not for a single remark. `title` is a short heading in {title_language} (at most about 20 Chinese characters or 8 English words), without numbering or `#`.{title_zh_note}
-- `terms`: at most {max_terms} names of people, organizations and products, and technical terms, that recur or matter. `term` is the correct spelling. `variants` lists other spellings of the same thing that actually appear in the transcript (speech-recognition errors, inconsistent spellings); leave it empty unless you are confident. `kind` is one of person, organization, product, term.{zh_note}{hints}
+- `terms`: at most {max_terms} names of people, organizations and products, and technical terms, that recur or matter. `term` is the name as the speaker uses it, spelled correctly: keep a Chinese name in Chinese when that is what is said, and do not expand it to a full name or swap in a translation. `variants` lists only misrecognized or misspelled forms of that same word that actually appear in the transcript (speech-recognition errors, typos); never a translation, an abbreviation, a short form or a full name, since the speaker's wording is kept. Leave it empty unless you are confident. `kind` is one of person, organization, product, term.{zh_note}{hints}
 
 ## Transcript
 
@@ -66,7 +66,7 @@ HINTS_BLOCK = """
 
 ## Video Chapters
 
-The video has its own chapters, listed below at the unit where each one starts. Keep each chapter as a section starting at or near that unit (move the start a few units if the topic clearly begins elsewhere), split a long chapter into several sections where the topic changes, and write the titles in {title_language}.
+The video has its own chapters, listed below at the unit where each one starts. Keep every chapter as its own section starting at or near that unit (move the start a few units if the topic clearly begins elsewhere); do not merge chapters. You may split a long chapter into several sections where the topic changes. Keep each chapter's title as written, including its numbers; only translate it into {title_language} if it is in another language, and replace placeholder titles such as "<Untitled Chapter 1>".
 
 {lines}"""
 
@@ -258,7 +258,7 @@ def _parse_terms(raw_terms, max_terms: int) -> list[dict]:
         for variant in entry.get("variants") if isinstance(entry.get("variants"), list) else []:
             variant = re.sub(r"\s+", " ", str(variant or "")).strip()
             if variant and len(variant) <= MAX_TERM_CHARS and variant.lower() != term.lower() \
-                    and variant not in variants:
+                    and variant not in variants and _is_misspelling(term, variant):
                 variants.append(variant)
         kind = str(entry.get("kind", "") or "").strip().lower()
         item = {"term": term, "variants": variants, "kind": kind if kind in TERM_KINDS else "term"}
@@ -270,6 +270,26 @@ def _parse_terms(raw_terms, max_terms: int) -> list[dict]:
         if len(terms) >= max_terms:
             break
     return terms
+
+
+def _has_cjk(text: str) -> bool:
+    return re.search(r"[\u3400-\u9fff]", text) is not None
+
+
+def _is_misspelling(term: str, variant: str) -> bool:
+    """Whether a variant can be a misspelling of the term rather than another way to say it.
+
+    A variant in another script is a translation (万事达 / Mastercard), and one
+    contained in the other is a short or full form (Tukey / John Tukey); the
+    speaker's wording is kept for both, so they are not corrected.
+    """
+    if _has_cjk(term) != _has_cjk(variant):
+        return False
+    if _has_cjk(term):
+        return term not in variant and variant not in term
+    term_words = set(re.findall(r"[a-z0-9]+", term.lower()))
+    variant_words = set(re.findall(r"[a-z0-9]+", variant.lower()))
+    return not (term_words <= variant_words or variant_words <= term_words)
 
 
 def _invalid(error_type: str, message: str) -> dict:

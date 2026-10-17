@@ -763,6 +763,15 @@ class WindowOutlineTests(unittest.TestCase):
         self.assertEqual([t["term"] for t in parsed["terms"]], ["OpenAI", "GPU"])
         self.assertEqual(parsed["terms"][0]["variants"], ["Open AI"])
 
+    def test_translations_and_short_or_full_forms_are_not_variants(self):
+        text = json.dumps({"sections": [{"start": 1, "title": "开场"}], "terms": [
+            {"term": "Mastercard", "variants": ["万事达", "MMastercard"]},
+            {"term": "John Tukey", "variants": ["Tukey", "John Tookey"]},
+            {"term": "英伟达", "variants": ["因为达", "Nvidia"]},
+        ]}, ensure_ascii=False)
+        parsed = outline.parse_outline(text, 1, 10)
+        self.assertEqual([t["variants"] for t in parsed["terms"]], [["MMastercard"], ["John Tookey"], ["因为达"]])
+
     def test_parse_drops_sections_out_of_range_or_out_of_order(self):
         text = json.dumps({"sections": [
             {"start": 11, "title": "甲"}, {"start": 20, "title": "乙"}, {"start": 15, "title": "倒退"},
