@@ -8,6 +8,7 @@ from tests.regression_window import (
     WindowBilingualTests,
     WindowCueSplitTests,
     WindowExecutorTests,
+    WindowOutlineTests,
     WindowProtocolTests,
     WindowSizingTests,
 )
@@ -21,6 +22,7 @@ __all__ = [
     "WindowBilingualTests",
     "WindowCueSplitTests",
     "WindowExecutorTests",
+    "WindowOutlineTests",
     "WindowProtocolTests",
     "WindowSizingTests",
     "WorkflowRegressionTests",

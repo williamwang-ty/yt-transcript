@@ -4,6 +4,7 @@ import re
 
 from tests._support import *  # noqa: F401,F403
 from kernel.long_text import agent_cli
+from kernel.long_text import outline
 from kernel.long_text import window
 
 
@@ -202,6 +203,8 @@ class WindowExecutorTests(unittest.TestCase):
             "long_text_mode": "window",
             "window_read_tokens": 200,
             "window_write_tokens": 100,
+            # The outline pass has its own tests (WindowOutlineTests).
+            "window_outline": False,
         })
         config.update(overrides)
         return config
@@ -697,3 +700,373 @@ class WindowCueSplitTests(unittest.TestCase):
         # Seen on a real video: "Alibaba.com" split into "Alibaba." and "com...".
         units = window.split_source_sentences("他们做了Alibaba.com这个网站。后来又做了别的", {}, 120)
         self.assertEqual(units, ["他们做了Alibaba.com这个网站。", "后来又做了别的"])
+
+
+def _outline_json(sections: list[tuple[int, str]], terms: list[dict] | None = None, **extra) -> str:
+    payload = {"sections": [{"start": start, "title": title, **extra} for start, title in sections],
+               "terms": terms or []}
+    return "```json\n" + json.dumps(payload, ensure_ascii=False) + "\n```"
+
+
+def _headed_marker_writer():
+    """Like _marker_writer, but the model also writes its own heading, as the task prompt asks."""
+    respond, prompts = _marker_writer()
+
+    def write(prompt: str) -> str:
+        return "## 模型自己的标题\n\n" + respond(prompt)
+
+    return write, prompts
+
+
+class WindowOutlineTests(unittest.TestCase):
+    """Issue #12: global outline + term list before the window rounds."""
+
+    SENTENCE_COUNT = 40
+    SECTIONS = [(1, "开场"), (15, "第二部分"), (28, "第三部分")]
+
+    def _config(self, **overrides) -> dict:
+        config = WindowExecutorTests._config(self, window_outline=True)
+        config.update(overrides)
+        return config
+
+    def _llm(self, outline_text: str, writer=None):
+        writer = writer or _headed_marker_writer()[0]
+        calls = {"outline": [], "rounds": []}
+
+        def llm(**kwargs):
+            prompt = kwargs["messages"][0]["content"]
+            if prompt.startswith("# Transcript Outline"):
+                calls["outline"].append(prompt)
+                return _api_result(outline_text)
+            calls["rounds"].append(prompt)
+            return _api_result(writer(prompt))
+
+        return llm, calls
+
+    def _merged(self, work_dir: Path, tmpdir: str) -> tuple[dict, str]:
+        output = Path(tmpdir) / "optimized.md"
+        merge = utils.merge_content(str(work_dir), str(output))
+        return merge, output.read_text(encoding="utf-8")
+
+    # --- parsing and validation -------------------------------------------
+
+    def test_parse_accepts_fenced_json_and_unit_numbers_written_as_tags(self):
+        text = "Here it is:\n```json\n" + json.dumps({
+            "sections": [{"start": "S1", "title": "## 开场"}, {"start": "[S7]", "title": "细节"}],
+            "terms": [{"term": "OpenAI", "variants": ["Open AI", "openai", "OpenAI"], "kind": "organization"},
+                      {"term": "openai"}, "GPU"],
+        }, ensure_ascii=False) + "\n```"
+        parsed = outline.parse_outline(text, 1, 10)
+        self.assertTrue(parsed["ok"], parsed)
+        self.assertEqual(parsed["sections"], [{"start": 1, "title": "开场"}, {"start": 7, "title": "细节"}])
+        # Duplicates dropped; a variant equal to the term (ignoring case) is not a variant.
+        self.assertEqual([t["term"] for t in parsed["terms"]], ["OpenAI", "GPU"])
+        self.assertEqual(parsed["terms"][0]["variants"], ["Open AI"])
+
+    def test_parse_drops_sections_out_of_range_or_out_of_order(self):
+        text = json.dumps({"sections": [
+            {"start": 11, "title": "甲"}, {"start": 20, "title": "乙"}, {"start": 15, "title": "倒退"},
+            {"start": 25, "title": "乙"}, {"start": 31, "title": "越界"}, {"start": 26, "title": "丙"},
+            {"start": 27, "title": ""}, {"start": 28, "title": "丁"},
+        ]}, ensure_ascii=False)
+        parsed = outline.parse_outline(text, 11, 30)
+        self.assertTrue(parsed["ok"], parsed)
+        self.assertEqual([s["start"] for s in parsed["sections"]], [11, 20, 26, 28])
+        self.assertEqual(parsed["dropped_sections"], 4)
+
+    def test_parse_rejects_missing_json_or_mostly_invalid_sections(self):
+        self.assertEqual(outline.parse_outline("没有 JSON", 1, 10)["error_type"], "no_json")
+        self.assertEqual(outline.parse_outline('{"terms": []}', 1, 10)["error_type"], "no_sections")
+        mostly_bad = json.dumps({"sections": [{"start": 50, "title": "a"}, {"start": 60, "title": "b"},
+                                              {"start": 2, "title": "c"}]})
+        self.assertEqual(outline.parse_outline(mostly_bad, 1, 10)["error_type"], "invalid_sections")
+        none_valid = json.dumps({"sections": [{"start": 0, "title": "a"}]})
+        self.assertEqual(outline.parse_outline(none_valid, 1, 10)["error_type"], "no_valid_sections")
+
+    def test_parts_are_near_equal_and_merge_without_repeating_a_continued_section(self):
+        self.assertEqual(outline.split_parts([10] * 10, 1000), [(0, 10)])
+        parts = outline.split_parts([10] * 10, 40)
+        self.assertEqual(len(parts), 3)
+        self.assertEqual(parts[0][0], 0)
+        self.assertEqual(parts[-1][1], 10)
+        self.assertEqual([b[0] for b in parts[1:]], [a[1] for a in parts[:-1]])
+        merged = outline.merge_parts([
+            {"sections": [{"start": 1, "title": "甲"}, {"start": 4, "title": "乙"}],
+             "terms": [{"term": "GPU", "variants": [], "kind": "term"}]},
+            {"sections": [{"start": 6, "title": "乙"}, {"start": 8, "title": "丙"}],
+             "terms": [{"term": "gpu", "variants": ["G P U"], "kind": "term"}]},
+        ])
+        self.assertEqual([s["title"] for s in merged["sections"]], ["甲", "乙", "丙"])
+        self.assertEqual(merged["terms"], [{"term": "GPU", "variants": ["G P U"], "kind": "term"}])
+
+    def test_heading_goes_before_the_paragraph_whose_middle_is_past_the_section_start(self):
+        sections = [{"start": 1, "title": "a"}, {"start": 12, "title": "b"}, {"start": 20, "title": "c"}]
+        self.assertEqual(outline.sections_before(sections, 0, 1, 4), 1)
+        # Section b starts late in S9-S12: it waits for the next paragraph.
+        self.assertEqual(outline.sections_before(sections, 1, 9, 12), 1)
+        self.assertEqual(outline.sections_before(sections, 1, 13, 15), 2)
+        # Early in a paragraph: the heading goes before it.
+        self.assertEqual(outline.sections_before(sections, 2, 19, 25), 3)
+
+    def test_model_heading_for_a_nearby_section_is_kept_where_the_model_put_it(self):
+        sections = [{"start": 1, "title": "开场"}, {"start": 10, "title": "第二部分", "title_zh": "第二部分"},
+                    {"start": 20, "title": "第三部分"}]
+        # The topic really starts a little after S10's tag: the model's heading stays there.
+        text = "前一个话题的结尾。\n\n## 第二部分\n\n新话题开始了。\n\n## 自己编的标题\n\n继续。"
+        body, placed, next_section = outline.place_headings(sections, 1, text, 9, 12)
+        self.assertEqual(body, "前一个话题的结尾。\n\n## 第二部分\n\n新话题开始了。\n\n继续。")
+        self.assertEqual((placed, next_section), ([10], 2))
+        # A matching title far from its section start is not trusted; the program places it.
+        body, placed, next_section = outline.place_headings(sections, 1, "## 第三部分\n\n甲。", 9, 11)
+        self.assertEqual((body, placed, next_section), ("## 第二部分\n\n甲。", [10], 2))
+        # Skipped sections before a model-placed one are headed with it, in order.
+        body, placed, next_section = outline.place_headings(sections, 1, "甲。\n\n## 第三部分\n\n乙。", 18, 21)
+        self.assertEqual(body, "甲。\n\n## 第二部分\n\n## 第三部分\n\n乙。")
+        self.assertEqual((placed, next_section), ([10, 20], 3))
+
+    def test_round_context_lists_nearby_sections_and_terms_found_in_the_window(self):
+        sections = [{"start": 1, "title": "甲"}, {"start": 10, "title": "乙"}, {"start": 30, "title": "丙"},
+                    {"start": 50, "title": "丁"}]
+        text = outline.round_outline_text(sections, cursor=4, window_end=20, next_section=1)
+        self.assertIn("[S1] 甲 (the section [S5] is in; already headed)", text)
+        self.assertIn("[S10] 乙 (starts in this window", text)
+        self.assertIn("put the line `## 乙` before it", text)
+        self.assertIn("[S30] 丙 (next section", text)
+        self.assertNotIn("丁", text)
+        terms = [{"term": "英伟达", "variants": ["因为达"], "kind": "organization"},
+                 {"term": "CUDA", "variants": [], "kind": "product"},
+                 {"term": "黄仁勋", "variants": [], "kind": "person"}]
+        glossary = outline.round_terms_text(terms, "因为达的cuda很强")
+        self.assertIn("英伟达 (the source may write it as 因为达; write 英伟达)", glossary)
+        self.assertIn("CUDA (keep this spelling)", glossary)
+        self.assertNotIn("黄仁勋", glossary)
+        self.assertEqual(outline.round_terms_text(terms, "没有相关的词"), "")
+
+    def test_youtube_chapter_times_map_to_the_unit_holding_that_cue(self):
+        cue_starts = [(0, 0.0), (10, 5.0), (20, 10.0), (30, 15.0)]
+        unit_offsets = [0, 8, 20, 25]
+        hints = outline.hints_from_times(
+            [{"title": "Intro", "start_time": 0}, {"title": "Main", "start_time": 10.2},
+             {"title": "Again", "start_time": 11.0}, {"title": "Late", "start_time": 13.0},
+             {"title": "", "start_time": 16}],
+            cue_starts, unit_offsets)
+        # 10.2s → cue at offset 20 → unit 3; 11s maps there too and is dropped;
+        # 13s → nearest cue at 15s, offset 30 → unit 4 (starting at offset 25).
+        self.assertEqual(hints, [{"start": 1, "title": "Intro"}, {"start": 3, "title": "Main"},
+                                 {"start": 4, "title": "Late"}])
+        self.assertEqual(outline.hints_from_times([{"title": "x", "start_time": 0}], cue_starts, [None] * 4), [])
+
+    # --- executor -----------------------------------------------------------
+
+    def test_outline_headings_replace_the_rounds_own_headings(self):
+        terms = [{"term": "测验", "variants": ["测试"], "kind": "term"}]
+        llm, calls = self._llm(_outline_json(self.SECTIONS, terms))
+        with tempfile.TemporaryDirectory() as tmpdir:
+            work_dir = WindowExecutorTests._make_work_dir(self, tmpdir)
+            result, _ = WindowExecutorTests._run(self, work_dir, self._config(), llm)
+            state = window.load_window_state(str(work_dir))
+            merge, merged = self._merged(work_dir, tmpdir)
+
+        self.assertTrue(result["success"], result)
+        self.assertEqual(len(calls["outline"]), 1)
+        self.assertEqual(result["outline"]["status"], "ok")
+        self.assertEqual(result["outline"]["section_count"], 3)
+        self.assertEqual(result["outline"]["unplaced_sections"], 0)
+        self.assertIn("[S1] " + _sentence(1), calls["outline"][0])
+        self.assertIn(f"[S{self.SENTENCE_COUNT}] ", calls["outline"][0])
+        first_round = calls["rounds"][0]
+        self.assertIn("do not invent headers", first_round)
+        self.assertIn("[S1] 开场 (starts in this window", first_round)
+        self.assertIn("write 测验", first_round)
+        self.assertNotIn("Terminology Guardrails", first_round)
+        # Headings come only from the outline, each once, in order, at its section start.
+        self.assertNotIn("模型自己的标题", merged)
+        self.assertEqual(re.findall(r"^## (.+)$", merged, re.MULTILINE), ["开场", "第二部分", "第三部分"])
+        self.assertTrue(merged.startswith("## 开场"))
+        for start, title in self.SECTIONS[1:]:
+            heading_at = merged.index(f"## {title}")
+            self.assertLess(merged.index(_sentence(start - 2)), heading_at)
+            self.assertGreater(merged.index(_sentence(start + 2)), heading_at)
+        for i in range(1, self.SENTENCE_COUNT + 1):
+            self.assertEqual(merged.count(_sentence(i)), 1, i)
+        self.assertEqual(merge["chapters_inserted"], 3)
+        self.assertEqual(sum(len(p.get("sections", [])) for p in state["paragraphs"]), 3)
+
+    def test_failed_outline_falls_back_to_headings_from_the_rounds(self):
+        llm, calls = self._llm("抱歉，我无法生成大纲。")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            work_dir = WindowExecutorTests._make_work_dir(self, tmpdir)
+            result, _ = WindowExecutorTests._run(self, work_dir, self._config(), llm)
+            _, merged = self._merged(work_dir, tmpdir)
+
+        self.assertTrue(result["success"], result)
+        self.assertEqual(result["outline"]["status"], "failed")
+        self.assertEqual(result["outline"]["error"], "part 1: response has no JSON object")
+        self.assertNotIn("Outline (section headings", calls["rounds"][0])
+        self.assertIn("Put `##` headers on their own line.", calls["rounds"][0])
+        self.assertIn("## 模型自己的标题", merged)
+
+    def test_outline_request_error_falls_back_and_disabled_outline_sends_no_request(self):
+        def llm(**kwargs):
+            prompt = kwargs["messages"][0]["content"]
+            if prompt.startswith("# Transcript Outline"):
+                raise utils.LLMRequestError("provider down", error_type="timeout", retryable=True)
+            return _api_result(_marker_writer()[0](prompt))
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            work_dir = WindowExecutorTests._make_work_dir(self, tmpdir)
+            result, _ = WindowExecutorTests._run(self, work_dir, self._config(), llm)
+        self.assertTrue(result["success"], result)
+        self.assertEqual(result["outline"]["status"], "failed")
+        self.assertIn("provider down", result["outline"]["error"])
+
+        llm, calls = self._llm(_outline_json(self.SECTIONS))
+        with tempfile.TemporaryDirectory() as tmpdir:
+            work_dir = WindowExecutorTests._make_work_dir(self, tmpdir)
+            result, _ = WindowExecutorTests._run(self, work_dir, self._config(window_outline=False), llm)
+        self.assertEqual(calls["outline"], [])
+        self.assertEqual(result["outline"]["status"], "disabled")
+
+    def test_resumed_run_reuses_the_outline_without_repeating_headings(self):
+        writer, _ = _headed_marker_writer()
+        failures = {"round": 0}
+
+        def flaky(prompt: str) -> str:
+            failures["round"] += 1
+            if failures["round"] == 3:
+                raise utils.LLMRequestError("provider down", error_type="timeout", retryable=True)
+            return writer(prompt)
+
+        first_llm, first_calls = self._llm(_outline_json(self.SECTIONS), writer=flaky)
+        second_llm, second_calls = self._llm(_outline_json([(1, "不该出现")]), writer=writer)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            work_dir = WindowExecutorTests._make_work_dir(self, tmpdir)
+            first, _ = WindowExecutorTests._run(self, work_dir, self._config(), first_llm)
+            second, _ = WindowExecutorTests._run(self, work_dir, self._config(), second_llm)
+            _, merged = self._merged(work_dir, tmpdir)
+
+        self.assertEqual(first["status"], "failed")
+        self.assertEqual(len(first_calls["outline"]), 1)
+        self.assertTrue(second["success"], second)
+        self.assertTrue(second["resumed"])
+        self.assertEqual(second_calls["outline"], [])
+        self.assertEqual(re.findall(r"^## (.+)$", merged, re.MULTILINE), ["开场", "第二部分", "第三部分"])
+
+    def test_long_source_is_outlined_in_parts_and_merged(self):
+        count = 120
+
+        def outline_by_part(prompt: str) -> str:
+            numbers = [n for n, _ in _window_lines(prompt.split("## Transcript", 1)[1])]
+            first, last = numbers[0], numbers[-1]
+            middle = (first + last) // 2
+            # Each part repeats the section the previous one ended with, then adds one.
+            title = "开场" if first == 1 else "延续"
+            return _outline_json([(first, title), (middle, f"话题{middle}")])
+
+        prompts = []
+
+        def llm(**kwargs):
+            prompt = kwargs["messages"][0]["content"]
+            if prompt.startswith("# Transcript Outline"):
+                prompts.append(prompt)
+                return _api_result(outline_by_part(prompt))
+            return _api_result(_marker_writer()[0](prompt))
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            work_dir = WindowExecutorTests._make_work_dir(self, tmpdir, count=count)
+            result, _ = WindowExecutorTests._run(self, work_dir, self._config(window_outline_read_tokens=1000), llm)
+            state = window.load_window_state(str(work_dir))
+
+        self.assertTrue(result["success"], result)
+        self.assertGreater(len(prompts), 1)
+        self.assertIn(f"This is part 1 of {len(prompts)}", prompts[0])
+        self.assertIn("from the previous part continues", prompts[1])
+        starts = [s["start"] for s in state["outline"]["sections"]]
+        self.assertEqual(starts, sorted(set(starts)))
+        self.assertEqual(state["outline"]["parts"], len(prompts))
+        self.assertEqual(result["outline"]["status"], "ok")
+
+    def test_chapter_plan_becomes_a_hint_and_is_not_inserted_again_at_merge(self):
+        llm, calls = self._llm(_outline_json([(1, "开场"), (60, "第二章细化")]))
+        with tempfile.TemporaryDirectory() as tmpdir:
+            work_dir = WindowExecutorTests._make_work_dir(self, tmpdir, count=120)
+            (work_dir / "chapter_plan.json").write_text(
+                json.dumps([{"start_chunk": 0, "title": "Opening"}, {"start_chunk": 1, "title": "Chapter Two"}]),
+                encoding="utf-8",
+            )
+            result, _ = WindowExecutorTests._run(self, work_dir, self._config(), llm)
+            state = window.load_window_state(str(work_dir))
+            _, merged = self._merged(work_dir, tmpdir)
+
+        self.assertTrue(result["success"], result)
+        self.assertIn("## Video Chapters", calls["outline"][0])
+        self.assertIn(f"- [S{state['chunk_starts']['1']}] Chapter Two", calls["outline"][0])
+        self.assertEqual(result["outline"]["chapter_hints"], 2)
+        self.assertNotIn("Chapter Two", merged)
+        self.assertEqual(re.findall(r"^## (.+)$", merged, re.MULTILINE), ["开场", "第二章细化"])
+
+    def test_chapters_file_from_chunk_document_maps_to_units_by_cue_time(self):
+        segments = [{"id": i, "text": f"第{i}条字幕说完了。", "start_time": i * 3.0, "end_time": i * 3.0 + 2.5}
+                    for i in range(60)]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            chapters = Path(tmpdir) / "chapters.json"
+            chapters.write_text(json.dumps({"has_chapters": True, "chapters": [
+                {"title": "Intro", "start_time": 0.0}, {"title": "Middle", "start_time": 90.0}]}),
+                encoding="utf-8")
+            document = {"source": {"type": "youtube"}, "workflow": {"mode": "chinese"},
+                        "content": {"text": "".join(s["text"] for s in segments), "preferred_chunk_source": "text"},
+                        "segments": segments}
+            path = Path(tmpdir) / "normalized_document.json"
+            path.write_text(json.dumps(document, ensure_ascii=False), encoding="utf-8")
+            work_dir = Path(tmpdir) / "chunks"
+            with mock.patch("sys.stdout", new_callable=io.StringIO):
+                utils.chunk_document(str(path), str(work_dir), 0, "cleanup_zh", chapters_path=str(chapters))
+            manifest = json.loads((work_dir / "manifest.json").read_text(encoding="utf-8"))
+            offsets: list = []
+            units, chunk_starts, _ = window.build_source_sentences(str(work_dir), {}, unit_offsets=offsets)
+            hints = window.load_chapter_hints(str(work_dir), offsets, chunk_starts)
+
+        self.assertEqual(manifest["chapters_path"], str(chapters.absolute()))
+        self.assertEqual(len(offsets), len(units))
+        # 90s is the start of cue 30, which is unit 31.
+        self.assertEqual(hints, [{"start": 1, "title": "Intro"}, {"start": 31, "title": "Middle"}])
+        self.assertEqual(units[30], "第30条字幕说完了。")
+
+    def test_bilingual_outline_titles_and_terms_carry_into_the_translation(self):
+        def llm(**kwargs):
+            prompt = kwargs["messages"][0]["content"]
+            if prompt.startswith("# Transcript Outline"):
+                self.assertIn('"title_zh"', prompt)
+                return _api_result(json.dumps({
+                    "sections": [{"start": 1, "title": "Opening", "title_zh": "开场"},
+                                 {"start": 16, "title": "Details", "title_zh": "细节"}],
+                    "terms": [{"term": "sentence", "variants": [], "kind": "term", "zh": "句子"}],
+                }))
+            if "Translation-Only" in prompt:
+                self.assertIn("- sentence => 句子", prompt)
+                body = prompt.split("## Input Text", 1)[1]
+                out = []
+                for number, block in re.findall(r"^\[S(\d+)\] (.*?)(?=\n\n|\Z)", body, re.MULTILINE | re.DOTALL)[:2]:
+                    out.append(f"[S{number}] {block.strip()}")
+                    if not block.startswith("#"):
+                        out.append("【译】" + block.strip())
+                out.append("<!--END-->")
+                return _api_result("\n\n".join(out))
+            return _api_result(WindowBilingualTests._structure_writer(prompt))
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source = Path(tmpdir) / "raw.txt"
+            source.write_text(" ".join(f"This is sentence number {i}." for i in range(1, 31)), encoding="utf-8")
+            work_dir = Path(tmpdir) / "chunks"
+            utils.chunk_text(str(source), str(work_dir), 0, "structure_only")
+            config = self._config()
+            structure, _ = WindowExecutorTests._run(self, work_dir, config, llm, prompt_name="structure_only")
+            translate, _ = WindowExecutorTests._run(self, work_dir, config, llm, prompt_name="translate_only",
+                                                    input_key="processed_path")
+            _, merged = self._merged(work_dir, tmpdir)
+
+        self.assertTrue(structure["success"], structure)
+        self.assertTrue(translate["success"], translate)
+        self.assertEqual(re.findall(r"^## (.+)$", merged, re.MULTILINE), ["Opening", "开场", "Details", "细节"])
+        for i in range(1, 31):
+            self.assertEqual(merged.count(f"This is sentence number {i}."), 2, i)

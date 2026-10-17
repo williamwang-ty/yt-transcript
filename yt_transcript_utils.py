@@ -94,6 +94,7 @@ from kernel.long_text import llm as kernel_llm
 from kernel.long_text import agent_cli as kernel_agent_cli
 from kernel.long_text import processing as kernel_processing
 from kernel.long_text import window as kernel_window
+from kernel.long_text import outline as kernel_outline
 from kernel import subtitle_language as kernel_subtitle_language
 
 
@@ -501,6 +502,9 @@ def _default_config_values(config_path: str = "") -> dict:
         "window_write_tokens": kernel_window.DEFAULT_WINDOW_WRITE_TOKENS,
         "window_tail_tokens": kernel_window.DEFAULT_WINDOW_TAIL_TOKENS,
         "window_marker_retries": kernel_window.DEFAULT_WINDOW_MARKER_RETRIES,
+        "window_outline": True,
+        "window_outline_read_tokens": kernel_outline.DEFAULT_OUTLINE_READ_TOKENS,
+        "window_outline_max_terms": kernel_outline.DEFAULT_OUTLINE_MAX_TERMS,
         "chunk_mode": DEFAULT_CHUNK_MODE,
         "chunk_size_override": 0,
         "chunk_tokens_structure_only": TASK_CHUNK_TOKEN_DEFAULTS["structure_only"],
@@ -7710,6 +7714,9 @@ def load_config(config_path: str = None, allow_missing: bool = False) -> dict:
         "window_write_tokens": parse_int_field('window_write_tokens', kernel_window.DEFAULT_WINDOW_WRITE_TOKENS, minimum=100),
         "window_tail_tokens": parse_int_field('window_tail_tokens', kernel_window.DEFAULT_WINDOW_TAIL_TOKENS, minimum=0),
         "window_marker_retries": parse_int_field('window_marker_retries', kernel_window.DEFAULT_WINDOW_MARKER_RETRIES, minimum=0),
+        "window_outline": _parse_bool(config.get('window_outline', True), True),
+        "window_outline_read_tokens": parse_int_field('window_outline_read_tokens', kernel_outline.DEFAULT_OUTLINE_READ_TOKENS, minimum=1000),
+        "window_outline_max_terms": parse_int_field('window_outline_max_terms', kernel_outline.DEFAULT_OUTLINE_MAX_TERMS, minimum=0),
         "chunk_mode": _normalize_chunk_mode(config.get('chunk_mode', DEFAULT_CHUNK_MODE)),
         "chunk_size_override": parse_int_field('chunk_size_override', 0, minimum=0),
         "chunk_tokens_structure_only": chunk_tokens_structure_only,
