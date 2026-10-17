@@ -692,3 +692,8 @@ class WindowCueSplitTests(unittest.TestCase):
         for chunk_id, text in chunks:
             self.assertEqual(chunk_starts[str(chunk_id)], unit_starts[position])
             position += len(re.sub(r"\s+", "", text))
+
+    def test_dot_inside_a_domain_is_not_a_sentence_end(self):
+        # Seen on a real video: "Alibaba.com" split into "Alibaba." and "com...".
+        units = window.split_source_sentences("他们做了Alibaba.com这个网站。后来又做了别的", {}, 120)
+        self.assertEqual(units, ["他们做了Alibaba.com这个网站。", "后来又做了别的"])
