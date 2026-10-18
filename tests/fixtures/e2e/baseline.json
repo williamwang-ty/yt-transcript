@@ -1,0 +1,236 @@
+{
+  "CIatbV3_Rjg": {
+    "status": "ok",
+    "failed_step": "",
+    "error": "",
+    "source": {
+      "src": "youtube",
+      "language": "en",
+      "kind": "manual",
+      "mode": "bilingual",
+      "fallback_used": false,
+      "blocked": []
+    },
+    "plan": {
+      "video_path": "short",
+      "routing_reason": "duration_short_single_pass",
+      "subtitle_quality_band": "excellent",
+      "reroute_recommended": false,
+      "prompts": [
+        "structure_only",
+        "translate_only"
+      ]
+    },
+    "raw_chars": 6539,
+    "llm_runs": [
+      {
+        "prompt": "structure_only",
+        "long_text_mode": "window",
+        "total_chunks": 1,
+        "processed_count": 1,
+        "failed_count": 0
+      },
+      {
+        "prompt": "translate_only",
+        "long_text_mode": "window",
+        "total_chunks": 1,
+        "processed_count": 1,
+        "failed_count": 0
+      }
+    ],
+    "llm_calls": [
+      "window",
+      "translate"
+    ],
+    "verify": {
+      "passed": true,
+      "hard_failures": [],
+      "warnings": [],
+      "checks": {
+        "size_ratio_vs_raw": 1.23,
+        "section_count": 3,
+        "paragraph_count": 41,
+        "total_chars": 8070,
+        "cn_char_ratio": 0.157,
+        "en_char_ratio": 0.628,
+        "bilingual_pairs": 24,
+        "header_density": 0.073,
+        "chunk_seam_warning_count": 0,
+        "glossary_drift_count": 0,
+        "semantic_missing_count": 0
+      }
+    },
+    "output": {
+      "file": "2026-07-31. Why Abraham Lincoln was killed _ Gary Gallagher and Lex Fridman.md",
+      "frontmatter": {
+        "title": "Why Abraham Lincoln was killed | Gary Gallagher and Lex Fridman",
+        "source": "https://www.youtube.com/watch?v=CIatbV3_Rjg",
+        "channel": "Lex Clips",
+        "date": "2026-07-31",
+        "created": "2026-07-31",
+        "bilingual": "true",
+        "duration": "7m",
+        "transcript_source": "YouTube Subtitles"
+      },
+      "headings": [
+        "# Why Abraham Lincoln was killed \\| Gary Gallagher and Lex Fridman",
+        "## Part 1",
+        "## Part 41",
+        "## Part 81"
+      ]
+    }
+  },
+  "E2Edeepgram": {
+    "status": "ok",
+    "failed_step": "",
+    "error": "",
+    "source": {
+      "src": "deepgram",
+      "language": "zh",
+      "kind": "audio",
+      "mode": "chinese"
+    },
+    "plan": {
+      "video_path": "short",
+      "routing_reason": "duration_short_single_pass",
+      "subtitle_quality_band": "",
+      "reroute_recommended": false,
+      "prompts": [
+        "cleanup_zh"
+      ]
+    },
+    "raw_chars": 3036,
+    "llm_runs": [
+      {
+        "prompt": "cleanup_zh",
+        "long_text_mode": "window",
+        "total_chunks": 1,
+        "processed_count": 1,
+        "failed_count": 0
+      }
+    ],
+    "llm_calls": [
+      "window"
+    ],
+    "verify": {
+      "passed": true,
+      "hard_failures": [],
+      "warnings": [
+        "Chinese spacing anomalies detected (223 issue(s), ratio 0.095)",
+        "Chinese punctuation density looks unusually low (density 0.001)"
+      ],
+      "checks": {
+        "size_ratio_vs_raw": 1.11,
+        "section_count": 1,
+        "paragraph_count": 7,
+        "total_chars": 3364,
+        "header_density": 0.143,
+        "chunk_seam_warning_count": 0,
+        "glossary_drift_count": 0,
+        "semantic_missing_count": 0
+      }
+    },
+    "output": {
+      "file": "2026-10-09. Fixture_ E255｜模型越来越强，为什么用户没感觉？再访阿里国际站总裁张阔 (no subtitles).md",
+      "frontmatter": {
+        "title": "Fixture: E255｜模型越来越强，为什么用户没感觉？再访阿里国际站总裁张阔 (no subtitles)",
+        "source": "https://www.youtube.com/watch?v=E2Edeepgram",
+        "channel": "硅谷101播客",
+        "date": "2026-10-09",
+        "created": "2026-10-09",
+        "bilingual": "false",
+        "duration": "8m",
+        "transcript_source": "Deepgram Transcription"
+      },
+      "headings": [
+        "# Fixture: E255｜模型越来越强，为什么用户没感觉？再访阿里国际站总裁张阔 \\(no subtitles\\)",
+        "## 第1部分"
+      ]
+    }
+  },
+  "Fhx_qNS2P8g": {
+    "status": "ok",
+    "failed_step": "",
+    "error": "",
+    "source": {
+      "src": "youtube",
+      "language": "zh-Hans",
+      "kind": "manual",
+      "mode": "chinese",
+      "fallback_used": false,
+      "blocked": []
+    },
+    "plan": {
+      "video_path": "long",
+      "routing_reason": "duration_threshold",
+      "subtitle_quality_band": "excellent",
+      "reroute_recommended": false,
+      "prompts": [
+        "cleanup_zh"
+      ]
+    },
+    "raw_chars": 11070,
+    "llm_runs": [
+      {
+        "prompt": "cleanup_zh",
+        "long_text_mode": "window",
+        "total_chunks": 3,
+        "processed_count": 3,
+        "failed_count": 0
+      }
+    ],
+    "llm_calls": [
+      "outline",
+      "window",
+      "window",
+      "window"
+    ],
+    "verify": {
+      "passed": true,
+      "hard_failures": [],
+      "warnings": [
+        "Possible truncation: last line looks incomplete: \"台每一个平台它的规则多多少少都有点差别然后每个平台因为它的受众和它自己的媒体形式有差异你发布这个内容\"",
+        "Chinese punctuation density looks unusually low (density 0.001)"
+      ],
+      "checks": {
+        "size_ratio_vs_raw": 1.01,
+        "section_count": 3,
+        "paragraph_count": 24,
+        "total_chars": 11203,
+        "header_density": 0.125,
+        "chunk_seam_warning_count": 0,
+        "glossary_drift_count": 0,
+        "semantic_missing_count": 0
+      }
+    },
+    "output": {
+      "file": "2026-10-09. E255｜模型越来越强，为什么用户没感觉？再访阿里国际站总裁张阔.md",
+      "frontmatter": {
+        "title": "E255｜模型越来越强，为什么用户没感觉？再访阿里国际站总裁张阔",
+        "source": "https://www.youtube.com/watch?v=Fhx_qNS2P8g",
+        "channel": "硅谷101播客",
+        "date": "2026-10-09",
+        "created": "2026-10-09",
+        "bilingual": "false",
+        "duration": "46m",
+        "transcript_source": "YouTube Subtitles"
+      },
+      "headings": [
+        "# E255｜模型越来越强，为什么用户没感觉？再访阿里国际站总裁张阔",
+        "## 第1部分",
+        "## 第41部分",
+        "## 第81部分"
+      ]
+    }
+  },
+  "tGVSOK3PNUI": {
+    "status": "unsupported",
+    "failed_step": "",
+    "error": "Spoken language 'ja' is not supported yet; only Chinese and English videos can be transcribed, and no manual Chinese subtitles are available",
+    "source": {},
+    "plan": {},
+    "raw_chars": null,
+    "llm_runs": [],
+    "llm_calls": []
+  }
+}

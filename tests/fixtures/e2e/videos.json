@@ -21,6 +21,13 @@
       "expected_case": "unsupported",
       "case": "unsupported_ja",
       "fixture_cut_minutes": 0
+    },
+    {
+      "id": "E2Edeepgram",
+      "label": "Chinese speech, no subtitles; offline stand-in built from Fhx_qNS2P8g's subtitles (info.json without tracks, Deepgram response synthesized from the cues)",
+      "expected_case": "deepgram",
+      "case": "deepgram_zh",
+      "fixture_cut_minutes": 8
     }
   ]
 }

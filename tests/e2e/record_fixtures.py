@@ -19,6 +19,12 @@ Usage:
 --deepgram-json reuses a response saved by an earlier run instead of paying
 for a new one (a raw response, a chunk cache envelope, or a split-mode file,
 whose first chunk is used).
+
+--offline-deepgram SOURCE_ID needs no network or key: it adds the case
+OFFLINE_DEEPGRAM_ID, a copy of an already recorded video with its subtitle
+tracks removed and a Deepgram-shaped response built from its subtitle file
+(one sentence per cue), so the no-subtitles -> Deepgram path runs on real
+speech text. Use it when a real Deepgram recording is not available.
 """
 
 from __future__ import annotations
@@ -60,6 +66,8 @@ FORMAT_KEYS = ("format_id", "ext", "acodec", "vcodec", "language", "language_pre
                "audio_channels", "abr")
 TRACK_QUERY_KEYS = ("lang", "tlang", "kind")
 WORD_KEYS = ("word", "punctuated_word", "start", "end", "speaker")
+OFFLINE_DEEPGRAM_ID = "E2Edeepgram"
+OFFLINE_DEEPGRAM_MINUTES = 8
 CUE_TIME = re.compile(r"^(\d+):(\d{2}):(\d{2})[.,](\d{3})\s+-->")
 
 
@@ -145,6 +153,53 @@ def cut_deepgram(payload: dict, max_minutes: float) -> dict:
     return payload
 
 
+def cue_seconds(stamp: str) -> float:
+    h, m, rest = stamp.strip().split(":")
+    return int(h) * 3600 + int(m) * 60 + float(rest.replace(",", "."))
+
+
+def deepgram_from_vtt(text: str, language: str) -> dict:
+    """A Deepgram-shaped response with one sentence per cue and five sentences per paragraph."""
+    cues = []
+    for block in re.split(r"\n\s*\n", text.strip()):
+        lines = block.splitlines()
+        timing = next((i for i, line in enumerate(lines) if "-->" in line), None)
+        if timing is None:
+            continue
+        start, end = (cue_seconds(part.split()[0]) for part in lines[timing].split("-->"))
+        body = re.sub(r"<[^>]+>", "", " ".join(lines[timing + 1:])).strip()
+        if language.startswith("zh"):
+            body = re.sub(r"(?<=[^\x00-\x7f]) | (?=[^\x00-\x7f])", "", body)
+        if body and (not cues or cues[-1]["text"] != body):
+            cues.append({"text": body, "start": start, "end": end})
+    cjk = language.startswith("zh")
+    words, paragraphs, utterances = [], [], []
+    for index, cue in enumerate(cues):
+        tokens = list(cue["text"].replace(" ", "")) if cjk else cue["text"].split()
+        step = (cue["end"] - cue["start"]) / max(1, len(tokens))
+        cue_words = [{"word": token, "punctuated_word": token, "start": round(cue["start"] + i * step, 3),
+                      "end": round(cue["start"] + (i + 1) * step, 3), "speaker": 0}
+                     for i, token in enumerate(tokens)]
+        words += cue_words
+        utterances.append({"start": cue["start"], "end": cue["end"], "transcript": cue["text"], "speaker": 0,
+                           "words": []})
+        if index % 5 == 0:
+            paragraphs.append({"speaker": 0, "start": cue["start"], "sentences": []})
+        paragraphs[-1]["sentences"].append({"text": cue["text"], "start": cue["start"], "end": cue["end"]})
+        paragraphs[-1]["end"] = cue["end"]
+    joiner = "" if cjk else " "
+    transcript = joiner.join(cue["text"] for cue in cues)
+    return {
+        "metadata": {"duration": cues[-1]["end"] if cues else 0},
+        "results": {
+            "channels": [{"detected_language": language.split("-")[0], "alternatives": [{
+                "transcript": transcript, "words": words,
+                "paragraphs": {"transcript": transcript, "paragraphs": paragraphs}}]}],
+            "utterances": utterances,
+        },
+    }
+
+
 def load_saved_deepgram(path: str) -> dict:
     data = json.loads(Path(path).read_text(encoding="utf-8"))
     if data.get("format") == utils.DEEPGRAM_CHUNK_CACHE_FORMAT:
@@ -162,6 +217,37 @@ def run_json(args: list[str], env: dict) -> dict:
         raise RuntimeError(f"{' '.join(args[:3])} exited {proc.returncode}: {proc.stderr.strip()[-500:]}")
     out = proc.stdout.strip()
     return json.loads(out[out.find("{"):])
+
+
+def make_offline_deepgram_case(out_dir: Path, source_id: str) -> dict:
+    """Build OFFLINE_DEEPGRAM_ID from a recorded subtitle video; see the module docstring."""
+    source = out_dir / source_id
+    tracks = sorted((source / "subs").glob("*.vtt"))
+    if not (source / "info.json").exists() or not tracks:
+        raise SystemExit(f"record {source_id} with subtitles first")
+    info = json.loads((source / "info.json").read_text(encoding="utf-8"))
+    language = tracks[0].stem
+    info.update(id=OFFLINE_DEEPGRAM_ID, subtitles={}, automatic_captions={}, chapters=None,
+                duration=OFFLINE_DEEPGRAM_MINUTES * 60,
+                title=f"Fixture: {info.get('title', '')} (no subtitles)",
+                webpage_url=f"https://www.youtube.com/watch?v={OFFLINE_DEEPGRAM_ID}")
+    vdir = out_dir / OFFLINE_DEEPGRAM_ID
+    if vdir.exists():
+        shutil.rmtree(vdir)
+    vdir.mkdir(parents=True)
+    (vdir / "info.json").write_text(json.dumps(info, ensure_ascii=False, indent=1) + "\n", encoding="utf-8")
+    payload = cut_deepgram(deepgram_from_vtt(tracks[0].read_text(encoding="utf-8"), language),
+                           OFFLINE_DEEPGRAM_MINUTES)
+    payload["metadata"]["fixture_source"] = f"synthesized from {source_id}/subs/{tracks[0].name}"
+    (vdir / "deepgram.json").write_text(json.dumps(payload, ensure_ascii=False) + "\n", encoding="utf-8")
+    return {
+        "id": OFFLINE_DEEPGRAM_ID,
+        "label": (f"Chinese speech, no subtitles; offline stand-in built from {source_id}'s subtitles "
+                  "(info.json without tracks, Deepgram response synthesized from the cues)"),
+        "expected_case": "deepgram",
+        "case": "deepgram_zh",
+        "fixture_cut_minutes": OFFLINE_DEEPGRAM_MINUTES,
+    }
 
 
 def record(case: dict, out_dir: Path, config: dict, env: dict, saved_deepgram: dict, cookie_args: list[str]) -> dict:
@@ -220,6 +306,8 @@ def main() -> int:
     parser.add_argument("--config", default="", help="config.yaml with deepgram_api_key / yt-dlp cookie settings")
     parser.add_argument("--only", action="append", default=[])
     parser.add_argument("--deepgram-json", action="append", default=[], help="VIDEO_ID=PATH of a saved response")
+    parser.add_argument("--offline-deepgram", default="", metavar="SOURCE_ID",
+                        help=f"Only build the offline {OFFLINE_DEEPGRAM_ID} case from a recorded video")
     args = parser.parse_args()
 
     config = utils.load_config(args.config) if args.config else {}
@@ -235,6 +323,14 @@ def main() -> int:
 
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
+    videos_path = out_dir / "videos.json"
+    if args.offline_deepgram:
+        offline = make_offline_deepgram_case(out_dir, args.offline_deepgram)
+        video_set = json.loads(videos_path.read_text(encoding="utf-8"))
+        video_set["videos"] = [v for v in video_set["videos"] if v["id"] != offline["id"]] + [offline]
+        videos_path.write_text(json.dumps(video_set, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        print(json.dumps({"id": offline["id"], "source": args.offline_deepgram}))
+        return 0
     version = subprocess.run(["yt-dlp", "--version"], capture_output=True, text=True).stdout.strip()
     recorded_at = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     failures = 0
@@ -251,7 +347,11 @@ def main() -> int:
     videos = [{**{k: c[k] for k in ("id", "label", "expected_case", "case")},
                "fixture_cut_minutes": c["max_minutes"]}
               for c in CASES if (out_dir / c["id"] / "info.json").exists()]
-    (out_dir / "videos.json").write_text(json.dumps({
+    # Keep an offline stand-in entry (see --offline-deepgram) across re-recordings.
+    if videos_path.exists():
+        videos += [v for v in json.loads(videos_path.read_text(encoding="utf-8"))["videos"]
+                   if v["id"] == OFFLINE_DEEPGRAM_ID and (out_dir / OFFLINE_DEEPGRAM_ID / "info.json").exists()]
+    videos_path.write_text(json.dumps({
         "description": ("End-to-end fixture set, recorded with tests/e2e/record_fixtures.py "
                         f"(yt-dlp {version}, {recorded_at}). Replayed offline by "
                         "scripts/run_regression.py --fixtures and tests/regression_e2e.py."),

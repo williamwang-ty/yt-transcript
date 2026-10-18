@@ -1,0 +1,482 @@
+{
+ "id": "E2Edeepgram",
+ "title": "Fixture: E255｜模型越来越强，为什么用户没感觉？再访阿里国际站总裁张阔 (no subtitles)",
+ "fulltitle": "E255｜模型越来越强，为什么用户没感觉？再访阿里国际站总裁张阔",
+ "channel": "硅谷101播客",
+ "uploader": "硅谷101播客",
+ "upload_date": "20261009",
+ "duration": 480,
+ "language": null,
+ "webpage_url": "https://www.youtube.com/watch?v=E2Edeepgram",
+ "chapters": null,
+ "subtitles": {},
+ "automatic_captions": {},
+ "formats": [
+  {
+   "format_id": "sb3",
+   "ext": "mhtml",
+   "acodec": "none",
+   "vcodec": "none",
+   "format_note": "storyboard",
+   "abr": 0
+  },
+  {
+   "format_id": "sb2",
+   "ext": "mhtml",
+   "acodec": "none",
+   "vcodec": "none",
+   "format_note": "storyboard",
+   "abr": 0
+  },
+  {
+   "format_id": "sb1",
+   "ext": "mhtml",
+   "acodec": "none",
+   "vcodec": "none",
+   "format_note": "storyboard",
+   "abr": 0
+  },
+  {
+   "format_id": "sb0",
+   "ext": "mhtml",
+   "acodec": "none",
+   "vcodec": "none",
+   "format_note": "storyboard",
+   "abr": 0
+  },
+  {
+   "format_id": "233",
+   "ext": "mp4",
+   "vcodec": "none",
+   "language": null,
+   "format_note": "Default, low",
+   "abr": null
+  },
+  {
+   "format_id": "234",
+   "ext": "mp4",
+   "vcodec": "none",
+   "language": null,
+   "format_note": "Default, high",
+   "abr": null
+  },
+  {
+   "format_id": "139-drc",
+   "ext": "m4a",
+   "acodec": "mp4a.40.5",
+   "vcodec": "none",
+   "language": null,
+   "language_preference": -1,
+   "format_note": "low, DRC",
+   "audio_channels": 2,
+   "abr": 48.784
+  },
+  {
+   "format_id": "249-drc",
+   "ext": "webm",
+   "acodec": "opus",
+   "vcodec": "none",
+   "language": null,
+   "language_preference": -1,
+   "format_note": "low, DRC",
+   "audio_channels": 2,
+   "abr": 50.29
+  },
+  {
+   "format_id": "250-drc",
+   "ext": "webm",
+   "acodec": "opus",
+   "vcodec": "none",
+   "language": null,
+   "language_preference": -1,
+   "format_note": "low, DRC",
+   "audio_channels": 2,
+   "abr": 62.137
+  },
+  {
+   "format_id": "139",
+   "ext": "m4a",
+   "acodec": "mp4a.40.5",
+   "vcodec": "none",
+   "language": null,
+   "language_preference": -1,
+   "format_note": "low",
+   "audio_channels": 2,
+   "abr": 48.784
+  },
+  {
+   "format_id": "249",
+   "ext": "webm",
+   "acodec": "opus",
+   "vcodec": "none",
+   "language": null,
+   "language_preference": -1,
+   "format_note": "low",
+   "audio_channels": 2,
+   "abr": 50.269
+  },
+  {
+   "format_id": "250",
+   "ext": "webm",
+   "acodec": "opus",
+   "vcodec": "none",
+   "language": null,
+   "language_preference": -1,
+   "format_note": "low",
+   "audio_channels": 2,
+   "abr": 61.91
+  },
+  {
+   "format_id": "140-drc",
+   "ext": "m4a",
+   "acodec": "mp4a.40.2",
+   "vcodec": "none",
+   "language": null,
+   "language_preference": -1,
+   "format_note": "medium, DRC",
+   "audio_channels": 2,
+   "abr": 129.473
+  },
+  {
+   "format_id": "251-drc",
+   "ext": "webm",
+   "acodec": "opus",
+   "vcodec": "none",
+   "language": null,
+   "language_preference": -1,
+   "format_note": "medium, DRC",
+   "audio_channels": 2,
+   "abr": 111.11
+  },
+  {
+   "format_id": "140",
+   "ext": "m4a",
+   "acodec": "mp4a.40.2",
+   "vcodec": "none",
+   "language": null,
+   "language_preference": -1,
+   "format_note": "medium",
+   "audio_channels": 2,
+   "abr": 129.473
+  },
+  {
+   "format_id": "251",
+   "ext": "webm",
+   "acodec": "opus",
+   "vcodec": "none",
+   "language": null,
+   "language_preference": -1,
+   "format_note": "medium",
+   "audio_channels": 2,
+   "abr": 110.772
+  },
+  {
+   "format_id": "602",
+   "ext": "mp4",
+   "acodec": "none",
+   "vcodec": "vp09.00.10.08",
+   "abr": 0
+  },
+  {
+   "format_id": "269",
+   "ext": "mp4",
+   "acodec": "none",
+   "vcodec": "avc1.4D400C",
+   "abr": 0
+  },
+  {
+   "format_id": "160",
+   "ext": "mp4",
+   "acodec": "none",
+   "vcodec": "avc1.4D400C",
+   "language": null,
+   "language_preference": -1,
+   "format_note": "144p",
+   "audio_channels": null,
+   "abr": 0
+  },
+  {
+   "format_id": "603",
+   "ext": "mp4",
+   "acodec": "none",
+   "vcodec": "vp09.00.11.08",
+   "abr": 0
+  },
+  {
+   "format_id": "278",
+   "ext": "webm",
+   "acodec": "none",
+   "vcodec": "vp9",
+   "language": null,
+   "language_preference": -1,
+   "format_note": "144p",
+   "audio_channels": null,
+   "abr": 0
+  },
+  {
+   "format_id": "394",
+   "ext": "mp4",
+   "acodec": "none",
+   "vcodec": "av01.0.00M.08",
+   "language": null,
+   "language_preference": -1,
+   "format_note": "144p",
+   "audio_channels": null,
+   "abr": 0
+  },
+  {
+   "format_id": "229",
+   "ext": "mp4",
+   "acodec": "none",
+   "vcodec": "avc1.4D4015",
+   "abr": 0
+  },
+  {
+   "format_id": "133",
+   "ext": "mp4",
+   "acodec": "none",
+   "vcodec": "avc1.4D4015",
+   "language": null,
+   "language_preference": -1,
+   "format_note": "240p",
+   "audio_channels": null,
+   "abr": 0
+  },
+  {
+   "format_id": "604",
+   "ext": "mp4",
+   "acodec": "none",
+   "vcodec": "vp09.00.20.08",
+   "abr": 0
+  },
+  {
+   "format_id": "242",
+   "ext": "webm",
+   "acodec": "none",
+   "vcodec": "vp9",
+   "language": null,
+   "language_preference": -1,
+   "format_note": "240p",
+   "audio_channels": null,
+   "abr": 0
+  },
+  {
+   "format_id": "395",
+   "ext": "mp4",
+   "acodec": "none",
+   "vcodec": "av01.0.00M.08",
+   "language": null,
+   "language_preference": -1,
+   "format_note": "240p",
+   "audio_channels": null,
+   "abr": 0
+  },
+  {
+   "format_id": "230",
+   "ext": "mp4",
+   "acodec": "none",
+   "vcodec": "avc1.4D401E",
+   "abr": 0
+  },
+  {
+   "format_id": "134",
+   "ext": "mp4",
+   "acodec": "none",
+   "vcodec": "avc1.4D401E",
+   "language": null,
+   "language_preference": -1,
+   "format_note": "360p",
+   "audio_channels": null,
+   "abr": 0
+  },
+  {
+   "format_id": "18",
+   "ext": "mp4",
+   "acodec": "mp4a.40.2",
+   "vcodec": "avc1.42001E",
+   "language": null,
+   "language_preference": -1,
+   "format_note": "360p",
+   "audio_channels": 2,
+   "abr": null
+  },
+  {
+   "format_id": "605",
+   "ext": "mp4",
+   "acodec": "none",
+   "vcodec": "vp09.00.21.08",
+   "abr": 0
+  },
+  {
+   "format_id": "243",
+   "ext": "webm",
+   "acodec": "none",
+   "vcodec": "vp9",
+   "language": null,
+   "language_preference": -1,
+   "format_note": "360p",
+   "audio_channels": null,
+   "abr": 0
+  },
+  {
+   "format_id": "396",
+   "ext": "mp4",
+   "acodec": "none",
+   "vcodec": "av01.0.01M.08",
+   "language": null,
+   "language_preference": -1,
+   "format_note": "360p",
+   "audio_channels": null,
+   "abr": 0
+  },
+  {
+   "format_id": "231",
+   "ext": "mp4",
+   "acodec": "none",
+   "vcodec": "avc1.4D401E",
+   "abr": 0
+  },
+  {
+   "format_id": "135",
+   "ext": "mp4",
+   "acodec": "none",
+   "vcodec": "avc1.4D401E",
+   "language": null,
+   "language_preference": -1,
+   "format_note": "480p",
+   "audio_channels": null,
+   "abr": 0
+  },
+  {
+   "format_id": "606",
+   "ext": "mp4",
+   "acodec": "none",
+   "vcodec": "vp09.00.30.08",
+   "abr": 0
+  },
+  {
+   "format_id": "244",
+   "ext": "webm",
+   "acodec": "none",
+   "vcodec": "vp9",
+   "language": null,
+   "language_preference": -1,
+   "format_note": "480p",
+   "audio_channels": null,
+   "abr": 0
+  },
+  {
+   "format_id": "397",
+   "ext": "mp4",
+   "acodec": "none",
+   "vcodec": "av01.0.04M.08",
+   "language": null,
+   "language_preference": -1,
+   "format_note": "480p",
+   "audio_channels": null,
+   "abr": 0
+  },
+  {
+   "format_id": "232",
+   "ext": "mp4",
+   "acodec": "none",
+   "vcodec": "avc1.4D401F",
+   "abr": 0
+  },
+  {
+   "format_id": "136",
+   "ext": "mp4",
+   "acodec": "none",
+   "vcodec": "avc1.4D401F",
+   "language": null,
+   "language_preference": -1,
+   "format_note": "720p",
+   "audio_channels": null,
+   "abr": 0
+  },
+  {
+   "format_id": "609",
+   "ext": "mp4",
+   "acodec": "none",
+   "vcodec": "vp09.00.31.08",
+   "abr": 0
+  },
+  {
+   "format_id": "247",
+   "ext": "webm",
+   "acodec": "none",
+   "vcodec": "vp9",
+   "language": null,
+   "language_preference": -1,
+   "format_note": "720p",
+   "audio_channels": null,
+   "abr": 0
+  },
+  {
+   "format_id": "398",
+   "ext": "mp4",
+   "acodec": "none",
+   "vcodec": "av01.0.05M.08",
+   "language": null,
+   "language_preference": -1,
+   "format_note": "720p",
+   "audio_channels": null,
+   "abr": 0
+  },
+  {
+   "format_id": "270",
+   "ext": "mp4",
+   "acodec": "none",
+   "vcodec": "avc1.640028",
+   "abr": 0
+  },
+  {
+   "format_id": "137",
+   "ext": "mp4",
+   "acodec": "none",
+   "vcodec": "avc1.640028",
+   "language": null,
+   "language_preference": -1,
+   "format_note": "1080p",
+   "audio_channels": null,
+   "abr": 0
+  },
+  {
+   "format_id": "614",
+   "ext": "mp4",
+   "acodec": "none",
+   "vcodec": "vp09.00.40.08",
+   "abr": 0
+  },
+  {
+   "format_id": "248",
+   "ext": "webm",
+   "acodec": "none",
+   "vcodec": "vp9",
+   "language": null,
+   "language_preference": -1,
+   "format_note": "1080p",
+   "audio_channels": null,
+   "abr": 0
+  },
+  {
+   "format_id": "399",
+   "ext": "mp4",
+   "acodec": "none",
+   "vcodec": "av01.0.08M.08",
+   "language": null,
+   "language_preference": -1,
+   "format_note": "1080p",
+   "audio_channels": null,
+   "abr": 0
+  },
+  {
+   "format_id": "616",
+   "ext": "mp4",
+   "acodec": "none",
+   "vcodec": "vp09.00.40.08",
+   "format_note": "Premium",
+   "abr": 0
+  }
+ ]
+}
