@@ -118,6 +118,19 @@ window_tail_tokens: 400
 # much output for the source it claims) before that stretch is processed once
 # with the plain fixed-chunk prompt.
 window_marker_retries: 1
+# Global outline (window mode, cleanup_zh and structure_only): before the
+# first round the whole numbered source goes to the model once and comes back
+# as a short JSON outline (section titles + first unit) and a list of names and
+# terms with their correct spellings. Rounds get the nearby outline lines and
+# the terms found in their window; section headings come only from the outline
+# (written by the model where the topic really starts, else placed by the
+# program). YouTube chapters (from chunk-document --chapters or
+# chapter_plan.json) are given as hints. If the outline fails, rounds place
+# their own headings as before. The source is outlined in parts when it is
+# longer than window_outline_read_tokens; raise it for long-context models.
+window_outline: true
+window_outline_read_tokens: 16000
+window_outline_max_terms: 40
 
 # Chunk planning
 # Default mode is token-aware. Set to "chars" for legacy character chunking.

@@ -26,6 +26,10 @@ Window sizes adapt per round. The write target N starts at
 output/source ratio so that a round reads only a little more than it is
 expected to write, which keeps re-reading low. The last stretch of the source
 is sent whole when one round can finish it.
+
+For prompts that write section headings, a global outline (see `outline.py`)
+is generated before the first round and kept in the state; headings then come
+from it rather than from each round.
 """
 
 from __future__ import annotations
@@ -43,6 +47,7 @@ from ..task_runtime import runtime as kernel_runtime
 from ..task_runtime import state as kernel_state
 from . import agent_cli as kernel_agent_cli
 from . import glossary as kernel_glossary
+from . import outline as kernel_outline
 
 LONG_TEXT_MODES = ("chunks", "window")
 DEFAULT_LONG_TEXT_MODE = "chunks"
@@ -115,9 +120,16 @@ The input below is one window of a longer transcript. Every source {unit} starts
 - {write_note}
 - Keep every [S<n>] tag in the output: write it right before the text that comes from that source {unit}, even in the middle of a sentence or paragraph. Do not add, drop or reorder tags, and cover the {units} in order without skipping any.
 - The tags are bookkeeping only; source {units} may start mid-sentence. Break paragraphs and place headers by meaning, never just because a tag starts there.
-- Separate paragraphs with a blank line, and keep them as short as the task asks: split a long passage into several paragraphs rather than one block. Put `##` headers on their own line.{task_note}
+- Separate paragraphs with a blank line, and keep them as short as the task asks: split a long passage into several paragraphs rather than one block.{header_note}{task_note}
 - When you stop, end the output with a line <!--END--> after the last complete paragraph.
 - Output only the processed text, the tags and that end line."""
+
+HEADER_NOTE = " Put `##` headers on their own line."
+OUTLINE_HEADER_NOTE = (
+    " Section headings come from the Outline block below, not from you: do not invent headers, even if the task "
+    "asks for them. Where a section the outline lists in this window begins, start a new paragraph and put that "
+    "section's `## ` title line, exactly as given, before it; write no other `#` lines."
+)
 
 TASK_PROTOCOL_NOTES = {
     # Window rounds see many sentences at once and tend to merge a whole
@@ -272,6 +284,7 @@ def load_cue_stream(work_dir: str) -> dict | None:
 
     parts: list[str] = []
     pauses: dict[int, float] = {}
+    starts: list[tuple[int, float]] = []
     offset = 0
     previous_end = None
     for segment in segments:
@@ -286,12 +299,14 @@ def load_cue_stream(work_dir: str) -> dict | None:
             if isinstance(start, (int, float)) and isinstance(previous_end, (int, float)):
                 pause = max(0.0, float(start) - float(previous_end))
             pauses[offset] = round(pause, 1)
+        if isinstance(start, (int, float)):
+            starts.append((offset, float(start)))
         parts.append(text)
         offset += len(text)
         previous_end = end if isinstance(end, (int, float)) else None
     if not pauses:
         return None
-    return {"text": "".join(parts), "pauses": pauses}
+    return {"text": "".join(parts), "pauses": pauses, "starts": starts}
 
 
 def _new_split_report() -> dict:
@@ -405,8 +420,8 @@ def split_source_sentences(text: str, config: dict | None = None,
 
 
 def build_source_sentences(work_dir: str, config: dict | None = None,
-                           max_sentence_tokens: int = DEFAULT_WINDOW_SENTENCE_MAX_TOKENS
-                           ) -> tuple[list[str], dict, dict]:
+                           max_sentence_tokens: int = DEFAULT_WINDOW_SENTENCE_MAX_TOKENS,
+                           unit_offsets: list | None = None) -> tuple[list[str], dict, dict]:
     """Number the raw source; also return each raw chunk's first unit number and a split report.
 
     Each chunk is located in the subtitle cues (ignoring whitespace) so long
@@ -415,6 +430,10 @@ def build_source_sentences(work_dir: str, config: dict | None = None,
     boundary, except one the chunker put inside a cue: those chunks are
     joined and cut again at cue ends, and the later chunk starts at the unit
     holding its first character.
+
+    When `unit_offsets` is given, it is filled with each unit's start in the
+    whitespace-free cue text (None for units of an unaligned chunk), for
+    mapping chapter times onto units.
     """
     report = _new_split_report()
     cues = load_cue_stream(work_dir)
@@ -428,7 +447,7 @@ def build_source_sentences(work_dir: str, config: dict | None = None,
         if found < 0:
             if cues:
                 report["unaligned_chunks"] += 1
-            runs.append({"members": [(chunk_id, text, 0)], "pauses": None})
+            runs.append({"members": [(chunk_id, text, 0)], "pauses": None, "start": None})
             continue
         report["aligned_chunks"] += 1
         end = found + len(compact)
@@ -441,7 +460,7 @@ def build_source_sentences(work_dir: str, config: dict | None = None,
             run["pauses"].update({offset + position: pause for position, pause in pauses.items()})
         else:
             offset = 0
-            run = {"members": [(chunk_id, text, 0)], "pauses": pauses}
+            run = {"members": [(chunk_id, text, 0)], "pauses": pauses, "start": found}
             runs.append(run)
         run["length"] = offset + len(compact)
         run["end"] = end
@@ -461,6 +480,8 @@ def build_source_sentences(work_dir: str, config: dict | None = None,
             continue
         unit_ends, total = [], 0
         for unit in run_units:
+            if unit_offsets is not None:
+                unit_offsets.append(None if run["start"] is None else run["start"] + total)
             total += len(re.sub(r"\s+", "", unit))
             unit_ends.append(total)
         for chunk_id, _, offset in members:
@@ -559,11 +580,13 @@ def number_sentences(sentences: list[str], start: int, end: int, separator: str 
 def build_window_prompt(prompt_template: str, *, sentences: list[str], cursor: int, window_end: int,
                         tail_text: str = "", write_tokens: int = DEFAULT_WINDOW_WRITE_TOKENS,
                         write_chars: int = 0, glossary_text: str = "", prompt_name: str = "",
-                        unit: str = "sentence", finish: bool = False) -> str:
+                        unit: str = "sentence", finish: bool = False, outline_text: str = "") -> str:
     """Assemble one window request from the task prompt and the window protocol.
 
     `finish=True` means the window holds the rest of the transcript and the
     write target was sized to cover it, so the model is asked to finish.
+    With `outline_text`, headings come from the global outline: the model
+    gets the outline lines for this window and may only write those titles.
     """
     import yt_transcript_utils as utils
 
@@ -590,9 +613,12 @@ def build_window_prompt(prompt_template: str, *, sentences: list[str], cursor: i
         first=cursor + 1,
         done_note=done_note,
         write_note=write_note,
+        header_note=OUTLINE_HEADER_NOTE if outline_text else HEADER_NOTE,
         task_note=TASK_PROTOCOL_NOTES.get(prompt_name, ""),
     )
     context = protocol
+    if outline_text:
+        context += "\n\n" + outline_text
     if tail_text.strip():
         context += "\n\n" + ALREADY_WRITTEN_BLOCK.format(tail=tail_text.strip())
     separator = "\n\n" if unit == "paragraph" else "\n"
@@ -868,22 +894,43 @@ def written_tail(out_dir: Path, state: dict, tail_tokens: int, config: dict | No
 
 def _commit_paragraphs(out_dir: Path, state: dict, paragraphs: list[dict], sentences: list[str],
                        *, mode: str, round_index: int) -> None:
-    """Write paragraphs to disk, then record them and the new cursor in the state."""
+    """Write paragraphs to disk, then record them and the new cursor in the state.
+
+    When the run has an outline, only headings for the outline's sections
+    are kept (the model's, where it wrote one near the section start, else
+    the program's); see `outline.place_headings`. Heading text is not
+    counted in `output_chars`.
+    """
+    outline = state.get("outline") or {}
+    use_outline = outline.get("status") == "ok" and _stage(state.get("input_key", RAW_STAGE)) == RAW_STAGE
+    sections = outline.get("sections", []) if use_outline else []
     for paragraph in paragraphs:
         paragraph_id = len(state["paragraphs"]) + 1
         file_name = f"out_{paragraph_id:05d}.md"
-        kernel_state.atomic_write_text(out_dir / file_name, paragraph["text"] + "\n")
-        source_chars = sum(len(sentences[i]) for i in range(paragraph["start"], paragraph["end"] + 1))
-        state["paragraphs"].append({
+        text = paragraph["text"]
+        placed = []
+        if sections:
+            content, placed, outline["next_section"] = kernel_outline.place_headings(
+                sections, int(outline.get("next_section", 0) or 0), text, paragraph["start"] + 1, paragraph["end"] + 1)
+            text = kernel_outline.strip_headers(content)
+        elif use_outline:
+            content = text = kernel_outline.strip_headers(text)
+        else:
+            content = text
+        entry = {
             "id": paragraph_id,
             "start": paragraph["start"] + 1,
             "end": paragraph["end"] + 1,
             "file": file_name,
             "mode": mode,
             "round": round_index,
-            "source_chars": source_chars,
-            "output_chars": len(paragraph["text"]),
-        })
+            "source_chars": sum(len(sentences[i]) for i in range(paragraph["start"], paragraph["end"] + 1)),
+            "output_chars": len(text),
+        }
+        if placed:
+            entry["sections"] = placed
+        kernel_state.atomic_write_text(out_dir / file_name, content.strip() + "\n")
+        state["paragraphs"].append(entry)
         state["cursor"] = paragraph["end"] + 1
     _write_state(out_dir, state)
 
@@ -960,11 +1007,18 @@ def merged_window_text(work_dir: str, state: dict | None = None,
 
     Markers are never stored in paragraph files. `chapter_starts` maps a raw
     chunk id to its chapter list (from chapter_plan.json); a chapter's heading
-    goes before the paragraph that covers the chunk's first unit.
+    goes before the paragraph that covers the chunk's first unit. When the
+    raw stage had an outline, its headings are already in the paragraph
+    files and `chapter_starts` is ignored.
     Returns the body and the number of chapters inserted.
     """
     state = state if state is not None else load_window_state(work_dir)
     out_dir = stage_dir_for(work_dir, state.get("input_key", RAW_STAGE))
+    raw_state = state if _stage(state.get("input_key", RAW_STAGE)) == RAW_STAGE else \
+        load_window_state(work_dir, RAW_STAGE)
+    if (raw_state.get("outline") or {}).get("status") == "ok":
+        # The outline already placed the headings, with the video chapters as hints.
+        chapter_starts = None
     pending = []
     for chunk_id, chapters in (chapter_starts or {}).items():
         start = (state.get("chunk_starts") or {}).get(str(chunk_id))
@@ -983,6 +1037,7 @@ def merged_window_text(work_dir: str, state: dict | None = None,
                 if headings:
                     parts.append("\n".join(f"## {heading}" for heading in headings))
                     inserted += 1
+        inserted += len(entry.get("sections", []))
         text = _paragraph_text(out_dir, entry)
         if text:
             parts.append(text)
@@ -1030,13 +1085,19 @@ def window_params(prompt_name: str, config: dict) -> dict:
 
 def run_window_rounds(work_dir: str, prompt_name: str, prompt_template: str, *, config: dict,
                       call_llm, state: dict, sentences: list[str], glossary_payload: dict | None = None,
-                      should_stop=None, log=None, input_key: str = RAW_STAGE) -> dict:
+                      should_stop=None, log=None, input_key: str = RAW_STAGE,
+                      outline_terms: list[dict] | None = None) -> dict:
     """Advance the cursor until the source is done, a stop is requested, or the LLM fails.
 
     `call_llm(prompt_text, max_output_tokens)` returns the backend result dict
     (`text`, optional `finish_reason`, `latency_ms`, `request_url`) and raises
     `LLMRequestError` after its own retries. `should_stop()` returns a status
     string (`aborted` / `paused`) to stop at a round boundary, or "".
+
+    When the state holds a usable outline (raw stage), each round gets the
+    outline lines for its window and the outline's terms instead of the
+    heuristic glossary, and only the outline's headings are kept.
+    `outline_terms` passes the raw stage's terms to the translation stage.
     """
     import yt_transcript_utils as utils
 
@@ -1061,6 +1122,17 @@ def run_window_rounds(work_dir: str, prompt_name: str, prompt_template: str, *, 
         return sum(unit_tokens(i) for i in range(start, end))
 
     max_glossary_terms = max(0, utils._parse_int_min(config.get("chunk_glossary_max_prompt_terms"), 8, 0))
+    outline = state.get("outline") or {}
+    sections = outline.get("sections", []) if outline.get("status") == "ok" and unit == "sentence" else []
+    if outline.get("status") == "ok" and unit == "sentence":
+        outline_terms = outline.get("terms", [])
+    translation_terms = unit == "paragraph"
+
+    def round_glossary(source_text: str) -> str:
+        if outline_terms:
+            return kernel_outline.round_terms_text(outline_terms, source_text, translation=translation_terms)
+        return _glossary_text(glossary_payload, source_text, max_glossary_terms)
+
     marker_failures = 0
     total = len(sentences)
 
@@ -1080,13 +1152,13 @@ def run_window_rounds(work_dir: str, prompt_name: str, prompt_template: str, *, 
         if use_fallback:
             end = build_read_window(sentences, cursor, params["fallback_chunk_tokens"], estimate)
             chunk_text = joiner.join(sentences[cursor:end])
-            glossary_text = _glossary_text(glossary_payload, chunk_text, max_glossary_terms)
+            glossary_text = round_glossary(chunk_text)
             prompt = build_fallback_prompt(prompt_template, chunk_text, tail_text=tail_text,
                                            glossary_text=glossary_text)
         else:
             end = total if plan["finish"] else build_read_window(sentences, cursor, plan["read_tokens"], estimate)
             window_text = joiner.join(sentences[cursor:end])
-            glossary_text = _glossary_text(glossary_payload, window_text, max_glossary_terms)
+            glossary_text = round_glossary(window_text)
             chars_per_token = len(window_text) / max(1, span_tokens(cursor, end))
             prompt = build_window_prompt(
                 prompt_template,
@@ -1100,6 +1172,8 @@ def run_window_rounds(work_dir: str, prompt_name: str, prompt_template: str, *, 
                 prompt_name=prompt_name,
                 unit=unit,
                 finish=plan["finish"] and end >= total,
+                outline_text=kernel_outline.round_outline_text(
+                    sections, cursor, end, int(outline.get("next_section", 0) or 0)) if sections else "",
             )
 
         record = {
@@ -1208,6 +1282,9 @@ def run_window_rounds(work_dir: str, prompt_name: str, prompt_template: str, *, 
                            round_index=round_index)
         log(f"ℹ️ Window round {round_index}: S{cursor + 1}-S{parsed['next_cursor']} done ({total} total)")
 
+    if sections:
+        # Sections starting too close to the end to get a paragraph of their own.
+        outline["unplaced_sections"] = len(sections) - int(outline.get("next_section", 0) or 0)
     state["status"] = "done"
     _write_state(out_dir, state)
     return {"status": "done"}
@@ -1243,6 +1320,110 @@ def _prepare_state(work_dir: str, prompt_name: str, input_key: str, sentences: l
     return _new_state(prompt_name, input_key, sentences, params), False
 
 
+def load_chapter_hints(work_dir: str, unit_offsets: list, chunk_starts: dict) -> list[dict]:
+    """YouTube chapters as outline hints, mapped onto source units.
+
+    Uses the chapters file recorded in the manifest (mapped through the
+    subtitle cue times), else chapter_plan.json (at each start chunk's first unit).
+    """
+    work_path = Path(work_dir)
+    chapters_value = str(_read_manifest(work_dir).get("chapters_path", "") or "").strip()
+    cues = load_cue_stream(work_dir)
+    if chapters_value and cues and cues.get("starts"):
+        try:
+            payload = json.loads(Path(chapters_value).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            payload = None
+        chapters = payload.get("chapters", []) if isinstance(payload, dict) else payload
+        if isinstance(chapters, list):
+            hints = kernel_outline.hints_from_times([c for c in chapters if isinstance(c, dict)],
+                                                    cues["starts"], unit_offsets)
+            if hints:
+                return hints
+    try:
+        plan = json.loads((work_path / "chapter_plan.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    return kernel_outline.hints_from_chunk_plan(plan, chunk_starts)
+
+
+def _prepare_outline(work_dir: str, prompt_name: str, state: dict, sentences: list[str], config: dict,
+                     params: dict, call_llm, *, unit_offsets: list, chunk_starts: dict, log) -> None:
+    """Generate the run's outline into `state["outline"]`, or keep the one it already has.
+
+    A run that already wrote output keeps whatever outline it started with,
+    so headings stay consistent across a resume; an outline that failed
+    before any output is retried. No outline is made when one round can
+    process the whole source, since that round sees all of it.
+    """
+    import yt_transcript_utils as utils
+
+    if not kernel_outline.outline_supported(prompt_name):
+        return
+    existing = state.get("outline")
+    if existing and (existing.get("status") == "ok" or state.get("paragraphs")):
+        return
+    if state.get("paragraphs"):
+        state["outline"] = {"status": "skipped", "error": "run started before the outline existed"}
+        return
+    if not kernel_outline.outline_enabled(config):
+        state["outline"] = {"status": "disabled"}
+        return
+    total_tokens = sum(utils._estimate_tokens(sentence, "tokens", config) for sentence in sentences)
+    if plan_round(initial_sizing(state["params"]), state["params"], total_tokens)["finish"]:
+        # One round reads the whole source anyway; an outline would only add a request.
+        state["outline"] = {"status": "skipped", "error": "the whole source fits in one round"}
+        return
+
+    hints = load_chapter_hints(work_dir, unit_offsets, chunk_starts)
+    log(f"ℹ️ Building the outline and term list ({len(sentences)} units"
+        f"{f', {len(hints)} video chapters as hints' if hints else ''}).")
+
+    def estimate(text: str) -> int:
+        return utils._estimate_tokens(text, "tokens", config)
+
+    record = kernel_outline.generate_outline(
+        sentences,
+        prompt_name=prompt_name,
+        call_llm=call_llm,
+        max_output_tokens=params["max_output_tokens"],
+        estimate=estimate,
+        read_tokens=utils._parse_int_min(config.get("window_outline_read_tokens"),
+                                         kernel_outline.DEFAULT_OUTLINE_READ_TOKENS, 1000),
+        max_terms=utils._parse_int_min(config.get("window_outline_max_terms"),
+                                       kernel_outline.DEFAULT_OUTLINE_MAX_TERMS, 0),
+        hints=hints,
+        log=log,
+    )
+    record["generated_at"] = _now_iso()
+    record["next_section"] = 0
+    state["outline"] = record
+    if record["status"] == "ok":
+        log(f"ℹ️ Outline: {len(record['sections'])} sections, {len(record['terms'])} terms.")
+    else:
+        log(f"⚠️ Outline failed ({record['error']}); the rounds will place their own headings.")
+
+
+def outline_summary(state: dict) -> dict:
+    outline = state.get("outline") or {}
+    if not outline:
+        return {"status": "none"}
+    summary = {"status": outline.get("status", "")}
+    if outline.get("status") in {"ok", "failed"}:
+        summary.update({
+            "section_count": len(outline.get("sections", [])),
+            "term_count": len(outline.get("terms", [])),
+            "parts": outline.get("parts", 0),
+            "chapter_hints": len(outline.get("hints", [])),
+            "requests": len(outline.get("requests", [])),
+        })
+    if outline.get("status") == "ok" and state.get("status") == "done":
+        summary["unplaced_sections"] = int(outline.get("unplaced_sections", 0) or 0)
+    if outline.get("error"):
+        summary["error"] = outline["error"]
+    return summary
+
+
 def _build_result(work_dir: str, state: dict, outcome: dict, *, prompt_name: str, input_key: str,
                   request_url: str, backend_decision: dict, warnings: list, resumed: bool) -> dict:
     status = outcome.get("status", state.get("status", ""))
@@ -1267,6 +1448,7 @@ def _build_result(work_dir: str, state: dict, outcome: dict, *, prompt_name: str
         "fallback_rounds": sum(1 for r in rounds if r.get("result") == "fallback"),
         "coverage": coverage,
         "efficiency": efficiency_report(state),
+        "outline": outline_summary(state),
         "params": state.get("params", {}),
         "sizing": state.get("sizing", {}),
         "request_url": request_url,
@@ -1320,12 +1502,14 @@ def _process_window_impl(work_dir: str, prompt_name: str, extra_instruction: str
 
     config = utils._load_optional_config(config_path) if dry_run else utils.load_config(config_path)
     params = window_params(prompt_name, config)
+    unit_offsets: list = []
     if stage == PROCESSED_STAGE:
         sentences, chunk_starts = build_processed_units(work_dir, config)
         unit_split = {}
         missing = "no finished raw-stage window output to process"
     else:
-        sentences, chunk_starts, unit_split = build_source_sentences(work_dir, config, params["sentence_max_tokens"])
+        sentences, chunk_starts, unit_split = build_source_sentences(
+            work_dir, config, params["sentence_max_tokens"], unit_offsets)
         missing = "no source text found in the raw chunks"
     if not sentences:
         print(f"Error: {missing} in {work_dir}", file=sys.stderr)
@@ -1439,6 +1623,16 @@ def _process_window_impl(work_dir: str, prompt_name: str, extra_instruction: str
     if resumed and state.get("cursor", 0):
         log(f"ℹ️ Resuming the window run at S{state['cursor'] + 1} of {len(sentences)}.")
 
+    outline_terms = None
+    if stage == RAW_STAGE:
+        _prepare_outline(work_dir, prompt_name, state, sentences, config, params, call_llm,
+                         unit_offsets=unit_offsets, chunk_starts=chunk_starts, log=log)
+        _write_state(out_dir, state)
+    else:
+        raw_outline = load_window_state(work_dir, RAW_STAGE).get("outline") or {}
+        if raw_outline.get("status") == "ok":
+            outline_terms = raw_outline.get("terms") or None
+
     outcome = run_window_rounds(
         work_dir,
         prompt_name,
@@ -1451,6 +1645,7 @@ def _process_window_impl(work_dir: str, prompt_name: str, extra_instruction: str
         should_stop=should_stop,
         log=log,
         input_key=stage,
+        outline_terms=outline_terms,
     )
     return _build_result(work_dir, state, outcome, prompt_name=prompt_name, input_key=stage,
                          request_url=request_url, backend_decision=backend_decision,

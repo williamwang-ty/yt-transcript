@@ -1,7 +1,24 @@
 """Public chunking commands for text, segments, and normalized documents."""
 
+import json
 import sys
 from pathlib import Path
+
+
+def _record_chapters_path(output_dir: str, chapters_path: str) -> None:
+    """Remember the chapters file in the manifest, so the window outline can use the chapters as hints."""
+    from ..task_runtime import state as kernel_state
+
+    if not chapters_path:
+        return
+    manifest_path = Path(output_dir) / "manifest.json"
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return
+    if isinstance(manifest, dict):
+        manifest["chapters_path"] = str(Path(chapters_path).absolute())
+        kernel_state.write_manifest(manifest_path, manifest)
 
 
 def chunk_text(input_path: str, output_dir: str, chunk_size: int = 0,
@@ -39,7 +56,7 @@ def chunk_segments(segments_path: str, output_dir: str, chunk_size: int = 0,
     import yt_transcript_utils as utils
 
     metadata, segments = utils._load_segment_document(segments_path)
-    return utils._chunk_segments_payload(
+    result = utils._chunk_segments_payload(
         metadata,
         segments,
         segments_path,
@@ -52,6 +69,8 @@ def chunk_segments(segments_path: str, output_dir: str, chunk_size: int = 0,
         source_kind="segments",
         source_segments_file=str(Path(segments_path).absolute()),
     )
+    _record_chapters_path(output_dir, chapters_path)
+    return result
 
 
 def chunk_document(normalized_document_path: str, output_dir: str, chunk_size: int = 0,
@@ -123,4 +142,5 @@ def chunk_document(normalized_document_path: str, output_dir: str, chunk_size: i
         )
 
     result["preferred_source_kind"] = preferred_source or ("segments" if has_segments else "text")
+    _record_chapters_path(output_dir, chapters_path)
     return result
