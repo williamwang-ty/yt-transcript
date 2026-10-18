@@ -39,7 +39,6 @@ Read from JSON:
 - `video_path`
 - `requires_llm_preflight`
 - `operations`
-- `replan_contract`
 - `outputs`
 - `source_route_reason`
 - `reroute_recommended`
@@ -189,9 +188,6 @@ This step is optional because `process-chunks` now runs the same resume repair a
   - `prompt=structure_only` for bilingual English-source output
 - Read `PLAN_JSON.chunking.driver`; when it is `chunk-document`, prefer the canonical normalized-document chunking path above instead of re-deriving raw-text vs timed-segment branching manually
 - If its `extra_instruction` is non-empty, pass it through `--extra-instruction`
-- Every chunk operation includes an `execution` object; follow it instead of re-deriving replan behavior in prose
-- When `execution.supports_auto_replan=true`, include every flag in `execution.recommended_cli_flags`
-- When `execution.on_replan_required=stop_and_review`, do not call `replan-remaining`; STOP and surface the manifest/runtime state for manual review
 - When the raw-stage prompt is `cleanup_zh`, `process-chunks` now auto-builds a transcript glossary if `/tmp/${VIDEO_ID}_chunks/glossary.json` does not exist yet; you may still run `build-glossary --mode transcript` explicitly beforehand if you want to inspect the terms first
 
 Canonical command shape:
@@ -201,8 +197,7 @@ Canonical command shape:
   python3 <skill-root>/yt_transcript_utils.py process-chunks \
       /tmp/${VIDEO_ID}_chunks \
       --prompt <RAW_STAGE_PROMPT> \
-      --agent-cli <your-agent> \
-      --auto-replan
+      --agent-cli <your-agent>
   ```
 - Processed translation stage (when present):
   ```bash
@@ -213,13 +208,9 @@ Canonical command shape:
       --input-key processed_path
   ```
 
-Sliding-window mode (`long_text_mode: window` in config.yaml, experimental): the commands above stay the same. For the `cleanup_zh` / `quick_cleanup` / `structure_only` raw stage, `process-chunks` (with or without `--auto-replan`) runs the window executor instead of the fixed chunks: it reads the source from the chunk files, writes paragraphs to `<work_dir>/window/`, and JSON reports `long_text_mode=window`, `status`, `coverage` and `efficiency`. The `translate_only --input-key processed_path` stage then also runs as a window over that output (into `<work_dir>/window/processed/`); if the raw stage used fixed chunks, translation does too. Re-running the same command resumes at the cursor. Before the first `cleanup_zh` / `structure_only` window round, the executor asks the model once for a global outline (section titles + start units, and a name/term list); the rounds then use those titles instead of inventing headings. Pass `--chapters /tmp/${VIDEO_ID}_chapters.json` to `chunk-document` (as above) so YouTube chapters are used as outline hints even on text-first Chinese paths. `merge-content` merges the latest window stage and refuses an unfinished window run; `chapter_plan.json` headings are only inserted when the run had no outline (`window_outline: false`, or the outline failed).
+Sliding-window mode (`long_text_mode: window`, the default): for the `cleanup_zh` / `quick_cleanup` / `structure_only` raw stage, `process-chunks` runs the window executor instead of fixed chunks: it reads the source from the chunk files, writes paragraphs to `<work_dir>/window/`, and JSON reports `long_text_mode=window`, `status`, `coverage` and `efficiency`. The `translate_only --input-key processed_path` stage then also runs as a window over that output (into `<work_dir>/window/processed/`); if the raw stage used fixed chunks, translation does too. Re-running the same command resumes at the cursor. Before the first `cleanup_zh` / `structure_only` window round, the executor asks the model once for a global outline (section titles + start units, and a name/term list); the rounds then use those titles instead of inventing headings. Pass `--chapters /tmp/${VIDEO_ID}_chapters.json` to `chunk-document` (as above) so YouTube chapters are used as outline hints even on text-first Chinese paths. `merge-content` merges the latest window stage and refuses an unfinished window run; `chapter_plan.json` headings are only inserted when the run had no outline (`window_outline: false`, or the outline failed).
 
-Current contract:
-
-- `input_key=raw_path` → use `--auto-replan`
-- Existing `chapter_plan.json` mappings remain valid after raw-path replans because `replan-remaining` remaps chapter start chunks onto the replacement plan
-- `input_key=processed_path` → auto-replan is unsupported; if JSON reports `replan_required=true`, STOP and review before continuing
+Fixed chunks (`long_text_mode: chunks`, kept as a legacy fallback): the same commands process one chunk file at a time. A work dir that already has finished fixed chunks keeps resuming that way even in window mode. If `process-chunks` reports `status=aborted` (for example after repeated consecutive timeouts), STOP and surface the manifest/runtime state before re-running it.
 
 ### Step 5: Merge
 
