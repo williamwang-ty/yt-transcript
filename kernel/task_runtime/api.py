@@ -13,7 +13,6 @@ from . import contracts as kernel_contracts
 from . import lifecycle as kernel_lifecycle
 from . import policy as kernel_policy
 from . import recovery as kernel_recovery
-from . import runtime as kernel_runtime
 from . import state as kernel_state
 
 

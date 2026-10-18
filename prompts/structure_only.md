@@ -21,7 +21,7 @@ You are a professional transcript editor. The following is raw transcript text t
 
 **Do NOT**:
 - Translate content
-- Fix speech recognition errors
+- Fix speech recognition errors, except names and terms whose spelling a Terminology section below gives
 - Remove or summarize content
 - Add speaker labels
 

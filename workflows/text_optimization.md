@@ -167,7 +167,7 @@ Notes:
 
 - `build-chapter-plan` requires each chunk in `manifest.json` to have `start_time` / `end_time`; this works when `chunk-document` selected timed segments, or when you used `chunk-segments` directly. If the plan resolved to text-first chunking (including Chinese YouTube-subtitle long paths), it will STOP with an error.
 - If you cannot produce timed chunks, continue without `chapter_plan.json`; `merge-content` still succeeds, just without injected YouTube chapter headers.
-- If you must have headings but lack timing, generate a best-effort plan by summarizing chunks and creating `chapter_plan.json` manually (this is not a true YouTube-chapter mapping).
+- If you must have headings but lack timing, generate a best-effort plan by summarizing chunks and creating `chapter_plan.json` manually (this is not a true YouTube-chapter mapping). Run any `process-chunks --prompt summarize` for this on a copy of the work dir: it writes fixed-chunk outputs, and a work dir with finished fixed chunks stays on fixed chunks for the real cleanup stage.
 
 ### Step 4: Process Chunks
 
@@ -181,14 +181,14 @@ python3 <skill-root>/yt_transcript_utils.py prepare-resume \
     --prompt <RAW_STAGE_PROMPT>
 ```
 
-This step is optional because `process-chunks` now runs the same resume repair automatically before execution starts.
+This step is optional and only applies to fixed chunks (`long_text_mode: chunks`): `process-chunks` runs the same resume repair automatically before execution starts. A window run needs no repair; re-running `process-chunks` resumes at the cursor saved in `<work_dir>/window/state.json`.
 
 - The first chunk operation is the monolingual cleanup / structuring stage:
   - `prompt=cleanup_zh` for Chinese monolingual output
   - `prompt=structure_only` for bilingual English-source output
 - Read `PLAN_JSON.chunking.driver`; when it is `chunk-document`, prefer the canonical normalized-document chunking path above instead of re-deriving raw-text vs timed-segment branching manually
 - If its `extra_instruction` is non-empty, pass it through `--extra-instruction`
-- When the raw-stage prompt is `cleanup_zh`, `process-chunks` now auto-builds a transcript glossary if `/tmp/${VIDEO_ID}_chunks/glossary.json` does not exist yet; you may still run `build-glossary --mode transcript` explicitly beforehand if you want to inspect the terms first
+- When the raw-stage prompt is `cleanup_zh`, `process-chunks` now auto-builds a transcript glossary if `/tmp/${VIDEO_ID}_chunks/glossary.json` does not exist yet; you may still run `build-glossary --mode transcript` explicitly beforehand if you want to inspect the terms first. In window mode these terms reach the rounds only when there is no outline; with an outline, its own term list is used, and `glossary.json` still feeds the `verify-quality` glossary checks
 
 Canonical command shape:
 
@@ -208,7 +208,7 @@ Canonical command shape:
       --input-key processed_path
   ```
 
-Sliding-window mode (`long_text_mode: window`, the default): for the `cleanup_zh` / `quick_cleanup` / `structure_only` raw stage, `process-chunks` runs the window executor instead of fixed chunks: it reads the source from the chunk files, writes paragraphs to `<work_dir>/window/`, and JSON reports `long_text_mode=window`, `status`, `coverage` and `efficiency`. The `translate_only --input-key processed_path` stage then also runs as a window over that output (into `<work_dir>/window/processed/`); if the raw stage used fixed chunks, translation does too. Re-running the same command resumes at the cursor. Before the first `cleanup_zh` / `structure_only` window round, the executor asks the model once for a global outline (section titles + start units, and a name/term list); the rounds then use those titles instead of inventing headings. Pass `--chapters /tmp/${VIDEO_ID}_chapters.json` to `chunk-document` (as above) so YouTube chapters are used as outline hints even on text-first Chinese paths. `merge-content` merges the latest window stage and refuses an unfinished window run; `chapter_plan.json` headings are only inserted when the run had no outline (`window_outline: false`, or the outline failed).
+Sliding-window mode (`long_text_mode: window`, the default): for the `cleanup_zh` / `quick_cleanup` / `structure_only` raw stage, `process-chunks` runs the window executor instead of fixed chunks: it reads the source from the chunk files, writes paragraphs to `<work_dir>/window/`, and JSON reports `long_text_mode=window`, `status`, `coverage` and `efficiency`. The `translate_only --input-key processed_path` stage then also runs as a window over that output (into `<work_dir>/window/processed/`); if the raw stage used fixed chunks, translation does too. Re-running the same command resumes at the cursor. Before the first `cleanup_zh` / `structure_only` window round, the executor asks the model once for a global outline (section titles + start units, and a name/term list); the rounds then use those titles instead of inventing headings. Pass `--chapters /tmp/${VIDEO_ID}_chapters.json` to `chunk-document` (as above) so YouTube chapters are used as outline hints even on text-first Chinese paths. `merge-content` merges the latest window stage; for an unfinished window run it still writes the file but reports `success=false`. `chapter_plan.json` headings are only inserted when the run had no outline (the whole source fits in one round, `quick_cleanup`, `window_outline: false`, or the outline failed). If a window run reports `status=failed` (an LLM error that outlasted the backend's retries), fix the cause and re-run the same command; it resumes at the cursor.
 
 Fixed chunks (`long_text_mode: chunks`, kept as a legacy fallback): the same commands process one chunk file at a time. A work dir that already has finished fixed chunks keeps resuming that way even in window mode. If `process-chunks` reports `status=aborted` (for example after repeated consecutive timeouts), STOP and surface the manifest/runtime state before re-running it.
 
@@ -247,6 +247,7 @@ If only `warnings` are present, review them before deciding to continue.
 `checks` now also carries advisory readability metrics such as chunk seam duplication,
 Chinese spacing anomalies, repeated phrase density, short paragraph ratio,
 header density, punctuation density, and glossary drift so the warning reasons stay explainable.
+For a window run (`--work-dir` given) it also reports source coverage: `window_coverage_ratio`, `window_uncovered_ranges`, `window_low_output_ratio_paragraphs` and `window_fallback_paragraphs`.
 
 Do not continue to final assembly until verification passes.
 When continuing to final assembly, construct any date fragment in the final Markdown filename as `yyyy-mm-dd`; do not reuse raw metadata `upload_date` (`yyyymmdd`) in the filename.

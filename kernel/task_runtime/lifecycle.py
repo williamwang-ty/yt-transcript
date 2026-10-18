@@ -43,11 +43,6 @@ def _transition_id(command: str, work_dir: str = "", observed_at: str = "") -> s
     return hashlib.sha1(payload.encode("utf-8")).hexdigest()[:16]
 
 
-def top_level_states() -> list[str]:
-    """Return the supported top-level lifecycle states."""
-    return list(TOP_LEVEL_LIFECYCLE_STATES)
-
-
 def observe_runtime_snapshot(work_dir: str = "") -> dict:
     """Observe the current persisted runtime status for a work directory."""
     observed_at = _now_iso()
@@ -136,20 +131,6 @@ def build_lifecycle_transition(command: str, result, *, context: dict | None = N
         "trace_id": str(trace_id or "").strip(),
         "observed_at_before": str(before_snapshot.get("observed_at", "") or "").strip(),
         "observed_at_after": str(after_snapshot.get("observed_at", "") or _now_iso()).strip(),
-    }
-
-
-def summarize_lifecycle_transition(transition: dict | None = None) -> dict:
-    """Build a concise lifecycle summary suitable for telemetry."""
-    payload = dict(transition or {})
-    return {
-        "transition_id": str(payload.get("transition_id", "")).strip(),
-        "active_stage": str(payload.get("active_stage", "")).strip(),
-        "state_before": str(payload.get("state_before", "")).strip(),
-        "state_after": str(payload.get("state_after", "")).strip(),
-        "transition_kind": str(payload.get("transition_kind", "")).strip(),
-        "control_signal": str(payload.get("control_signal", "")).strip(),
-        "success": bool(payload.get("success", False)),
     }
 
 

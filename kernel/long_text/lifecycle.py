@@ -359,7 +359,7 @@ def _resume_run_impl(work_dir: str, reason: str = "") -> dict:
     runtime_control = _ensure_runtime_control_state(runtime)
 
     pause_before = kernel_state.summarize_runtime_pause_request(work_dir)
-    pause_after = kernel_state.clear_runtime_pause(work_dir)
+    kernel_state.clear_runtime_pause(work_dir)
 
     runtime_status_before = str(runtime.get("status", "pending")).strip() or "pending"
     runtime_status_after = _infer_resume_runtime_status(runtime, manifest.get("chunks", []))

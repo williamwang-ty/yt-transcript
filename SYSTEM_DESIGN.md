@@ -747,16 +747,16 @@ The window executor was introduced because small fixed chunks needed a stack of 
 - **chunk files**
   - the output of `chunk-document` / `chunk-segments` / `chunk-text`; the fixed-chunk executor processes them one by one, and the window executor reads its source from them
 - **unit / `[S<n>]`**
-  - one numbered source sentence; an over-long unpunctuated sentence is cut at subtitle cue ends (longest pause first), otherwise every ~120 tokens
+  - one numbered source sentence (in the `translate_only` stage, one paragraph of the raw-stage output, split only above ~600 tokens); an over-long unpunctuated sentence is cut at subtitle cue ends (longest pause first), otherwise every ~120 tokens
 
 ##### Layer 2: document-level guidance
 
 - **global outline**
-  - one upfront pass over the numbered full text (`window_outline`, for `cleanup_zh` and `structure_only`) that returns section titles with their first unit; YouTube chapters are mapped to units and kept verbatim
+  - one upfront pass over the numbered full text (`window_outline`, for `cleanup_zh` and `structure_only`) that returns section titles with their first unit; YouTube chapters are mapped to units, and a section starting at a chapter keeps the chapter title (translated into Chinese for `cleanup_zh` when the title has none)
 - **glossary**
   - names and terms with their correct spellings and seen mis-recognitions, from the outline pass and from `build-glossary`
 - **chapter plan**
-  - optional chapter-to-chunk mapping used at merge time when a run has no outline
+  - optional chapter-to-chunk mapping, used at merge time when a run has no outline, and as outline hints when there is no chapters file or no timed cues
 
 ##### Layer 3: round execution and control
 
@@ -834,7 +834,7 @@ A response cut off before `<!--END-->` only loses its last paragraph: the cursor
 - **Prompt and consistency layer**: `kernel/long_text/prompting.py`, `kernel/long_text/glossary.py`, `kernel/long_text/semantic.py`
   - prompt assembly, glossary context, and the semantic-anchor checks used by `verify-quality`
 - **LLM request layer**: `kernel/long_text/llm.py`, `kernel/long_text/agent_cli.py`
-  - API retries, timeouts, output caps, and truncation retries; the agent-CLI backend (`llm_backend: auto`) runs the host agent's own CLI and falls back to the API
+  - API retries, timeouts, and the `max_tokens` stop line; fixed chunks retry a cut-off response with a larger ceiling (`llm_output_retry_*`), while window rounds keep the complete paragraphs and shrink the write target instead; the agent-CLI backend (`llm_backend: auto`) runs the host agent's own CLI and falls back to the API
 - **Boundary surface layer**: `kernel/long_text/chunking.py`, `kernel/long_text/merge.py`
   - chunking and merge command surfaces
 
@@ -851,7 +851,7 @@ The model never decides where its output starts or stops in the source. It copie
 
 #### B. Structure decided once
 
-Headings come only from the global outline. A round may write a heading where the topic actually begins near the outline's start unit; otherwise the program inserts it. This replaces per-chunk heading guesses, which drifted between chunks.
+When the run has an outline, headings come only from it. A round may write a heading where the topic actually begins near the outline's start unit; otherwise the program inserts it. This replaces per-chunk heading guesses, which drifted between chunks. Without an outline (the whole source fits in one round, `quick_cleanup`, `window_outline: false`, or the outline failed), rounds place their own headings and merge can insert `chapter_plan.json` headings.
 
 #### C. Sizes as soft targets
 
@@ -859,7 +859,7 @@ Headings come only from the global outline. A round may write a heading where th
 
 #### D. Deterministic-first verification
 
-Each round is validated by rules (tags, end line, length ratio) before it is kept. The final document goes through `verify-quality`, which reports length, structure, glossary, semantic-anchor, and translation checks; only `hard_failures` block.
+Each round is validated by rules (tags in order and in range, length ratio) before it is kept; a missing end line only drops the last paragraph. The final document goes through `verify-quality`, which reports length, structure, glossary, semantic-anchor, and translation checks; only `hard_failures` block.
 
 #### E. Fallback instead of replanning
 
@@ -867,7 +867,7 @@ When rounds keep failing on one stretch, the executor processes that stretch as 
 
 #### F. Persisted state, runtime control, and telemetry
 
-Window state (cursor, outline, adaptive sizes, saved paragraphs) lives under `<work_dir>/window/` (`window/processed/` for translation) so a re-run resumes at the cursor. Runtime ownership, lifecycle envelopes, and telemetry are shared with the fixed-chunk executor, which also honors pause and cancel requests between chunks.
+Window state (cursor, outline, adaptive sizes, saved paragraphs) lives under `<work_dir>/window/` (`window/processed/` for translation) so a re-run resumes at the cursor. Runtime ownership, lifecycle envelopes, and telemetry are shared with the fixed-chunk executor; both honor pause and cancel requests between rounds or chunks.
 
 ### 7.6 Why this subsystem design fits the whole project
 
@@ -1769,16 +1769,16 @@ runtime 设计在当前仓库里的落点如下：
 - **chunk 文件**
   - `chunk-document` / `chunk-segments` / `chunk-text` 的输出；固定分块执行器逐个处理，窗口执行器从中读取原文
 - **单元 / `[S<n>]`**
-  - 一个编号的原文句子；没有标点的长句在字幕条结束处切开（优先最长停顿），对不上字幕时每约 120 token 切一次
+  - 一个编号的原文句子（`translate_only` 阶段是上一阶段输出的一个段落，超过约 600 token 才拆开）；没有标点的长句在字幕条结束处切开（优先最长停顿），对不上字幕时每约 120 token 切一次
 
 ##### Layer 2：文档级指导
 
 - **全局大纲**
-  - 对带编号全文的一次前置调用（`window_outline`，用于 `cleanup_zh` 和 `structure_only`），返回章节标题和起始单元；YouTube 章节会映射到单元并原样保留
+  - 对带编号全文的一次前置调用（`window_outline`，用于 `cleanup_zh` 和 `structure_only`），返回章节标题和起始单元；YouTube 章节会映射到单元，从章节处开始的小节沿用章节标题（`cleanup_zh` 下标题没有中文时用译文）
 - **术语表（glossary）**
   - 人名、术语的正确写法和见到的识别错误，来自大纲调用和 `build-glossary`
 - **chapter plan**
-  - 可选的章节到 chunk 映射，只在任务没有大纲时用于 merge
+  - 可选的章节到 chunk 映射，在任务没有大纲时用于 merge；没有章节文件或带时间的字幕条时也用作大纲提示
 
 ##### Layer 3：轮次执行与控制
 
@@ -1856,7 +1856,7 @@ LLM 请求（API 或 agent CLI）
 - **prompt 与一致性层**：`kernel/long_text/prompting.py`、`kernel/long_text/glossary.py`、`kernel/long_text/semantic.py`
   - prompt 组装、术语上下文，以及 `verify-quality` 使用的 semantic anchor 检查
 - **LLM 请求层**：`kernel/long_text/llm.py`、`kernel/long_text/agent_cli.py`
-  - API 的重试、超时、输出上限和截断重试；agent CLI 后端（`llm_backend: auto`）调用宿主 agent 自己的命令行，失败时回退到 API
+  - API 的重试、超时和 `max_tokens` 停止线；固定分块遇到被截断的响应会加大上限重试（`llm_output_retry_*`），窗口轮次则保留完整段落并调小写目标；agent CLI 后端（`llm_backend: auto`）调用宿主 agent 自己的命令行，失败时回退到 API
 - **边界接口层**：`kernel/long_text/chunking.py`、`kernel/long_text/merge.py`
   - 分块与合并命令接口
 
@@ -1873,7 +1873,7 @@ LLM 请求（API 或 agent CLI）
 
 #### B. 结构只决定一次
 
-标题只来自全局大纲。话题在大纲起始单元附近真正开始的地方，模型可以写出标题；否则由程序插入。这取代了每块各自猜标题、块与块之间标题漂移的做法。
+有大纲时，标题只来自大纲。话题在大纲起始单元附近真正开始的地方，模型可以写出标题；否则由程序插入。这取代了每块各自猜标题、块与块之间标题漂移的做法。没有大纲时（全文一轮就能写完、`quick_cleanup`、`window_outline: false` 或大纲失败），各轮自己放标题，merge 可以插入 `chapter_plan.json` 的标题。
 
 #### C. 大小是软目标
 
@@ -1881,7 +1881,7 @@ LLM 请求（API 或 agent CLI）
 
 #### D. 优先确定性校验
 
-每轮在保留之前先用规则校验（编号、结束行、长度比）。最终文档经过 `verify-quality`，报告长度、结构、术语、semantic anchor 和翻译检查；只有 `hard_failures` 会阻断。
+每轮在保留之前先用规则校验（编号顺序和范围、长度比）；缺少结束行只会丢掉最后一段。最终文档经过 `verify-quality`，报告长度、结构、术语、semantic anchor 和翻译检查；只有 `hard_failures` 会阻断。
 
 #### E. 用兜底代替 replan
 
@@ -1889,7 +1889,7 @@ LLM 请求（API 或 agent CLI）
 
 #### F. 持久化状态、运行控制与 telemetry
 
-window state（游标、大纲、自适应大小、已保存段落）放在 `<work_dir>/window/`（翻译阶段在 `window/processed/`），重新运行会从游标续跑。runtime ownership、lifecycle envelope 和 telemetry 与固定分块执行器共用；固定分块执行器还会在 chunk 之间响应暂停和取消请求。
+window state（游标、大纲、自适应大小、已保存段落）放在 `<work_dir>/window/`（翻译阶段在 `window/processed/`），重新运行会从游标续跑。runtime ownership、lifecycle envelope 和 telemetry 与固定分块执行器共用；两个执行器都会在轮次或 chunk 之间响应暂停和取消请求。
 
 ### 7.6 为什么这个子系统设计适合整个项目
 

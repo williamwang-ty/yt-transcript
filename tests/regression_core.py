@@ -2077,7 +2077,7 @@ work_dir: /tmp/vid001_chunks
                 'chunk_tokens_translate_only: "999"\n'
                 'chunk_tokens_summarize: "2222"\n'
                 'chunk_hard_cap_multiplier: "1.5"\n'
-                'chunk_overlap_sentences: "0"\n'
+                'chunk_glossary_max_prompt_terms: "5"\n'
                 'output_ratio_structure_only: "1.2"\n'
                 'output_ratio_quick_cleanup: "1.08"\n'
                 'output_ratio_cleanup_zh: "1.05"\n'
@@ -2102,6 +2102,7 @@ work_dir: /tmp/vid001_chunks
             self.assertEqual(config["chunk_tokens_translate_only"], 999)
             self.assertEqual(config["chunk_tokens_summarize"], 2222)
             self.assertEqual(config["chunk_hard_cap_multiplier"], 1.5)
+            self.assertEqual(config["chunk_glossary_max_prompt_terms"], 5)
             self.assertEqual(config["output_ratio_structure_only"], 1.2)
             self.assertEqual(config["output_ratio_quick_cleanup"], 1.08)
             self.assertEqual(config["output_ratio_cleanup_zh"], 1.05)
