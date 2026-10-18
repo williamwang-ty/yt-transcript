@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import hashlib
 import time
-from pathlib import Path
 
 
 CONTRACT_SCHEMA_VERSION = 1
@@ -168,22 +167,6 @@ def build_decision_record(*, decision_id: str = "", state_before: str = "",
         "decider_type": str(decider_type or "rule").strip() or "rule",
         "policy_checks": dict(policy_checks or {}),
         "decided_at": str(decided_at or _now_iso()).strip(),
-    }
-
-
-def build_action_request(*, action_id: str = "", action_type: str = "",
-                         tool_name: str = "", inputs: dict | None = None,
-                         requested_at: str = "") -> dict:
-    """Build a normalized action-request payload."""
-    seed = f"{action_type}:{tool_name}:{requested_at or _now_iso()}"
-    return {
-        "schema_version": CONTRACT_SCHEMA_VERSION,
-        "format": ACTION_REQUEST_FORMAT,
-        "action_id": str(action_id or _stable_id("action", seed)).strip(),
-        "action_type": str(action_type or "").strip(),
-        "tool_name": str(tool_name or "").strip(),
-        "inputs": dict(inputs or {}),
-        "requested_at": str(requested_at or _now_iso()).strip(),
     }
 
 

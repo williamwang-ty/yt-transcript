@@ -341,7 +341,7 @@ Current policy is intentional and explicit:
 - `manifest.json` records an explicit `plan.chunk_contract` so a resumed fixed-chunk run keeps its original chunk sizes
 - chunk execution now also has explicit resume semantics: stale `running` / missing-output checkpoints are repaired deterministically into `done` or `interrupted` before work resumes
 - `process-chunks` now treats transient gateway disconnects such as `Remote end closed connection without response` as retryable transport failures, and can auto-rerun suspiciously short / malformed chunk outputs before keeping a warning
-- `process-chunks --dry-run` validates prompts, manifests, and chunk budgets without requiring live LLM credentials; actual execution still requires `llm_api_key`, `llm_base_url`, and `llm_model`
+- `process-chunks --dry-run` validates prompts, manifests, and chunk budgets without requiring live LLM credentials or probing a backend; actual execution needs a working backend: the calling agent's CLI (`llm_backend: auto`) or `llm_api_key`, `llm_base_url` and `llm_model`
 - `download.sh` now writes subtitle and audio artifacts into per-video isolated temp directories under `/tmp/${VIDEO_ID}_downloads/...` and exposes `download_dir` in JSON for deterministic selection and cleanup
 - `download.sh subtitles` now requests the exact selected subtitle language codes, so regional variants such as `en-GB` / `zh-TW` work instead of being dropped by a hard-coded whitelist
 - `download.sh subtitles` now tries one source-family candidate at a time: Chinese first, then English only as a fallback when no usable Chinese track can be downloaded
@@ -697,6 +697,8 @@ bash scripts/preflight.sh --require-llm
 - `transcribe-deepgram --output-segments` 可选输出带时间戳的对齐 segments，用于后续 timed chunk 与 YouTube 章节映射
 - `transcribe-deepgram` 现在默认就是 utterance-first 组装；仍保留 `--disable-utterances --legacy-flat-output` 作为兼容/排障回退
 - `transcribe-deepgram` 现在还会在结果 JSON 中输出轻量可观测字段，例如 paragraph/sentence/word 计数、逐 chunk 的 transcript 元数据，以及 structured-output 回退 warning
+- `download.sh` 会把字幕和音频文件写到按视频隔离的临时目录 `/tmp/${VIDEO_ID}_downloads/...`，并在 JSON 里返回 `download_dir`，便于确定性地选取和清理
+- `download.sh subtitles` 会请求所选字幕的精确语言代码，因此 `en-GB` / `zh-TW` 这类地区变体也能下载，不会被写死的白名单丢掉
 - `download.sh subtitles` 现在会按“中文优先、英文回退”的顺序一次只尝试一个源字幕轨；当可见的中文字幕下载失败时，才会继续尝试英文字幕
 - 字幕驱动的 workflow 仍支持“中文字幕单语输出”和“英文字幕双语输出”两条路径；其中中文单语现在优先走 `cleanup_zh`，英文字幕仍走 `structure_only -> translate_only`
 - `download.sh subtitles` 现在会显式区分“平台列出了哪些轨”和“当前运行环境实际下载到了哪条轨”：`listed_candidates` 描述可见候选，`attempted_candidates` / `blocked_candidates` / `fallback_used` 描述实际下载结果
@@ -716,10 +718,14 @@ bash scripts/preflight.sh --require-llm
 - `manifest.json` 会显式记录 `plan.chunk_contract`，固定分块任务续跑时沿用原来的分块大小
 - chunk 执行现在也有显式 resume 语义：在继续执行前，stale 的 `running` / 缺失输出 checkpoint 会被确定性修复为 `done` 或 `interrupted`
 - `process-chunks` 现在会把 `Remote end closed connection without response` 这类瞬时网关断连视为可重试传输错误，并可在产出异常短/结构异常的 chunk 时自动重跑一轮，再决定是否保留 warning
+- `process-chunks --dry-run` 只校验 prompt、manifest 和分块预算，不需要真实的 LLM 凭据，也不探测后端；真正执行时需要一个可用的后端：调用方 agent 的 CLI（`llm_backend: auto`），或者 `llm_api_key`、`llm_base_url` 和 `llm_model`
+- `plan-optimization` 是规范的长短路由：`< 1800s = short`，`>= 1800s = long`；`SKILL.md` 里的 Quick Mode 是其中更窄的 `< 900s` 子集，只用于字幕条件好的视频
 - `manifest.json` 现在会把不可变 `plan` 和可变 `runtime` 状态分开，同时为每个 chunk 记录 `attempt_logs` 级别的请求观测数据
 - 固定分块按每个任务的分块目标（`chunk_tokens_*`）切，硬上限是目标的 `chunk_hard_cap_multiplier` 倍；原来为小固定分块加的 continuity 上下文、autotune 和 `replan-remaining` 补丁已随窗口模式转正删除，固定分块连续超时多次后直接停止
 - `build-glossary --mode transcript` 现在会从 raw chunk、可用的 normalized document 标题/频道、chapter 标题，以及可选 metadata/description 上下文中抽取术语；当 `cleanup_zh` 的 work_dir 里还没有 glossary 时，`process-chunks` 会自动生成这一份 glossary
 - glossary 的筛选与校验现在会对简单 ASCII 术语做边界感知匹配，因此像 `API` 这样的缩写不会再因为 `rapid`、`capital` 之类的无关单词而误命中
+- `run_kernel_command(...)` 是 kernel 命令稳定的 Python envelope API；`python3 yt_transcript_utils.py --api-envelope ...` 在 CLI 上输出同样的 `yt_transcript.command_result/v1` envelope，不影响原有的扁平 JSON 输出
+- 产出 envelope 的 kernel 命令在能推断出稳定的就近路径时，会把 `yt_transcript.telemetry_event/v1` 记录追加到本地 `telemetry.jsonl`
 - `runtime.status` 现在会区分 `completed` / `completed_with_errors` / `aborted`
 - 运行时 token 估算默认仍是本地启发式 fallback；`test-token-count` / `preflight.sh --require-llm` 会探测 provider 级 token count，并在不可用时明确回退到 local estimate
 - `chunk_hard_cap_multiplier` 会被限制在保守的 `1.0-2.0` 区间，避免配置失误把 chunk 包络静默放大

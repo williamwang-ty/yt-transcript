@@ -292,15 +292,15 @@ class RuntimeRegressionTests(FixedChunkExecutorTestCase):
         }
         policy_evaluation = {
             "profile": "default",
-            "allowed_actions": ["continue_stage", "switch_model_profile", "shrink_chunk_size"],
+            "allowed_actions": ["continue_stage", "retry_action", "pause_run"],
             "budget_pressure_level": "normal",
         }
 
         def fake_ranker(payload):
-            self.assertEqual(payload["allowed_actions"], ["continue_stage", "switch_model_profile", "shrink_chunk_size"])
+            self.assertEqual(payload["allowed_actions"], ["continue_stage", "retry_action", "pause_run"])
             return {
-                "selected_action": "switch_model_profile",
-                "reason": "smaller model profile is cheaper for this ambiguous case",
+                "selected_action": "retry_action",
+                "reason": "a retry is cheaper for this ambiguous case",
                 "confidence": 0.81,
             }
 
@@ -314,7 +314,7 @@ class RuntimeRegressionTests(FixedChunkExecutorTestCase):
             decision_mode="llm_assisted",
         )
 
-        self.assertEqual(decision_record["selected_action"], "switch_model_profile")
+        self.assertEqual(decision_record["selected_action"], "retry_action")
         self.assertEqual(decision_record["decider_type"], "llm-assisted")
 
     def test_policy_escalates_timeout_driven_processing_abort(self):
@@ -342,7 +342,8 @@ class RuntimeRegressionTests(FixedChunkExecutorTestCase):
         )
 
         self.assertNotIn("replan_remaining", policy_evaluation["allowed_actions"])
-        self.assertIn("shrink_chunk_size", policy_evaluation["allowed_actions"])
+        self.assertNotIn("shrink_chunk_size", policy_evaluation["allowed_actions"])
+        self.assertIn("retry_action", policy_evaluation["allowed_actions"])
         self.assertEqual(policy_evaluation["budget_pressure_level"], "high")
         self.assertEqual(decision_record["selected_action"], "request_human_escalation")
 

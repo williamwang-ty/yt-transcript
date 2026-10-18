@@ -9,17 +9,18 @@ cursor into numbered source units and moves it forward round by round:
 2. Each round sends a read window starting at the cursor, plus the tail of
    what was already written as left context, and asks for about N tokens of
    output that stop at a paragraph or section end.
-3. The model ends every paragraph with `<!--S<n>-->`, the number of the last
-   source unit that paragraph covers.
-4. Complete paragraphs are written to disk, a trailing paragraph without a
-   marker is dropped, and the cursor moves past the last marker.
+3. The model copies each unit's `[S<n>]` tag in front of that unit's text
+   and ends the response with `<!--END-->`; the program derives which units
+   each paragraph covers from the tags.
+4. Complete paragraphs are written to disk; without the end line the last
+   paragraph is dropped. The cursor moves past the last kept unit.
 
-Progress is read only from the markers, so a cut-off response is not a
-failure, it just advances less; nothing depends on `finish_reason` or
-`max_tokens`, and the same loop works for API and agent-CLI backends. When a
-response has no usable markers (or an implausible amount of output) twice in
-a row, that stretch of the source is processed once with the plain
-fixed-chunk prompt instead.
+Progress is read only from the tags, so a cut-off response is not a failure,
+it just advances less, and the same loop works for API and agent-CLI
+backends. A reported truncation (`finish_reason`) only shrinks the next write
+target. When a response has no usable tags (or an implausible amount of
+output) more than `window_marker_retries` times in a row, that stretch of
+the source is processed once with the plain fixed-chunk prompt instead.
 
 Window sizes adapt per round. The write target N starts at
 `window_write_tokens`; the read window is sized from N and the measured
@@ -58,6 +59,8 @@ WINDOW_PROMPTS = {
     RAW_STAGE: ("cleanup_zh", "structure_only", "quick_cleanup"),
     PROCESSED_STAGE: ("translate_only",),
 }
+# Fixed-chunk prompts whose outputs are side files, not the merged document.
+SIDE_CHUNK_PROMPTS = ("summarize",)
 
 DEFAULT_WINDOW_READ_TOKENS = 6000
 DEFAULT_WINDOW_WRITE_TOKENS = 3000
@@ -183,10 +186,6 @@ def stage_dir_for(work_dir: str, input_key: str = RAW_STAGE) -> Path:
     return base / PROCESSED_DIR_NAME if _stage(input_key) == PROCESSED_STAGE else base
 
 
-def window_dir_for(work_dir: str) -> Path:
-    return stage_dir_for(work_dir, RAW_STAGE)
-
-
 def state_path_for(work_dir: str, input_key: str = RAW_STAGE) -> Path:
     return stage_dir_for(work_dir, input_key) / STATE_FILE_NAME
 
@@ -232,7 +231,11 @@ def has_chunk_progress(work_dir: str) -> bool:
     if manifest.get(EXECUTOR_MANIFEST_KEY) == "window":
         return False
     chunks = manifest.get("chunks") if isinstance(manifest.get("chunks"), list) else []
-    return any(isinstance(chunk, dict) and chunk.get("status") == "done" for chunk in chunks)
+    # Chunks finished by a side prompt (summarize writes summary_chunk_*.txt,
+    # which merge never reads) are not progress on the document itself.
+    return any(isinstance(chunk, dict) and chunk.get("status") == "done"
+               and str(chunk.get("output_prompt_name", "")).strip() not in SIDE_CHUNK_PROMPTS
+               for chunk in chunks)
 
 
 def set_manifest_executor(work_dir: str, executor: str, stage: str = "") -> None:

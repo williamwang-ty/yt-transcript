@@ -424,6 +424,26 @@ class WindowExecutorTests(unittest.TestCase):
             self.assertFalse((work_dir / "window").exists())
             self.assertTrue(result["success"], result)
 
+    def test_summarize_on_the_work_dir_does_not_pin_it_to_fixed_chunks(self):
+        respond, _ = _marker_writer()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            work_dir = self._make_work_dir(tmpdir, count=120)
+            summary, _ = self._run(work_dir, self._config(), lambda **kw: _api_result("摘要。"),
+                                   prompt_name="summarize")
+            self.assertTrue(summary["success"], summary)
+            manifest = json.loads((work_dir / "manifest.json").read_text(encoding="utf-8"))
+            self.assertNotEqual(manifest.get("long_text_executor"), "chunks")
+            self.assertFalse(window.has_chunk_progress(str(work_dir)))
+
+            result, _ = self._run(work_dir, self._config(),
+                                  lambda **kw: _api_result(respond(kw["messages"][0]["content"])))
+            self.assertEqual(result["long_text_mode"], "window")
+
+            # A later summarize must not take the merged output away from the window run.
+            self._run(work_dir, self._config(), lambda **kw: _api_result("摘要。"), prompt_name="summarize")
+            manifest = json.loads((work_dir / "manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest.get("long_text_executor"), "window")
+
     def test_chapter_plan_headings_land_before_the_chunk_start_paragraph(self):
         respond, _ = _marker_writer()
         with tempfile.TemporaryDirectory() as tmpdir:

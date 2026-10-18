@@ -31,7 +31,7 @@ Commands:
     advance-run <work_dir>         Advance the runtime through the preferred bounded control path
     apply-control <work_dir>       Apply pause or cancel through the stable runtime-facing API
     finalize-run <work_dir>        Finalize a run summary and optionally materialize merged output
-    process-chunks <work_dir> --prompt <name>  Compatibility helper for direct chunk processing (--input-key for chained processing)
+    process-chunks <work_dir> --prompt <name>  Run one long-text stage: sliding window by default, fixed chunks with long_text_mode: chunks (--input-key for chained processing)
     resolve-llm-backend            Show whether chunks go to the calling agent's CLI or the configured API
     prepare-resume <work_dir>      Repair stale chunk/runtime state before resuming a run
     runtime-status <work_dir>      Inspect manifest runtime, ownership, and local runtime-control status
@@ -349,7 +349,6 @@ DEFAULT_LLM_BASE_URL = "https://api.deepseek.com"
 DEFAULT_CHUNK_MODE = "tokens"
 DEFAULT_CHUNK_HARD_CAP_MULTIPLIER = 1.33
 MAX_CHUNK_HARD_CAP_MULTIPLIER = 2.0
-DEFAULT_CHUNK_OVERLAP_SENTENCES = 0
 DEFAULT_ENABLE_TOKEN_COUNT_PROBE = True
 DEFAULT_LLM_CHUNK_RECOVERY_ATTEMPTS = 1
 DEFAULT_LLM_CHUNK_RECOVERY_BACKOFF_SEC = 1.0
@@ -490,7 +489,6 @@ def _default_config_values(config_path: str = "") -> dict:
         "chunk_tokens_translate_only": TASK_CHUNK_TOKEN_DEFAULTS["translate_only"],
         "chunk_tokens_summarize": TASK_CHUNK_TOKEN_DEFAULTS["summarize"],
         "chunk_hard_cap_multiplier": DEFAULT_CHUNK_HARD_CAP_MULTIPLIER,
-        "chunk_overlap_sentences": DEFAULT_CHUNK_OVERLAP_SENTENCES,
         "chunk_glossary_max_prompt_terms": 8,
         "output_ratio_structure_only": TASK_OUTPUT_RATIO_DEFAULTS["structure_only"],
         "output_ratio_quick_cleanup": TASK_OUTPUT_RATIO_DEFAULTS["quick_cleanup"],
@@ -800,16 +798,6 @@ def _build_quality_gate_contract(*, bilingual: bool = False) -> dict:
     return kernel_contracts.build_quality_gate_contract(bilingual=bilingual)
 
 
-def _build_chunk_verification_contract(prompt_name: str, *, applicable: bool = True) -> dict:
-    """Build chunk verification contract."""
-    return kernel_contracts.build_chunk_verification_contract(prompt_name, applicable=applicable)
-
-
-def _build_repair_contract(prompt_name: str, config: dict | None = None, *, applicable: bool = True) -> dict:
-    """Build repair contract."""
-    return kernel_contracts.build_repair_contract(prompt_name, config, applicable=applicable)
-
-
 def _build_operation_control_contract(kind: str, prompt_name: str, *,
                                       input_key: str = "raw_path",
                                       config: dict | None = None,
@@ -822,11 +810,6 @@ def _build_operation_control_contract(kind: str, prompt_name: str, *,
         config=config,
         bilingual=bilingual,
     )
-
-
-def _build_runtime_control_state() -> dict:
-    """Build runtime control state."""
-    return kernel_contracts.build_runtime_control_state()
 
 
 def _ensure_runtime_control_state(runtime: dict) -> dict:
@@ -2036,33 +2019,6 @@ def _hard_split_text(text: str, max_len: int) -> list[str]:
     return [text[i:i + max_len].strip() for i in range(0, len(text), max_len) if text[i:i + max_len].strip()]
 
 
-def _parse_vtt_timestamp(value: str) -> float | None:
-    """Parse vtt timestamp."""
-    return kernel_subtitle_cleanup.parse_vtt_timestamp(str(value or "").replace(",", "."))
-
-
-def _parse_vtt_time_range(line: str) -> tuple[float | None, float | None]:
-    """Parse vtt time range."""
-    return kernel_subtitle_cleanup.parse_vtt_time_range(line)
-
-
-def _strip_subtitle_markup(text: str) -> str:
-    """Strip lightweight subtitle markup such as VTT cue tags."""
-    cleaned, _ = kernel_subtitle_cleanup.strip_subtitle_markup(text)
-    return cleaned
-
-
-def _subtitle_join_needs_space(left: str, right: str) -> bool:
-    """Return whether two subtitle fragments need an inserted ASCII space."""
-    return kernel_subtitle_cleanup.subtitle_join_needs_space(left, right)
-
-
-def _join_subtitle_fragments(fragments: list[str]) -> str:
-    """Join subtitle fragments without inserting spaces inside CJK text."""
-    joined, _ = kernel_subtitle_cleanup.join_subtitle_fragments(fragments)
-    return joined
-
-
 def _normalize_subtitle_text(text: str) -> str:
     """Apply conservative cleanup tailored to subtitle-derived text."""
     return kernel_subtitle_cleanup.normalize_subtitle_text(text)
@@ -2911,7 +2867,7 @@ def test_deepgram_api(api_key: str) -> dict:
     req = urllib.request.Request(url, data=b'', headers=headers, method='POST')
     
     try:
-        with urllib.request.urlopen(req, timeout=10) as response:
+        with urllib.request.urlopen(req, timeout=10):
             # Unexpected success with empty audio
             return {"valid": True, "error": None, "balance_warning": False}
     except urllib.error.HTTPError as e:
@@ -7128,7 +7084,7 @@ def load_config(config_path: str = None, allow_missing: bool = False) -> dict:
             minimum=1.0,
             maximum=MAX_CHUNK_HARD_CAP_MULTIPLIER,
         ),
-        "chunk_overlap_sentences": parse_int_field('chunk_overlap_sentences', DEFAULT_CHUNK_OVERLAP_SENTENCES, minimum=0),
+        "chunk_glossary_max_prompt_terms": parse_int_field('chunk_glossary_max_prompt_terms', 8, minimum=0),
         "output_ratio_structure_only": output_ratio_structure_only,
         "output_ratio_quick_cleanup": output_ratio_quick_cleanup,
         "output_ratio_cleanup_zh": output_ratio_cleanup_zh,

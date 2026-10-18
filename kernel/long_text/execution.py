@@ -17,7 +17,8 @@ def _route_long_text_mode(work_dir: str, prompt_name: str, input_key: str,
 
     Window mode covers the stages `kernel_window.window_supported` lists; any
     other stage keeps the fixed-chunk executor. A raw-stage chunk run marks the
-    work dir as chunk-owned so merge-content reads the chunk outputs.
+    work dir as chunk-owned so merge-content reads the chunk outputs; a side
+    prompt such as summarize leaves the owner unchanged.
     """
     import yt_transcript_utils as utils
 
@@ -34,7 +35,7 @@ def _route_long_text_mode(work_dir: str, prompt_name: str, input_key: str,
         else:
             reason = f"long_text_mode=window does not cover prompt '{prompt_name}' ({input_key})"
         print(f"ℹ️ {reason}; using fixed chunks.", file=sys.stderr)
-    if not dry_run and raw_stage:
+    if not dry_run and raw_stage and prompt_name not in kernel_window.SIDE_CHUNK_PROMPTS:
         kernel_window.set_manifest_executor(work_dir, "chunks")
     return "chunks"
 

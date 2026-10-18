@@ -208,11 +208,6 @@ def _clear_runtime_signal(work_dir: str, *, filename: str,
     }
 
 
-def runtime_cancel_path(work_dir: str) -> Path:
-    """Return the cancel-signal path for a work directory."""
-    return _runtime_signal_path(work_dir, RUNTIME_CANCEL_FILENAME)
-
-
 def summarize_runtime_cancel_request(work_dir: str) -> dict:
     """Summarize the current runtime-cancel request, if any."""
     return _summarize_runtime_signal(
@@ -268,11 +263,6 @@ def clear_runtime_cancel(work_dir: str) -> dict:
         path_field="cancel_path",
         signal_name="cancel",
     )
-
-
-def runtime_pause_path(work_dir: str) -> Path:
-    """Return the pause-signal path for a work directory."""
-    return _runtime_signal_path(work_dir, RUNTIME_PAUSE_FILENAME)
 
 
 def summarize_runtime_pause_request(work_dir: str) -> dict:

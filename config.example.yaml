@@ -147,7 +147,11 @@ chunk_tokens_translate_only: 900
 chunk_tokens_summarize: 2500
 # Soft target * multiplier for forced split guardrail. Valid range: 1.0-2.0.
 chunk_hard_cap_multiplier: 1.33
-chunk_overlap_sentences: 0
+# Most transcript glossary terms put into one request's prompt.
+chunk_glossary_max_prompt_terms: 8
+# Expected output/source token ratio per task. Fixed chunks use it for
+# sizing; the window uses it as the starting ratio for its read window and
+# for rejecting rounds whose output is far too short or long.
 output_ratio_structure_only: 1.15
 output_ratio_quick_cleanup: 1.05
 output_ratio_cleanup_zh: 1.05

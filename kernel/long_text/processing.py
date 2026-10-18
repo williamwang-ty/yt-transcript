@@ -137,7 +137,6 @@ def _process_chunks_impl(work_dir: str, prompt_name: str, extra_instruction: str
         "auto_built": glossary_auto_built,
         "max_prompt_terms": max(0, _parse_int_min(config.get("chunk_glossary_max_prompt_terms"), 8, 0)),
     }
-    plan_chunk_contract = plan.get("chunk_contract", {}) if isinstance(plan.get("chunk_contract", {}), dict) else _build_manifest_chunk_contract()
     manifest_chunk_size = max(0, _parse_int(plan.get("chunk_size"), manifest.get("chunk_size", 0)))
     manifest_chunk_mode = _normalize_chunk_mode(plan.get("chunk_mode", manifest.get("chunk_mode", config.get("chunk_mode", DEFAULT_CHUNK_MODE))))
     plan_target_tokens = max(1, _parse_int(plan.get("target_input_tokens", plan.get("target_tokens", prompt_budget["target_tokens"])), prompt_budget["target_tokens"]))
