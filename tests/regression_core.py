@@ -1091,7 +1091,7 @@ class CoreRegressionTests(unittest.TestCase):
             self.assertEqual(manifest["plan"]["chunk_contract"]["driver"], "chunk-document")
             self.assertEqual(manifest["plan"]["chunk_contract"]["source_kind"], "segments")
             self.assertEqual(manifest["plan"]["chunk_contract"]["boundary_mode"], "strict")
-            self.assertEqual(manifest["plan"]["continuity"]["mode"], "reference_only")
+            self.assertNotIn("continuity", manifest["plan"])
             self.assertEqual(
                 manifest["plan"]["chunk_contract"]["normalized_document_path"],
                 str(normalized_document.absolute()),
@@ -1628,7 +1628,6 @@ work_dir: /tmp/vid001_chunks
             self.assertEqual(result["chunking"]["driver"], "chunk-document")
             self.assertEqual(result["chunking"]["preferred_source_kind"], "text")
             self.assertEqual(result["chunking"]["boundary_mode"], "strict")
-            self.assertEqual(result["chunking"]["continuity_mode"], "reference_only")
 
     def test_plan_optimization_returns_short_bilingual_operations(self):
         """Test plan optimization returns short bilingual operations."""
@@ -1658,7 +1657,6 @@ work_dir: /tmp/vid001_chunks
             self.assertEqual([op["prompt"] for op in result["operations"]], ["structure_only", "translate_only"])
             self.assertFalse(result["requires_llm_preflight"])
             self.assertTrue(all(op["execution"]["mode"] == "single_pass" for op in result["operations"]))
-            self.assertTrue(all(not op["execution"]["supports_auto_replan"] for op in result["operations"]))
 
     def test_plan_optimization_routes_short_chinese_youtube_to_cleanup_prompt(self):
         """Test plan optimization routes Chinese subtitle text through cleanup_zh."""
@@ -1865,12 +1863,10 @@ work_dir: /tmp/vid001_chunks
             self.assertTrue(result["requires_llm_preflight"])
             self.assertEqual(result["operations"][0]["prompt"], "cleanup_zh")
             self.assertIn("Deepgram ASR", result["operations"][0]["extra_instruction"])
-            self.assertTrue(result["operations"][0]["execution"]["supports_auto_replan"])
-            self.assertEqual(result["operations"][0]["execution"]["recommended_cli_flags"], ["--auto-replan"])
-            self.assertEqual(result["operations"][0]["execution"]["on_replan_required"], "auto_replan_remaining")
-            self.assertTrue(result["replan_contract"]["raw_path"]["supports_auto_replan"])
+            self.assertEqual(result["operations"][0]["execution"], {"mode": "chunked"})
+            self.assertNotIn("replan_contract", result)
             self.assertEqual(result["operations"][0]["control"]["repair"]["mode"], "bounded_retry")
-            self.assertEqual(result["operations"][0]["control"]["replan"]["on_replan_required"], "auto_replan_remaining")
+            self.assertNotIn("replan", result["operations"][0]["control"])
             self.assertEqual(result["quality_contract"]["stop_rule"], "hard_failures_stop")
 
     def test_cleanup_zh_reuses_structure_only_chunk_tuning(self):
@@ -1948,11 +1944,8 @@ work_dir: /tmp/vid001_chunks
 
             self.assertTrue(result["passed"], result)
             self.assertEqual([op["prompt"] for op in result["operations"]], ["structure_only", "translate_only"])
-            self.assertTrue(result["operations"][0]["execution"]["supports_auto_replan"])
-            self.assertFalse(result["operations"][1]["execution"]["supports_auto_replan"])
-            self.assertEqual(result["operations"][1]["execution"]["on_replan_required"], "stop_and_review")
-            self.assertEqual(result["replan_contract"]["processed_path"]["on_replan_required"], "stop_and_review")
-            self.assertFalse(result["operations"][1]["control"]["replan"]["supports_auto_replan"])
+            self.assertEqual(result["operations"][1]["input_key"], "processed_path")
+            self.assertEqual(result["operations"][1]["execution"], {"mode": "chunked"})
             self.assertEqual(result["operations"][1]["control"]["quality_gate"]["hard_failure_checks"][-1]["id"], "bilingual_pairs")
 
     def test_quality_gate_contract_exposes_advisory_readability_metrics(self):
@@ -2084,10 +2077,7 @@ work_dir: /tmp/vid001_chunks
                 'chunk_tokens_translate_only: "999"\n'
                 'chunk_tokens_summarize: "2222"\n'
                 'chunk_hard_cap_multiplier: "1.5"\n'
-                'chunk_safety_buffer_tokens: "321"\n'
                 'chunk_overlap_sentences: "0"\n'
-                'chunk_context_tail_sentences: "2"\n'
-                'chunk_context_summary_tokens: "70"\n'
                 'output_ratio_structure_only: "1.2"\n'
                 'output_ratio_quick_cleanup: "1.08"\n'
                 'output_ratio_cleanup_zh: "1.05"\n'
@@ -2098,13 +2088,7 @@ work_dir: /tmp/vid001_chunks
                 'max_output_tokens_cleanup_zh: "3200"\n'
                 'max_output_tokens_translate_only: "1550"\n'
                 'max_output_tokens_summarize: "512"\n'
-                'enable_token_count_probe: "false"\n'
-                'enable_chunk_autotune: "true"\n'
-                'autotune_reduce_percent: "0.3"\n'
-                'autotune_increase_percent: "0.15"\n'
-                'autotune_success_window: "9"\n'
-                'autotune_p95_latency_threshold_ms: "12345"\n'
-                'autotune_canary_chunks: "4"\n',
+                'enable_token_count_probe: "false"\n',
                 encoding="utf-8",
             )
 
@@ -2118,9 +2102,6 @@ work_dir: /tmp/vid001_chunks
             self.assertEqual(config["chunk_tokens_translate_only"], 999)
             self.assertEqual(config["chunk_tokens_summarize"], 2222)
             self.assertEqual(config["chunk_hard_cap_multiplier"], 1.5)
-            self.assertEqual(config["chunk_safety_buffer_tokens"], 321)
-            self.assertEqual(config["chunk_context_tail_sentences"], 2)
-            self.assertEqual(config["chunk_context_summary_tokens"], 70)
             self.assertEqual(config["output_ratio_structure_only"], 1.2)
             self.assertEqual(config["output_ratio_quick_cleanup"], 1.08)
             self.assertEqual(config["output_ratio_cleanup_zh"], 1.05)
@@ -2132,12 +2113,6 @@ work_dir: /tmp/vid001_chunks
             self.assertEqual(config["max_output_tokens_translate_only"], 1550)
             self.assertEqual(config["max_output_tokens_summarize"], 512)
             self.assertFalse(config["enable_token_count_probe"])
-            self.assertTrue(config["enable_chunk_autotune"])
-            self.assertEqual(config["autotune_reduce_percent"], 0.3)
-            self.assertEqual(config["autotune_increase_percent"], 0.15)
-            self.assertEqual(config["autotune_success_window"], 9)
-            self.assertEqual(config["autotune_p95_latency_threshold_ms"], 12345)
-            self.assertEqual(config["autotune_canary_chunks"], 4)
 
     def test_load_config_invalid_chunk_values_fall_back(self):
         """Test load config invalid chunk values fall back."""
@@ -2149,18 +2124,9 @@ work_dir: /tmp/vid001_chunks
                 'chunk_size_override: "oops"\n'
                 'chunk_tokens_structure_only: "bad"\n'
                 'chunk_hard_cap_multiplier: "10.0"\n'
-                'chunk_safety_buffer_tokens: "-1"\n'
-                'chunk_context_tail_sentences: "-1"\n'
-                'chunk_context_summary_tokens: "-1"\n'
                 'output_ratio_summarize: "bad"\n'
                 'max_output_tokens_summarize: "0"\n'
-                'enable_token_count_probe: "banana"\n'
-                'enable_chunk_autotune: "banana"\n'
-                'autotune_reduce_percent: "1.2"\n'
-                'autotune_increase_percent: "0"\n'
-                'autotune_success_window: "0"\n'
-                'autotune_p95_latency_threshold_ms: "-1"\n'
-                'autotune_canary_chunks: "0"\n',
+                'enable_token_count_probe: "banana"\n',
                 encoding="utf-8",
             )
 
@@ -2171,25 +2137,15 @@ work_dir: /tmp/vid001_chunks
             self.assertEqual(config["chunk_size_override"], 0)
             self.assertEqual(config["chunk_tokens_structure_only"], 1200)
             self.assertEqual(config["chunk_hard_cap_multiplier"], 1.33)
-            self.assertEqual(config["chunk_safety_buffer_tokens"], 400)
-            self.assertEqual(config["chunk_context_tail_sentences"], 1)
-            self.assertEqual(config["chunk_context_summary_tokens"], 60)
             self.assertEqual(config["output_ratio_summarize"], 0.15)
             self.assertEqual(config["max_output_tokens_summarize"], utils.DEFAULT_MAX_OUTPUT_TOKENS)
             self.assertTrue(config["enable_token_count_probe"])
-            self.assertFalse(config["enable_chunk_autotune"])
-            self.assertEqual(config["autotune_reduce_percent"], 0.25)
-            self.assertEqual(config["autotune_increase_percent"], 0.10)
-            self.assertEqual(config["autotune_success_window"], 20)
-            self.assertEqual(config["autotune_p95_latency_threshold_ms"], 45000)
-            self.assertEqual(config["autotune_canary_chunks"], 3)
-            self.assertGreaterEqual(len(config["config_warnings"]), 10)
+            self.assertGreaterEqual(len(config["config_warnings"]), 4)
             warning_output = fake_stderr.getvalue()
             self.assertIn("Warning: Invalid numeric config values", warning_output)
             self.assertIn("chunk_size_override='oops'", warning_output)
             self.assertIn("chunk_hard_cap_multiplier='10.0'", warning_output)
             self.assertIn("max_output_tokens_summarize='0'", warning_output)
-            self.assertIn("autotune_reduce_percent='1.2'", warning_output)
 
     def test_chunk_text_uses_token_aware_default_budget(self):
         """Test chunk text uses token aware default budget."""
@@ -2299,25 +2255,19 @@ work_dir: /tmp/vid001_chunks
         summary_budget = utils._calculate_chunk_budget("summarize", summary_prompt, default_config)
 
         self.assertLess(structure_budget["target_tokens"], summary_budget["target_tokens"])
+        # Chunks are sized by the task target alone, with no request-cap clamp.
+        self.assertEqual(structure_budget["target_tokens"], utils._get_task_chunk_target("structure_only", default_config))
+        self.assertEqual(structure_budget["hard_cap_tokens"], int(-(-structure_budget["target_tokens"] * 1.33 // 1)))
         # The output ceiling is a stop line, not a slice of the request budget.
         self.assertEqual(structure_budget["planned_max_output_tokens"], utils.DEFAULT_MAX_OUTPUT_TOKENS)
         self.assertEqual(summary_budget["planned_max_output_tokens"], utils.DEFAULT_MAX_OUTPUT_TOKENS)
-
-        # The request budget still sizes the input chunk from the expected output.
-        structure_total = (
-            structure_budget["prompt_tokens"]
-            + structure_budget["target_tokens"]
-            + structure_budget["expected_output_tokens"]
-            + structure_budget["safety_buffer_tokens"]
-        )
-        self.assertLessEqual(structure_total, structure_budget["effective_budget_tokens"])
 
         override_config = utils._default_config_values()
         override_config["chunk_size_override"] = 777
         self.assertEqual(utils._get_task_chunk_target("structure_only", override_config), 777)
 
     def test_calculate_chunk_budget_output_ceiling_ignores_input_budget(self):
-        """Test a configured output ceiling is used as-is and only the context window bounds it."""
+        """Test a configured output ceiling is used as-is and does not change the chunk size."""
         cleanup_prompt = (PROJECT_ROOT / "prompts" / "cleanup_zh.md").read_text(encoding="utf-8")
         config = utils._default_config_values()
         default_budget = utils._calculate_chunk_budget("cleanup_zh", cleanup_prompt, config)
@@ -2325,38 +2275,11 @@ work_dir: /tmp/vid001_chunks
         config["max_output_tokens_cleanup_zh"] = 12000
         override_budget = utils._calculate_chunk_budget("cleanup_zh", cleanup_prompt, config)
         self.assertEqual(override_budget["planned_max_output_tokens"], 12000)
-        # Raising the output ceiling does not shrink the input chunk.
         self.assertEqual(override_budget["target_tokens"], default_budget["target_tokens"])
 
-        small_window = utils._calculate_chunk_budget(
-            "cleanup_zh", cleanup_prompt, config, model_info={"context_window": 8000},
-        )
-        self.assertEqual(
-            small_window["planned_max_output_tokens"],
-            8000
-            - small_window["prompt_tokens"]
-            - small_window["hard_cap_tokens"]
-            - small_window["safety_buffer_tokens"],
-        )
-
-    def test_calculate_chunk_budget_reserves_continuity_context(self):
-        """Test calculate chunk budget reserves continuity context."""
-        structure_prompt = (PROJECT_ROOT / "prompts" / "structure_only.md").read_text(encoding="utf-8")
-        with_continuity = utils._default_config_values()
-        without_continuity = utils._default_config_values()
-        without_continuity["chunk_context_tail_sentences"] = 0
-
-        budget_with = utils._calculate_chunk_budget("structure_only", structure_prompt, with_continuity)
-        budget_without = utils._calculate_chunk_budget("structure_only", structure_prompt, without_continuity)
-
-        self.assertGreater(budget_with["continuity_reserve_tokens"], 0)
-        self.assertEqual(budget_without["continuity_reserve_tokens"], 0)
-        self.assertGreater(budget_with["prompt_tokens"], budget_without["prompt_tokens"])
-        self.assertLess(budget_with["target_tokens"], budget_without["target_tokens"])
-
-    def test_inject_continuity_context_appends_when_no_anchor(self):
-        """Test inject continuity context appends when no anchor."""
-        result = utils._inject_continuity_context("Prompt header", "## Continuity Context\ncontext")
+    def test_inject_context_block_appends_when_no_anchor(self):
+        """Test a context block is appended when the prompt has no input anchor."""
+        result = utils._inject_context_block("Prompt header", "## Continuity Context\ncontext")
         self.assertEqual(result, "Prompt header\n\n## Continuity Context\ncontext\n")
 
     def test_truncate_tail_text_to_tokens_handles_boundary_cases(self):

@@ -638,7 +638,7 @@ def build_window_prompt(prompt_template: str, *, sentences: list[str], cursor: i
     return utils._build_chunk_prompt(
         prompt_template,
         number_sentences(sentences, cursor, window_end, separator),
-        continuity_text=context,
+        context_text=context,
         glossary_text=glossary_text,
     )
 
@@ -649,7 +649,7 @@ def build_fallback_prompt(prompt_template: str, chunk_text: str, *, tail_text: s
     import yt_transcript_utils as utils
 
     context = PREVIOUS_CONTEXT_BLOCK.format(tail=tail_text.strip()) if tail_text.strip() else ""
-    return utils._build_chunk_prompt(prompt_template, chunk_text, continuity_text=context,
+    return utils._build_chunk_prompt(prompt_template, chunk_text, context_text=context,
                                      glossary_text=glossary_text)
 
 
@@ -1479,8 +1479,6 @@ def _build_result(work_dir: str, state: dict, outcome: dict, *, prompt_name: str
         "aborted": status == "aborted",
         "aborted_reason": "Cancellation requested" if status == "aborted" else outcome.get("error", ""),
         "paused": status == "paused",
-        "replan_required": False,
-        "replan_reason": "",
     }
     if coverage["uncovered_ranges"] and success:
         warnings.append(f"Window run left source units without output: {', '.join(coverage['uncovered_ranges'][:5])}")

@@ -29,16 +29,12 @@ def _bind_utils_globals() -> None:
 def _new_chunk_manifest_entry(chunk_id: int, chunk_content: str, budget: dict,
                               config: dict | None = None, *, raw_path: str = "",
                               processed_path: str = "", plan_id: str = "",
-                              continuity_prev_chunk_id: int | None = None,
-                              chunk_contract: dict | None = None,
-                              continuity_policy: dict | None = None) -> dict:
+                              chunk_contract: dict | None = None) -> dict:
     """Create the persisted manifest record for a single planned chunk."""
     _bind_utils_globals()
     config = config or {}
     chunk_contract = chunk_contract if isinstance(chunk_contract, dict) else _build_manifest_chunk_contract()
-    continuity_policy = continuity_policy if isinstance(continuity_policy, dict) else _build_manifest_continuity_policy(config)
-    # The chunk entry is the durable checkpoint for one unit of work. It keeps
-    # both execution bookkeeping and the continuity metadata needed for retries.
+    # The chunk entry is the durable checkpoint for one unit of work.
     return {
         "id": chunk_id,
         "chunk_id": chunk_id,
@@ -48,33 +44,16 @@ def _new_chunk_manifest_entry(chunk_id: int, chunk_content: str, budget: dict,
         "source_kind": str(chunk_contract.get("source_kind", "text")).strip() or "text",
         "boundary_mode": str(chunk_contract.get("boundary_mode", "strict")).strip() or "strict",
         "output_scope": str(chunk_contract.get("output_scope", "current_chunk_only")).strip() or "current_chunk_only",
-        "continuity_mode": str(continuity_policy.get("mode", "reference_only")).strip() or "reference_only",
         "char_count": len(chunk_content),
         "input_chars": len(chunk_content),
         "estimated_input_tokens": _estimate_tokens(chunk_content, "tokens", config),
         "input_tokens": _estimate_tokens(chunk_content, "tokens", config),
         "token_count_source": budget.get("token_count_source", ""),
-        "tail_context_text": _extract_tail_sentences(
-            chunk_content,
-            max(0, _parse_int(continuity_policy.get("tail_sentences"), DEFAULT_CHUNK_CONTEXT_TAIL_SENTENCES)),
-            config,
-        ),
-        "processed_tail_context_text": "",
-        "processed_input_tail_context_text": "",
-        "processed_input_section_title": "",
         "output_prompt_name": "",
         "output_input_key": "",
-        "continuity_prev_chunk_id": continuity_prev_chunk_id,
-        "continuity_context_chars": 0,
-        "continuity_context_tokens": 0,
-        "continuity_section_title": "",
         "glossary_terms": [],
         "glossary_term_count": 0,
         "glossary_context_tokens": 0,
-        "semantic_anchors": [],
-        "semantic_anchor_count": 0,
-        "semantic_context_tokens": 0,
-        "last_section_title": "",
         "output_chars": 0,
         "actual_output_tokens": 0,
         "planned_max_output_tokens": budget.get("planned_max_output_tokens", 0),
@@ -90,10 +69,6 @@ def _new_chunk_manifest_entry(chunk_id: int, chunk_content: str, budget: dict,
         "latency_ms": None,
         "request_url": "",
         "streaming_used": False,
-        "autotune_target_tokens": 0,
-        "autotune_next_target_tokens": 0,
-        "autotune_event": "",
-        "autotune_reason": "",
         "superseded_by_plan_id": "",
         "updated_at": "",
         "started_at": "",
@@ -117,8 +92,7 @@ def _resolve_chunk_output_path(work_path: Path, chunk_info: dict, prompt_name: s
 
 def _ensure_chunk_runtime_defaults(manifest: dict, runtime: dict, plan: dict,
                                    prompt_budget: dict, request_url: str,
-                                   planned_max_output_tokens: int,
-                                   autotune_state: dict) -> None:
+                                   planned_max_output_tokens: int) -> None:
     """Backfill chunk/runtime fields needed by resume and processing loops."""
     _bind_utils_globals()
     for chunk_info in manifest.get("chunks", []):
@@ -138,33 +112,17 @@ def _ensure_chunk_runtime_defaults(manifest: dict, runtime: dict, plan: dict,
         chunk_info.setdefault("estimated_input_tokens", 0)
         chunk_info.setdefault("input_tokens", chunk_info.get("estimated_input_tokens", 0))
         chunk_info.setdefault("token_count_source", prompt_budget["token_count_source"])
-        chunk_info.setdefault("tail_context_text", "")
-        chunk_info.setdefault("processed_tail_context_text", "")
-        chunk_info.setdefault("processed_input_tail_context_text", "")
-        chunk_info.setdefault("processed_input_section_title", "")
         chunk_info.setdefault("output_prompt_name", "")
         chunk_info.setdefault("output_input_key", "")
-        chunk_info.setdefault("continuity_prev_chunk_id", None)
-        chunk_info.setdefault("continuity_context_chars", 0)
-        chunk_info.setdefault("continuity_context_tokens", 0)
-        chunk_info.setdefault("continuity_section_title", "")
         chunk_info.setdefault("glossary_terms", [])
         chunk_info.setdefault("glossary_term_count", 0)
         chunk_info.setdefault("glossary_context_tokens", 0)
-        chunk_info.setdefault("semantic_anchors", [])
-        chunk_info.setdefault("semantic_anchor_count", 0)
-        chunk_info.setdefault("semantic_context_tokens", 0)
-        chunk_info.setdefault("last_section_title", "")
         chunk_info.setdefault("output_chars", 0)
         chunk_info.setdefault("actual_output_tokens", 0)
         chunk_info.setdefault("prompt_tokens", prompt_budget["prompt_tokens"])
         chunk_info.setdefault("planned_max_output_tokens", planned_max_output_tokens)
         chunk_info.setdefault("request_url", request_url)
         chunk_info.setdefault("streaming_used", False)
-        chunk_info.setdefault("autotune_target_tokens", autotune_state["current_target_tokens"])
-        chunk_info.setdefault("autotune_next_target_tokens", autotune_state["current_target_tokens"])
-        chunk_info.setdefault("autotune_event", "")
-        chunk_info.setdefault("autotune_reason", "")
         chunk_info.setdefault("superseded_by_plan_id", "")
         chunk_info.setdefault("updated_at", "")
         chunk_info.setdefault("started_at", "")
@@ -178,8 +136,6 @@ def _infer_resume_runtime_status(runtime: dict, chunks: list[dict]) -> str:
     active_statuses = {str(chunk.get("status", "pending")).strip() or "pending" for chunk in active_chunks}
     previous_status = str(runtime.get("status", "pending")).strip() or "pending"
 
-    if runtime.get("replan_required", False):
-        return "aborted"
     if active_chunks and active_statuses == {"done"}:
         return "completed"
     if INTERRUPTED_CHUNK_STATUS in active_statuses:
@@ -367,7 +323,6 @@ def _prepare_resume_impl(work_dir: str, prompt_name: str = "", config_path: str 
     plan = manifest["plan"]
     runtime = manifest["runtime"]
     planned_max_output_tokens = max(1, _parse_int(plan.get("planned_max_output_tokens"), prompt_budget["planned_max_output_tokens"]))
-    autotune_state = _build_autotune_state(plan, config, manifest.get("autotune"))
     _ensure_chunk_runtime_defaults(
         manifest,
         runtime,
@@ -375,7 +330,6 @@ def _prepare_resume_impl(work_dir: str, prompt_name: str = "", config_path: str 
         prompt_budget,
         request_url=str(runtime.get("last_request_url", "")).strip(),
         planned_max_output_tokens=planned_max_output_tokens,
-        autotune_state=autotune_state,
     )
     resume = _prepare_manifest_for_resume(
         manifest,

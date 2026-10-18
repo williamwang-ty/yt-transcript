@@ -368,18 +368,6 @@ class WindowExecutorTests(unittest.TestCase):
         self.assertEqual(result["request_url"], "cli:claude-code")
         self.assertEqual(result["coverage"]["coverage_ratio"], 1.0)
 
-    def test_auto_replan_entry_point_also_routes_to_the_window_executor(self):
-        respond, _ = _marker_writer()
-        with tempfile.TemporaryDirectory() as tmpdir:
-            work_dir = self._make_work_dir(tmpdir)
-            with mock.patch.object(utils, "load_config", return_value=self._config()), \
-                mock.patch.object(utils, "_call_llm_api",
-                                  side_effect=lambda **kw: _api_result(respond(kw["messages"][0]["content"]))), \
-                mock.patch("sys.stderr", new_callable=io.StringIO):
-                result = utils.process_chunks_with_replans(str(work_dir), "cleanup_zh")
-        self.assertTrue(result["success"], result)
-        self.assertEqual(result["long_text_mode"], "window")
-
     def test_chunks_mode_and_unsupported_prompts_keep_the_fixed_chunk_executor(self):
         chunk_output = lambda **kw: _api_result("## 标题\n\n" + kw["messages"][0]["content"][-200:])  # noqa: E731
         with tempfile.TemporaryDirectory() as tmpdir:

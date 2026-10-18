@@ -267,7 +267,7 @@ def _stage_for_command(command: str, result, context: dict | None = None) -> str
         return explicit_stage
 
     normalized = str(command or "").strip()
-    if normalized in {"pause-run", "cancel-run", "resume-run", "runtime-status", "prepare-resume", "replan-remaining", "process-chunks", "advance-run", "inspect-run", "apply-control"}:
+    if normalized in {"pause-run", "cancel-run", "resume-run", "runtime-status", "prepare-resume", "process-chunks", "advance-run", "inspect-run", "apply-control"}:
         return "processing"
     if normalized in {"create-run", "validate-state", "plan-optimization", "chunk-text", "chunk-segments", "chunk-document", "get-chapters", "build-chapter-plan"}:
         return "planning"
@@ -512,7 +512,7 @@ def derive_quality_report(command: str, result=None, *, context: dict | None = N
         checks = result.get("checks", {}) if isinstance(result.get("checks", {}), dict) else {}
         coverage_score = 1.0 if result.get("passed", False) else 0.0
         missing_sections = result.get("missing_semantic_anchors", []) if isinstance(result.get("missing_semantic_anchors", []), list) else []
-        recommended_action = "accept_output" if result.get("passed", False) else "repair_or_replan"
+        recommended_action = "accept_output" if result.get("passed", False) else "repair_chunk"
         if (
             result.get("passed", False)
             and _parse_bool(checks.get("reroute_recommended"), False)

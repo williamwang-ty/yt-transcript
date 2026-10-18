@@ -163,8 +163,6 @@ def build_command_telemetry_event(command: str, result, *, trace_id: str,
             event["processed_count"] = _parse_int(result.get("processed_count"), 0)
         if "failed_count" in result:
             event["failed_count"] = _parse_int(result.get("failed_count"), 0)
-        if "replan_required" in result:
-            event["replan_required"] = bool(result.get("replan_required", False))
         if "dry_run" in result:
             event["dry_run"] = bool(result.get("dry_run", False))
         lifecycle_summary = result.get("lifecycle", {}) if isinstance(result.get("lifecycle", {}), dict) else {}

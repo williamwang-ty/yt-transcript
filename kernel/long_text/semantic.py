@@ -67,31 +67,6 @@ def extract_semantic_anchors(source_text: str, *, max_items: int = 8) -> dict:
     return limited
 
 
-def build_anchor_prompt_context(source_text: str, *, max_items: int = 8) -> dict:
-    """Build anchor prompt context."""
-    anchors = extract_semantic_anchors(source_text, max_items=max_items)
-    ordered = anchors["ordered"]
-    if not ordered:
-        return {
-            "text": "",
-            "anchors": anchors,
-        }
-
-    lines = [
-        "## Semantic Anchors",
-        "",
-        "Preserve these high-signal anchors exactly if they appear in the current chunk.",
-        "Do not drop or alter them unless the source chunk itself changes them.",
-        "",
-    ]
-    for anchor in ordered:
-        lines.append(f"- {anchor}")
-    return {
-        "text": "\n".join(lines).strip(),
-        "anchors": anchors,
-    }
-
-
 def _normalized_numeric(anchor: str) -> str:
     """Normalize numeric anchors so comma formatting does not affect comparison."""
     return str(anchor or "").replace(",", "")
@@ -104,7 +79,6 @@ def evaluate_semantic_anchors(source_text: str, result_text: str, *, max_items: 
     if not ordered:
         return {
             "warnings": [],
-            "retry_reasons": [],
             "anchors": anchors,
             "missing_anchors": [],
         }
@@ -121,14 +95,11 @@ def evaluate_semantic_anchors(source_text: str, result_text: str, *, max_items: 
             missing.append(anchor)
 
     warnings = []
-    retry_reasons = []
     if missing:
         warnings.append(f"{ANCHOR_WARNING_PREFIX}: missing anchors in output: " + ", ".join(missing))
-        retry_reasons.append("missing_semantic_anchors")
 
     return {
         "warnings": warnings,
-        "retry_reasons": retry_reasons,
         "anchors": anchors,
         "missing_anchors": missing,
     }

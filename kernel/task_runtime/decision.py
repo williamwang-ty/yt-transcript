@@ -24,8 +24,6 @@ def _select_action(*, run_state: dict | None = None, result=None,
         return "fallback_to_deepgram", "quality report recommends rerouting source acquisition to Deepgram", 0.95, "rule"
     if quality_report.get("passed", False) and "accept_output" in allowed_actions:
         return "accept_output", "quality report passed; accept output", 0.95, "rule"
-    if payload.get("replan_required", False) and "replan_remaining" in allowed_actions:
-        return "replan_remaining", "result explicitly requires replanning", 0.95, "rule"
     if payload.get("paused", False) and "resume_run" in allowed_actions:
         return "resume_run", "runtime is paused and resumable", 0.9, "rule"
     if payload.get("aborted", False) and "request_human_escalation" in allowed_actions:
@@ -35,8 +33,6 @@ def _select_action(*, run_state: dict | None = None, result=None,
     if active_stage == "verify" and not quality_report.get("passed", payload.get("passed", False)):
         if "repair_chunk" in allowed_actions:
             return "repair_chunk", "quality gate failed; repair is the lowest-cost next step", 0.8, "rule"
-        if "replan_remaining" in allowed_actions:
-            return "replan_remaining", "quality gate failed and repair is unavailable", 0.75, "rule"
     if active_stage == "processing" and payload.get("warning_count", 0) and "retry_action" in allowed_actions:
         return "retry_action", "warnings detected during processing; retry is allowed", 0.7, "rule"
     preferred = str(evaluator_report.get("recommended_action", "")).strip()

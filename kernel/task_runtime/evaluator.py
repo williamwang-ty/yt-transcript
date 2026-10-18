@@ -74,17 +74,6 @@ def derive_evaluator_report(command: str, *, quality_report: dict | None = None,
         )
 
     substate = str(processing_state.get("substate", "")).strip()
-    if substate == "replan_pending":
-        return build_evaluator_report(
-            scope="processing",
-            quality_gate_state="warn",
-            recommended_action="replan_remaining",
-            rationale="processing substate indicates replan is pending",
-            warnings=payload.get("warnings", []),
-            hard_failures=[],
-            metadata={"command": normalized, "substate": substate},
-        )
-
     if payload.get("warning_count", 0):
         return build_evaluator_report(
             scope="processing",

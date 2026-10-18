@@ -340,14 +340,12 @@ def run_video(video: dict, out_dir: Path, stage: str, allow_deepgram: bool, time
             args = utils("process-chunks", str(chunks_dir), "--prompt", op["prompt"], "--input-key", input_key)
             if op.get("extra_instruction"):
                 args += ["--extra-instruction", op["extra_instruction"]]
-            if input_key == "raw_path":
-                args.append("--auto-replan")
             pc = run_json(args, logs / f"process_chunks_{index}_{op['prompt']}.log", max(timeout, 3600))
             llm_runs.append({"prompt": op["prompt"], **{k: pc.get(k) for k in (
-                "success", "total_chunks", "processed_count", "failed_count", "replan_required")}})
-            if not pc.get("success") or pc.get("replan_required"):
+                "success", "long_text_mode", "total_chunks", "processed_count", "failed_count")}})
+            if not pc.get("success"):
                 raise StepError(f"process-chunks {op['prompt']}: failed_count={pc.get('failed_count')} "
-                                f"replan_required={pc.get('replan_required')}")
+                                f"{pc.get('message') or pc.get('aborted_reason') or ''}".rstrip())
         result["llm_runs"] = llm_runs
         done()
 
