@@ -167,7 +167,7 @@ Notes:
 
 - `build-chapter-plan` requires each chunk in `manifest.json` to have `start_time` / `end_time`; this works when `chunk-document` selected timed segments, or when you used `chunk-segments` directly. If the plan resolved to text-first chunking (including Chinese YouTube-subtitle long paths), it will STOP with an error.
 - If you cannot produce timed chunks, continue without `chapter_plan.json`; `merge-content` still succeeds, just without injected YouTube chapter headers.
-- If you must have headings but lack timing, generate a best-effort plan by summarizing chunks and creating `chapter_plan.json` manually (this is not a true YouTube-chapter mapping). Run any `process-chunks --prompt summarize` for this on a copy of the work dir: it writes fixed-chunk outputs, and a work dir with finished fixed chunks stays on fixed chunks for the real cleanup stage.
+- If you must have headings but lack timing, generate a best-effort plan by summarizing chunks and creating `chapter_plan.json` manually (this is not a true YouTube-chapter mapping). `process-chunks --prompt summarize` writes `summary_chunk_*.txt` next to the chunks and does not change which executor the cleanup stage uses.
 
 ### Step 4: Process Chunks
 

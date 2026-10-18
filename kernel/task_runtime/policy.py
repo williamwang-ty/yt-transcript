@@ -10,8 +10,6 @@ STANDARD_ACTIONS = (
     "continue_stage",
     "retry_action",
     "repair_chunk",
-    "shrink_chunk_size",
-    "switch_model_profile",
     "fallback_to_deepgram",
     "degrade_output_mode",
     "accept_output",
@@ -86,7 +84,9 @@ def evaluate_policy(*, run_state: dict | None = None, result=None,
         if payload.get("failed_count", 0) or payload.get("warning_count", 0):
             allowed_actions.extend(["retry_action", "repair_chunk"])
         if _timeout_signal(payload):
-            allowed_actions.extend(["shrink_chunk_size", "switch_model_profile"])
+            # Re-running resumes the run; the window executor shrinks its
+            # write target after slow or timed-out rounds by itself.
+            allowed_actions.append("retry_action")
     elif active_stage == "verify":
         if quality_report.get("passed", payload.get("passed", False)):
             allowed_actions.append("accept_output")

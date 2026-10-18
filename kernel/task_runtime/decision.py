@@ -28,8 +28,8 @@ def _select_action(*, run_state: dict | None = None, result=None,
         return "resume_run", "runtime is paused and resumable", 0.9, "rule"
     if payload.get("aborted", False) and "request_human_escalation" in allowed_actions:
         return "request_human_escalation", "run aborted; escalate for inspection", 0.85, "rule"
-    if policy_evaluation.get("budget_pressure_level") == "high" and "shrink_chunk_size" in allowed_actions:
-        return "shrink_chunk_size", "high timeout pressure suggests shrinking chunk size", 0.8, "rule"
+    if policy_evaluation.get("budget_pressure_level") == "high" and "retry_action" in allowed_actions:
+        return "retry_action", "timeouts stopped the stage; re-running resumes it", 0.8, "rule"
     if active_stage == "verify" and not quality_report.get("passed", payload.get("passed", False)):
         if "repair_chunk" in allowed_actions:
             return "repair_chunk", "quality gate failed; repair is the lowest-cost next step", 0.8, "rule"

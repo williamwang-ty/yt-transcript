@@ -59,6 +59,8 @@ WINDOW_PROMPTS = {
     RAW_STAGE: ("cleanup_zh", "structure_only", "quick_cleanup"),
     PROCESSED_STAGE: ("translate_only",),
 }
+# Fixed-chunk prompts whose outputs are side files, not the merged document.
+SIDE_CHUNK_PROMPTS = ("summarize",)
 
 DEFAULT_WINDOW_READ_TOKENS = 6000
 DEFAULT_WINDOW_WRITE_TOKENS = 3000
@@ -229,7 +231,11 @@ def has_chunk_progress(work_dir: str) -> bool:
     if manifest.get(EXECUTOR_MANIFEST_KEY) == "window":
         return False
     chunks = manifest.get("chunks") if isinstance(manifest.get("chunks"), list) else []
-    return any(isinstance(chunk, dict) and chunk.get("status") == "done" for chunk in chunks)
+    # Chunks finished by a side prompt (summarize writes summary_chunk_*.txt,
+    # which merge never reads) are not progress on the document itself.
+    return any(isinstance(chunk, dict) and chunk.get("status") == "done"
+               and str(chunk.get("output_prompt_name", "")).strip() not in SIDE_CHUNK_PROMPTS
+               for chunk in chunks)
 
 
 def set_manifest_executor(work_dir: str, executor: str, stage: str = "") -> None:
