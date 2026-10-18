@@ -1,0 +1,604 @@
+{
+ "id": "Fhx_qNS2P8g",
+ "title": "E255｜模型越来越强，为什么用户没感觉？再访阿里国际站总裁张阔",
+ "fulltitle": "E255｜模型越来越强，为什么用户没感觉？再访阿里国际站总裁张阔",
+ "channel": "硅谷101播客",
+ "uploader": "硅谷101播客",
+ "upload_date": "20261009",
+ "duration": 2773,
+ "language": null,
+ "webpage_url": "https://www.youtube.com/watch?v=Fhx_qNS2P8g",
+ "chapters": [
+  {
+   "start_time": 0,
+   "end_time": 78,
+   "title": "<Untitled Chapter 1>"
+  },
+  {
+   "start_time": 78,
+   "title": "AI同事市场：编程之外，专业工作走到了哪一步？",
+   "end_time": 158
+  },
+  {
+   "start_time": 158,
+   "title": "商业任务为什么比编程更难？",
+   "end_time": 228
+  },
+  {
+   "start_time": 228,
+   "title": "从采购搜索到日常经营，Accio Work的任务边界如何扩展",
+   "end_time": 372
+  },
+  {
+   "start_time": 372,
+   "title": "商家案例：植物监测产品，从创意走到设计、供应链和销售",
+   "end_time": 467
+  },
+  {
+   "start_time": 467,
+   "title": "找工厂、比报价、拿样品：采购流程里，人和AI如何协作",
+   "end_time": 613
+  },
+  {
+   "start_time": 613,
+   "title": "中美Agent生态的差异：垂直SaaS与平台工具",
+   "end_time": 690
+  },
+  {
+   "start_time": 690,
+   "title": "AI会替代SaaS吗？",
+   "end_time": 851
+  },
+  {
+   "start_time": 851,
+   "title": "独立站与平台电商：不同市场如何影响产品设计",
+   "end_time": 916
+  },
+  {
+   "start_time": 916,
+   "title": "Agent公式：模型 × 工程框架 × 上下文",
+   "end_time": 1066
+  },
+  {
+   "start_time": 1066,
+   "title": "模型与工程联合优化，不能只等模型升级",
+   "end_time": 1229
+  },
+  {
+   "start_time": 1229,
+   "title": "107个真实任务：无人干预条件下，最前沿模型通过率约61",
+   "end_time": 1472
+  },
+  {
+   "start_time": 1472,
+   "title": "报价、钓鱼邮件、订船和纠纷：怎样才算真正完成任务？",
+   "end_time": 1593
+  },
+  {
+   "start_time": 1593,
+   "title": "新版本也可能退步，评测必须持续做",
+   "end_time": 1735
+  },
+  {
+   "start_time": 1735,
+   "title": "多平台经营：有流水，不代表有利润",
+   "end_time": 1959
+  },
+  {
+   "start_time": 1959,
+   "title": "产品品味、市场判断与预算分配：老板仍要做的选择",
+   "end_time": 2024
+  },
+  {
+   "start_time": 2024,
+   "title": "多模型路由：如何为不同任务匹配能力与成本？",
+   "end_time": 2285
+  },
+  {
+   "start_time": 2285,
+   "title": "多个Agent建议冲突，商家该听谁的？",
+   "end_time": 2435
+  },
+  {
+   "start_time": 2435,
+   "title": "上云、定时任务、事件响应与长期经营，是不同的能力",
+   "end_time": 2585
+  },
+  {
+   "start_time": 2585,
+   "title": "CoCreate现场：商家对Agent有哪些期待？",
+   "end_time": 2683
+  },
+  {
+   "start_time": 2683,
+   "title": "小企业如何借助AI，把生意做得更大",
+   "end_time": 2773
+  }
+ ],
+ "subtitles": {
+  "zh-Hans": [
+   {
+    "ext": "vtt",
+    "name": "Chinese (Simplified)",
+    "url": "https://www.youtube.com/api/timedtext?lang=zh-Hans"
+   }
+  ]
+ },
+ "automatic_captions": {
+  "zh-Hans": [
+   {
+    "ext": "vtt",
+    "name": "",
+    "url": ""
+   }
+  ]
+ },
+ "formats": [
+  {
+   "format_id": "sb3",
+   "ext": "mhtml",
+   "acodec": "none",
+   "vcodec": "none",
+   "format_note": "storyboard",
+   "abr": 0
+  },
+  {
+   "format_id": "sb2",
+   "ext": "mhtml",
+   "acodec": "none",
+   "vcodec": "none",
+   "format_note": "storyboard",
+   "abr": 0
+  },
+  {
+   "format_id": "sb1",
+   "ext": "mhtml",
+   "acodec": "none",
+   "vcodec": "none",
+   "format_note": "storyboard",
+   "abr": 0
+  },
+  {
+   "format_id": "sb0",
+   "ext": "mhtml",
+   "acodec": "none",
+   "vcodec": "none",
+   "format_note": "storyboard",
+   "abr": 0
+  },
+  {
+   "format_id": "233",
+   "ext": "mp4",
+   "vcodec": "none",
+   "language": null,
+   "format_note": "Default, low",
+   "abr": null
+  },
+  {
+   "format_id": "234",
+   "ext": "mp4",
+   "vcodec": "none",
+   "language": null,
+   "format_note": "Default, high",
+   "abr": null
+  },
+  {
+   "format_id": "139-drc",
+   "ext": "m4a",
+   "acodec": "mp4a.40.5",
+   "vcodec": "none",
+   "language": null,
+   "language_preference": -1,
+   "format_note": "low, DRC",
+   "audio_channels": 2,
+   "abr": 48.784
+  },
+  {
+   "format_id": "249-drc",
+   "ext": "webm",
+   "acodec": "opus",
+   "vcodec": "none",
+   "language": null,
+   "language_preference": -1,
+   "format_note": "low, DRC",
+   "audio_channels": 2,
+   "abr": 50.29
+  },
+  {
+   "format_id": "250-drc",
+   "ext": "webm",
+   "acodec": "opus",
+   "vcodec": "none",
+   "language": null,
+   "language_preference": -1,
+   "format_note": "low, DRC",
+   "audio_channels": 2,
+   "abr": 62.137
+  },
+  {
+   "format_id": "139",
+   "ext": "m4a",
+   "acodec": "mp4a.40.5",
+   "vcodec": "none",
+   "language": null,
+   "language_preference": -1,
+   "format_note": "low",
+   "audio_channels": 2,
+   "abr": 48.784
+  },
+  {
+   "format_id": "249",
+   "ext": "webm",
+   "acodec": "opus",
+   "vcodec": "none",
+   "language": null,
+   "language_preference": -1,
+   "format_note": "low",
+   "audio_channels": 2,
+   "abr": 50.269
+  },
+  {
+   "format_id": "250",
+   "ext": "webm",
+   "acodec": "opus",
+   "vcodec": "none",
+   "language": null,
+   "language_preference": -1,
+   "format_note": "low",
+   "audio_channels": 2,
+   "abr": 61.91
+  },
+  {
+   "format_id": "140-drc",
+   "ext": "m4a",
+   "acodec": "mp4a.40.2",
+   "vcodec": "none",
+   "language": null,
+   "language_preference": -1,
+   "format_note": "medium, DRC",
+   "audio_channels": 2,
+   "abr": 129.473
+  },
+  {
+   "format_id": "251-drc",
+   "ext": "webm",
+   "acodec": "opus",
+   "vcodec": "none",
+   "language": null,
+   "language_preference": -1,
+   "format_note": "medium, DRC",
+   "audio_channels": 2,
+   "abr": 111.11
+  },
+  {
+   "format_id": "140",
+   "ext": "m4a",
+   "acodec": "mp4a.40.2",
+   "vcodec": "none",
+   "language": null,
+   "language_preference": -1,
+   "format_note": "medium",
+   "audio_channels": 2,
+   "abr": 129.473
+  },
+  {
+   "format_id": "251",
+   "ext": "webm",
+   "acodec": "opus",
+   "vcodec": "none",
+   "language": null,
+   "language_preference": -1,
+   "format_note": "medium",
+   "audio_channels": 2,
+   "abr": 110.772
+  },
+  {
+   "format_id": "602",
+   "ext": "mp4",
+   "acodec": "none",
+   "vcodec": "vp09.00.10.08",
+   "abr": 0
+  },
+  {
+   "format_id": "269",
+   "ext": "mp4",
+   "acodec": "none",
+   "vcodec": "avc1.4D400C",
+   "abr": 0
+  },
+  {
+   "format_id": "160",
+   "ext": "mp4",
+   "acodec": "none",
+   "vcodec": "avc1.4D400C",
+   "language": null,
+   "language_preference": -1,
+   "format_note": "144p",
+   "audio_channels": null,
+   "abr": 0
+  },
+  {
+   "format_id": "603",
+   "ext": "mp4",
+   "acodec": "none",
+   "vcodec": "vp09.00.11.08",
+   "abr": 0
+  },
+  {
+   "format_id": "278",
+   "ext": "webm",
+   "acodec": "none",
+   "vcodec": "vp9",
+   "language": null,
+   "language_preference": -1,
+   "format_note": "144p",
+   "audio_channels": null,
+   "abr": 0
+  },
+  {
+   "format_id": "394",
+   "ext": "mp4",
+   "acodec": "none",
+   "vcodec": "av01.0.00M.08",
+   "language": null,
+   "language_preference": -1,
+   "format_note": "144p",
+   "audio_channels": null,
+   "abr": 0
+  },
+  {
+   "format_id": "229",
+   "ext": "mp4",
+   "acodec": "none",
+   "vcodec": "avc1.4D4015",
+   "abr": 0
+  },
+  {
+   "format_id": "133",
+   "ext": "mp4",
+   "acodec": "none",
+   "vcodec": "avc1.4D4015",
+   "language": null,
+   "language_preference": -1,
+   "format_note": "240p",
+   "audio_channels": null,
+   "abr": 0
+  },
+  {
+   "format_id": "604",
+   "ext": "mp4",
+   "acodec": "none",
+   "vcodec": "vp09.00.20.08",
+   "abr": 0
+  },
+  {
+   "format_id": "242",
+   "ext": "webm",
+   "acodec": "none",
+   "vcodec": "vp9",
+   "language": null,
+   "language_preference": -1,
+   "format_note": "240p",
+   "audio_channels": null,
+   "abr": 0
+  },
+  {
+   "format_id": "395",
+   "ext": "mp4",
+   "acodec": "none",
+   "vcodec": "av01.0.00M.08",
+   "language": null,
+   "language_preference": -1,
+   "format_note": "240p",
+   "audio_channels": null,
+   "abr": 0
+  },
+  {
+   "format_id": "230",
+   "ext": "mp4",
+   "acodec": "none",
+   "vcodec": "avc1.4D401E",
+   "abr": 0
+  },
+  {
+   "format_id": "134",
+   "ext": "mp4",
+   "acodec": "none",
+   "vcodec": "avc1.4D401E",
+   "language": null,
+   "language_preference": -1,
+   "format_note": "360p",
+   "audio_channels": null,
+   "abr": 0
+  },
+  {
+   "format_id": "18",
+   "ext": "mp4",
+   "acodec": "mp4a.40.2",
+   "vcodec": "avc1.42001E",
+   "language": null,
+   "language_preference": -1,
+   "format_note": "360p",
+   "audio_channels": 2,
+   "abr": null
+  },
+  {
+   "format_id": "605",
+   "ext": "mp4",
+   "acodec": "none",
+   "vcodec": "vp09.00.21.08",
+   "abr": 0
+  },
+  {
+   "format_id": "243",
+   "ext": "webm",
+   "acodec": "none",
+   "vcodec": "vp9",
+   "language": null,
+   "language_preference": -1,
+   "format_note": "360p",
+   "audio_channels": null,
+   "abr": 0
+  },
+  {
+   "format_id": "396",
+   "ext": "mp4",
+   "acodec": "none",
+   "vcodec": "av01.0.01M.08",
+   "language": null,
+   "language_preference": -1,
+   "format_note": "360p",
+   "audio_channels": null,
+   "abr": 0
+  },
+  {
+   "format_id": "231",
+   "ext": "mp4",
+   "acodec": "none",
+   "vcodec": "avc1.4D401E",
+   "abr": 0
+  },
+  {
+   "format_id": "135",
+   "ext": "mp4",
+   "acodec": "none",
+   "vcodec": "avc1.4D401E",
+   "language": null,
+   "language_preference": -1,
+   "format_note": "480p",
+   "audio_channels": null,
+   "abr": 0
+  },
+  {
+   "format_id": "606",
+   "ext": "mp4",
+   "acodec": "none",
+   "vcodec": "vp09.00.30.08",
+   "abr": 0
+  },
+  {
+   "format_id": "244",
+   "ext": "webm",
+   "acodec": "none",
+   "vcodec": "vp9",
+   "language": null,
+   "language_preference": -1,
+   "format_note": "480p",
+   "audio_channels": null,
+   "abr": 0
+  },
+  {
+   "format_id": "397",
+   "ext": "mp4",
+   "acodec": "none",
+   "vcodec": "av01.0.04M.08",
+   "language": null,
+   "language_preference": -1,
+   "format_note": "480p",
+   "audio_channels": null,
+   "abr": 0
+  },
+  {
+   "format_id": "232",
+   "ext": "mp4",
+   "acodec": "none",
+   "vcodec": "avc1.4D401F",
+   "abr": 0
+  },
+  {
+   "format_id": "136",
+   "ext": "mp4",
+   "acodec": "none",
+   "vcodec": "avc1.4D401F",
+   "language": null,
+   "language_preference": -1,
+   "format_note": "720p",
+   "audio_channels": null,
+   "abr": 0
+  },
+  {
+   "format_id": "609",
+   "ext": "mp4",
+   "acodec": "none",
+   "vcodec": "vp09.00.31.08",
+   "abr": 0
+  },
+  {
+   "format_id": "247",
+   "ext": "webm",
+   "acodec": "none",
+   "vcodec": "vp9",
+   "language": null,
+   "language_preference": -1,
+   "format_note": "720p",
+   "audio_channels": null,
+   "abr": 0
+  },
+  {
+   "format_id": "398",
+   "ext": "mp4",
+   "acodec": "none",
+   "vcodec": "av01.0.05M.08",
+   "language": null,
+   "language_preference": -1,
+   "format_note": "720p",
+   "audio_channels": null,
+   "abr": 0
+  },
+  {
+   "format_id": "270",
+   "ext": "mp4",
+   "acodec": "none",
+   "vcodec": "avc1.640028",
+   "abr": 0
+  },
+  {
+   "format_id": "137",
+   "ext": "mp4",
+   "acodec": "none",
+   "vcodec": "avc1.640028",
+   "language": null,
+   "language_preference": -1,
+   "format_note": "1080p",
+   "audio_channels": null,
+   "abr": 0
+  },
+  {
+   "format_id": "614",
+   "ext": "mp4",
+   "acodec": "none",
+   "vcodec": "vp09.00.40.08",
+   "abr": 0
+  },
+  {
+   "format_id": "248",
+   "ext": "webm",
+   "acodec": "none",
+   "vcodec": "vp9",
+   "language": null,
+   "language_preference": -1,
+   "format_note": "1080p",
+   "audio_channels": null,
+   "abr": 0
+  },
+  {
+   "format_id": "399",
+   "ext": "mp4",
+   "acodec": "none",
+   "vcodec": "av01.0.08M.08",
+   "language": null,
+   "language_preference": -1,
+   "format_note": "1080p",
+   "audio_channels": null,
+   "abr": 0
+  },
+  {
+   "format_id": "616",
+   "ext": "mp4",
+   "acodec": "none",
+   "vcodec": "vp09.00.40.08",
+   "format_note": "Premium",
+   "abr": 0
+  }
+ ]
+}
