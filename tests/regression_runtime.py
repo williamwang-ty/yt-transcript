@@ -910,6 +910,24 @@ class RuntimeRegressionTests(FixedChunkExecutorTestCase):
             self.assertEqual(result["checks"]["glossary_drift_count"], 0)
             self.assertFalse(any("Glossary drift detected" in warning for warning in result["warnings"]))
 
+    def test_verify_quality_ignores_case_only_glossary_differences(self):
+        """Test verify quality does not count a recased term (Transdigm -> TransDigm) as drift."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            raw = Path(tmpdir) / "raw.txt"
+            optimized = Path(tmpdir) / "opt.md"
+            work_dir = Path(tmpdir) / "chunks"
+            raw.write_text("Transdigm 和 OpenAI 发布了财报。", encoding="utf-8")
+            utils.chunk_text(str(raw), str(work_dir), 80, "cleanup_zh")
+            (work_dir / "glossary.json").write_text(json.dumps({
+                "terms": [{"term": "Transdigm", "aliases": [], "preferred_output": "Transdigm", "source": "transcript", "count": 2}],
+            }), encoding="utf-8")
+            optimized.write_text("## Section\n\nTransDigm 和 OpenAI 发布了财报。\n", encoding="utf-8")
+
+            result = utils.verify_quality(str(optimized), str(raw), bilingual=False, work_dir=str(work_dir))
+
+            self.assertTrue(result["checks"]["glossary_drift_applicable"], result["checks"])
+            self.assertEqual(result["checks"]["glossary_drift_count"], 0)
+
     def test_verify_quality_hard_fails_empty_processed_chunk_file(self):
         """Test verify quality rejects zero-byte processed chunk artifacts."""
         with tempfile.TemporaryDirectory() as tmpdir:
