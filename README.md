@@ -190,16 +190,16 @@ yt-transcript/
 │   │   └── telemetry.py    # Telemetry query and summary helpers
 │   └── long_text/          # Long-text transformation layer
 │       ├── glossary.py     # Glossary extraction and terminology checks
-│       ├── semantic.py     # Semantic anchor extraction and checks
+│       ├── semantic.py     # Semantic anchor checks for verify-quality
 │       ├── contracts.py    # Control contracts and policy state
-│       ├── autotune.py     # Chunk autotune and token-source summarization
 │       ├── lifecycle.py    # Manifest lifecycle and resume-state helpers
 │       ├── prompting.py    # Prompt assembly and chunking-context helpers
 │       ├── llm.py          # LLM request loop and retry helpers
-│       ├── processing.py   # Chunk-processing and replan execution loops
+│       ├── window.py       # Sliding-window executor (default long-text mode)
+│       ├── processing.py   # Fixed-chunk processing loop (legacy `chunks` mode)
 │       ├── chunking.py     # Chunking command surfaces
 │       ├── merge.py        # Merge and chapter-plan command surfaces
-│       └── execution.py    # Execution, resume, and replan command surfaces
+│       └── execution.py    # Execution, executor routing, and resume command surfaces
 ├── tests/                   # Regression test suite
 ├── config.yaml              # Local config (gitignored)
 ├── config.example.yaml      # Config template
@@ -229,7 +229,7 @@ Phase 4 adds `kernel/task_runtime/recovery.py` and `artifacts.py` so long-text r
 Phase 5 adds `kernel/task_runtime/evaluator.py` plus constrained llm-assisted ranking hooks so quality-gated recommendations and optional model-assisted action selection can coexist without bypassing the allowed-action contract.
 Phase 6 adds `kernel/task_runtime/api.py`, making `create-run`, `inspect-run`, `advance-run`, `apply-control`, `resume-run`, and `finalize-run` the preferred outer runtime contract while preserving the older control commands as compatibility helpers.
 
-The hardest internal subsystem is long-text transformation. It activates only when the planning layer determines that the input is long enough to require chunking, continuity control, consistency protection, verification, repair / replan, and deterministic merge.
+The hardest internal subsystem is long-text transformation. It activates only when the planning layer determines that the input is long enough to require windowed or chunked processing, consistency protection (outline + glossary), verification, repair, and deterministic merge.
 
 [Read separate System Design Document](SYSTEM_DESIGN.md)
 
@@ -289,15 +289,14 @@ This keeps workflow logic in scripts instead of ad-hoc shell parsing inside the 
 
 At the whole-project level, it is the routing boundary between source acquisition and text transformation. At the long-text subsystem level, it defines the execution contract that downstream chunk processing must follow:
 
-- `operations[*].execution.supports_auto_replan`
-- `operations[*].execution.recommended_cli_flags`
-- `operations[*].execution.on_replan_required`
+- `operations[*].kind` (`chunk` or `prompt`), `prompt`, `input_key` or `input` / `output`
+- `operations[*].execution.mode` (`chunked` or `single_pass`)
 
 `normalize-document` materializes `/tmp/${VIDEO_ID}_normalized_document.json` from either raw text or timed `segments.json`, and `plan-optimization` auto-materializes it when source artifacts already exist. When the source segments came from subtitle cleanup, the normalized document now also preserves lightweight cleanup diagnostics under `diagnostics.subtitle_cleanup` and an explainable subtitle-path quality summary under `diagnostics.subtitle_quality`.
 
 `plan-optimization` now separates duration routing from source routing: `routing_reason` still explains short-vs-long execution, while `source_route_reason`, `subtitle_quality_score`, `reroute_recommended`, and `reroute_target` explain whether the current subtitle source should be kept, manually reviewed, or replaced with Deepgram.
 
-For long-video chunking, `plan-optimization` now also emits a canonical `chunking` block; when normalization exists, `chunk-document` is the preferred driver and it keeps chunk boundary / continuity assumptions explicit in `manifest.json`.
+For long-video chunking, `plan-optimization` now also emits a canonical `chunking` block; when normalization exists, `chunk-document` is the preferred driver and it keeps the chunk boundaries explicit in `manifest.json` (the window executor reads its source from those chunk files).
 
 The current design also has explicit resume semantics: `prepare-resume` repairs stale manifest state manually, while `process-chunks` runs the same repair step automatically before execution continues.
 
@@ -307,8 +306,8 @@ Known limitation: all state and work files live under `/tmp`, which macOS emptie
 
 Current policy is intentional and explicit:
 
-- `raw_path` chunk stages use `process-chunks --auto-replan`
-- `processed_path` chunk stages do **not** auto-replan; if `replan_required=true`, stop and review manually
+- long-text stages run `process-chunks`; with the default `long_text_mode: window` it drives the sliding-window executor, and `long_text_mode: chunks` keeps the legacy fixed-chunk executor
+- a work dir that already has finished fixed chunks keeps resuming in `chunks` mode
 
 ### 🧭 Intentional Design Decisions
 
@@ -337,11 +336,10 @@ Current policy is intentional and explicit:
 - prompt names are validated eagerly for chunk planning, so typos fail fast instead of silently falling back to generic budgets
 - `process-chunks` sends `max_tokens` as a stop line (default 8192 per task, only bounded by the context window) instead of carving it out of the input budget, so reasoning tokens no longer squeeze the answer
 - a chunk response cut off at `max_tokens` (`finish_reason` = `length` / `max_tokens` / `max_output_tokens`, any provider) is retried with a larger ceiling (`llm_output_retry_*`, formerly `llm_reasoning_retry_*`); one still cut off after that is flagged `truncated_output`
-- `long_text_mode: window` (experimental, default stays `chunks`) runs `cleanup_zh`, `quick_cleanup` and the bilingual `structure_only` → `translate_only` pair as a sliding window: numbered source units (an over-long unpunctuated sentence is cut at subtitle cue ends, preferring the longest pauses, when the timed cues in `normalized_document.json` match the text, also where the chunker had cut inside a cue; otherwise every ~120 tokens), a read window from a cursor, a soft write target, and the model copying each unit's `[S<n>]` tag in front of its text and ending with `<!--END-->`; the program works out where each paragraph ends. Complete paragraphs are saved under `<work_dir>/window/` (`window/processed/` for the translation stage), a response without the end line loses only its last paragraph, and the cursor moves past what was kept, so truncation only means less progress. Sizes adapt per round: the write target starts at `window_write_tokens` and shrinks after truncated or slow rounds, the read window follows the write target and the measured output/source ratio (capped at `window_read_tokens`) so little is read twice, and the last stretch goes in one round when it fits. A round whose output is far shorter or longer than its source is rejected like a response with bad tags. It works the same for the API and agent-CLI backends, resumes paragraph by paragraph, falls back to one fixed chunk after repeated bad rounds, and reports coverage and how much was re-read. Old half-finished chunk runs resume only in `chunks` mode
+- `long_text_mode: window` (the default; `chunks` is kept as a legacy fallback) runs `cleanup_zh`, `quick_cleanup` and the bilingual `structure_only` → `translate_only` pair as a sliding window: numbered source units (an over-long unpunctuated sentence is cut at subtitle cue ends, preferring the longest pauses, when the timed cues in `normalized_document.json` match the text, also where the chunker had cut inside a cue; otherwise every ~120 tokens), a read window from a cursor, a soft write target, and the model copying each unit's `[S<n>]` tag in front of its text and ending with `<!--END-->`; the program works out where each paragraph ends. Complete paragraphs are saved under `<work_dir>/window/` (`window/processed/` for the translation stage), a response without the end line loses only its last paragraph, and the cursor moves past what was kept, so truncation only means less progress. Sizes adapt per round: the write target starts at `window_write_tokens` and shrinks after truncated or slow rounds, the read window follows the write target and the measured output/source ratio (capped at `window_read_tokens`) so little is read twice, and the last stretch goes in one round when it fits. A round whose output is far shorter or longer than its source is rejected like a response with bad tags. It works the same for the API and agent-CLI backends, resumes paragraph by paragraph, falls back to one fixed chunk after repeated bad rounds, and reports coverage and how much was re-read. Work dirs that already have finished fixed chunks keep resuming with fixed chunks, and stages the window does not cover (such as `summarize`) use fixed chunks
 - In window mode, `cleanup_zh` and `structure_only` first get a global outline (`window_outline: true`): the whole numbered source goes to the model once (in parts above `window_outline_read_tokens`, 16000 by default) and comes back as a short JSON list of sections (title + first unit, checked to be in range and increasing) and of names and terms with their correct spellings and seen misspellings. Each round gets the outline lines near its window and the terms found in it; headings come only from the outline, written by the model where the topic actually begins near the section start or else inserted by the program, so section structure is decided once for the whole text. YouTube chapters (`chunk-document --chapters`, or `chapter_plan.json`) are mapped to units and given as hints. The bilingual pair gets English + Chinese titles and the terms' Chinese renderings carry into `translate_only`. The outline is kept in the window state and reused on resume; if it fails, rounds place their own headings as before
-- `manifest.json` now records explicit `plan.chunk_contract` and `plan.continuity`; `process-chunks` follows that plan-owned continuity policy instead of silently drifting with later config changes
+- `manifest.json` records an explicit `plan.chunk_contract` so a resumed fixed-chunk run keeps its original chunk sizes
 - chunk execution now also has explicit resume semantics: stale `running` / missing-output checkpoints are repaired deterministically into `done` or `interrupted` before work resumes
-- `process-chunks` also injects a short continuity context from the previous chunk (tail sentence + optional section title) without enabling body overlap, and chunk budgeting now reserves a small token allowance for that carry-over context
 - `process-chunks` now treats transient gateway disconnects such as `Remote end closed connection without response` as retryable transport failures, and can auto-rerun suspiciously short / malformed chunk outputs before keeping a warning
 - `process-chunks --dry-run` validates prompts, manifests, and chunk budgets without requiring live LLM credentials; actual execution still requires `llm_api_key`, `llm_base_url`, and `llm_model`
 - `download.sh` now writes subtitle and audio artifacts into per-video isolated temp directories under `/tmp/${VIDEO_ID}_downloads/...` and exposes `download_dir` in JSON for deterministic selection and cleanup
@@ -352,13 +350,12 @@ Current policy is intentional and explicit:
 - subtitle-driven workflows still support Chinese-source monolingual mode and English-source bilingual mode; Chinese-source runs now prefer `cleanup_zh`, while English-source runs still use `structure_only -> translate_only`; when neither usable Chinese nor English subtitles can be downloaded, the workflow should stop and fall back to audio transcription
 - `plan-optimization` is the canonical short/long router with `< 1800s = short` and `>= 1800s = long`; the Quick Mode shortcut from `SKILL.md` is a narrower `< 900s` subset for subtitle-friendly videos
 - `manifest.json` now separates immutable `plan` metadata from `runtime` state, and `process-chunks` records attempt-level telemetry (`attempt_logs`) in addition to chunk-level fields
-- `process-chunks` no longer rewrites the current batch budget on the fly; when canary chunks or retry history show the plan is unhealthy, it aborts with `replan_required=true` so `replan-remaining` can generate a new plan for unfinished raw chunks
-- `process-chunks --auto-replan` preserves that architecture boundary while automating the orchestration loop (`process -> replan-remaining -> resume`) for raw-path plans
+- fixed chunks are sized by each task's chunk target (`chunk_tokens_*`) with a hard cap of `chunk_hard_cap_multiplier` × target; the old continuity context, autotune and `replan-remaining` patches were removed with the switch to window mode, and a fixed-chunk run stops after repeated consecutive timeouts instead
 - `build-glossary --mode transcript` now mines glossary terms from raw chunks plus any available normalized-document title/channel, chapter titles, and optional metadata/description context; `cleanup_zh` auto-builds that glossary when the work_dir does not have one yet
 - glossary selection and verification now use boundary-aware matching for simple ASCII terms, so acronyms like `API` do not get falsely selected from unrelated words such as `rapid` or `capital`
 - `run_kernel_command(...)` is the stable Python envelope API for kernel commands, and `python3 yt_transcript_utils.py --api-envelope ...` emits the same `yt_transcript.command_result/v1` envelope on the CLI without breaking legacy flat JSON output
 - envelope-producing kernel commands append local `yt_transcript.telemetry_event/v1` records to `telemetry.jsonl` when a stable nearby sink path can be inferred
-- `runtime.status` now distinguishes `completed`, `completed_with_errors`, and `aborted`, and raw-path replans remap existing `chapter_plan.json` chunk starts so merged chapter headers still land on valid chunk boundaries
+- `runtime.status` now distinguishes `completed`, `completed_with_errors`, and `aborted`
 - runtime token estimation remains heuristic by default; `test-token-count` / `preflight.sh --require-llm` probe provider-side token counting and clearly fall back to local estimates when unavailable
 - `chunk_hard_cap_multiplier` is constrained to a conservative `1.0-2.0` range so misconfiguration cannot silently blow up chunk envelopes
 - `preflight.sh` is staged so subtitle-only workflows do not require Deepgram or LLM credentials up front, while `--require-llm` now performs both reachability and token-count capability probes
@@ -384,7 +381,7 @@ Current policy is intentional and explicit:
 |----------|--------------------------|--------------|
 | Short video with subtitles | `preflight.sh` → `download.sh metadata` → create state → `validate-state --stage metadata` → `download.sh subtitle-info` → `download.sh subtitles` → `validate-state --stage post-source` → optimize → `verify-quality` | Stop only if `validate-state` or `verify-quality` returns non-empty `hard_failures` |
 | Video without usable subtitles | `preflight.sh` → `download.sh metadata` → `download.sh subtitle-info` → `preflight.sh --require-deepgram` → `transcribe-deepgram` → `validate-state --stage post-source` → optimize → `verify-quality` | Stop on any command failure or non-empty `hard_failures` |
-| Long video | `validate-state --stage post-source` → `plan-optimization` → if `requires_llm_preflight=true`, run `preflight.sh --require-llm` → chunk → raw-path `process-chunks --auto-replan` → optional processed-path translation → merge → `verify-quality` → `validate-state --stage pre-assemble` | `warnings` alone do not block; `hard_failures` block |
+| Long video | `validate-state --stage post-source` → `plan-optimization` → if `requires_llm_preflight=true`, run `preflight.sh --require-llm` → chunk → raw-path `process-chunks` → optional processed-path translation → merge → `verify-quality` → `validate-state --stage pre-assemble` | `warnings` alone do not block; `hard_failures` block |
 
 Live regression: `python3 scripts/run_regression.py` runs the pipeline on a fixed set of real videos and reports `verify-quality` results; see [tests/live_regression/README.md](tests/live_regression/README.md).
 
@@ -405,9 +402,8 @@ python3 yt_transcript_utils.py validate-state /tmp/${VIDEO_ID}_state.md --stage 
 # 4. Optimization planning
 python3 yt_transcript_utils.py plan-optimization /tmp/${VIDEO_ID}_state.md
 
-# 4b. Long-video raw chunk stages follow the plan contract
-#     use process-chunks --auto-replan for raw_path,
-#     but stop-and-review for processed_path replan_required
+# 4b. Long-video stages run process-chunks for each plan operation
+#     (sliding window by default; long_text_mode: chunks for fixed chunks)
 
 # 5. Audio fallback when needed
 bash scripts/preflight.sh --require-deepgram
@@ -570,16 +566,16 @@ yt-transcript/
 │   │   └── telemetry.py    # telemetry 查询与汇总辅助
 │   └── long_text/          # 长文本变换层
 │       ├── glossary.py     # glossary 提取与术语检查
-│       ├── semantic.py     # semantic anchor 提取与检查
+│       ├── semantic.py     # verify-quality 用的 semantic anchor 检查
 │       ├── contracts.py    # control contract 与 policy state
-│       ├── autotune.py     # chunk autotune 与 token source 汇总
 │       ├── lifecycle.py    # manifest 生命周期与 resume state 辅助
 │       ├── prompting.py    # prompt 组装与 chunking context 辅助
 │       ├── llm.py          # LLM 请求循环与重试辅助
-│       ├── processing.py   # chunk 处理与 replan 执行循环
+│       ├── window.py       # 滑动窗口执行器（默认长文本模式）
+│       ├── processing.py   # 固定分块处理循环（旧的 `chunks` 模式）
 │       ├── chunking.py     # 分块命令表面
 │       ├── merge.py        # merge 与 chapter-plan 命令表面
-│       └── execution.py    # 执行、resume 与 replan 命令表面
+│       └── execution.py    # 执行、执行器选择与 resume 命令表面
 ├── tests/                   # 回归测试集
 ├── config.yaml              # 本地配置（已 gitignore）
 ├── config.example.yaml      # 配置模板
@@ -604,7 +600,7 @@ yt-transcript/
 
 Phase 6 进一步加入了 `kernel/task_runtime/api.py`，把 `create-run`、`inspect-run`、`advance-run`、`apply-control`、`resume-run`、`finalize-run` 收敛为首选外部运行时接口；原来的 `runtime-status`、`process-chunks`、`pause-run`、`cancel-run` 等命令仍然保留，但定位为兼容辅助入口。
 
-其中最难的内部子系统是长文本变换。它只会在 planning 层判断输入足够长、必须进入 chunk 处理时激活，并负责 chunking、continuity、一致性保护、verification、repair / replan 与确定性 merge。
+其中最难的内部子系统是长文本变换。它只会在 planning 层判断输入足够长、必须进入 chunk 处理时激活，并负责窗口或分块处理、一致性保护（大纲 + 术语表）、verification、repair 与确定性 merge。
 
 [阅读详细系统设计文档](SYSTEM_DESIGN.md)
 
@@ -664,15 +660,14 @@ bash scripts/preflight.sh --require-llm
 
 在整个项目层面，它是 source acquisition 和 text transformation 之间的路由边界；在长文本子系统层面，它定义了后续 chunk 执行必须遵循的 execution contract：
 
-- `operations[*].execution.supports_auto_replan`
-- `operations[*].execution.recommended_cli_flags`
-- `operations[*].execution.on_replan_required`
+- `operations[*].kind`（`chunk` 或 `prompt`）、`prompt`、`input_key` 或 `input` / `output`
+- `operations[*].execution.mode`（`chunked` 或 `single_pass`）
 
 `normalize-document` 会基于 raw text 或带时间戳的 `segments.json` 物化 `/tmp/${VIDEO_ID}_normalized_document.json`；当源 artifact 已存在时，`plan-optimization` 也会自动完成这一步。如果这些 segments 来自字幕清洗阶段，标准化文档还会把轻量清洗诊断透传到 `diagnostics.subtitle_cleanup`，并在 `diagnostics.subtitle_quality` 下写入可解释的字幕源质量摘要。
 
 `plan-optimization` 现在把“时长/体积路由”和“源路径质量路由”分开表达：`routing_reason` 仍只解释 short/long 执行路径，而 `source_route_reason`、`subtitle_quality_score`、`reroute_recommended`、`reroute_target` 用来解释当前字幕源是继续沿用、只做人工复核，还是建议切换到 Deepgram。
 
-对于长视频分块，`plan-optimization` 现在还会输出显式的 `chunking` 契约；一旦 normalization 已存在，优先使用 `chunk-document`，并把 chunk 边界 / continuity 假设显式记录到 `manifest.json`。
+对于长视频分块，`plan-optimization` 现在还会输出显式的 `chunking` 契约；一旦 normalization 已存在，优先使用 `chunk-document`，并把 chunk 边界显式记录到 `manifest.json`（滑动窗口执行器也从这些 chunk 文件读原文）。
 
 当前设计还包含显式的 resume 语义：`prepare-resume` 用于手动修复 stale manifest，而 `process-chunks` 在继续执行前会自动做同样的修复。
 
@@ -682,8 +677,8 @@ bash scripts/preflight.sh --require-llm
 
 当前约定是明确固定的：
 
-- `raw_path` 阶段统一使用 `process-chunks --auto-replan`
-- `processed_path` 阶段不做自动 replan；若返回 `replan_required=true`，必须先停下人工检查
+- 长文本各阶段都运行 `process-chunks`；默认 `long_text_mode: window` 走滑动窗口执行器，`long_text_mode: chunks` 保留旧的固定分块执行器
+- 已经有固定分块完成进度的工作目录，续跑时继续用 `chunks` 模式
 
 ### 🧭 设计上的刻意取舍
 
@@ -716,18 +711,16 @@ bash scripts/preflight.sh --require-llm
 - 分块阶段会提前校验 prompt 名称，避免因为 prompt 拼写错误而静默回退到通用预算
 - `process-chunks` 把 `max_tokens` 当作停止线（每个任务默认 8192，只受上下文窗口约束），不再从输入预算里切一块给输出，思考 token 不会再挤掉正文
 - 分块响应如果停在 `max_tokens`（任何厂商的 `finish_reason` = `length` / `max_tokens` / `max_output_tokens`），会加大上限重试（`llm_output_retry_*`，旧名 `llm_reasoning_retry_*`）；重试后仍被截断的块会标记为 `truncated_output`
-- `long_text_mode: window`（实验性，默认仍是 `chunks`）用滑动窗口处理 `cleanup_zh`、`quick_cleanup` 和双语的 `structure_only` → `translate_only` 两步：原文按单元编号（没有标点的长句在字幕条结束处切开，优先选停顿最长的地方，前提是 `normalized_document.json` 里的带时间字幕能和原文对上，切块时切在字幕条中间的地方也一并重切；对不上就每约 120 token 硬切），从游标读一段，按软目标写，模型把每个单元的 `[S<n>]` 编号原样写在对应文字前面，最后输出 `<!--END-->`，每段到哪里结束由程序推算。完整段落存到 `<work_dir>/window/`（翻译阶段在 `window/processed/`），没有结束行时只丢掉最后一段，游标移到保留内容之后，截断只是少推进一点。窗口每轮自适应：写目标从 `window_write_tokens` 开始，被截断或太慢就调小；读窗口跟着写目标和实测的输出/原文比例走（上限 `window_read_tokens`），尽量不重复读；剩下的原文一轮能写完就一次发完。输出比原文短太多或长太多的一轮按无效处理。API 和命令行后端用法一样，断点续跑精确到段落，连续失败就把这一段按固定分块处理，并报告覆盖率和重复阅读比例。旧的半截分块任务只能用 `chunks` 模式续跑
+- `long_text_mode: window`（默认；`chunks` 作为旧方案保留兜底）用滑动窗口处理 `cleanup_zh`、`quick_cleanup` 和双语的 `structure_only` → `translate_only` 两步：原文按单元编号（没有标点的长句在字幕条结束处切开，优先选停顿最长的地方，前提是 `normalized_document.json` 里的带时间字幕能和原文对上，切块时切在字幕条中间的地方也一并重切；对不上就每约 120 token 硬切），从游标读一段，按软目标写，模型把每个单元的 `[S<n>]` 编号原样写在对应文字前面，最后输出 `<!--END-->`，每段到哪里结束由程序推算。完整段落存到 `<work_dir>/window/`（翻译阶段在 `window/processed/`），没有结束行时只丢掉最后一段，游标移到保留内容之后，截断只是少推进一点。窗口每轮自适应：写目标从 `window_write_tokens` 开始，被截断或太慢就调小；读窗口跟着写目标和实测的输出/原文比例走（上限 `window_read_tokens`），尽量不重复读；剩下的原文一轮能写完就一次发完。输出比原文短太多或长太多的一轮按无效处理。API 和命令行后端用法一样，断点续跑精确到段落，连续失败就把这一段按固定分块处理，并报告覆盖率和重复阅读比例。已经有固定分块完成进度的工作目录继续用固定分块续跑，窗口不覆盖的阶段（如 `summarize`）也用固定分块
 - 窗口模式下，`cleanup_zh` 和 `structure_only` 会先生成全局大纲（`window_outline: true`）：把带编号的全文交给模型一次（超过 `window_outline_read_tokens`，默认 16000，就分段生成再合并），返回一份短 JSON：章节列表（标题 + 起始单元编号，校验在范围内且递增）和人名、术语表（正确写法和原文里出现的错写）。每轮请求带上窗口附近的大纲和窗口里出现的术语；标题只来自大纲，由模型在章节起始句附近话题真正开始的地方写出，没写就由程序插入，全文的章节划分一次定好。YouTube 章节（`chunk-document --chapters` 或 `chapter_plan.json`）会映射到单元编号作为提示。双语流程的标题是英文 + 中文，术语的中文译法会带到 `translate_only`。大纲存在窗口运行状态里，断点续跑直接复用；生成失败时退回到每轮自己插标题
-- `manifest.json` 现在会显式记录 `plan.chunk_contract` 与 `plan.continuity`；`process-chunks` 会遵循 plan-own 的 continuity 策略，而不是被后续 config 漂移静默改变
+- `manifest.json` 会显式记录 `plan.chunk_contract`，固定分块任务续跑时沿用原来的分块大小
 - chunk 执行现在也有显式 resume 语义：在继续执行前，stale 的 `running` / 缺失输出 checkpoint 会被确定性修复为 `done` 或 `interrupted`
-- `process-chunks` 还会注入上一块的轻量 continuity context（尾句 + 可选 section title），但不会启用正文 overlap；同时分块预算也会为这段 carry-over context 预留一小段 token 成本
 - `process-chunks` 现在会把 `Remote end closed connection without response` 这类瞬时网关断连视为可重试传输错误，并可在产出异常短/结构异常的 chunk 时自动重跑一轮，再决定是否保留 warning
 - `manifest.json` 现在会把不可变 `plan` 和可变 `runtime` 状态分开，同时为每个 chunk 记录 `attempt_logs` 级别的请求观测数据
-- `process-chunks` 不再在当前 batch 内偷偷改预算；如果 canary 或重试历史表明当前 plan 不健康，会以 `replan_required=true` 终止，并通过 `replan-remaining` 为剩余原始 chunk 生成新计划
-- `process-chunks --auto-replan` 会在不破坏上述边界的前提下，自动编排 `process -> replan-remaining -> resume` 这一恢复链路（仅适用于 `raw_path` 计划）
+- 固定分块按每个任务的分块目标（`chunk_tokens_*`）切，硬上限是目标的 `chunk_hard_cap_multiplier` 倍；原来为小固定分块加的 continuity 上下文、autotune 和 `replan-remaining` 补丁已随窗口模式转正删除，固定分块连续超时多次后直接停止
 - `build-glossary --mode transcript` 现在会从 raw chunk、可用的 normalized document 标题/频道、chapter 标题，以及可选 metadata/description 上下文中抽取术语；当 `cleanup_zh` 的 work_dir 里还没有 glossary 时，`process-chunks` 会自动生成这一份 glossary
 - glossary 的筛选与校验现在会对简单 ASCII 术语做边界感知匹配，因此像 `API` 这样的缩写不会再因为 `rapid`、`capital` 之类的无关单词而误命中
-- `runtime.status` 现在会区分 `completed` / `completed_with_errors` / `aborted`，而 raw replan 也会同步重映射已有 `chapter_plan.json` 的 chunk 起点，保证 merge 阶段的章节标题仍落在有效 chunk 边界上
+- `runtime.status` 现在会区分 `completed` / `completed_with_errors` / `aborted`
 - 运行时 token 估算默认仍是本地启发式 fallback；`test-token-count` / `preflight.sh --require-llm` 会探测 provider 级 token count，并在不可用时明确回退到 local estimate
 - `chunk_hard_cap_multiplier` 会被限制在保守的 `1.0-2.0` 区间，避免配置失误把 chunk 包络静默放大
 - `preflight.sh` 采用分层校验，确保只走字幕路径时不必预先配置 Deepgram 或 LLM 凭据；进入 `--require-llm` 时会同时做连通性和 token count 能力探测
@@ -754,7 +747,7 @@ bash scripts/preflight.sh --require-llm
 |------|--------------|--------------|
 | 有字幕短视频 | `preflight.sh` → `download.sh metadata` → 创建 state → `validate-state --stage metadata` → `download.sh subtitle-info` → `download.sh subtitles` → `validate-state --stage post-source` → 优化 → `verify-quality` | 只有 `validate-state` 或 `verify-quality` 返回非空 `hard_failures` 才停止 |
 | 无可用字幕视频 | `preflight.sh` → `download.sh metadata` → `download.sh subtitle-info` → `preflight.sh --require-deepgram` → `transcribe-deepgram` → `validate-state --stage post-source` → 优化 → `verify-quality` | 任一命令失败或 `hard_failures` 非空都必须停止 |
-| 长视频 | `validate-state --stage post-source` → `plan-optimization` → 若 `requires_llm_preflight=true` 则执行 `preflight.sh --require-llm` → 分块 → `raw_path` 阶段使用 `process-chunks --auto-replan` → 需要时执行 `processed_path` 翻译阶段 → 合并 → `verify-quality` → `validate-state --stage pre-assemble` | `warnings` 不自动阻断，`hard_failures` 阻断 |
+| 长视频 | `validate-state --stage post-source` → `plan-optimization` → 若 `requires_llm_preflight=true` 则执行 `preflight.sh --require-llm` → 分块 → `raw_path` 阶段运行 `process-chunks` → 需要时执行 `processed_path` 翻译阶段 → 合并 → `verify-quality` → `validate-state --stage pre-assemble` | `warnings` 不自动阻断，`hard_failures` 阻断 |
 
 真实视频回归：`python3 scripts/run_regression.py` 会在一组固定的真实视频上跑完整流程并汇总 `verify-quality` 结果，详见 [tests/live_regression/README.md](tests/live_regression/README.md)。
 
@@ -775,9 +768,8 @@ python3 yt_transcript_utils.py validate-state /tmp/${VIDEO_ID}_state.md --stage 
 # 4. 优化计划
 python3 yt_transcript_utils.py plan-optimization /tmp/${VIDEO_ID}_state.md
 
-# 4b. 长视频 raw chunk 阶段遵循 plan contract
-#     raw_path 用 process-chunks --auto-replan,
-#     processed_path 若出现 replan_required 则停下人工检查
+# 4b. 长视频按 plan 的每个 operation 运行 process-chunks
+#     （默认滑动窗口；long_text_mode: chunks 用固定分块）
 
 # 5. 需要时走音频兜底
 bash scripts/preflight.sh --require-deepgram

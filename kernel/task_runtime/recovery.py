@@ -22,8 +22,6 @@ def derive_processing_substate(result=None, *, runtime_status: dict | None = Non
     """Derive a processing sub-state from result/runtime status signals."""
     payload = result if isinstance(result, dict) else {}
     runtime_status = runtime_status if isinstance(runtime_status, dict) else {}
-    if payload.get("replan_required", False):
-        return "replan_pending"
     if payload.get("paused", False):
         return "chunk_warning"
     if payload.get("failed_count", 0) or payload.get("warning_count", 0):
@@ -74,8 +72,6 @@ def build_recovery_summary(work_dir: str = "", *, result=None) -> dict:
         recommended_action = "prepare_resume"
     elif effective_status in {"paused", "pause_requested"}:
         recommended_action = "resume_run"
-    elif (result or {}).get("replan_required", False):
-        recommended_action = "replan_remaining"
     return {
         "schema_version": RECOVERY_SCHEMA_VERSION,
         "format": RECOVERY_SUMMARY_FORMAT,

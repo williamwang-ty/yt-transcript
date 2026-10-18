@@ -537,7 +537,7 @@ DecisionRecord
         |
         v
 Act
-(process / replan / pause / resume / cancel / finalize)
+(process / pause / resume / cancel / finalize)
         |
         v
 Commit
@@ -563,7 +563,7 @@ Instead:
 - policy derives the allowed action set
 - the decision layer must choose from that allowed set
 - an optional LLM ranker may help rank or select **within** the allowed set only
-- recovery actions such as `pause`, `resume`, `cancel`, `prepare_resume`, and `replan_remaining` are first-class runtime semantics rather than one-off exceptions
+- recovery actions such as `pause`, `resume`, `cancel`, and `prepare_resume` are first-class runtime semantics rather than one-off exceptions
 
 This keeps adaptation without giving up control boundaries.
 
@@ -663,10 +663,10 @@ This layer lives in `kernel/long_text/*`.
 
 Its job is to perform domain-specific text work:
 
-- chunking and prompt assembly
-- glossary and semantic-anchor consistency
+- windowed or chunked processing and prompt assembly
+- outline, glossary, and semantic-anchor consistency
 - LLM request execution
-- repair, replan, merge, and resume behavior
+- repair, fallback, merge, and resume behavior
 
 This layer answers:
 
@@ -718,270 +718,156 @@ The subsystem must solve several coupled problems at once:
 
 The long-text subsystem is designed to be:
 
-- **partitionable**: split a large document into tractable units
-- **resumable**: continue after interruption
+- **partitionable**: process a large document in tractable rounds
+- **resumable**: continue after interruption without redoing finished paragraphs
 - **verifiable**: check output through deterministic rules first
-- **controllable**: support retry, repair, pause, resume, cancel, and replanning semantics
-- **mergeable**: reassemble chunk results deterministically
-- **consistency-aware**: preserve terminology and high-signal details across chunks
+- **controllable**: support retry, fallback, and resume semantics under runtime ownership
+- **mergeable**: reassemble round results deterministically
+- **consistency-aware**: decide section structure and terminology once for the whole document
 
 ### 7.4 Long-text subsystem vocabulary and information flow
 
 Before describing the implementation layers, it helps to first define the subsystem’s own vocabulary and working flow.
-This makes the later architecture section easier to read because the reader already knows what each layer is operating on.
+
+#### Two executors
+
+`long_text_mode` picks the executor (`kernel/long_text/execution.py` routes each `process-chunks` call):
+
+- **`window`** (default): the sliding-window executor in `kernel/long_text/window.py`. It covers `cleanup_zh`, `quick_cleanup`, and the bilingual `structure_only` → `translate_only` pair.
+- **`chunks`** (legacy fallback): the fixed-chunk executor in `kernel/long_text/processing.py`. It still runs stages the window does not cover (such as `summarize`) and any work dir that already has finished fixed chunks, so old runs resume the way they started.
+
+The window executor was introduced because small fixed chunks needed a stack of patches (continuity context, autotune, replanning) to hide their seams; those patches were removed when window mode became the default.
 
 #### Long-text vocabulary by layer
 
-As with the runtime, the long-text subsystem becomes much easier to understand when its terms are grouped into layers rather than treated as one flat list.
-
-##### Layer 1: source shaping and boundary contracts
-
-These terms answer: *what source are we transforming, and what are the exact output boundaries?*
+##### Layer 1: source shaping
 
 - **normalized document**
-  - the canonical input shape derived from raw text or timed segments before long-text processing begins
-- **plan**
-  - the explicit execution plan for one processing or replanning pass
-- **`plan_id`**
-  - the stable identifier for a specific plan instance
-- **chunk contract**
-  - the boundary rules that define what a chunk may output and what it must not output
-- **continuity policy**
-  - the policy that decides what neighboring context may be carried across boundaries as reference only
-- **chunk**
-  - one bounded processing unit with a stable core range
-- **`chunk_id`**
-  - the durable identifier of a chunk within a plan
+  - the canonical input shape derived from raw text or timed segments; its timed cues tell the window executor where speech pauses are
+- **chunk files**
+  - the output of `chunk-document` / `chunk-segments` / `chunk-text`; the fixed-chunk executor processes them one by one, and the window executor reads its source from them
+- **unit / `[S<n>]`**
+  - one numbered source sentence; an over-long unpunctuated sentence is cut at subtitle cue ends (longest pause first), otherwise every ~120 tokens
 
-This layer exists so later processing never has to guess what a chunk “probably means.”
+##### Layer 2: document-level guidance
 
-##### Layer 2: prompt context and consistency guidance
-
-These terms answer: *what guidance does the model receive before it transforms one chunk?*
-
-- **`prompt_name` / prompt template**
-  - the named transformation contract applied to the chunk, such as structure, translation, or cleanup
-- **continuity context**
-  - limited neighboring context, such as prior tail text or section title, carried as reference rather than output scope
+- **global outline**
+  - one upfront pass over the numbered full text (`window_outline`, for `cleanup_zh` and `structure_only`) that returns section titles with their first unit; YouTube chapters are mapped to units and kept verbatim
 - **glossary**
-  - terminology guidance that protects names, terms, and abbreviations across the full document
-- **semantic anchors**
-  - high-signal facts such as dates, numbers, versions, percentages, and URLs that should survive transformation
+  - names and terms with their correct spellings and seen mis-recognitions, from the outline pass and from `build-glossary`
 - **chapter plan**
-  - optional chapter-to-chunk mapping used later for deterministic merge and article structure
+  - optional chapter-to-chunk mapping used at merge time when a run has no outline
 
-This layer is not global orchestration. It is the local guidance package for one bounded transformation step.
+##### Layer 3: round execution and control
 
-##### Layer 3: execution, repair, and replanning control
-
-These terms answer: *how does one chunk move through execution, and what happens when the nominal path fails?*
-
-- **processing loop**
-  - the main bounded execution loop over the current chunk set
-- **chunk status**
-  - the persisted state of a chunk, such as pending, running, done, failed, interrupted, or superseded
-- **retry**
-  - repeating the same bounded action under the same local assumptions
-- **repair**
-  - a local corrective attempt that tries to recover one chunk without replacing the full plan
-- **replan / `replan_remaining`**
-  - generating a new plan for the unfinished remainder because the current plan is no longer healthy enough
-- **autotune**
-  - bounded adjustment of chunk sizing and output budget based on observed runtime pressure
-- **pause / resume / cancel**
-  - runtime control semantics applied to long-text work at safe boundaries
-
-This layer is where the subsystem becomes operational rather than merely prompt-driven.
+- **cursor**
+  - the first unit not yet written; everything before it is saved as complete paragraphs
+- **read window / write target**
+  - how much source a round reads from the cursor and how much output it should aim for; both adapt per round (`window_read_tokens`, `window_write_tokens`)
+- **round**
+  - one model call: read window + tail of written output + nearby outline lines + matching terms; the model copies each unit's `[S<n>]` tag and ends with `<!--END-->`
+- **fallback**
+  - after repeated invalid rounds, the stretch is processed once as one fixed chunk so the run still advances
+- **runtime ownership**
+  - each run holds the work dir under the shared runtime lock, so two processes cannot write the same stage
 
 ##### Layer 4: verification, merge, and final outputs
 
-These terms answer: *how do we decide that local work is acceptable and reassemble it into a document?*
-
-- **deterministic verification**
-  - rule-based checks for missing structure, suspicious length, missing glossary terms, missing anchors, or missing translation
-- **quality gate**
-  - the final structured stop/go evaluation over the assembled output
+- **round validation**
+  - tags present, in range, and increasing; output/source length ratio within bounds
+- **coverage / efficiency**
+  - which units were written and how much source was read twice
 - **merge**
-  - deterministic ordered concatenation of chunk outputs plus optional document-level wrapping
-- **assembled output**
-  - the document reconstructed from bounded chunk outputs rather than regenerated holistically
-- **warnings / attempt history**
-  - the inspection trail that explains where the subsystem had to retry, repair, or degrade
-
-This layer closes the loop by converting many bounded local results into one inspectable document-level result.
-
-##### Why this layered vocabulary matters
-
-The long-text subsystem must be understandable in four directions at once:
-
-- as a boundary system: *what exactly is each chunk allowed to do?*
-- as a guidance system: *what context and consistency signals shape generation?*
-- as a control system: *how do repair, retry, pause, and replan work?*
-- as an output system: *how do local results become a reliable final document?*
-
-That is why the subsystem vocabulary is intentionally layered around boundaries, guidance, execution control, and outputs.
+  - deterministic ordered concatenation of the latest stage's paragraphs plus document-level wrapping
+- **quality gate**
+  - `verify-quality` over the assembled output; semantic anchors (dates, numbers, versions, URLs) are checked here as warnings
 
 #### Small long-text information flow
 
-The subsystem can be pictured as this compact flow:
-
 ```text
 Normalized source artifacts
-(raw text / segments / normalized document)
         |
         v
-Plan + chunk contract
-(plan_id / chunk boundaries / continuity policy / chapter mapping)
+Chunk files -> numbered units [S1..Sn]
         |
         v
-Manifested chunk set
-(chunk states + processing metadata)
+Global outline + glossary (once, cached in window state)
         |
         v
-Prompt-context assembly
-(prompt template + continuity context + glossary + semantic anchors)
+Round: read window from cursor + written tail + outline + terms
         |
         v
-LLM request execution
-(one bounded chunk action)
+LLM request (API or agent CLI)
         |
         v
-Deterministic verification
-(length / structure / glossary / anchors / translation checks)
+Validate tags / END line / length ratio
         |
-        +-----------------------------+
-        | pass                        | fail
-        v                             v
-Mark chunk done                 Retry / repair
-        |                             |
-        |                             +------------+
-        |                                          |
-        +--------------------------> if plan unhealthy
-                                              |
-                                              v
-                                      Replan remaining
-                                              |
-                                              v
-                                     New chunk set / new plan
-                                              |
-                                              v
-Deterministic merge
-(chunk outputs + chapter plan + document wrapper)
+        +-------------------------+
+        | valid                   | invalid (repeated)
+        v                         v
+Keep complete paragraphs     Process this stretch as one fixed chunk
+Advance cursor                    |
+        |<------------------------+
+        v
+More units? -> next round
         |
         v
-Final quality gate
-        |
-        v
-Article-like markdown output
+Deterministic merge -> quality gate -> markdown output
 ```
 
-Not every run will traverse every branch.
-Shorter or healthier runs may go straight from chunk execution to merge, while troubled runs may loop through repair, pause/resume, or replanning before converging.
+A response cut off before `<!--END-->` only loses its last paragraph: the cursor moves past what was kept, so truncation means less progress, not a broken document.
 
 ### 7.5 Long-text subsystem architecture
 
-Before describing the logic in detail, it helps to state the layered implementation view explicitly.
-
 #### Layered implementation view
 
+- **Executor routing**: `kernel/long_text/execution.py`
+  - picks window or fixed chunks per stage and exposes the processing, resume, pause, and cancel command surfaces
+- **Sliding-window executor**: `kernel/long_text/window.py`, `kernel/long_text/outline.py`
+  - unit numbering, outline pass, round loop, adaptive sizes, validation, fallback, window state, coverage reporting
+- **Fixed-chunk executor**: `kernel/long_text/processing.py`
+  - the legacy chunk loop with output-health retries and a consecutive-timeout stop
 - **Contract and control layer**: `kernel/long_text/contracts.py`
-  - defines chunk contract, continuity policy, verification contract, repair policy, and replan policy
+  - chunk contract, verification and repair policy, runtime control summaries
 - **Lifecycle and resumability layer**: `kernel/long_text/lifecycle.py`
-  - defines per-chunk manifest entries, runtime defaults, and resume-repair behavior
-- **Prompt and context assembly layer**: `kernel/long_text/prompting.py`, `kernel/long_text/glossary.py`, `kernel/long_text/semantic.py`
-  - prepares continuity, terminology, and semantic-anchor context before each LLM call
-- **LLM request layer**: `kernel/long_text/llm.py`
-  - owns retries, timeout behavior, and streaming fallback
-- **Processing-control layer**: `kernel/long_text/processing.py`
-  - owns the main chunk loop, reasoning-metadata stream decisions, repair decisions, autotune, abort / pause / replan behavior, and manifest updates
-- **Boundary surface layer**: `kernel/long_text/chunking.py`, `kernel/long_text/merge.py`, `kernel/long_text/execution.py`
-  - exposes chunking, merge, resume, and replan command surfaces to the rest of the project
+  - per-chunk manifest entries, runtime defaults, and resume repair
+- **Prompt and consistency layer**: `kernel/long_text/prompting.py`, `kernel/long_text/glossary.py`, `kernel/long_text/semantic.py`
+  - prompt assembly, glossary context, and the semantic-anchor checks used by `verify-quality`
+- **LLM request layer**: `kernel/long_text/llm.py`, `kernel/long_text/agent_cli.py`
+  - API retries, timeouts, output caps, and truncation retries; the agent-CLI backend (`llm_backend: auto`) runs the host agent's own CLI and falls back to the API
+- **Boundary surface layer**: `kernel/long_text/chunking.py`, `kernel/long_text/merge.py`
+  - chunking and merge command surfaces
 
-This subsystem also depends on the generic runtime layer rather than reimplementing job control locally:
+This subsystem depends on the generic runtime layer rather than reimplementing job control locally:
 
 - `kernel/task_runtime/runtime.py`
 - `kernel/task_runtime/lifecycle.py`
 - `kernel/task_runtime/state.py`
 - `kernel/task_runtime/controller.py`
 
-#### A. Plan and chunk contract
+#### A. The program owns boundaries, not the model
 
-The subsystem does not begin with chunk execution. It begins with an explicit contract that defines:
+The model never decides where its output starts or stops in the source. It copies the unit tags it was given, and the program derives paragraph ranges, checks that they are in order, and decides what to keep. This makes merge a plain concatenation.
 
-- chunk boundaries
-- output scope
-- continuity policy
-- merge assumptions
-- verification expectations
+#### B. Structure decided once
 
-This prevents later stages from guessing what a chunk “probably means.”
+Headings come only from the global outline. A round may write a heading where the topic actually begins near the outline's start unit; otherwise the program inserts it. This replaces per-chunk heading guesses, which drifted between chunks.
 
-#### B. Chunking with strict output boundaries
+#### C. Sizes as soft targets
 
-Chunking is designed around a stable core range per chunk.
+`max_tokens` is only a loose stop line. The write target shrinks after truncated or slow rounds; the read window follows the write target and the measured output/source ratio, so little source is read twice. The last stretch goes in one round when it fits.
 
-The subsystem may provide neighboring context as reference, but the model is required to output only the current chunk’s core transformation. This keeps merge simple and deterministic.
+#### D. Deterministic-first verification
 
-#### C. Continuity as reference, not shared output
+Each round is validated by rules (tags, end line, length ratio) before it is kept. The final document goes through `verify-quality`, which reports length, structure, glossary, semantic-anchor, and translation checks; only `hard_failures` block.
 
-To avoid abrupt transitions, the subsystem passes limited continuity context such as:
+#### E. Fallback instead of replanning
 
-- previous chunk tail
-- previous section title
-- boundary rules
+When rounds keep failing on one stretch, the executor processes that stretch as one fixed chunk and moves on. There is no plan-level replanning step.
 
-But continuity is reference-only. It is not part of the required output range.
+#### F. Persisted state, runtime control, and telemetry
 
-#### D. Consistency controls: glossary and semantic anchors
-
-Document-level consistency is protected through deterministic control signals such as:
-
-- glossary terms for names and terminology
-- semantic anchors for dates, numbers, percentages, versions, and URLs
-
-These are injected into prompts and then checked again after generation.
-
-#### E. Deterministic-first verification
-
-The subsystem prefers deterministic checks before introducing any probabilistic judge layer.
-
-Typical checks include:
-
-- output length anomalies
-- missing structure
-- missing translation when translation is expected
-- missing glossary terms
-- missing semantic anchors
-
-This keeps repair triggers stable and cheap.
-
-#### F. Repair versus replan
-
-Not every failure means the same thing.
-
-The subsystem distinguishes:
-
-- **repairable local failure**: retry or repair a specific chunk under the same plan
-- **plan-level failure**: the current plan itself is unhealthy and should be replaced for the remaining work
-
-This distinction is what prevents endless retries and gives the subsystem engineering semantics.
-
-#### G. Deterministic merge and final assembly
-
-Merge is intentionally kept simple.
-
-If the chunk contract is sound, chunk outputs can be reassembled through ordered concatenation plus document-level wrapping. A healthy subsystem should not depend on clever post-hoc alignment to fix unclear boundaries.
-
-#### H. Persisted state, runtime control, and telemetry
-
-Because long-text transformation is a long-lived job, it relies on:
-
-- persisted manifests and chunk state
-- ownership and runtime control markers
-- pause / resume / cancel semantics
-- telemetry and attempt history
-
-These are not add-ons. They are part of the subsystem design itself.
+Window state (cursor, outline, adaptive sizes, saved paragraphs) lives under `<work_dir>/window/` (`window/processed/` for translation) so a re-run resumes at the cursor. Runtime ownership, lifecycle envelopes, and telemetry are shared with the fixed-chunk executor, which also honors pause and cancel requests between chunks.
 
 ### 7.6 Why this subsystem design fits the whole project
 
@@ -1100,11 +986,9 @@ The internal implementation is best read as a workflow façade above two kernel 
 - `kernel/long_text/glossary.py`
   - terminology extraction and checks for long-text consistency
 - `kernel/long_text/semantic.py`
-  - high-signal anchor extraction and checks
+  - high-signal anchor extraction and the checks `verify-quality` reports
 - `kernel/long_text/contracts.py`
-  - control contracts, replan policy state, and chunk/runtime control helpers
-- `kernel/long_text/autotune.py`
-  - chunk autotune policy and token-source summary helpers
+  - control contracts and chunk/runtime control helpers
 - `kernel/long_text/lifecycle.py`
   - manifest lifecycle, resume repair, and chunk/runtime defaulting
 - `kernel/long_text/prompting.py`
@@ -1112,13 +996,17 @@ The internal implementation is best read as a workflow façade above two kernel 
 - `kernel/long_text/llm.py`
   - LLM request, retry, and streaming fallback helpers
 - `kernel/long_text/processing.py`
-  - chunk-processing, replan, and auto-replan execution loops
+  - the fixed-chunk processing loop (legacy `long_text_mode: chunks`)
+- `kernel/long_text/window.py`, `kernel/long_text/outline.py`
+  - the sliding-window executor (default) and its global outline + glossary pass
+- `kernel/long_text/agent_cli.py`
+  - the agent-CLI LLM backend and its API fallback
 - `kernel/long_text/chunking.py`
   - public chunking command surfaces for long-text processing
 - `kernel/long_text/merge.py`
   - chapter-plan mapping and deterministic merge command surfaces
 - `kernel/long_text/execution.py`
-  - execution, resume, and replan command surfaces for long-text jobs
+  - executor routing plus execution and resume command surfaces for long-text jobs
 - `README.md`
   - user-facing overview and operational entrypoints
 - `SYSTEM_DESIGN.md`
@@ -1671,7 +1559,7 @@ DecisionRecord
         |
         v
 Act
-(process / replan / pause / resume / cancel / finalize)
+(process / pause / resume / cancel / finalize)
         |
         v
 Commit
@@ -1697,7 +1585,7 @@ runtime 的关键设计原则之一，是模型不能接管 orchestration。
 - policy 先推导 allowed action set
 - decision layer 只能在这个 allowed set 里做选择
 - 可选的 LLM ranker 只能在 allowed set **内部** 排序或选择
-- `pause`、`resume`、`cancel`、`prepare_resume`、`replan_remaining` 等恢复动作必须是 first-class runtime semantics，而不是 special case
+- `pause`、`resume`、`cancel`、`prepare_resume` 等恢复动作必须是 first-class runtime semantics，而不是 special case
 
 这样系统才能在保留自适应能力的同时，不失去控制边界。
 
@@ -1797,10 +1685,10 @@ runtime 设计在当前仓库里的落点如下：
 
 它负责真正的领域执行：
 
-- chunking 与 prompt 组装
-- glossary 与 semantic-anchor 一致性控制
+- 窗口或分块处理与 prompt 组装
+- 大纲、glossary 与 semantic-anchor 一致性控制
 - LLM 请求执行
-- repair、replan、merge、resume 行为
+- repair、兜底、merge、resume 行为
 
 这一层回答的问题是：
 
@@ -1852,271 +1740,156 @@ runtime 设计在当前仓库里的落点如下：
 
 长文本子系统被设计成：
 
-- **可切分**：把大文档拆成可处理单元
-- **可恢复**：中断后能继续
+- **可切分**：把大文档分成若干轮处理
+- **可恢复**：中断后继续，已完成的段落不重做
 - **可验证**：优先通过确定性规则检查结果
-- **可控制**：支持 retry、repair、pause、resume、cancel、replan
-- **可合并**：局部结果能确定性重组为整体
-- **有一致性感知**：能保护跨 chunk 的术语和高信号细节
+- **可控制**：在 runtime ownership 之下支持重试、兜底和续跑
+- **可合并**：每轮结果能确定性重组为整体
+- **有一致性感知**：章节结构和术语对整篇文档只决定一次
 
 ### 7.4 长文本子系统的词汇表与信息流
 
-在展开实现分层之前，最好先定义这个子系统自己的词汇体系与工作流。
-这样后面的架构章节会更容易理解，因为读者先知道“每一层到底在操作什么对象”。
+在展开实现分层之前，先定义这个子系统自己的词汇与工作流。
+
+#### 两个执行器
+
+`long_text_mode` 决定用哪个执行器（每次 `process-chunks` 调用由 `kernel/long_text/execution.py` 选择）：
+
+- **`window`**（默认）：`kernel/long_text/window.py` 里的滑动窗口执行器，覆盖 `cleanup_zh`、`quick_cleanup` 以及双语的 `structure_only` → `translate_only` 两步。
+- **`chunks`**（旧方案，保留兜底）：`kernel/long_text/processing.py` 里的固定分块执行器。窗口不覆盖的阶段（如 `summarize`）和已经有固定分块完成进度的工作目录仍然用它，旧任务按原来的方式续跑。
+
+引入窗口执行器，是因为小的固定分块需要一堆补丁（continuity 上下文、autotune、replan）来掩盖接缝；窗口模式转为默认后，这些补丁已经删除。
 
 #### 分层理解长文本子系统词汇表
 
-和 runtime 一样，长文本子系统如果被当成一个平铺的大词汇表，就会很难读。
-把它按层拆开，会清楚很多。
-
-##### 第 1 层：source 整形与边界 contract
-
-这一层回答的是：*我们到底在变换什么 source，以及每个 chunk 的输出边界到底是什么？*
+##### Layer 1：源文本整形
 
 - **normalized document**
-  - 在长文本处理真正开始之前，由 raw text 或 timed segments 规范化出来的标准输入形态
-- **plan**
-  - 一次 processing 或 replanning pass 的显式执行计划
-- **`plan_id`**
-  - 某个具体计划实例的稳定标识
-- **chunk contract**
-  - 定义 chunk 允许输出什么、不允许输出什么的边界规则
-- **continuity policy**
-  - 决定哪些相邻上下文可以跨边界携带为 reference-only 的策略
-- **chunk**
-  - 一个有明确边界的处理单元
-- **`chunk_id`**
-  - 某个 chunk 在当前计划里的稳定标识
+  - 从 raw text 或带时间戳 segments 得到的标准输入形态；其中的字幕时间告诉窗口执行器哪里有停顿
+- **chunk 文件**
+  - `chunk-document` / `chunk-segments` / `chunk-text` 的输出；固定分块执行器逐个处理，窗口执行器从中读取原文
+- **单元 / `[S<n>]`**
+  - 一个编号的原文句子；没有标点的长句在字幕条结束处切开（优先最长停顿），对不上字幕时每约 120 token 切一次
 
-这一层存在的意义，是让后面的执行阶段不需要再去猜“这个 chunk 大概是什么意思”。
+##### Layer 2：文档级指导
 
-##### 第 2 层：prompt 上下文与一致性引导
-
-这一层回答的是：*模型在处理某个 chunk 之前，究竟会收到哪些引导信息？*
-
-- **`prompt_name` / prompt template**
-  - 施加在当前 chunk 上的命名变换 contract，例如 structure、translation、cleanup
-- **continuity context**
-  - 诸如上一段 tail text、上一节标题之类的有限相邻上下文；它是 reference，不属于输出范围
-- **glossary**
-  - 保护整篇文档中名称、术语、缩写一致性的术语引导
-- **semantic anchors**
-  - 日期、数字、版本号、百分比、URL 这类应当被保留下来的高信号事实
+- **全局大纲**
+  - 对带编号全文的一次前置调用（`window_outline`，用于 `cleanup_zh` 和 `structure_only`），返回章节标题和起始单元；YouTube 章节会映射到单元并原样保留
+- **术语表（glossary）**
+  - 人名、术语的正确写法和见到的识别错误，来自大纲调用和 `build-glossary`
 - **chapter plan**
-  - 可选的 chapter-to-chunk 映射，供后续 deterministic merge 和文章结构装配使用
+  - 可选的章节到 chunk 映射，只在任务没有大纲时用于 merge
 
-这一层不是全局 orchestration，而是某一个受限变换步骤的局部引导包。
+##### Layer 3：轮次执行与控制
 
-##### 第 3 层：执行、修复与重规划控制
+- **游标（cursor）**
+  - 第一个还没写出的单元；它之前的内容都已存为完整段落
+- **读窗口 / 写目标**
+  - 一轮从游标读多少原文、输出大约写多少；两者每轮自适应（`window_read_tokens`、`window_write_tokens`）
+- **轮次（round）**
+  - 一次模型调用：读窗口 + 已写内容的结尾 + 附近的大纲行 + 匹配的术语；模型照抄每个单元的 `[S<n>]` 编号，最后输出 `<!--END-->`
+- **兜底（fallback）**
+  - 连续多轮无效后，把这一段按一个固定分块处理一次，保证任务继续推进
+- **runtime ownership**
+  - 每次运行在共享的 runtime 锁下占有工作目录，两个进程不会同时写同一阶段
 
-这一层回答的是：*一个 chunk 在执行过程中怎么流转，名义路径失败时又会发生什么？*
+##### Layer 4：校验、合并与最终输出
 
-- **processing loop**
-  - 面向当前 chunk 集合的主执行循环
-- **chunk status**
-  - chunk 的持久化状态，例如 pending、running、done、failed、interrupted、superseded
-- **retry**
-  - 在同样的局部假设下，再执行一次同样的受限动作
-- **repair**
-  - 不更换整份 plan 的前提下，对单个 chunk 进行局部修复
-- **replan / `replan_remaining`**
-  - 因为当前计划已不够健康，所以为未完成剩余部分生成新计划
-- **autotune**
-  - 基于运行时压力，对 chunk 尺寸和输出预算做有边界的调整
-- **pause / resume / cancel**
-  - 在安全边界上施加到长文本作业上的 runtime control 语义
-
-这一层使得子系统不只是“会发 prompt”，而是真正成为一个可运行、可恢复、可收敛的工程系统。
-
-##### 第 4 层：验证、merge 与最终输出
-
-这一层回答的是：*我们怎么判断局部结果可接受，并把它们重新装配成整篇文档？*
-
-- **deterministic verification**
-  - 基于规则的检查：结构缺失、长度异常、glossary 缺失、anchors 缺失、该翻译未翻译等
-- **quality gate**
-  - 对 assembled output 做最终的结构化 stop/go 评估
+- **轮次校验**
+  - 编号齐全、在范围内且递增；输出/原文长度比在合理范围
+- **覆盖率 / 效率**
+  - 哪些单元已写出，多少原文被重复阅读
 - **merge**
-  - 通过 ordered concatenation 加上文档级包装，对 chunk 输出做确定性重组
-- **assembled output**
-  - 由多个受限 chunk 结果重建出来的整篇文档，而不是重新整体生成
-- **warnings / attempt history**
-  - 说明系统在哪些地方 retry、repair、degrade 过的检查轨迹
+  - 把最新阶段的段落按顺序确定性拼接，再加文档级包装
+- **quality gate**
+  - 对组装结果运行 `verify-quality`；semantic anchors（日期、数字、版本号、URL）在这里作为 warning 检查
 
-这一层负责把很多个受限的局部结果，收敛成一个可检查的文档级结果。
-
-##### 为什么要这样分层
-
-长文本子系统必须同时朝四个方向可解释：
-
-- 作为边界系统：*每个 chunk 究竟被允许做什么？*
-- 作为引导系统：*哪些上下文和一致性信号在塑造生成？*
-- 作为控制系统：*repair、retry、pause、replan 是怎么运作的？*
-- 作为输出系统：*局部结果最后怎样变成可靠整文？*
-
-所以它的词汇必须围绕“边界、引导、执行控制、输出”这四层来组织，而不是混成一团。
-
-#### 小型长文本信息流图
-
-可以把这个子系统理解成下面这条紧凑的信息流：
+#### 精简版长文本信息流
 
 ```text
-Normalized source artifacts
-(raw text / segments / normalized document)
+标准化源 artifacts
         |
         v
-Plan + chunk contract
-(plan_id / chunk boundaries / continuity policy / chapter mapping)
+chunk 文件 -> 编号单元 [S1..Sn]
         |
         v
-Manifested chunk set
-(chunk states + processing metadata)
+全局大纲 + 术语表（只做一次，缓存在 window state）
         |
         v
-Prompt-context assembly
-(prompt template + continuity context + glossary + semantic anchors)
+一轮：从游标读窗口 + 已写结尾 + 大纲 + 术语
         |
         v
-LLM request execution
-(one bounded chunk action)
+LLM 请求（API 或 agent CLI）
         |
         v
-Deterministic verification
-(length / structure / glossary / anchors / translation checks)
+校验编号 / 结束行 / 长度比
         |
-        +-----------------------------+
-        | pass                        | fail
-        v                             v
-Mark chunk done                 Retry / repair
-        |                             |
-        |                             +------------+
-        |                                          |
-        +--------------------------> if plan unhealthy
-                                              |
-                                              v
-                                      Replan remaining
-                                              |
-                                              v
-                                     New chunk set / new plan
-                                              |
-                                              v
-Deterministic merge
-(chunk outputs + chapter plan + document wrapper)
+        +-------------------------+
+        | 有效                    | 连续无效
+        v                         v
+保留完整段落                把这一段按一个固定分块处理
+推进游标                          |
+        |<------------------------+
+        v
+还有单元？-> 下一轮
         |
         v
-Final quality gate
-        |
-        v
-Article-like markdown output
+确定性 merge -> quality gate -> markdown 输出
 ```
 
-并不是每个 run 都会经过每一条分支。
-更短或更健康的 run，可能直接从 chunk execution 进入 merge；而遇到问题的 run，则可能先经历 repair、pause/resume 或 replanning，再逐步收敛。
+响应在 `<!--END-->` 之前被截断时，只丢掉最后一段：游标移到已保留内容之后，截断只是少推进一点，不会让文档出错。
 
 ### 7.5 长文本子系统的架构设计
 
-在讲具体逻辑之前，先把实现层次直接说清楚。
-
 #### 分层实现视图
 
-- **Contract 与 control 层**：`kernel/long_text/contracts.py`
-  - 定义 chunk contract、continuity policy、verification contract、repair policy 与 replan policy
-- **Lifecycle 与 resumability 层**：`kernel/long_text/lifecycle.py`
-  - 定义每个 chunk 的 manifest 记录、runtime 默认值，以及 resume repair 行为
-- **Prompt 与上下文组装层**：`kernel/long_text/prompting.py`、`kernel/long_text/glossary.py`、`kernel/long_text/semantic.py`
-  - 在每次 LLM 调用前准备 continuity、terminology、semantic anchor 相关上下文
-- **LLM request 层**：`kernel/long_text/llm.py`
-  - 管理 retries、timeout 行为，以及 streaming fallback
-- **Processing control 层**：`kernel/long_text/processing.py`
-  - 管理主 chunk 循环、reasoning 元数据驱动的 stream 决策、repair 决策、autotune、abort / pause / replan 行为，以及 manifest 更新
-- **边界命令层**：`kernel/long_text/chunking.py`、`kernel/long_text/merge.py`、`kernel/long_text/execution.py`
-  - 向项目其它部分暴露 chunking、merge、resume、replan 这些命令接口
+- **执行器选择**：`kernel/long_text/execution.py`
+  - 按阶段选择窗口或固定分块，并暴露处理、续跑、暂停、取消等命令接口
+- **滑动窗口执行器**：`kernel/long_text/window.py`、`kernel/long_text/outline.py`
+  - 单元编号、大纲调用、轮次循环、自适应大小、校验、兜底、window state、覆盖率报告
+- **固定分块执行器**：`kernel/long_text/processing.py`
+  - 旧的 chunk 循环，带输出健康度重试和连续超时停止
+- **契约与控制层**：`kernel/long_text/contracts.py`
+  - chunk contract、verification 与 repair 策略、runtime control 摘要
+- **生命周期与可恢复层**：`kernel/long_text/lifecycle.py`
+  - 每个 chunk 的 manifest 条目、runtime 默认值与 resume 修复
+- **prompt 与一致性层**：`kernel/long_text/prompting.py`、`kernel/long_text/glossary.py`、`kernel/long_text/semantic.py`
+  - prompt 组装、术语上下文，以及 `verify-quality` 使用的 semantic anchor 检查
+- **LLM 请求层**：`kernel/long_text/llm.py`、`kernel/long_text/agent_cli.py`
+  - API 的重试、超时、输出上限和截断重试；agent CLI 后端（`llm_backend: auto`）调用宿主 agent 自己的命令行，失败时回退到 API
+- **边界接口层**：`kernel/long_text/chunking.py`、`kernel/long_text/merge.py`
+  - 分块与合并命令接口
 
-同时，这个子系统不会自己重复实现一套作业控制逻辑，而是直接依赖通用 runtime 层：
+这个子系统依赖通用 runtime 层，而不是在本地重复实现作业控制：
 
 - `kernel/task_runtime/runtime.py`
 - `kernel/task_runtime/lifecycle.py`
 - `kernel/task_runtime/state.py`
 - `kernel/task_runtime/controller.py`
 
-#### A. plan 与 chunk contract
+#### A. 边界由程序决定，而不是模型
 
-子系统并不是从执行 chunk 开始，而是从一个显式 contract 开始。这个 contract 定义：
+模型从不决定自己的输出从原文哪里开始、到哪里结束。它只照抄给它的单元编号，程序据此推算每段覆盖的范围、检查顺序，并决定保留什么。因此 merge 只是简单拼接。
 
-- chunk 边界
-- 输出范围
-- continuity 策略
-- merge 假设
-- verification 预期
+#### B. 结构只决定一次
 
-这样后续阶段就不会再去猜“这个 chunk 大概意味着什么”。
+标题只来自全局大纲。话题在大纲起始单元附近真正开始的地方，模型可以写出标题；否则由程序插入。这取代了每块各自猜标题、块与块之间标题漂移的做法。
 
-#### B. 严格输出边界的 chunking
+#### C. 大小是软目标
 
-chunking 围绕“每个 chunk 有稳定 core range”来设计。
+`max_tokens` 只是宽松的停止线。被截断或太慢的轮次之后写目标会调小；读窗口跟着写目标和实测的输出/原文比例走，尽量少重复读原文。剩下的原文一轮能写完时就一次发完。
 
-系统可以给模型提供前后参考上下文，但模型只被允许输出当前 chunk 核心范围内的变换结果。这样 merge 才能保持简单、确定。
+#### D. 优先确定性校验
 
-#### C. 把 continuity 当作参考，而不是共享输出
+每轮在保留之前先用规则校验（编号、结束行、长度比）。最终文档经过 `verify-quality`，报告长度、结构、术语、semantic anchor 和翻译检查；只有 `hard_failures` 会阻断。
 
-为了避免段落断裂，子系统会传递有限的 continuity context，例如：
+#### E. 用兜底代替 replan
 
-- previous chunk tail
-- previous section title
-- boundary rules
+某一段连续多轮失败时，执行器把这一段按一个固定分块处理，然后继续。不再有计划级的 replan 步骤。
 
-但这些都是参考信息，不属于必须输出的内容范围。
+#### F. 持久化状态、运行控制与 telemetry
 
-#### D. 一致性控制：glossary 与 semantic anchors
-
-文档级一致性通过一些确定性的控制信号来保护，例如：
-
-- glossary：保护名称、术语、缩写
-- semantic anchors：保护日期、数字、百分比、版本号、URL
-
-这些信号会先注入 prompt，再在生成后重新检查。
-
-#### E. 确定性优先的验证
-
-在引入概率性的 judge 层之前，子系统优先使用确定性检查。
-
-典型检查包括：
-
-- 输出长度异常
-- 结构缺失
-- 需要翻译但没翻译
-- glossary 词项缺失
-- semantic anchors 缺失
-
-这样 repair trigger 才会稳定且便宜。
-
-#### F. repair 与 replan 的区分
-
-并不是每一种失败都表示同一件事。
-
-子系统会区分：
-
-- **局部可修复失败**：在同一计划下重试或修复单个 chunk
-- **计划级失败**：当前计划本身不健康，应该为剩余任务生成新计划
-
-这个区分，是防止无限重试、赋予系统工程语义的关键。
-
-#### G. 确定性的 merge 与最终装配
-
-merge 被刻意设计得尽量简单。
-
-如果 chunk contract 是健康的，那么 chunk 输出就应该能够通过有序拼接 + 文档级包装重新组装回来，而不依赖事后“聪明对齐”来修补边界不清晰的问题。
-
-#### H. 持久化状态、运行控制与 telemetry
-
-因为长文本变换是一个长生命周期作业，它必须依赖：
-
-- 持久化 manifest 与 chunk state
-- ownership 与 runtime control markers
-- pause / resume / cancel 语义
-- telemetry 与 attempt history
-
-这些都不是附加能力，而是子系统设计的一部分。
+window state（游标、大纲、自适应大小、已保存段落）放在 `<work_dir>/window/`（翻译阶段在 `window/processed/`），重新运行会从游标续跑。runtime ownership、lifecycle envelope 和 telemetry 与固定分块执行器共用；固定分块执行器还会在 chunk 之间响应暂停和取消请求。
 
 ### 7.6 为什么这个子系统设计适合整个项目
 
@@ -2235,11 +2008,9 @@ merge 被刻意设计得尽量简单。
 - `kernel/long_text/glossary.py`
   - 长文本一致性的术语提取与检查
 - `kernel/long_text/semantic.py`
-  - 高信号 anchor 的提取与检查
+  - 高信号 anchor 的提取，以及 `verify-quality` 报告的检查
 - `kernel/long_text/contracts.py`
-  - control contract、replan policy state 与 chunk/runtime control 辅助
-- `kernel/long_text/autotune.py`
-  - chunk autotune 策略与 token source 汇总辅助
+  - control contract 与 chunk/runtime control 辅助
 - `kernel/long_text/lifecycle.py`
   - manifest 生命周期、resume repair 与 chunk/runtime 默认化
 - `kernel/long_text/prompting.py`
@@ -2247,13 +2018,17 @@ merge 被刻意设计得尽量简单。
 - `kernel/long_text/llm.py`
   - LLM 请求、重试与 streaming fallback 辅助
 - `kernel/long_text/processing.py`
-  - chunk 处理、replan 与 auto-replan 执行循环
+  - 固定分块处理循环（旧的 `long_text_mode: chunks`）
+- `kernel/long_text/window.py`、`kernel/long_text/outline.py`
+  - 滑动窗口执行器（默认）及其全局大纲 + 术语表调用
+- `kernel/long_text/agent_cli.py`
+  - agent CLI 形式的 LLM 后端及其 API 回退
 - `kernel/long_text/chunking.py`
   - 长文本分块相关的公开命令表面
 - `kernel/long_text/merge.py`
   - chapter-plan 映射与确定性 merge 的公开命令表面
 - `kernel/long_text/execution.py`
-  - 长文本作业的执行、resume 与 replan 命令表面
+  - 长文本作业的执行器选择、执行与 resume 命令表面
 - `README.md`
   - 面向用户的总览与操作入口
 - `SYSTEM_DESIGN.md`

@@ -14,7 +14,7 @@ def _utils():
 
 
 def new_plan_id() -> str:
-    """Create a stable plan ID for one planning or replanning pass."""
+    """Create a stable plan ID for one planning pass."""
     return f"plan_{time.strftime('%Y%m%d%H%M%S', time.localtime())}_{random.randint(1000, 9999)}"
 
 
@@ -25,15 +25,14 @@ def build_manifest_chunk_contract(source_kind: str = "text", *, driver: str = ""
     utils = _utils()
     normalized_source_kind = "segments" if str(source_kind).strip() == "segments" else "text"
     default_driver = "chunk-segments" if normalized_source_kind == "segments" else "chunk-text"
-    # This contract makes merge predictable: context may be shown to the model,
-    # but only the current chunk body may appear in the output.
+    # This contract makes merge predictable: only the current chunk body may
+    # appear in the output.
     return {
         "version": utils.CHUNK_CONTRACT_SCHEMA_VERSION,
         "driver": str(driver or default_driver).strip(),
         "source_kind": normalized_source_kind,
         "boundary_mode": "strict",
         "output_scope": "current_chunk_only",
-        "continuity_mode": "reference_only",
         "merge_strategy": "ordered_concat",
         "overlap_strategy": "context_only_no_output_overlap",
         "normalized_document_path": str(normalized_document_path).strip(),
@@ -43,52 +42,13 @@ def build_manifest_chunk_contract(source_kind: str = "text", *, driver: str = ""
     }
 
 
-def build_manifest_continuity_policy(config: dict | None = None, *, tail_sentences: int | None = None,
-                                     summary_token_cap: int | None = None) -> dict:
-    """Build the reference-only continuity policy carried across chunk boundaries."""
-    utils = _utils()
-    config = config or {}
-    resolved_tail_sentences = max(
-        0,
-        utils._parse_int(
-            tail_sentences,
-            utils._parse_int_min(
-                config.get("chunk_context_tail_sentences"),
-                utils.DEFAULT_CHUNK_CONTEXT_TAIL_SENTENCES,
-                0,
-            ),
-        ),
-    )
-    resolved_summary_token_cap = max(
-        0,
-        utils._parse_int(
-            summary_token_cap,
-            utils._parse_int_min(
-                config.get("chunk_context_summary_tokens"),
-                utils.DEFAULT_CHUNK_CONTEXT_SUMMARY_TOKENS,
-                0,
-            ),
-        ),
-    )
-    return {
-        "mode": "reference_only",
-        "tail_sentences": resolved_tail_sentences,
-        "summary_token_cap": resolved_summary_token_cap,
-        "carry_section_title": True,
-        "carry_tail_text": resolved_tail_sentences > 0,
-        "boundary_rule": "Only transform the current chunk body below.",
-        "output_rule": "Do not repeat or rewrite this context in the output.",
-    }
-
-
 def build_manifest_plan(prompt_name: str, chunk_mode: str, recommended_chunk_size: int,
                         effective_chunk_size: int, budget: dict, *, source_file: str = "",
                         plan_id: str = "", prior_plan_id: str = "",
-                        chunk_contract: dict | None = None,
-                        continuity_policy: dict | None = None) -> dict:
+                        chunk_contract: dict | None = None) -> dict:
     """Build the normalized manifest plan shared by chunking and execution."""
     utils = _utils()
-    # The plan records the budget and boundary assumptions that all later retry,
+    # The plan records the sizing and boundary assumptions that later retry,
     # repair, merge, and resume behavior must continue to respect.
     return {
         "plan_id": plan_id or new_plan_id(),
@@ -103,14 +63,10 @@ def build_manifest_plan(prompt_name: str, chunk_mode: str, recommended_chunk_siz
         "planned_max_output_tokens": budget.get("planned_max_output_tokens", 0),
         "prompt_tokens": budget.get("prompt_tokens", 0),
         "prompt_template_tokens": budget.get("prompt_template_tokens", 0),
-        "effective_budget_tokens": budget.get("effective_budget_tokens", 0),
         "output_ratio": budget.get("output_ratio", utils.DEFAULT_UNKNOWN_OUTPUT_RATIO),
-        "chunk_safety_buffer_tokens": budget.get("safety_buffer_tokens", 0),
-        "continuity_reserve_tokens": budget.get("continuity_reserve_tokens", 0),
         "token_count_source": budget.get("token_count_source", ""),
         "source_file": source_file,
         "chunk_contract": chunk_contract if isinstance(chunk_contract, dict) else build_manifest_chunk_contract(),
-        "continuity": continuity_policy if isinstance(continuity_policy, dict) else build_manifest_continuity_policy(),
         "created_at": utils._now_iso(),
     }
 
@@ -119,11 +75,6 @@ def normalize_operation_input_key(input_key: str = "") -> str:
     """Normalize operation input key."""
     normalized = str(input_key or "").strip()
     return normalized or "raw_path"
-
-
-def resolve_replan_action(input_key: str = "") -> str:
-    """Resolve the default action when the current plan becomes invalid."""
-    return "auto_replan_remaining" if normalize_operation_input_key(input_key) == "raw_path" else "stop_and_review"
 
 
 def build_quality_gate_contract(*, bilingual: bool = False) -> dict:
@@ -310,64 +261,11 @@ def build_repair_contract(prompt_name: str, config: dict | None = None, *, appli
     }
 
 
-def build_replan_contract(input_key: str = "raw_path", *, applicable: bool = True,
-                          canary_chunks: int = 0,
-                          max_auto_replans: int | None = None) -> dict:
-    """Build the policy that decides when a whole plan must be regenerated."""
-    utils = _utils()
-    if not applicable:
-        return {
-            "version": utils.CONTROL_CONTRACT_SCHEMA_VERSION,
-            "mode": "not_applicable",
-            "supports_auto_replan": False,
-            "recommended_cli_flags": [],
-            "on_replan_required": "not_applicable",
-            "trigger_conditions": [],
-        }
-
-    action = resolve_replan_action(input_key)
-    supports_auto_replan = action == "auto_replan_remaining"
-    contract = {
-        "version": utils.CONTROL_CONTRACT_SCHEMA_VERSION,
-        "mode": "document_abort_and_replan",
-        "supports_auto_replan": supports_auto_replan,
-        "recommended_cli_flags": ["--auto-replan"] if supports_auto_replan else [],
-        "on_replan_required": action,
-        "auto_replan_eligible_input_keys": ["raw_path"],
-        "trigger_conditions": [
-            {
-                "id": "timeout_retry_instability",
-                "effect": "abort_current_run_and_replan_remaining",
-            },
-            {
-                "id": "context_or_budget_error",
-                "effect": "abort_current_run_and_replan_remaining",
-            },
-            {
-                "id": "bad_response_requires_replan",
-                "effect": "abort_current_run_and_replan_remaining",
-            },
-            {
-                "id": "canary_autotune_shrink",
-                "effect": "abort_current_run_and_replan_remaining",
-                "canary_chunk_limit": max(
-                    1,
-                    utils._parse_int_min(canary_chunks, utils.DEFAULT_AUTOTUNE_CANARY_CHUNKS, 1),
-                ),
-            },
-        ],
-    }
-    if max_auto_replans is not None:
-        contract["max_auto_replans"] = max(0, utils._parse_int(max_auto_replans, 0))
-    return contract
-
-
 def build_operation_control_contract(kind: str, prompt_name: str, *,
                                      input_key: str = "raw_path",
                                      config: dict | None = None,
-                                     bilingual: bool = False,
-                                     max_auto_replans: int | None = None) -> dict:
-    """Bundle verification, repair, replan, and quality-gate policy for an operation."""
+                                     bilingual: bool = False) -> dict:
+    """Bundle verification, repair, and quality-gate policy for an operation."""
     utils = _utils()
     config = config or {}
     is_chunk = kind == "chunk"
@@ -378,16 +276,6 @@ def build_operation_control_contract(kind: str, prompt_name: str, *,
         "input_key": normalize_operation_input_key(input_key) if is_chunk else "",
         "verification": build_chunk_verification_contract(prompt_name, applicable=is_chunk),
         "repair": build_repair_contract(prompt_name, config, applicable=is_chunk),
-        "replan": build_replan_contract(
-            input_key,
-            applicable=is_chunk,
-            canary_chunks=utils._parse_int_min(
-                config.get("autotune_canary_chunks"),
-                utils.DEFAULT_AUTOTUNE_CANARY_CHUNKS,
-                1,
-            ),
-            max_auto_replans=max_auto_replans,
-        ),
         "quality_gate": build_quality_gate_contract(bilingual=bilingual),
     }
 
@@ -400,9 +288,6 @@ def build_runtime_control_state() -> dict:
         "verification_warning_count": 0,
         "repair_attempted_count": 0,
         "repair_exhausted_count": 0,
-        "last_replan_trigger": "",
-        "last_replan_action": "",
-        "last_replan_chunk_id": None,
         "pause_requested": False,
         "pause_reason": "",
         "paused_at": "",
@@ -419,9 +304,6 @@ def ensure_runtime_control_state(runtime: dict) -> dict:
     control.setdefault("verification_warning_count", 0)
     control.setdefault("repair_attempted_count", 0)
     control.setdefault("repair_exhausted_count", 0)
-    control.setdefault("last_replan_trigger", "")
-    control.setdefault("last_replan_action", "")
-    control.setdefault("last_replan_chunk_id", None)
     control.setdefault("pause_requested", False)
     control.setdefault("pause_reason", "")
     control.setdefault("paused_at", "")
@@ -471,47 +353,9 @@ def record_chunk_verification(chunk_info: dict, *, status: str, warnings: list[s
     control["last_verified_at"] = utils._now_iso()
 
 
-def classify_replan_trigger(error: Exception | None = None, *,
-                            had_timeout_retry: bool = False,
-                            autotune_last_event: str = "") -> str:
-    """Classify why the current plan should stop and be regenerated."""
-    utils = _utils()
-    if had_timeout_retry:
-        return "timeout_retry_instability"
-    if autotune_last_event == "shrink":
-        return "canary_autotune_shrink"
-    if error is not None:
-        if utils._is_timeout_error(error):
-            return "timeout_retry_instability"
-        status_code = getattr(error, "status_code", None)
-        response_hint = str(getattr(error, "response_body", "") or "").lower()
-        if status_code in {413, 422}:
-            return "context_or_budget_error"
-        if status_code == 400 and any(
-            token in response_hint
-            for token in ("context", "prompt", "max token", "too long", "token limit")
-        ):
-            return "context_or_budget_error"
-        if str(getattr(error, "error_type", "") or "") == "bad_response":
-            return "bad_response_requires_replan"
-    return "manual_review"
-
-
-def mark_runtime_replan(runtime: dict, *, reason: str, trigger: str,
-                        input_key: str, chunk_id: int | None = None) -> None:
-    """Mark the runtime as requiring replanning before further chunk execution."""
-    runtime["replan_required"] = True
-    runtime["replan_reason"] = str(reason or "").strip()
-    control = ensure_runtime_control_state(runtime)
-    control["last_replan_trigger"] = str(trigger or "manual_review")
-    control["last_replan_action"] = resolve_replan_action(input_key)
-    control["last_replan_chunk_id"] = chunk_id
-
-
 def build_process_control_summary(runtime: dict, operation_control: dict) -> dict:
     """Build an operator-facing summary of control-state outcomes for a run."""
     runtime_control = ensure_runtime_control_state(runtime)
-    replan_contract = operation_control.get("replan", {}) if isinstance(operation_control.get("replan", {}), dict) else {}
     repair_contract = operation_control.get("repair", {}) if isinstance(operation_control.get("repair", {}), dict) else {}
     return {
         "operation": operation_control,
@@ -524,20 +368,6 @@ def build_process_control_summary(runtime: dict, operation_control: dict) -> dic
             "max_retries_per_chunk": repair_contract.get("max_retries_per_chunk", 0),
             "backoff_sec": repair_contract.get("backoff_sec", 0.0),
             "after_max_retries": repair_contract.get("after_max_retries", "not_applicable"),
-        },
-        "replan": {
-            "required": bool(runtime.get("replan_required", False)),
-            "reason": str(runtime.get("replan_reason", "") or ""),
-            "trigger": str(runtime_control.get("last_replan_trigger", "") or ""),
-            "action": str(
-                runtime_control.get(
-                    "last_replan_action",
-                    replan_contract.get("on_replan_required", "not_applicable"),
-                )
-                or ""
-            ),
-            "supports_auto_replan": bool(replan_contract.get("supports_auto_replan", False)),
-            "last_replan_chunk_id": runtime_control.get("last_replan_chunk_id"),
         },
         "pause": {
             "requested": bool(runtime_control.get("pause_requested", False)),
@@ -552,7 +382,7 @@ def build_manifest_runtime(plan_id: str, request_url: str = "") -> dict:
     """Build the top-level runtime payload stored in `manifest.json`."""
     utils = _utils()
     # This runtime payload is the durable document-level status record. It lets
-    # resume, pause, cancellation, and replan logic cooperate on disk.
+    # resume, pause, and cancellation logic cooperate on disk.
     return {
         "status": "pending",
         "active_plan_id": plan_id,
@@ -563,9 +393,6 @@ def build_manifest_runtime(plan_id: str, request_url: str = "") -> dict:
         "superseded_count": 0,
         "interrupted_count": 0,
         "current_chunk_index": 0,
-        "replan_required": False,
-        "replan_reason": "",
-        "last_replanned_at": "",
         "last_resume_check_at": "",
         "last_resume_repair_at": "",
         "resume_repair_count": 0,

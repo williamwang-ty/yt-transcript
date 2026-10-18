@@ -513,7 +513,7 @@ def evaluate_glossary_terms(glossary_payload: dict, source_text: str, result_tex
         expected = preferred_output or term
         if term:
             selected_term_names.append(term)
-        if expected and not _text_contains_term(result, expected, ignore_case=False):
+        if expected and not _text_contains_term(result, expected, ignore_case=True):
             missing_terms.append(term)
         elif term:
             preserved_terms.append(term)

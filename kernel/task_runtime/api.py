@@ -41,7 +41,6 @@ COMPATIBILITY_COMMANDS = [
     "runtime-status",
     "process-chunks",
     "prepare-resume",
-    "replan-remaining",
     "pause-run",
     "cancel-run",
 ]
@@ -481,23 +480,16 @@ def _default_prompt_name(inspection: dict, prompt_name: str = "") -> str:
     return str(plan.get("prompt_name", "")).strip() or "structure_only"
 
 
-def _resolve_advance_command(action: str, inspection: dict, *, auto_replan: bool,
-                             dry_run: bool) -> tuple[str, str]:
+def _resolve_advance_command(action: str, inspection: dict) -> tuple[str, str]:
     """Resolve the concrete legacy command that should implement advance-run."""
     normalized = str(action or DEFAULT_RUNTIME_ADVANCE_ACTION).strip().lower().replace("_", "-")
     aliases = {
         "process": "process-chunks",
         "process-chunks": "process-chunks",
-        "process-with-replans": "process-chunks-with-replans",
-        "process-chunks-with-replans": "process-chunks-with-replans",
         "prepare-resume": "prepare-resume",
-        "replan-remaining": "replan-remaining",
     }
     if normalized in aliases:
-        selected = aliases[normalized]
-        if selected == "process-chunks" and auto_replan and not dry_run:
-            return "process-chunks-with-replans", "explicit process command upgraded to bounded replan loop"
-        return selected, "explicit runtime action requested"
+        return aliases[normalized], "explicit runtime action requested"
 
     recovery_summary = inspection.get("recovery_summary", {}) if isinstance(inspection.get("recovery_summary", {}), dict) else {}
     runtime_status = str(inspection.get("effective_runtime_status", "")).strip()
@@ -506,10 +498,6 @@ def _resolve_advance_command(action: str, inspection: dict, *, auto_replan: bool
         return "", "run is paused; resume-run is required before advance-run"
     if recommended_action == "prepare_resume":
         return "prepare-resume", "recovery summary indicates resume-safe preparation is required"
-    if recommended_action == "replan_remaining":
-        return "replan-remaining", "recovery summary indicates replanning is required"
-    if auto_replan and not dry_run:
-        return "process-chunks-with-replans", "default bounded processing path"
     return "process-chunks", "default processing path"
 
 
@@ -517,8 +505,7 @@ def advance_run(work_dir: str, prompt_name: str = "", *, run_id: str = "",
                 action: str = DEFAULT_RUNTIME_ADVANCE_ACTION, extra_instruction: str = "",
                 config_path: str = None, dry_run: bool = False,
                 input_key: str = "raw_path", force: bool = False,
-                auto_replan: bool = True, max_replans: int = 3,
-                chunk_size: int = 0, policy_profile: str = "default") -> dict:
+                policy_profile: str = "default") -> dict:
     """Advance the runtime by selecting and dispatching the next bounded action."""
     inspection = inspect_run(work_dir, run_id=run_id, policy_profile=policy_profile)
     if not inspection.get("success", False):
@@ -540,12 +527,7 @@ def advance_run(work_dir: str, prompt_name: str = "", *, run_id: str = "",
             "message": f"manifest.json not found in {work_dir}",
         }
 
-    selected_command, rationale = _resolve_advance_command(
-        action,
-        inspection,
-        auto_replan=auto_replan,
-        dry_run=dry_run,
-    )
+    selected_command, rationale = _resolve_advance_command(action, inspection)
     if not selected_command:
         return {
             **inspection,
@@ -564,24 +546,6 @@ def advance_run(work_dir: str, prompt_name: str = "", *, run_id: str = "",
             prompt_name=resolved_prompt,
             config_path=config_path,
             input_key=input_key,
-        )
-    elif selected_command == "replan-remaining":
-        result = kernel_execution.replan_remaining(
-            work_dir,
-            prompt_name=resolved_prompt,
-            config_path=config_path,
-            chunk_size=chunk_size,
-            input_key=input_key,
-        )
-    elif selected_command == "process-chunks-with-replans":
-        result = kernel_execution.process_chunks_with_replans(
-            work_dir,
-            resolved_prompt,
-            extra_instruction=extra_instruction,
-            config_path=config_path,
-            input_key=input_key,
-            force=force,
-            max_replans=max_replans,
         )
     else:
         result = kernel_execution.process_chunks(

@@ -170,10 +170,11 @@ class WindowProtocolTests(unittest.TestCase):
         self.assertIn(4, flagged)
         self.assertNotIn(2, flagged)
 
-    def test_long_text_mode_defaults_to_chunks(self):
-        self.assertEqual(window.resolve_long_text_mode({}), "chunks")
-        self.assertEqual(window.resolve_long_text_mode({"long_text_mode": "Window"}), "window")
-        self.assertEqual(window.resolve_long_text_mode({"long_text_mode": "weird"}), "chunks")
+    def test_long_text_mode_defaults_to_window(self):
+        self.assertEqual(window.resolve_long_text_mode({}), "window")
+        self.assertEqual(window.resolve_long_text_mode({"long_text_mode": "Chunks"}), "chunks")
+        self.assertEqual(window.resolve_long_text_mode({"long_text_mode": "weird"}), "window")
+        self.assertEqual(utils._default_config_values()["long_text_mode"], "window")
         self.assertTrue(window.window_supported("cleanup_zh", "raw_path"))
         self.assertTrue(window.window_supported("structure_only", "raw_path"))
         self.assertFalse(window.window_supported("summarize", "raw_path"))
@@ -367,18 +368,6 @@ class WindowExecutorTests(unittest.TestCase):
         self.assertEqual(result["request_url"], "cli:claude-code")
         self.assertEqual(result["coverage"]["coverage_ratio"], 1.0)
 
-    def test_auto_replan_entry_point_also_routes_to_the_window_executor(self):
-        respond, _ = _marker_writer()
-        with tempfile.TemporaryDirectory() as tmpdir:
-            work_dir = self._make_work_dir(tmpdir)
-            with mock.patch.object(utils, "load_config", return_value=self._config()), \
-                mock.patch.object(utils, "_call_llm_api",
-                                  side_effect=lambda **kw: _api_result(respond(kw["messages"][0]["content"]))), \
-                mock.patch("sys.stderr", new_callable=io.StringIO):
-                result = utils.process_chunks_with_replans(str(work_dir), "cleanup_zh")
-        self.assertTrue(result["success"], result)
-        self.assertEqual(result["long_text_mode"], "window")
-
     def test_chunks_mode_and_unsupported_prompts_keep_the_fixed_chunk_executor(self):
         chunk_output = lambda **kw: _api_result("## 标题\n\n" + kw["messages"][0]["content"][-200:])  # noqa: E731
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -392,6 +381,48 @@ class WindowExecutorTests(unittest.TestCase):
             result, _ = self._run(work_dir, self._config(), chunk_output, prompt_name="summarize")
             self.assertNotEqual(result.get("long_text_mode"), "window")
             self.assertFalse((work_dir / "window").exists())
+
+    def test_default_config_runs_the_window_executor_end_to_end(self):
+        respond, _ = _marker_writer()
+        config = self._config()
+        config.pop("long_text_mode")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            work_dir = self._make_work_dir(tmpdir)
+            result, _ = self._run(work_dir, config, lambda **kw: _api_result(respond(kw["messages"][0]["content"])))
+            output = Path(tmpdir) / "optimized.md"
+            merge = utils.merge_content(str(work_dir), str(output))
+            merged = output.read_text(encoding="utf-8")
+            report = utils.verify_quality(str(output), work_dir=str(work_dir))
+
+        self.assertTrue(result["success"], result)
+        self.assertEqual(result["long_text_mode"], "window")
+        self.assertEqual(merge["long_text_mode"], "window")
+        for i in range(1, self.SENTENCE_COUNT + 1):
+            self.assertEqual(merged.count(_sentence(i)), 1, i)
+        self.assertEqual(report["checks"]["window_coverage_ratio"], 1.0)
+
+    def test_work_dir_with_fixed_chunk_progress_finishes_in_chunks_mode(self):
+        chunk_output = lambda **kw: _api_result("## 标题\n\n" + kw["messages"][0]["content"][-200:])  # noqa: E731
+        with tempfile.TemporaryDirectory() as tmpdir:
+            work_dir = self._make_work_dir(tmpdir, count=120)
+            manifest_path = work_dir / "manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            self.assertGreater(len(manifest["chunks"]), 1)
+            # A run from before window became the default: no executor key, one chunk done.
+            manifest.pop("long_text_executor", None)
+            first = manifest["chunks"][0]
+            (work_dir / first["processed_path"]).write_text("已处理的第一块。", encoding="utf-8")
+            first["status"] = "done"
+            manifest_path.write_text(json.dumps(manifest, ensure_ascii=False), encoding="utf-8")
+            self.assertTrue(window.has_chunk_progress(str(work_dir)))
+
+            config = self._config()
+            config.pop("long_text_mode")
+            result, _ = self._run(work_dir, config, chunk_output)
+
+            self.assertNotEqual(result.get("long_text_mode"), "window")
+            self.assertFalse((work_dir / "window").exists())
+            self.assertTrue(result["success"], result)
 
     def test_chapter_plan_headings_land_before_the_chunk_start_paragraph(self):
         respond, _ = _marker_writer()

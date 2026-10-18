@@ -10,7 +10,6 @@ STANDARD_ACTIONS = (
     "continue_stage",
     "retry_action",
     "repair_chunk",
-    "replan_remaining",
     "shrink_chunk_size",
     "switch_model_profile",
     "fallback_to_deepgram",
@@ -49,7 +48,6 @@ def _timeout_signal(result: dict) -> bool:
     payload = result if isinstance(result, dict) else {}
     text = " ".join([
         str(payload.get("aborted_reason", "")).strip(),
-        str(payload.get("replan_reason", "")).strip(),
         str(payload.get("error", "")).strip(),
     ]).lower()
     return "timeout" in text or "timed out" in text
@@ -81,8 +79,6 @@ def evaluate_policy(*, run_state: dict | None = None, result=None,
 
     if active_stage == "processing":
         allowed_actions.extend(["continue_stage", "pause_run", "abort_run"])
-        if payload.get("replan_required", False):
-            allowed_actions.extend(["replan_remaining", "request_human_escalation"])
         if payload.get("paused", False) or effective_status in {"paused", "pause_requested"}:
             allowed_actions.extend(["resume_run", "abort_run"])
         if payload.get("aborted", False):
@@ -95,7 +91,7 @@ def evaluate_policy(*, run_state: dict | None = None, result=None,
         if quality_report.get("passed", payload.get("passed", False)):
             allowed_actions.append("accept_output")
         else:
-            allowed_actions.extend(["repair_chunk", "replan_remaining", "degrade_output_mode", "request_human_escalation", "abort_run"])
+            allowed_actions.extend(["repair_chunk", "degrade_output_mode", "request_human_escalation", "abort_run"])
     elif active_stage == "assemble":
         allowed_actions.extend(["continue_stage", "abort_run"])
     elif active_stage in {"planning", "normalize", "preflight", "source"}:
@@ -139,5 +135,5 @@ def evaluate_policy(*, run_state: dict | None = None, result=None,
         "degrade_allowed": degrade_allowed,
         "escalation_required": escalation_required,
         "budget_pressure_level": budget_pressure_level,
-        "reason": _single_line_text(payload.get("replan_reason", "") or payload.get("aborted_reason", "") or payload.get("error", "")),
+        "reason": _single_line_text(payload.get("aborted_reason", "") or payload.get("error", "")),
     }

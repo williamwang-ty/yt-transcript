@@ -3,8 +3,8 @@
 from tests._support import *
 
 
-class RuntimeRegressionTests(unittest.TestCase):
-    """Regression coverage for runtime ownership, pause, resume, and replan behavior."""
+class RuntimeRegressionTests(FixedChunkExecutorTestCase):
+    """Regression coverage for runtime ownership, pause, resume, and chunk execution."""
     def test_atomic_write_text_avoids_shared_tmp_name_race_for_same_target(self):
         """Concurrent writers to the same target should not share a temp path."""
         from kernel.task_runtime import state as kernel_state
@@ -155,7 +155,7 @@ class RuntimeRegressionTests(unittest.TestCase):
             self.assertIn("quality_report", bundle)
             self.assertEqual(bundle["quality_report"]["format"], runtime_contracts.QUALITY_REPORT_FORMAT)
             self.assertFalse(bundle["quality_report"]["passed"])
-            self.assertEqual(bundle["quality_report"]["recommended_action"], "repair_or_replan")
+            self.assertEqual(bundle["quality_report"]["recommended_action"], "repair_chunk")
             self.assertEqual(bundle["evaluator_report"]["recommended_action"], "repair_chunk")
             self.assertIn("repair_chunk", bundle["policy"]["allowed_actions"])
             self.assertEqual(bundle["decision_record"]["selected_action"], "repair_chunk")
@@ -317,8 +317,8 @@ class RuntimeRegressionTests(unittest.TestCase):
         self.assertEqual(decision_record["selected_action"], "switch_model_profile")
         self.assertEqual(decision_record["decider_type"], "llm-assisted")
 
-    def test_policy_prefers_replan_for_timeout_driven_processing_failure(self):
-        """Test policy and decision select replan for timeout-driven processing failures."""
+    def test_policy_escalates_timeout_driven_processing_abort(self):
+        """Test policy and decision escalate a timeout-driven processing abort."""
         from kernel.task_runtime import decision as runtime_decision
         from kernel.task_runtime import policy as runtime_policy
 
@@ -330,9 +330,7 @@ class RuntimeRegressionTests(unittest.TestCase):
         result = {
             "success": False,
             "aborted": True,
-            "aborted_reason": "timeout on chunk 0; reduce target for future requests",
-            "replan_required": True,
-            "replan_reason": "timeout on chunk 0; reduce target for future requests",
+            "aborted_reason": "Stopped after 2 consecutive timeout failures.",
             "warning_count": 1,
         }
         policy_evaluation = runtime_policy.evaluate_policy(run_state=run_state, result=result, context={"work_dir": "/tmp/demo"})
@@ -343,10 +341,10 @@ class RuntimeRegressionTests(unittest.TestCase):
             policy_evaluation=policy_evaluation,
         )
 
-        self.assertIn("replan_remaining", policy_evaluation["allowed_actions"])
+        self.assertNotIn("replan_remaining", policy_evaluation["allowed_actions"])
         self.assertIn("shrink_chunk_size", policy_evaluation["allowed_actions"])
         self.assertEqual(policy_evaluation["budget_pressure_level"], "high")
-        self.assertEqual(decision_record["selected_action"], "replan_remaining")
+        self.assertEqual(decision_record["selected_action"], "request_human_escalation")
 
     def test_telemetry_summary_reads_local_journal(self):
         """Test telemetry summary reads local journal."""
@@ -710,96 +708,6 @@ class RuntimeRegressionTests(unittest.TestCase):
             output = (work_dir / manifest["chunks"][0]["processed_path"]).read_text(encoding="utf-8")
             self.assertIn("OpenAI API", output)
 
-    def test_process_chunks_injects_semantic_anchor_guardrails(self):
-        """Test process chunks injects semantic anchor guardrails."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            source = Path(tmpdir) / "raw.txt"
-            work_dir = Path(tmpdir) / "chunks"
-            source.write_text("访问 https://example.com 于 2026-03-08 完成 32% 进度。", encoding="utf-8")
-            utils.chunk_text(str(source), str(work_dir), 120, "structure_only")
-
-            config = utils._default_config_values()
-            config.update({
-                "llm_api_key": "key",
-                "llm_base_url": "https://api.example.com",
-                "llm_model": "demo",
-                "llm_api_format": "openai",
-            })
-
-            captured = {}
-
-            def fake_llm(*args, **kwargs):
-                """Fake llm."""
-                captured["prompt"] = kwargs["messages"][0]["content"]
-                return {
-                    "text": "## 结果\n\n访问 https://example.com 于 2026-03-08 完成 32% 进度。",
-                    "latency_ms": 12,
-                    "request_url": "https://api.example.com/v1/chat/completions",
-                    "streaming_used": False,
-                    "attempts": 1,
-                }
-
-            with mock.patch.object(utils, "load_config", return_value=config), mock.patch.object(
-                utils,
-                "_call_llm_api",
-                side_effect=fake_llm,
-            ):
-                result = utils.process_chunks(str(work_dir), "structure_only")
-
-            self.assertTrue(result["success"])
-            self.assertIn("Semantic Anchors", captured["prompt"])
-            self.assertIn("https://example.com", captured["prompt"])
-            self.assertIn("2026-03-08", captured["prompt"])
-            self.assertIn("32%", captured["prompt"])
-            self.assertEqual(result["semantic_verification"]["mode"], "anchor_checks")
-
-    def test_process_chunks_retries_when_semantic_anchor_missing(self):
-        """Test process chunks retries when semantic anchor missing."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            source = Path(tmpdir) / "raw.txt"
-            work_dir = Path(tmpdir) / "chunks"
-            source.write_text("本季度增长 32%。", encoding="utf-8")
-            utils.chunk_text(str(source), str(work_dir), 120, "structure_only")
-
-            config = utils._default_config_values()
-            config.update({
-                "llm_api_key": "key",
-                "llm_base_url": "https://api.example.com",
-                "llm_model": "demo",
-                "llm_api_format": "openai",
-                "llm_chunk_recovery_attempts": 1,
-            })
-
-            responses = [
-                {
-                    "text": "## 结果\n\n本季度增长显著。",
-                    "latency_ms": 10,
-                    "request_url": "https://api.example.com/v1/chat/completions",
-                    "streaming_used": False,
-                    "attempts": 1,
-                },
-                {
-                    "text": "## 结果\n\n本季度增长 32%。",
-                    "latency_ms": 12,
-                    "request_url": "https://api.example.com/v1/chat/completions",
-                    "streaming_used": False,
-                    "attempts": 1,
-                },
-            ]
-
-            with mock.patch.object(utils, "load_config", return_value=config), mock.patch.object(
-                utils,
-                "_call_llm_api",
-                side_effect=responses,
-            ) as mocked_call:
-                result = utils.process_chunks(str(work_dir), "structure_only")
-
-            manifest = json.loads((work_dir / "manifest.json").read_text(encoding="utf-8"))
-            self.assertTrue(result["success"])
-            self.assertEqual(mocked_call.call_count, 2)
-            self.assertEqual(manifest["chunks"][0]["recovery_attempts"], 1)
-            self.assertIn("32%", (work_dir / manifest["chunks"][0]["processed_path"]).read_text(encoding="utf-8"))
-
     def test_verify_quality_reports_missing_semantic_anchors(self):
         """Test verify quality reports missing semantic anchors."""
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1002,6 +910,24 @@ class RuntimeRegressionTests(unittest.TestCase):
             self.assertEqual(result["checks"]["glossary_drift_count"], 0)
             self.assertFalse(any("Glossary drift detected" in warning for warning in result["warnings"]))
 
+    def test_verify_quality_ignores_case_only_glossary_differences(self):
+        """Test verify quality does not count a recased term (Transdigm -> TransDigm) as drift."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            raw = Path(tmpdir) / "raw.txt"
+            optimized = Path(tmpdir) / "opt.md"
+            work_dir = Path(tmpdir) / "chunks"
+            raw.write_text("Transdigm 和 OpenAI 发布了财报。", encoding="utf-8")
+            utils.chunk_text(str(raw), str(work_dir), 80, "cleanup_zh")
+            (work_dir / "glossary.json").write_text(json.dumps({
+                "terms": [{"term": "Transdigm", "aliases": [], "preferred_output": "Transdigm", "source": "transcript", "count": 2}],
+            }), encoding="utf-8")
+            optimized.write_text("## Section\n\nTransDigm 和 OpenAI 发布了财报。\n", encoding="utf-8")
+
+            result = utils.verify_quality(str(optimized), str(raw), bilingual=False, work_dir=str(work_dir))
+
+            self.assertTrue(result["checks"]["glossary_drift_applicable"], result["checks"])
+            self.assertEqual(result["checks"]["glossary_drift_count"], 0)
+
     def test_verify_quality_hard_fails_empty_processed_chunk_file(self):
         """Test verify quality rejects zero-byte processed chunk artifacts."""
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1119,8 +1045,6 @@ class RuntimeRegressionTests(unittest.TestCase):
                     dry_run=True,
                     input_key="raw_path",
                     force=False,
-                    auto_replan=False,
-                    max_replans=3,
                 )
 
             contracts = envelope["contracts"]
@@ -1615,84 +1539,6 @@ class RuntimeRegressionTests(unittest.TestCase):
             self.assertEqual(result["ownership"]["recovered_stale_owner"]["stale_reason"], "dead_process")
             self.assertFalse(owner_path.exists())
 
-    # Pin the executor so a local config.yaml with long_text_mode: window
-    # does not route this chunk-executor test to the window path.
-    @mock.patch("kernel.long_text.window.resolve_long_text_mode", return_value="chunks")
-    def test_process_chunks_with_replans_shares_runtime_owner_across_steps(self, _mode):
-        """Test process chunks with replans shares runtime owner across steps."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            source = Path(tmpdir) / "raw.txt"
-            work_dir = Path(tmpdir) / "chunks"
-            source.write_text("第一句。第二句。第三句。第四句。第五句。第六句。", encoding="utf-8")
-            utils.chunk_text(str(source), str(work_dir), 4, "structure_only")
-
-            seen_calls = []
-            process_call_count = {"count": 0}
-
-            def fake_process_chunks(*args, **kwargs):
-                """Fake process chunks."""
-                ownership = kwargs.get("runtime_ownership") or {}
-                seen_calls.append(("process", ownership.get("owner_id", ""), bool(ownership.get("delegated", False))))
-                if process_call_count["count"] == 0:
-                    process_call_count["count"] += 1
-                    return {
-                        "success": False,
-                        "processed_count": 0,
-                        "failed_count": 1,
-                        "skipped_count": 0,
-                        "superseded_count": 0,
-                        "warnings": [],
-                        "output_files": [],
-                        "request_url": "https://api.example.com/v1/chat/completions",
-                        "aborted": True,
-                        "aborted_reason": "need replan",
-                        "replan_required": True,
-                        "replan_reason": "timeout on chunk 0",
-                        "plan": {"plan_id": "plan_a"},
-                        "control": {"replan": {}},
-                    }
-                return {
-                    "success": True,
-                    "processed_count": 1,
-                    "failed_count": 0,
-                    "skipped_count": 0,
-                    "superseded_count": 0,
-                    "warnings": [],
-                    "output_files": [],
-                    "request_url": "https://api.example.com/v1/chat/completions",
-                    "aborted": False,
-                    "aborted_reason": "",
-                    "replan_required": False,
-                    "replan_reason": "",
-                    "plan": {"plan_id": "plan_b"},
-                    "control": {"replan": {}},
-                }
-
-            def fake_replan_remaining(*args, **kwargs):
-                """Fake replan remaining."""
-                ownership = kwargs.get("runtime_ownership") or {}
-                seen_calls.append(("replan", ownership.get("owner_id", ""), bool(ownership.get("delegated", False))))
-                return {
-                    "success": True,
-                    "replanned": True,
-                    "warnings": [],
-                }
-
-            with mock.patch.object(utils, "process_chunks", side_effect=fake_process_chunks), mock.patch.object(
-                utils,
-                "replan_remaining",
-                side_effect=fake_replan_remaining,
-            ):
-                result = utils.process_chunks_with_replans(str(work_dir), "structure_only", max_replans=1)
-
-            owner_ids = {owner_id for _, owner_id, _ in seen_calls}
-            self.assertTrue(result["success"])
-            self.assertEqual(result["replan_count"], 1)
-            self.assertEqual(len(owner_ids), 1)
-            self.assertEqual(result["ownership"]["owner_id"], next(iter(owner_ids)))
-            self.assertTrue(all(delegated for _, _, delegated in seen_calls))
-            self.assertTrue(result["ownership"]["released"])
-
     def test_prepare_resume_marks_stale_running_chunk_interrupted(self):
         """Test prepare resume marks stale running chunk interrupted."""
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1878,120 +1724,6 @@ class RuntimeRegressionTests(unittest.TestCase):
             self.assertEqual(manifest["planned_max_output_tokens"], utils.TASK_MAX_OUTPUT_TOKEN_DEFAULTS["summarize"])
             self.assertEqual(manifest["chunks"][0]["planned_max_output_tokens"], utils.TASK_MAX_OUTPUT_TOKEN_DEFAULTS["summarize"])
 
-    def test_process_chunks_injects_continuity_context(self):
-        """Test process chunks injects continuity context."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            source = Path(tmpdir) / "raw.txt"
-            work_dir = Path(tmpdir) / "chunks"
-            config_path = Path(tmpdir) / "config.yaml"
-            source.write_text("第一句。第二句。第三句。第四句。", encoding="utf-8")
-            config_path.write_text(
-                f'output_dir: "{tmpdir}"\n'
-                'chunk_mode: "chars"\n'
-                'chunk_context_tail_sentences: 1\n'
-                'chunk_context_summary_tokens: 20\n',
-                encoding="utf-8",
-            )
-            utils.chunk_text(str(source), str(work_dir), 8, config_path=str(config_path))
-            manifest_before = json.loads((work_dir / "manifest.json").read_text(encoding="utf-8"))
-
-            recorded_prompts = []
-            fake_outputs = iter([
-                "## Intro\n\n整理后的第一部分。",
-                "## Follow-up\n\n整理后的第二部分。",
-                "## Third\n\n整理后的第三部分。",
-                "## Final\n\n整理后的第四部分。",
-            ])
-
-            def fake_call(**kwargs):
-                """Fake call."""
-                recorded_prompts.append(kwargs["messages"][0]["content"])
-                return {
-                    "text": next(fake_outputs),
-                    "latency_ms": 12,
-                    "request_url": "https://api.example.com/v1/chat/completions",
-                    "streaming_used": False,
-                    "attempts": 1,
-                }
-
-            config = utils._default_config_values()
-            config.update({
-                "llm_api_key": "key",
-                "llm_base_url": "https://api.example.com",
-                "llm_model": "demo",
-                "llm_api_format": "openai",
-                "chunk_context_tail_sentences": 1,
-                "chunk_context_summary_tokens": 20,
-            })
-
-            with mock.patch.object(utils, "load_config", return_value=config), mock.patch.object(
-                utils, "_call_llm_api", side_effect=fake_call
-            ):
-                result = utils.process_chunks(str(work_dir), "structure_only")
-
-            manifest = json.loads((work_dir / "manifest.json").read_text(encoding="utf-8"))
-            self.assertTrue(result["success"])
-            self.assertNotIn("## Continuity Context", recorded_prompts[0])
-            self.assertIn("## Continuity Context", recorded_prompts[1])
-            self.assertIn("Do not repeat or rewrite this context in the output.", recorded_prompts[1])
-            self.assertIn(manifest_before["chunks"][0]["tail_context_text"], recorded_prompts[1])
-            self.assertEqual(manifest["chunks"][1]["continuity_prev_chunk_id"], 0)
-            self.assertGreater(manifest["chunks"][1]["continuity_context_tokens"], 0)
-            self.assertEqual(manifest["chunks"][0]["last_section_title"], "## Intro")
-
-    def test_process_chunks_uses_manifest_continuity_policy_even_if_runtime_config_disables_it(self):
-        """Test process chunks uses manifest continuity policy even if runtime config disables it."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            source = Path(tmpdir) / "raw.txt"
-            work_dir = Path(tmpdir) / "chunks"
-            config_path = Path(tmpdir) / "chunk_config.yaml"
-            source.write_text("第一句。第二句。第三句。第四句。", encoding="utf-8")
-            config_path.write_text(
-                f"""output_dir: "{tmpdir}"
-chunk_mode: "chars"
-chunk_context_tail_sentences: 1
-chunk_context_summary_tokens: 20
-""",
-                encoding="utf-8",
-            )
-            utils.chunk_text(str(source), str(work_dir), 8, config_path=str(config_path))
-
-            runtime_config = utils._default_config_values()
-            runtime_config.update({
-                "llm_api_key": "key",
-                "llm_base_url": "https://api.example.com",
-                "llm_model": "demo",
-                "llm_api_format": "openai",
-                "chunk_context_tail_sentences": 0,
-                "chunk_context_summary_tokens": 0,
-            })
-
-            recorded_prompts = []
-            fake_outputs = iter([
-                "## Intro" + chr(10) + chr(10) + "整理后的第一部分。",
-                "## Follow-up" + chr(10) + chr(10) + "整理后的第二部分。",
-                "## Third" + chr(10) + chr(10) + "整理后的第三部分。",
-                "## Final" + chr(10) + chr(10) + "整理后的第四部分。",
-            ])
-
-            with mock.patch.object(utils, "load_config", return_value=runtime_config), mock.patch.object(
-                utils,
-                "_call_llm_api",
-                side_effect=lambda **kwargs: recorded_prompts.append(kwargs["messages"][0]["content"]) or {
-                    "text": next(fake_outputs),
-                    "latency_ms": 12,
-                    "request_url": "https://api.example.com/v1/chat/completions",
-                    "streaming_used": False,
-                    "attempts": 1,
-                },
-            ):
-                result = utils.process_chunks(str(work_dir), "structure_only")
-
-            self.assertTrue(result["success"])
-            self.assertIn("## Continuity Context", recorded_prompts[1])
-            self.assertIn("Only transform the current chunk body below.", recorded_prompts[1])
-            self.assertIn("Do not repeat or rewrite this context in the output.", recorded_prompts[1])
-
     def test_process_chunks_reuses_manifest_token_estimates_without_remote_probe(self):
         """Test process chunks reuses manifest token estimates without remote probe."""
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -2026,78 +1758,6 @@ chunk_context_summary_tokens: 20
             self.assertEqual(manifest["chunks"][0]["token_count_source"], "manifest_cached_input")
             self.assertEqual(manifest["token_count_source"], "manifest_cached_input")
             self.assertIn("est_source=manifest_cached_input", stderr.getvalue())
-
-    def test_process_chunks_uses_processed_tail_for_chained_continuity(self):
-        """Test process chunks uses processed tail for chained continuity."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            source = Path(tmpdir) / "raw.txt"
-            work_dir = Path(tmpdir) / "chunks"
-            source.write_text("原始甲。原始乙。原始丙。原始丁。", encoding="utf-8")
-            utils.chunk_text(str(source), str(work_dir), 8)
-            manifest_before = json.loads((work_dir / "manifest.json").read_text(encoding="utf-8"))
-            raw_tail = manifest_before["chunks"][0]["tail_context_text"]
-
-            config = utils._default_config_values()
-            config.update({
-                "llm_api_key": "key",
-                "llm_base_url": "https://api.example.com",
-                "llm_model": "demo",
-                "llm_api_format": "openai",
-                "chunk_context_tail_sentences": 1,
-                "chunk_context_summary_tokens": 20,
-            })
-
-            structured_outputs = iter([
-                "## Intro\n\n结构化第一块。PROCESSED_TAIL_ONE。",
-                "## Follow-up\n\n结构化第二块。PROCESSED_TAIL_TWO。",
-                "## Third\n\n结构化第三块。PROCESSED_TAIL_THREE。",
-                "## Final\n\n结构化第四块。PROCESSED_TAIL_FOUR。",
-            ])
-            with mock.patch.object(utils, "load_config", return_value=config), mock.patch.object(
-                utils,
-                "_call_llm_api",
-                side_effect=lambda **kwargs: {
-                    "text": next(structured_outputs),
-                    "latency_ms": 12,
-                    "request_url": "https://api.example.com/v1/chat/completions",
-                    "streaming_used": False,
-                    "attempts": 1,
-                },
-            ):
-                first_pass = utils.process_chunks(str(work_dir), "structure_only")
-
-            self.assertTrue(first_pass["success"])
-
-            translate_prompts = []
-            translated_outputs = iter([
-                "[EN1]\n\n" + ("这是第一块的中文翻译。\n" * 6),
-                "[EN2]\n\n" + ("这是第二块的中文翻译。\n" * 6),
-                "[EN3]\n\n" + ("这是第三块的中文翻译。\n" * 6),
-                "[EN4]\n\n" + ("这是第四块的中文翻译。\n" * 6),
-            ])
-            stderr = io.StringIO()
-            with mock.patch.object(utils, "load_config", return_value=config), mock.patch.object(
-                utils,
-                "_call_llm_api",
-                side_effect=lambda **kwargs: translate_prompts.append(kwargs["messages"][0]["content"]) or {
-                    "text": next(translated_outputs),
-                    "latency_ms": 12,
-                    "request_url": "https://api.example.com/v1/chat/completions",
-                    "streaming_used": False,
-                    "attempts": 1,
-                },
-            ), mock.patch("sys.stderr", stderr):
-                second_pass = utils.process_chunks(str(work_dir), "translate_only", input_key="processed_path", force=True)
-
-            manifest_after = json.loads((work_dir / "manifest.json").read_text(encoding="utf-8"))
-            self.assertTrue(second_pass["success"])
-            self.assertIn("Previous section title:", translate_prompts[1])
-            self.assertIn("## Intro", translate_prompts[1])
-            self.assertIn("PROCESSED_TAIL_ONE", translate_prompts[1])
-            self.assertNotIn(raw_tail, translate_prompts[1])
-            self.assertEqual(manifest_after["chunks"][0]["token_count_source"], "manifest_cached_output")
-            self.assertEqual(manifest_after["token_count_source"], "manifest_cached_output")
-            self.assertIn("est_source=manifest_cached_output", stderr.getvalue())
 
     def test_process_chunks_dry_run_preserves_char_manifest_units(self):
         """Test process chunks dry run preserves char manifest units."""
@@ -2178,123 +1838,15 @@ chunk_context_summary_tokens: 20
             manifest = json.loads((work_dir / "manifest.json").read_text(encoding="utf-8"))
             self.assertFalse(result["success"])
             self.assertTrue(result["aborted"])
-            self.assertTrue(result["replan_required"])
-            self.assertEqual(result["failed_count"], 1)
+            self.assertIn("2 consecutive timeout failures", result["aborted_reason"])
+            self.assertEqual(result["failed_count"], 2)
             self.assertEqual(manifest["chunks"][0]["status"], "failed")
-            self.assertEqual(manifest["chunks"][1]["status"], "pending")
-            self.assertTrue(manifest["runtime"]["replan_required"])
+            self.assertEqual(manifest["chunks"][1]["status"], "failed")
+            self.assertEqual(manifest["chunks"][2]["status"], "pending")
             self.assertEqual(manifest["runtime"]["status"], "aborted")
 
-    def test_process_chunks_autotune_shrinks_after_timeout(self):
-        """Test process chunks autotune shrinks after timeout."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            source = Path(tmpdir) / "raw.txt"
-            work_dir = Path(tmpdir) / "chunks"
-            source.write_text("第一句。第二句。第三句。第四句。第五句。第六句。", encoding="utf-8")
-            utils.chunk_text(str(source), str(work_dir), 4, "structure_only")
-
-            timeout_error = utils.LLMRequestError(
-                "timed out",
-                error_type="timeout",
-                retryable=True,
-                request_url="https://api.example.com/v1/chat/completions",
-            )
-            timeout_error.attempts = 1
-            call_counter = {"count": 0}
-
-            def fake_call(**kwargs):
-                """Fake call."""
-                if call_counter["count"] == 0:
-                    call_counter["count"] += 1
-                    raise timeout_error
-                call_counter["count"] += 1
-                return {
-                    "text": "## Done\n\n处理完成。",
-                    "latency_ms": 12,
-                    "request_url": "https://api.example.com/v1/chat/completions",
-                    "streaming_used": False,
-                    "attempts": 1,
-                }
-
-            config = utils._default_config_values()
-            config.update({
-                "llm_api_key": "key",
-                "llm_base_url": "https://api.example.com",
-                "llm_model": "demo",
-                "llm_api_format": "openai",
-                "enable_chunk_autotune": True,
-                "llm_stop_after_consecutive_timeouts": 99,
-            })
-
-            stderr = io.StringIO()
-            with mock.patch.object(utils, "load_config", return_value=config), \
-                mock.patch.object(utils, "_call_llm_api", side_effect=fake_call), \
-                mock.patch("sys.stderr", stderr):
-                result = utils.process_chunks(str(work_dir), "structure_only")
-
-            manifest = json.loads((work_dir / "manifest.json").read_text(encoding="utf-8"))
-            first_chunk = manifest["chunks"][0]
-
-            self.assertFalse(result["success"])
-            self.assertTrue(result["replan_required"])
-            self.assertEqual(first_chunk["error_type"], "timeout")
-            self.assertEqual(first_chunk["autotune_event"], "shrink")
-            self.assertLess(first_chunk["autotune_next_target_tokens"], first_chunk["autotune_target_tokens"])
-            self.assertEqual(manifest["autotune"]["current_target_tokens"], first_chunk["autotune_next_target_tokens"])
-            self.assertIn("chunk_id=0", stderr.getvalue())
-            self.assertIn("planned_max_output_tokens=", stderr.getvalue())
-            self.assertIn("Autotune chunk_id=0 event=shrink", stderr.getvalue())
-
-    def test_process_chunks_autotune_increases_after_success_window(self):
-        """Test process chunks autotune increases after success window."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            source = Path(tmpdir) / "raw.txt"
-            work_dir = Path(tmpdir) / "chunks"
-            source.write_text(("第一句。第二句。第三句。第四句。" * 6), encoding="utf-8")
-            utils.chunk_text(str(source), str(work_dir), 4, "structure_only")
-            manifest_before = json.loads((work_dir / "manifest.json").read_text(encoding="utf-8"))
-            base_target = manifest_before["autotune"]["current_target_tokens"]
-
-            config = utils._default_config_values()
-            config.update({
-                "llm_api_key": "key",
-                "llm_base_url": "https://api.example.com",
-                "llm_model": "demo",
-                "llm_api_format": "openai",
-                "enable_chunk_autotune": True,
-                "autotune_success_window": 2,
-                "autotune_increase_percent": 0.10,
-                "autotune_p95_latency_threshold_ms": 1000,
-            })
-
-            stderr = io.StringIO()
-            with mock.patch.object(utils, "load_config", return_value=config), mock.patch.object(
-                utils,
-                "_call_llm_api",
-                side_effect=lambda **kwargs: {
-                    "text": "## Done\n\n处理完成。",
-                    "latency_ms": 12,
-                    "request_url": "https://api.example.com/v1/chat/completions",
-                    "streaming_used": False,
-                    "attempts": 1,
-                },
-            ), mock.patch("sys.stderr", stderr):
-                result = utils.process_chunks(str(work_dir), "structure_only")
-
-            manifest = json.loads((work_dir / "manifest.json").read_text(encoding="utf-8"))
-
-            self.assertTrue(result["success"])
-            self.assertGreater(manifest["autotune"]["current_target_tokens"], base_target)
-            self.assertIn("Autotune", stderr.getvalue())
-            self.assertTrue(
-                any(chunk["autotune_event"] == "increase" for chunk in manifest["chunks"] if chunk["status"] == "done")
-            )
-            self.assertTrue(
-                all("input_tokens" in chunk and "error_type" in chunk for chunk in manifest["chunks"])
-            )
-
-    def test_process_chunks_records_attempt_logs_and_aborts_for_retry_timeout(self):
-        """Test process chunks records attempt logs and aborts for retry timeout."""
+    def test_process_chunks_records_attempt_logs_and_continues_after_retry_timeout(self):
+        """Test a timeout retried within a chunk is logged and the run carries on."""
         with tempfile.TemporaryDirectory() as tmpdir:
             source = Path(tmpdir) / "raw.txt"
             work_dir = Path(tmpdir) / "chunks"
@@ -2307,7 +1859,6 @@ chunk_context_summary_tokens: 20
                 "llm_base_url": "https://api.example.com",
                 "llm_model": "demo",
                 "llm_api_format": "openai",
-                "enable_chunk_autotune": True,
                 "llm_max_retries": 1,
                 "llm_backoff_sec": 0.01,
             })
@@ -2322,28 +1873,27 @@ chunk_context_summary_tokens: 20
                         retryable=True,
                         request_url="https://api.example.com/v1/chat/completions",
                     ),
+                ] + [
                     {
                         "text": "## Done\n\n处理完成。",
                         "latency_ms": 12,
                         "request_url": "https://api.example.com/v1/chat/completions",
                         "streaming_used": False,
-                    },
-                ]
+                    }
+                ] * len(json.loads((work_dir / "manifest.json").read_text(encoding="utf-8"))["chunks"])
                 result = utils.process_chunks(str(work_dir), "structure_only")
 
             manifest = json.loads((work_dir / "manifest.json").read_text(encoding="utf-8"))
             first_chunk = manifest["chunks"][0]
 
-            self.assertFalse(result["success"])
-            self.assertTrue(result["replan_required"])
+            self.assertTrue(result["success"], result)
+            self.assertFalse(result["aborted"])
             self.assertEqual(first_chunk["status"], "done")
             self.assertEqual(len(first_chunk["attempt_logs"]), 2)
             self.assertEqual(first_chunk["attempt_logs"][0]["error_type"], "timeout")
             self.assertEqual(first_chunk["attempt_logs"][1]["result"], "success")
-            self.assertTrue(manifest["runtime"]["replan_required"])
-            self.assertEqual(result["control"]["replan"]["trigger"], "timeout_retry_instability")
-            self.assertEqual(result["control"]["replan"]["action"], "auto_replan_remaining")
-            self.assertEqual(manifest["runtime"]["control"]["last_replan_chunk_id"], first_chunk["id"])
+            self.assertTrue(all(chunk["status"] == "done" for chunk in manifest["chunks"]))
+            self.assertNotIn("replan", result["control"])
 
     def test_process_chunks_auto_recovers_suspicious_short_output(self):
         """Test process chunks auto recovers suspicious short output."""
@@ -2653,84 +2203,6 @@ chunk_context_summary_tokens: 20
             self.assertTrue(first_chunk["control"]["repair_exhausted"])
             self.assertEqual(first_chunk["control"]["retry_reasons"], ["short_output"])
 
-    def test_replan_remaining_supersedes_pending_chunks_and_appends_new_plan(self):
-        """Test replan remaining supersedes pending chunks and appends new plan."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            source = Path(tmpdir) / "raw.txt"
-            work_dir = Path(tmpdir) / "chunks"
-            source.write_text("第一句。第二句。第三句。第四句。第五句。第六句。", encoding="utf-8")
-            utils.chunk_text(str(source), str(work_dir), 4, "structure_only")
-
-            manifest_path = work_dir / "manifest.json"
-            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-            manifest["chunks"][0]["status"] = "done"
-            manifest["runtime"]["replan_required"] = True
-            manifest["runtime"]["replan_reason"] = "timeout on chunk 1"
-            manifest["autotune"]["current_target_tokens"] = 3
-            manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
-
-            result = utils.replan_remaining(str(work_dir), prompt_name="structure_only")
-
-            manifest_after = json.loads(manifest_path.read_text(encoding="utf-8"))
-            superseded = [chunk for chunk in manifest_after["chunks"] if chunk.get("status") == utils.SUPERSEDED_CHUNK_STATUS]
-            active_pending = [chunk for chunk in manifest_after["chunks"] if chunk.get("status") == "pending"]
-            first_pending_index = next(
-                index for index, chunk in enumerate(manifest_after["chunks"])
-                if chunk.get("status") == "pending"
-            )
-
-            self.assertTrue(result["success"])
-            self.assertTrue(result["replanned"])
-            self.assertEqual(len(superseded), 5)
-            self.assertGreater(len(active_pending), 0)
-            self.assertEqual(manifest_after["runtime"]["active_plan_id"], result["plan_id"])
-            self.assertEqual(manifest_after["runtime"]["current_chunk_index"], first_pending_index)
-            self.assertFalse(manifest_after["runtime"]["replan_required"])
-            self.assertEqual(result["chunk_size"], 3)
-
-    def test_process_chunks_clears_stale_replan_flags_after_success(self):
-        """Test process chunks clears stale replan flags after success."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            source = Path(tmpdir) / "raw.txt"
-            work_dir = Path(tmpdir) / "chunks"
-            source.write_text("第一句。第二句。第三句。第四句。", encoding="utf-8")
-            utils.chunk_text(str(source), str(work_dir), 4, "structure_only")
-
-            manifest_path = work_dir / "manifest.json"
-            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-            manifest["runtime"]["replan_required"] = True
-            manifest["runtime"]["replan_reason"] = "stale flag"
-            manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
-
-            config = utils._default_config_values()
-            config.update({
-                "llm_api_key": "key",
-                "llm_base_url": "https://api.example.com",
-                "llm_model": "demo",
-                "llm_api_format": "openai",
-            })
-
-            with mock.patch.object(utils, "load_config", return_value=config), mock.patch.object(
-                utils,
-                "_call_llm_api",
-                return_value={
-                    "text": "## Done\n\n处理完成。",
-                    "latency_ms": 12,
-                    "request_url": "https://api.example.com/v1/chat/completions",
-                    "streaming_used": False,
-                    "attempts": 1,
-                },
-            ):
-                result = utils.process_chunks(str(work_dir), "structure_only")
-
-            manifest_after = json.loads(manifest_path.read_text(encoding="utf-8"))
-
-            self.assertTrue(result["success"])
-            self.assertFalse(result["replan_required"])
-            self.assertFalse(manifest_after["runtime"]["replan_required"])
-            self.assertEqual(manifest_after["runtime"]["replan_reason"], "")
-            self.assertEqual(manifest_after["runtime"]["status"], "completed")
-
     def test_process_chunks_marks_completed_with_errors_for_nonfatal_failures(self):
         """Test process chunks marks completed with errors for nonfatal failures."""
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -2771,156 +2243,6 @@ chunk_context_summary_tokens: 20
             self.assertFalse(result["aborted"])
             self.assertEqual(result["failed_count"], 1)
             self.assertEqual(manifest_after["runtime"]["status"], "completed_with_errors")
-            self.assertFalse(manifest_after["runtime"]["replan_required"])
-
-    def test_process_chunks_with_replans_auto_recovers_after_canary_abort(self):
-        """Test process chunks with replans auto recovers after canary abort."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            source = Path(tmpdir) / "raw.txt"
-            work_dir = Path(tmpdir) / "chunks"
-            source.write_text("第一句。第二句。第三句。第四句。第五句。第六句。", encoding="utf-8")
-            utils.chunk_text(str(source), str(work_dir), 4, "structure_only")
-
-            timeout_error = utils.LLMRequestError(
-                "timed out",
-                error_type="timeout",
-                retryable=True,
-                request_url="https://api.example.com/v1/chat/completions",
-            )
-            timeout_error.attempts = 1
-            call_counter = {"count": 0}
-
-            def fake_call(**kwargs):
-                """Fake call."""
-                if call_counter["count"] == 0:
-                    call_counter["count"] += 1
-                    raise timeout_error
-                call_counter["count"] += 1
-                return {
-                    "text": "## Done\n\n处理完成。",
-                    "latency_ms": 12,
-                    "request_url": "https://api.example.com/v1/chat/completions",
-                    "streaming_used": False,
-                    "attempts": 1,
-                }
-
-            config = utils._default_config_values()
-            config.update({
-                "llm_api_key": "key",
-                "llm_base_url": "https://api.example.com",
-                "llm_model": "demo",
-                "llm_api_format": "openai",
-                "enable_chunk_autotune": True,
-                "autotune_canary_chunks": 1,
-                "llm_stop_after_consecutive_timeouts": 99,
-            })
-
-            with mock.patch.object(utils, "load_config", return_value=config), \
-                mock.patch.object(utils, "_call_llm_api", side_effect=fake_call):
-                result = utils.process_chunks_with_replans(
-                    str(work_dir),
-                    "structure_only",
-                    max_replans=1,
-                )
-
-            manifest = json.loads((work_dir / "manifest.json").read_text(encoding="utf-8"))
-            self.assertTrue(result["success"])
-            self.assertEqual(result["replan_count"], 1)
-            self.assertEqual(
-                result["superseded_count"],
-                sum(1 for chunk in manifest["chunks"] if chunk.get("status") == utils.SUPERSEDED_CHUNK_STATUS),
-            )
-            self.assertFalse(manifest["runtime"]["replan_required"])
-            self.assertEqual(manifest["runtime"]["status"], "completed")
-            self.assertTrue(any(chunk["status"] == utils.SUPERSEDED_CHUNK_STATUS for chunk in manifest["chunks"]))
-            self.assertEqual(result["control"]["replan"]["auto_replan_count"], 1)
-            self.assertEqual(result["control"]["replan"]["max_auto_replans"], 1)
-
-    # Pin the executor so a local config.yaml with long_text_mode: window
-    # does not route this chunk-executor test to the window path.
-    @mock.patch("kernel.long_text.window.resolve_long_text_mode", return_value="chunks")
-    def test_process_chunks_with_replans_stops_when_replan_step_fails(self, _mode):
-        """Test process chunks with replans stops when replan step fails."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            source = Path(tmpdir) / "raw.txt"
-            work_dir = Path(tmpdir) / "chunks"
-            source.write_text("第一句。第二句。第三句。第四句。", encoding="utf-8")
-            utils.chunk_text(str(source), str(work_dir), 4, "structure_only")
-
-            with mock.patch.object(utils, "process_chunks", side_effect=[
-                {
-                    "success": False,
-                    "processed_count": 0,
-                    "failed_count": 1,
-                    "skipped_count": 0,
-                    "superseded_count": 0,
-                    "warnings": [],
-                    "output_files": [],
-                    "request_url": "https://api.example.com/v1/chat/completions",
-                    "aborted": True,
-                    "aborted_reason": "need replan",
-                    "replan_required": True,
-                    "replan_reason": "timeout on chunk 0",
-                    "plan": {"plan_id": "plan_a"},
-                },
-            ]), mock.patch.object(utils, "replan_remaining", return_value={
-                "success": False,
-                "replanned": False,
-                "error": "failed to generate replacement plan",
-                "warnings": ["controller warning"],
-            }):
-                result = utils.process_chunks_with_replans(str(work_dir), "structure_only", max_replans=1)
-
-        self.assertFalse(result["success"])
-        self.assertTrue(result["aborted"])
-        self.assertTrue(result["replan_required"])
-        self.assertIn("failed to generate replacement plan", result["aborted_reason"])
-        self.assertEqual(result["warning_count"], 1)
-
-    def test_merge_content_keeps_chapter_headers_after_replan_remaining(self):
-        """Test merge content keeps chapter headers after replan remaining."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            source = Path(tmpdir) / "raw.txt"
-            work_dir = Path(tmpdir) / "chunks"
-            output_file = Path(tmpdir) / "merged.md"
-            source.write_text("第一句。第二句。第三句。第四句。第五句。第六句。", encoding="utf-8")
-            utils.chunk_text(str(source), str(work_dir), 4, "structure_only")
-
-            manifest_path = work_dir / "manifest.json"
-            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-            (work_dir / "chapter_plan.json").write_text(
-                json.dumps([
-                    {"start_chunk": 1, "title_en": "Chapter One", "title_zh": "第一章"},
-                ], ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
-            manifest["chunks"][0]["status"] = "done"
-            (work_dir / manifest["chunks"][0]["processed_path"]).write_text("done-0", encoding="utf-8")
-            manifest["runtime"]["replan_required"] = True
-            manifest["autotune"]["current_target_tokens"] = 3
-            manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
-
-            result = utils.replan_remaining(str(work_dir), prompt_name="structure_only")
-            manifest_after = json.loads(manifest_path.read_text(encoding="utf-8"))
-            for chunk in manifest_after["chunks"]:
-                if chunk.get("status") == "pending":
-                    (work_dir / chunk["processed_path"]).write_text(
-                        f"content-{chunk['chunk_id']}",
-                        encoding="utf-8",
-                    )
-                    chunk["status"] = "done"
-            manifest_path.write_text(json.dumps(manifest_after, ensure_ascii=False, indent=2), encoding="utf-8")
-
-            merge_result = utils.merge_content(str(work_dir), str(output_file))
-            merged_text = output_file.read_text(encoding="utf-8")
-            chapter_plan = json.loads((work_dir / "chapter_plan.json").read_text(encoding="utf-8"))
-
-            self.assertTrue(result["success"])
-            self.assertTrue(merge_result["success"])
-            self.assertEqual(merge_result["chapters_inserted"], 1)
-            self.assertIn("Chapter One", merged_text)
-            self.assertIn("第一章", merged_text)
-            self.assertNotEqual(chapter_plan[0]["start_chunk"], 1)
 
     def test_create_run_persists_task_record_and_contracts(self):
         """Test create-run persists a runtime task record and stable envelope contracts."""

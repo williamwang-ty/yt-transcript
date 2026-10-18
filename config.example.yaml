@@ -96,9 +96,8 @@ llm_output_retry_attempts: 2
 llm_output_retry_multiplier: 2.0
 llm_output_retry_max_tokens: 16384
 
-# Long-text executor: chunks | window
-# chunks: fixed chunks planned up front (default).
-# window: experimental sliding window for cleanup_zh, quick_cleanup and the
+# Long-text executor: window | chunks
+# window (default): sliding window for cleanup_zh, quick_cleanup and the
 #         bilingual pair structure_only -> translate_only. Source units are
 #         numbered; each request reads from a cursor, aims to write about N
 #         tokens, and copies each unit's [S<n>] tag in front of its text,
@@ -108,8 +107,10 @@ llm_output_retry_max_tokens: 16384
 #         never exceeds it), the read window is N divided by the measured
 #         output/source ratio plus 25% look-ahead, capped at window_read_tokens,
 #         and the last stretch is sent whole when one round can finish it.
-#         A work dir started in chunks mode resumes only in chunks mode.
-long_text_mode: "chunks"
+# chunks: legacy fixed chunks planned up front, one request per chunk. Other
+#         prompts (summarize) always use it, and so does a work dir that
+#         already finished chunks in this mode, so its done chunks are kept.
+long_text_mode: "window"
 window_read_tokens: 6000
 window_write_tokens: 3000
 # Tail of the already-written output sent as left context each round.
@@ -132,7 +133,9 @@ window_outline: true
 window_outline_read_tokens: 16000
 window_outline_max_terms: 40
 
-# Chunk planning
+# Chunk planning (chunk-text / chunk-segments / chunk-document). The window
+# executor reads its source from these chunk files and renumbers it, so chunk
+# size matters only to the fixed-chunk executor.
 # Default mode is token-aware. Set to "chars" for legacy character chunking.
 chunk_mode: "tokens"
 # Override the per-task chunk target in the active mode. 0 disables override.
@@ -144,31 +147,19 @@ chunk_tokens_translate_only: 900
 chunk_tokens_summarize: 2500
 # Soft target * multiplier for forced split guardrail. Valid range: 1.0-2.0.
 chunk_hard_cap_multiplier: 1.33
-chunk_safety_buffer_tokens: 400
 chunk_overlap_sentences: 0
-# Continuity context uses the last N sentence(s) from the previous chunk.
-chunk_context_tail_sentences: 1
-# Soft token cap for the carried continuity excerpt.
-chunk_context_summary_tokens: 60
 output_ratio_structure_only: 1.15
 output_ratio_quick_cleanup: 1.05
 output_ratio_cleanup_zh: 1.05
 output_ratio_translate_only: 1.10
 output_ratio_summarize: 0.15
-# max_tokens ceiling per chunk request. It is a stop line, not a budget: chunk
-# size decides how much a request writes, and an unused ceiling costs nothing.
-# Only the model's context window (minus prompt and input) can lower it. Set a
-# smaller value only if your model rejects 8192.
+# max_tokens ceiling per request (chunk or window round). It is a stop line,
+# not a budget: chunk size or the window write target decides how much a
+# request writes, and an unused ceiling costs nothing. Set a smaller value
+# only if your model rejects 8192.
 max_output_tokens_structure_only: 8192
 max_output_tokens_quick_cleanup: 8192
 max_output_tokens_cleanup_zh: 8192
 max_output_tokens_translate_only: 8192
 max_output_tokens_summarize: 8192
 enable_token_count_probe: true
-enable_chunk_autotune: false
-autotune_reduce_percent: 0.25
-autotune_increase_percent: 0.10
-autotune_success_window: 20
-autotune_p95_latency_threshold_ms: 45000
-# Number of early chunks to treat as canaries before the plan is considered stable.
-autotune_canary_chunks: 3
