@@ -33,6 +33,9 @@ PROBE_PROMPT = "Reply with OK only."
 UNIT_START = re.compile(r"^\[S(\d+)\] ?", re.MULTILINE)
 OUTLINE_LINE = re.compile(r"^- \[S(\d+)\] (.+?)(?: \((?:the section|starts in this window|next section)[^)]*\))?$",
                           re.MULTILINE)
+ZH_CHARS = ("的一是在不了有和人这中大为上个国我以要他时来用们生到作地于出就分对成会可主发年动同工也能下过子说产种面而方"
+            "后多定行学法所民得经十三之进着等部度家电力里如水化高自二理起小物现实加量都两体制机当使点从业本去把性好应开它"
+            "合还因由其些然前外天政四日那社义事平形相全表间样与关各重新线内数正心反你明看原又么利比或但质气第向道命此变条")
 HINT_LINE = re.compile(r"^- \[S(\d+)\] (.+)$", re.MULTILINE)
 
 
@@ -55,6 +58,17 @@ def units_after(text: str, first: int) -> list[tuple[int, str]]:
         end = matches[index + 1].start() if index + 1 < len(matches) else len(body)
         units.append((int(match.group(1)), body[match.end():end].strip()))
     return units
+
+
+def placeholder_translation(number: int, text: str) -> str:
+    """A recognizable Chinese stand-in, about as long as a real translation.
+
+    Each English word maps to one character, so the text is not one phrase
+    repeated (which verify-quality would flag) and stays deterministic.
+    """
+    words = re.findall(r"[A-Za-z0-9']+", text)
+    body = "".join(ZH_CHARS[sum(map(ord, word)) % len(ZH_CHARS)] for word in words)
+    return f"（占位译文 S{number}）{body}。"
 
 
 def zh_title(index: int) -> str:
@@ -119,7 +133,9 @@ def window_round(prompt: str) -> str:
         if heading:
             out.append(f"## {heading}")
         if paragraph_units:
-            out.append(f"[S{number}] {text}\n\n（占位译文 S{number}）这是第{number}段的中文译文。")
+            # A heading unit stays as is (translate_only keeps headers in English).
+            out.append(f"[S{number}] {text}" if text.startswith("#") and "\n" not in text
+                       else f"[S{number}] {text}\n\n{placeholder_translation(number, text)}")
         else:
             paragraph.append(f"[S{number}] {text}")
     if paragraph:

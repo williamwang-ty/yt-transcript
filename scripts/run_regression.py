@@ -8,7 +8,8 @@ Stages (pick with --stage):
     source    metadata, subtitle selection (or Deepgram), raw text + segments
     plan      source + validate-state + plan-optimization (no paid API calls
               unless a video needs Deepgram)
-    full      plan + chunked LLM optimization + merge + verify-quality (default)
+    full      plan + chunked LLM optimization + merge + verify-quality +
+              assemble-final (default)
 
 The full stage always runs the chunked path (chunk-document/segments/text,
 process-chunks, merge-content), even when plan-optimization says
@@ -19,6 +20,13 @@ Usage:
     python3 scripts/run_regression.py
     python3 scripts/run_regression.py --stage plan --only H_peyIigkkc
     python3 scripts/run_regression.py --compare /tmp/yt_regression/<old>/report.json
+    python3 scripts/run_regression.py --fixtures tests/fixtures/e2e
+
+--fixtures replays recorded videos offline (see tests/e2e/): a fake yt-dlp
+serves the recorded metadata and subtitles, Deepgram answers from the recorded
+response, and the LLM is tests/fake_llm.py through the agent CLI setting.
+Every other step runs the real code. tests/regression_e2e.py runs it in a
+copy of the skill with its own config.yaml.
 
 Each run writes <out-dir>/report.json, <out-dir>/report.md and one folder per
 video with every intermediate file and command output.
@@ -28,6 +36,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -39,6 +49,8 @@ ROOT_DIR = Path(__file__).resolve().parent.parent
 UTILS = ROOT_DIR / "yt_transcript_utils.py"
 DOWNLOAD_SH = ROOT_DIR / "scripts" / "download.sh"
 DEFAULT_VIDEOS = ROOT_DIR / "tests" / "live_regression" / "videos.json"
+E2E_DIR = ROOT_DIR / "tests" / "e2e"
+FAKE_LLM = ROOT_DIR / "tests" / "fake_llm.py"
 STAGES = ("source", "plan", "full")
 
 # verify-quality checks worth tracking across runs.
@@ -65,12 +77,38 @@ class StepError(RuntimeError):
     """A pipeline step failed; the message is shown in the report."""
 
 
+# Environment for every command; fixture mode adds the fakes (see fixture_env).
+CMD_ENV: dict | None = None
+# Fixture mode: transcribe-deepgram goes through tests/e2e/fake_deepgram.py.
+FIXTURE_MODE = False
+# Extra args for the commands that read config.yaml for LLM settings.
+CONFIG_ARGS: list[str] = []
+
+
+def write_fixture_config(path: Path) -> None:
+    """Config for fixture runs: the LLM is the fake agent CLI, no API."""
+    path.write_text(
+        "llm_backend: auto\n"
+        f"llm_agent_cli: {json.dumps(shlex.join([sys.executable, str(FAKE_LLM)]))}\n",
+        encoding="utf-8",
+    )
+
+
+def fixture_env(fixtures_dir: Path) -> dict:
+    """Environment that points download.sh and the LLM backend at the fakes."""
+    env = dict(os.environ)
+    env["PATH"] = f"{E2E_DIR / 'bin'}{os.pathsep}{env.get('PATH', '')}"
+    env["YT_TRANSCRIPT_E2E_FIXTURES"] = str(fixtures_dir.resolve())
+    env["YT_TRANSCRIPT_AGENT_CLI"] = shlex.join([sys.executable, str(FAKE_LLM)])
+    return env
+
+
 def run_cmd(args: list[str], log_path: Path, timeout: int, ok_codes: tuple[int, ...] = (0,)) -> str:
     """Run a command, save stdout/stderr to log_path, return stdout."""
     started = time.monotonic()
     try:
         proc = subprocess.run(
-            args, cwd=ROOT_DIR, capture_output=True, text=True, timeout=timeout,
+            args, cwd=ROOT_DIR, capture_output=True, text=True, timeout=timeout, env=CMD_ENV,
         )
     except subprocess.TimeoutExpired as exc:
         stderr = exc.stderr.decode("utf-8", "replace") if isinstance(exc.stderr, bytes) else (exc.stderr or "")
@@ -114,6 +152,19 @@ def utils(*args: str) -> list[str]:
 
 def download(url: str, mode: str) -> list[str]:
     return ["bash", str(DOWNLOAD_SH), url, mode]
+
+
+def deepgram(*args: str) -> list[str]:
+    if FIXTURE_MODE:
+        return [sys.executable, str(E2E_DIR / "fake_deepgram.py"), "transcribe-deepgram", *args,
+                "--api-key", "fixture"]
+    return utils("transcribe-deepgram", *args)
+
+
+def iso_date(upload_date: str) -> str:
+    """yyyymmdd -> yyyy-mm-dd, the date format for output filenames."""
+    text = str(upload_date or "")
+    return f"{text[:4]}-{text[4:6]}-{text[6:8]}" if len(text) == 8 and text.isdigit() else text
 
 
 def write_state(path: Path, fields: dict) -> None:
@@ -165,7 +216,7 @@ def run_video(video: dict, out_dir: Path, stage: str, allow_deepgram: bool, time
         done()
         step("deepgram")
         dg = run_json(
-            utils("transcribe-deepgram", audio["audio_file"], "--language", language,
+            deepgram(audio["audio_file"], "--language", language,
                   "--output-json", str(vdir / f"{vid}_deepgram.json"),
                   "--output-text", str(raw_text),
                   "--output-segments", str(segments)),
@@ -246,7 +297,7 @@ def run_video(video: dict, out_dir: Path, stage: str, allow_deepgram: bool, time
                 result["error"] = "no usable subtitles and --no-deepgram set"
                 return result
             transcribe_audio(audio_language)
-            mode = result["source"]["mode"]
+            mode, language = result["source"]["mode"], result["source"]["language"]
             subtitle_source = "Deepgram Transcription"
             src = "deepgram"
 
@@ -329,14 +380,15 @@ def run_video(video: dict, out_dir: Path, stage: str, allow_deepgram: bool, time
             chunk_args = utils("chunk-segments", str(segments), str(chunks_dir), "--prompt", first_prompt)
         else:
             chunk_args = utils("chunk-text", str(raw_text), str(chunks_dir), "--prompt", first_prompt)
-        run_cmd(chunk_args, logs / "chunk.log", timeout)
+        run_cmd(chunk_args + CONFIG_ARGS, logs / "chunk.log", timeout)
         done()
 
         step("llm")
         llm_runs = []
         for index, op in enumerate(operations):
             input_key = op.get("input_key") or ("raw_path" if index == 0 else "processed_path")
-            args = utils("process-chunks", str(chunks_dir), "--prompt", op["prompt"], "--input-key", input_key)
+            args = utils("process-chunks", str(chunks_dir), "--prompt", op["prompt"], "--input-key", input_key,
+                         *CONFIG_ARGS)
             if op.get("extra_instruction"):
                 args += ["--extra-instruction", op["extra_instruction"]]
             pc = run_json(args, logs / f"process_chunks_{index}_{op['prompt']}.log", max(timeout, 3600))
@@ -368,7 +420,29 @@ def run_video(video: dict, out_dir: Path, stage: str, allow_deepgram: bool, time
             "checks": {k: checks[k] for k in TRACKED_CHECKS if k in checks},
         }
         done()
-        result["status"] = "ok" if vq.get("passed") else "quality_failed"
+
+        if not vq.get("passed"):
+            result["status"] = "quality_failed"
+            return result
+
+        # Same call as SKILL.md Step 5; the date in the filename is yyyy-mm-dd.
+        step("assemble")
+        date = iso_date(meta.get("upload_date", ""))
+        clean_title = run_cmd(utils("sanitize-filename", str(meta.get("title", ""))),
+                              logs / "sanitize_filename.log", timeout).strip()
+        output_file = vdir / "output" / f"{date}. {clean_title}.md"
+        output_file.parent.mkdir(exist_ok=True)
+        af_args = utils("assemble-final", str(optimized), str(output_file),
+                        "--title", str(meta.get("title", "")), "--source", url,
+                        "--channel", str(meta.get("channel", "")), "--date", str(meta.get("upload_date", "")),
+                        "--created", date, "--duration", str(meta.get("duration", 0) or 0),
+                        "--transcript-source", subtitle_source)
+        if mode == "bilingual":
+            af_args.append("--bilingual")
+        run_cmd(af_args, logs / "assemble.log", timeout)
+        result["output_file"] = output_file.name
+        done()
+        result["status"] = "ok"
     except UnsupportedLanguage as exc:
         result["status"] = "unsupported"
         result["error"] = str(exc)
@@ -516,7 +590,16 @@ def main() -> int:
     parser.add_argument("--compare", default="", help="Earlier report.json to diff against")
     parser.add_argument("--no-deepgram", action="store_true", help="Skip videos that need audio transcription")
     parser.add_argument("--timeout", type=int, default=300, help="Per-command timeout in seconds")
+    parser.add_argument("--fixtures", default="",
+                        help="Replay recorded fixtures offline (default video set: <dir>/videos.json)")
     args = parser.parse_args()
+
+    global CMD_ENV, FIXTURE_MODE
+    if args.fixtures:
+        CMD_ENV = fixture_env(Path(args.fixtures))
+        FIXTURE_MODE = True
+        if args.videos == str(DEFAULT_VIDEOS):
+            args.videos = str(Path(args.fixtures) / "videos.json")
 
     video_set = json.loads(Path(args.videos).read_text(encoding="utf-8"))
     videos = video_set["videos"] if isinstance(video_set, dict) else video_set
@@ -529,6 +612,9 @@ def main() -> int:
     started = datetime.now(timezone.utc)
     out_dir = Path(args.out_dir or f"/tmp/yt_regression/{started.strftime('%Y%m%dT%H%M%SZ')}")
     out_dir.mkdir(parents=True, exist_ok=True)
+    if FIXTURE_MODE:
+        write_fixture_config(out_dir / "fixture_config.yaml")
+        CONFIG_ARGS[:] = ["--config-path", str(out_dir / "fixture_config.yaml")]
 
     results = []
     for video in videos:
