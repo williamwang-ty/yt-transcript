@@ -43,5 +43,20 @@ __all__ = [
     "mock",
     "utils",
     "PROJECT_ROOT",
+    "FixedChunkExecutorTestCase",
     "FIXTURES_DIR",
 ]
+
+
+class FixedChunkExecutorTestCase(unittest.TestCase):
+    """Base for tests of the fixed-chunk executor (`long_text_mode: chunks`).
+
+    Window is the default executor; these tests pin chunks so process-chunks
+    runs the code they exercise.
+    """
+
+    def setUp(self):
+        super().setUp()
+        patcher = mock.patch("kernel.long_text.window.resolve_long_text_mode", return_value="chunks")
+        patcher.start()
+        self.addCleanup(patcher.stop)

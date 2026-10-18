@@ -22,16 +22,19 @@ def _route_long_text_mode(work_dir: str, prompt_name: str, input_key: str,
     import yt_transcript_utils as utils
 
     mode = kernel_window.resolve_long_text_mode(utils._load_optional_config(config_path))
-    if mode == "window" and kernel_window.window_supported(prompt_name, input_key, work_dir):
+    raw_stage = (input_key or "raw_path") == "raw_path"
+    chunk_progress = raw_stage and kernel_window.has_chunk_progress(work_dir)
+    if mode == "window" and not chunk_progress and kernel_window.window_supported(prompt_name, input_key, work_dir):
         return "window"
     if mode == "window":
-        if (input_key or "raw_path") == "processed_path" and \
-                prompt_name in kernel_window.WINDOW_PROMPTS[kernel_window.PROCESSED_STAGE]:
+        if chunk_progress and prompt_name in kernel_window.WINDOW_PROMPTS[kernel_window.RAW_STAGE]:
+            reason = "this work dir already has fixed-chunk progress"
+        elif not raw_stage and prompt_name in kernel_window.WINDOW_PROMPTS[kernel_window.PROCESSED_STAGE]:
             reason = "the raw stage did not finish in window mode"
         else:
             reason = f"long_text_mode=window does not cover prompt '{prompt_name}' ({input_key})"
         print(f"ℹ️ {reason}; using fixed chunks.", file=sys.stderr)
-    if not dry_run and (input_key or "raw_path") == "raw_path":
+    if not dry_run and raw_stage:
         kernel_window.set_manifest_executor(work_dir, "chunks")
     return "chunks"
 

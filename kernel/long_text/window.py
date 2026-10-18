@@ -50,7 +50,7 @@ from . import glossary as kernel_glossary
 from . import outline as kernel_outline
 
 LONG_TEXT_MODES = ("chunks", "window")
-DEFAULT_LONG_TEXT_MODE = "chunks"
+DEFAULT_LONG_TEXT_MODE = "window"
 RAW_STAGE = "raw_path"
 PROCESSED_STAGE = "processed_path"
 # Prompts the window executor runs, per input stage.
@@ -154,7 +154,7 @@ PREVIOUS_CONTEXT_BLOCK = """## Previous Output (context only, do not repeat)
 
 
 def resolve_long_text_mode(config: dict | None) -> str:
-    """Return `window` or `chunks` from config, defaulting to `chunks`."""
+    """Return `window` or `chunks` from config, defaulting to `window`."""
     value = str((config or {}).get("long_text_mode", DEFAULT_LONG_TEXT_MODE) or "").strip().lower()
     return value if value in LONG_TEXT_MODES else DEFAULT_LONG_TEXT_MODE
 
@@ -220,6 +220,19 @@ def load_window_state(work_dir: str, input_key: str | None = None) -> dict:
 def manifest_uses_window(work_dir: str) -> bool:
     """Return whether the latest executor run in this work dir was the window one."""
     return _read_manifest(work_dir).get(EXECUTOR_MANIFEST_KEY) == "window"
+
+
+def has_chunk_progress(work_dir: str) -> bool:
+    """Return whether a fixed-chunk run already finished chunks in this work dir.
+
+    Such a run (for example one started before window became the default)
+    keeps the fixed-chunk executor so its done chunks are not redone.
+    """
+    manifest = _read_manifest(work_dir)
+    if manifest.get(EXECUTOR_MANIFEST_KEY) == "window":
+        return False
+    chunks = manifest.get("chunks") if isinstance(manifest.get("chunks"), list) else []
+    return any(isinstance(chunk, dict) and chunk.get("status") == "done" for chunk in chunks)
 
 
 def set_manifest_executor(work_dir: str, executor: str, stage: str = "") -> None:

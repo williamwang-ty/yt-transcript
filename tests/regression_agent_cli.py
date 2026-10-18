@@ -14,7 +14,7 @@ def _completed(stdout="", returncode=0, stderr=""):
     return subprocess.CompletedProcess(args=[], returncode=returncode, stdout=stdout, stderr=stderr)
 
 
-class AgentCliRegressionTests(unittest.TestCase):
+class AgentCliRegressionTests(FixedChunkExecutorTestCase):
     """Agent detection, backend selection, and the CLI call wrapper."""
 
     def test_detects_known_agents_from_marker_variables(self):
