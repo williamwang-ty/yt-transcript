@@ -22,7 +22,6 @@ from unittest import mock
 import yt_transcript_utils as utils
 from kernel import pipeline
 from kernel.long_text import agent_cli as _agent_cli
-from kernel.task_runtime import runtime as kernel_runtime
 from tests.e2e import fake_deepgram
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -338,12 +337,11 @@ class RunCommandTests(unittest.TestCase):
     def test_active_lock_fails_with_locked(self):
         work_dir = self.work_dir(ENGLISH)
         work_dir.mkdir(parents=True)
-        owner = kernel_runtime.acquire_runtime_ownership(str(work_dir), "run")
-        self.assertTrue(owner["success"])
+        self.assertTrue(pipeline.acquire_lock(work_dir))
         try:
             result = self.run_video(ENGLISH)
         finally:
-            kernel_runtime.release_runtime_ownership(str(work_dir), owner["owner_id"])
+            pipeline.release_lock(work_dir)
         self.assertEqual(("failed", "locked"), (result["status"], result["reason"]))
         self.assertTrue(result["retryable"])
         self.assertEqual("done", self.run_video(ENGLISH)["status"])

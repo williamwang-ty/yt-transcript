@@ -213,7 +213,7 @@ def report_item(video: dict, result: dict, state: dict, blocked: list[str] | Non
     if tasks:
         item["llm_runs"] = [
             {"prompt": prompt, "success": record.get("status") == "done",
-             **{key: record.get(key) for key in ("long_text_mode", "total_chunks", "processed_count", "failed_count")}}
+             **{key: record.get(key) for key in ("round_count", "invalid_rounds", "fallback_rounds")}}
             for prompt, record in ((task["prompt"], tasks.get(task["prompt"], {})) for task in plan.get("tasks", []))
         ]
     verify = (stages.get("verify") or {}).get("summary") or {}

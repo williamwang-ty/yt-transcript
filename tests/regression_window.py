@@ -1,9 +1,11 @@
-"""Regression tests for the sliding-window long-text executor (long_text_mode=window)."""
+"""Regression tests for the sliding-window long-text executor."""
 
 import re
 
 from tests._support import *  # noqa: F401,F403
 from kernel.long_text import agent_cli
+from kernel.long_text import chunking
+from kernel.long_text import merge as kernel_merge
 from kernel.long_text import outline
 from kernel.long_text import window
 
@@ -171,28 +173,11 @@ class WindowProtocolTests(unittest.TestCase):
         self.assertIn(4, flagged)
         self.assertNotIn(2, flagged)
 
-    def test_long_text_mode_defaults_to_window(self):
-        self.assertEqual(window.resolve_long_text_mode({}), "window")
-        self.assertEqual(window.resolve_long_text_mode({"long_text_mode": "Chunks"}), "chunks")
-        self.assertEqual(window.resolve_long_text_mode({"long_text_mode": "weird"}), "window")
-        self.assertEqual(utils._default_config_values()["long_text_mode"], "window")
-        self.assertTrue(window.window_supported("cleanup_zh", "raw_path"))
-        self.assertTrue(window.window_supported("structure_only", "raw_path"))
-        self.assertFalse(window.window_supported("summarize", "raw_path"))
-        self.assertFalse(window.window_supported("cleanup_zh", "processed_path"))
-        # translate_only needs a finished raw-stage window run in the work dir.
-        self.assertFalse(window.window_supported("translate_only", "processed_path"))
-
-
 class WindowExecutorTests(unittest.TestCase):
     SENTENCE_COUNT = 40
 
     def _make_work_dir(self, tmpdir: str, count: int = SENTENCE_COUNT) -> Path:
-        source = Path(tmpdir) / "raw.txt"
-        source.write_text("".join(_sentence(i) for i in range(1, count + 1)), encoding="utf-8")
-        work_dir = Path(tmpdir) / "chunks"
-        utils.chunk_text(str(source), str(work_dir), 0, "cleanup_zh")
-        return work_dir
+        return chunk_plain_text("".join(_sentence(i) for i in range(1, count + 1)), Path(tmpdir) / "chunks")
 
     def _config(self, **overrides) -> dict:
         config = utils._default_config_values()
@@ -202,7 +187,6 @@ class WindowExecutorTests(unittest.TestCase):
             "llm_base_url": "https://api.example.com",
             "llm_model": "demo",
             "llm_api_format": "openai",
-            "long_text_mode": "window",
             "window_read_tokens": 200,
             "window_write_tokens": 100,
             # The outline pass has its own tests (WindowOutlineTests).
@@ -215,7 +199,7 @@ class WindowExecutorTests(unittest.TestCase):
         with mock.patch.object(utils, "load_config", return_value=config), \
             mock.patch.object(utils, "_call_llm_api", side_effect=llm) as api_call, \
             mock.patch("sys.stderr", new_callable=io.StringIO):
-            result = utils.process_chunks(str(work_dir), prompt_name, **kwargs)
+            result = window.process_window(str(work_dir), prompt_name, **kwargs)
         return result, api_call
 
     def test_window_run_covers_every_sentence_and_merges_without_markers(self):
@@ -226,13 +210,11 @@ class WindowExecutorTests(unittest.TestCase):
                 work_dir, self._config(), lambda **kw: _api_result(respond(kw["messages"][0]["content"]))
             )
             output = Path(tmpdir) / "optimized.md"
-            merge = utils.merge_content(str(work_dir), str(output))
+            merge = kernel_merge.merge_content(str(work_dir), str(output))
             merged = output.read_text(encoding="utf-8")
-            manifest = json.loads((work_dir / "manifest.json").read_text(encoding="utf-8"))
             report = utils.verify_quality(str(output), work_dir=str(work_dir))
 
         self.assertTrue(result["success"], result)
-        self.assertEqual(result["long_text_mode"], "window")
         self.assertEqual(result["coverage"]["coverage_ratio"], 1.0)
         self.assertEqual(result["coverage"]["uncovered_ranges"], [])
         self.assertGreater(api_call.call_count, 3)
@@ -240,9 +222,7 @@ class WindowExecutorTests(unittest.TestCase):
         # Each round restarts right after the last complete marker.
         starts = [_window_lines(p)[0][0] for p in prompts]
         self.assertEqual(starts, sorted(set(starts)))
-        self.assertEqual(manifest["long_text_executor"], "window")
         self.assertTrue(merge["success"], merge)
-        self.assertEqual(merge["long_text_mode"], "window")
         self.assertNotIn("<!--", merged)
         self.assertNotIn("[S", merged)
         for i in range(1, self.SENTENCE_COUNT + 1):
@@ -322,7 +302,7 @@ class WindowExecutorTests(unittest.TestCase):
             prompts.clear()
             second, _ = self._run(work_dir, self._config(), lambda **kw: _api_result(respond(kw["messages"][0]["content"])))
             output = Path(tmpdir) / "optimized.md"
-            utils.merge_content(str(work_dir), str(output))
+            kernel_merge.merge_content(str(work_dir), str(output))
             merged = output.read_text(encoding="utf-8")
 
         self.assertTrue(second["success"], second)
@@ -338,9 +318,30 @@ class WindowExecutorTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             work_dir = self._make_work_dir(tmpdir)
             self._run(work_dir, self._config(), down)
-            merge = utils.merge_content(str(work_dir), str(Path(tmpdir) / "optimized.md"))
+            merge = kernel_merge.merge_content(str(work_dir), str(Path(tmpdir) / "optimized.md"))
         self.assertFalse(merge["success"])
         self.assertIn("failed", merge["message"])
+
+    def test_cleanup_zh_builds_a_transcript_glossary_for_rounds_without_an_outline(self):
+        prompts = []
+
+        def llm(**kwargs):
+            prompts.append(kwargs["messages"][0]["content"])
+            return _api_result(tag_echo(prompts[-1]))
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            work_dir = chunk_plain_text("OpenAI API 发布流程。我们用 OpenAI API 做测试。", Path(tmpdir) / "chunks")
+            normalized = Path(tmpdir) / "chunks_normalized_document.json"
+            document = json.loads(normalized.read_text(encoding="utf-8"))
+            document["source"] = {"title": "OpenAI API Deep Dive", "channel": "DeepgramLabs"}
+            normalized.write_text(json.dumps(document, ensure_ascii=False), encoding="utf-8")
+            result, _ = self._run(work_dir, self._config(), llm)
+            glossary_written = (work_dir / "glossary.json").exists()
+
+        self.assertTrue(result["success"], result)
+        self.assertIn("Terminology Guardrails", prompts[0])
+        self.assertIn("OpenAI", prompts[0].split("Terminology Guardrails", 1)[1])
+        self.assertTrue(glossary_written)
 
     def test_cli_backend_progresses_from_markers_alone(self):
         respond, _ = _marker_writer()
@@ -361,131 +362,13 @@ class WindowExecutorTests(unittest.TestCase):
                 mock.patch.object(agent_cli, "call_cli_llm", side_effect=cli) as cli_call, \
                 mock.patch.object(utils, "_call_llm_api") as api_call, \
                 mock.patch("sys.stderr", new_callable=io.StringIO):
-                result = utils.process_chunks(str(work_dir), "cleanup_zh")
+                result = window.process_window(str(work_dir), "cleanup_zh")
 
         self.assertTrue(result["success"], result)
         self.assertGreater(cli_call.call_count, 1)
         api_call.assert_not_called()
         self.assertEqual(result["request_url"], "cli:claude-code")
         self.assertEqual(result["coverage"]["coverage_ratio"], 1.0)
-
-    def test_chunks_mode_and_unsupported_prompts_keep_the_fixed_chunk_executor(self):
-        chunk_output = lambda **kw: _api_result("## 标题\n\n" + kw["messages"][0]["content"][-200:])  # noqa: E731
-        with tempfile.TemporaryDirectory() as tmpdir:
-            work_dir = self._make_work_dir(tmpdir)
-            result, _ = self._run(work_dir, self._config(long_text_mode="chunks"), chunk_output)
-            self.assertNotEqual(result.get("long_text_mode"), "window")
-            self.assertFalse((work_dir / "window").exists())
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            work_dir = self._make_work_dir(tmpdir)
-            result, _ = self._run(work_dir, self._config(), chunk_output, prompt_name="summarize")
-            self.assertNotEqual(result.get("long_text_mode"), "window")
-            self.assertFalse((work_dir / "window").exists())
-
-    def test_default_config_runs_the_window_executor_end_to_end(self):
-        respond, _ = _marker_writer()
-        config = self._config()
-        config.pop("long_text_mode")
-        with tempfile.TemporaryDirectory() as tmpdir:
-            work_dir = self._make_work_dir(tmpdir)
-            result, _ = self._run(work_dir, config, lambda **kw: _api_result(respond(kw["messages"][0]["content"])))
-            output = Path(tmpdir) / "optimized.md"
-            merge = utils.merge_content(str(work_dir), str(output))
-            merged = output.read_text(encoding="utf-8")
-            report = utils.verify_quality(str(output), work_dir=str(work_dir))
-
-        self.assertTrue(result["success"], result)
-        self.assertEqual(result["long_text_mode"], "window")
-        self.assertEqual(merge["long_text_mode"], "window")
-        for i in range(1, self.SENTENCE_COUNT + 1):
-            self.assertEqual(merged.count(_sentence(i)), 1, i)
-        self.assertEqual(report["checks"]["window_coverage_ratio"], 1.0)
-
-    def test_work_dir_with_fixed_chunk_progress_finishes_in_chunks_mode(self):
-        chunk_output = lambda **kw: _api_result("## 标题\n\n" + kw["messages"][0]["content"][-200:])  # noqa: E731
-        with tempfile.TemporaryDirectory() as tmpdir:
-            work_dir = self._make_work_dir(tmpdir, count=120)
-            manifest_path = work_dir / "manifest.json"
-            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-            self.assertGreater(len(manifest["chunks"]), 1)
-            # A run from before window became the default: no executor key, one chunk done.
-            manifest.pop("long_text_executor", None)
-            first = manifest["chunks"][0]
-            (work_dir / first["processed_path"]).write_text("已处理的第一块。", encoding="utf-8")
-            first["status"] = "done"
-            manifest_path.write_text(json.dumps(manifest, ensure_ascii=False), encoding="utf-8")
-            self.assertTrue(window.has_chunk_progress(str(work_dir)))
-
-            config = self._config()
-            config.pop("long_text_mode")
-            result, _ = self._run(work_dir, config, chunk_output)
-
-            self.assertNotEqual(result.get("long_text_mode"), "window")
-            self.assertFalse((work_dir / "window").exists())
-            self.assertTrue(result["success"], result)
-
-    def test_summarize_on_the_work_dir_does_not_pin_it_to_fixed_chunks(self):
-        respond, _ = _marker_writer()
-        with tempfile.TemporaryDirectory() as tmpdir:
-            work_dir = self._make_work_dir(tmpdir, count=120)
-            summary, _ = self._run(work_dir, self._config(), lambda **kw: _api_result("摘要。"),
-                                   prompt_name="summarize")
-            self.assertTrue(summary["success"], summary)
-            manifest = json.loads((work_dir / "manifest.json").read_text(encoding="utf-8"))
-            self.assertNotEqual(manifest.get("long_text_executor"), "chunks")
-            self.assertFalse(window.has_chunk_progress(str(work_dir)))
-
-            result, _ = self._run(work_dir, self._config(),
-                                  lambda **kw: _api_result(respond(kw["messages"][0]["content"])))
-            self.assertEqual(result["long_text_mode"], "window")
-
-            # A later summarize must not take the merged output away from the window run.
-            self._run(work_dir, self._config(), lambda **kw: _api_result("摘要。"), prompt_name="summarize")
-            manifest = json.loads((work_dir / "manifest.json").read_text(encoding="utf-8"))
-            self.assertEqual(manifest.get("long_text_executor"), "window")
-
-    def test_chapter_plan_headings_land_before_the_chunk_start_paragraph(self):
-        respond, _ = _marker_writer()
-        with tempfile.TemporaryDirectory() as tmpdir:
-            work_dir = self._make_work_dir(tmpdir, count=120)
-            manifest = json.loads((work_dir / "manifest.json").read_text(encoding="utf-8"))
-            self.assertGreater(manifest["total_chunks"], 1)
-            (work_dir / "chapter_plan.json").write_text(
-                json.dumps([{"start_chunk": 0, "title": "开场"}, {"start_chunk": 1, "title": "第二章"}],
-                           ensure_ascii=False),
-                encoding="utf-8",
-            )
-            self._run(work_dir, self._config(), lambda **kw: _api_result(respond(kw["messages"][0]["content"])))
-            state = window.load_window_state(str(work_dir))
-            second_start = state["chunk_starts"]["1"]
-            output = Path(tmpdir) / "optimized.md"
-            merge = utils.merge_content(str(work_dir), str(output))
-            merged = output.read_text(encoding="utf-8")
-
-        self.assertEqual(merge["chapters_inserted"], 2)
-        self.assertTrue(merged.startswith("## 开场"))
-        heading_at = merged.index("## 第二章")
-        # The first sentence of chunk 1 comes after its heading.
-        self.assertGreater(merged.index(_sentence(second_start)), heading_at)
-
-    def test_find_unfinished_points_window_runs_at_their_cursor(self):
-        def down(**kwargs):
-            raise utils.LLMRequestError("provider down", error_type="timeout", retryable=True)
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            work_dir = self._make_work_dir(tmpdir)
-            self._run(work_dir, self._config(), down)
-            (Path(tmpdir) / "vid123_state.md").write_text(
-                f"vid: vid123\nstep: 4\nwork_dir: {work_dir}\n", encoding="utf-8"
-            )
-            report = utils.find_unfinished_runs(tmpdir)
-
-        self.assertEqual(len(report["unfinished"]), 1)
-        entry = report["unfinished"][0]
-        self.assertEqual(entry["chunks"]["long_text_mode"], "window")
-        self.assertIn("resume at S1", entry["next_action"])
-
 
 class WindowSizingTests(unittest.TestCase):
     PARAMS = {"read_tokens": 6000, "write_tokens": 3000, "max_output_tokens": 8192, "expected_ratio": 1.0}
@@ -563,16 +446,14 @@ class WindowBilingualTests(unittest.TestCase):
             return _api_result(writer(prompt))
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            source = Path(tmpdir) / "raw.txt"
-            source.write_text(" ".join(f"This is sentence number {i}." for i in range(1, 31)), encoding="utf-8")
-            work_dir = Path(tmpdir) / "chunks"
-            utils.chunk_text(str(source), str(work_dir), 0, "structure_only")
+            work_dir = chunk_plain_text(" ".join(f"This is sentence number {i}." for i in range(1, 31)),
+                                        Path(tmpdir) / "chunks", "structure_only")
             config = WindowExecutorTests._config(self)
             structure, _ = WindowExecutorTests._run(self, work_dir, config, llm, prompt_name="structure_only")
             translate, _ = WindowExecutorTests._run(self, work_dir, config, llm, prompt_name="translate_only",
                                                     input_key="processed_path")
             output = Path(tmpdir) / "optimized.md"
-            merge = utils.merge_content(str(work_dir), str(output))
+            merge = kernel_merge.merge_content(str(work_dir), str(output))
             merged = output.read_text(encoding="utf-8")
 
         self.assertTrue(structure["success"], structure)
@@ -598,27 +479,20 @@ class WindowBilingualTests(unittest.TestCase):
                                              + ["<!--END-->"]))
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            source = Path(tmpdir) / "raw.txt"
-            source.write_text(" ".join(f"Yes, that is turn {i}." for i in range(1, 9)), encoding="utf-8")
-            work_dir = Path(tmpdir) / "chunks"
-            utils.chunk_text(str(source), str(work_dir), 0, "structure_only")
+            work_dir = chunk_plain_text(" ".join(f"Yes, that is turn {i}." for i in range(1, 9)),
+                                        Path(tmpdir) / "chunks", "structure_only")
             config = WindowExecutorTests._config(self)
             WindowExecutorTests._run(self, work_dir, config, llm, prompt_name="structure_only")
             translate, _ = WindowExecutorTests._run(self, work_dir, config, llm, prompt_name="translate_only",
                                                     input_key="processed_path")
             output = Path(tmpdir) / "optimized.md"
-            utils.merge_content(str(work_dir), str(output))
+            kernel_merge.merge_content(str(work_dir), str(output))
             merged = output.read_text(encoding="utf-8")
 
         self.assertTrue(translate["success"], translate)
         blocks = merged.split("\n\n")
         self.assertEqual(16, len(blocks), merged)
         self.assertEqual(["Yes, that is turn 1.", "译文1"], blocks[:2])
-
-    def test_translation_stays_on_chunks_when_the_raw_stage_used_chunks(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            work_dir = WindowExecutorTests._make_work_dir(self, tmpdir)
-            self.assertFalse(window.window_supported("translate_only", "processed_path", str(work_dir)))
 
 
 # Unpunctuated caption phrases; with 0.1s gaps inside a thought and 0.8s after
@@ -655,22 +529,21 @@ class WindowCueSplitTests(unittest.TestCase):
         path = Path(tmpdir) / "normalized_document.json"
         path.write_text(json.dumps(document, ensure_ascii=False), encoding="utf-8")
         work_dir = Path(tmpdir) / "chunks"
-        with mock.patch("sys.stdout", new_callable=io.StringIO):
-            utils.chunk_document(str(path), str(work_dir), 0, "cleanup_zh")
+        with mock.patch("sys.stderr", new_callable=io.StringIO):
+            chunking.chunk_document(str(path), str(work_dir), "cleanup_zh", utils._default_config_values())
         return work_dir
 
     def test_long_unpunctuated_units_end_at_cue_pauses(self):
         segments = _cue_segments()
         with tempfile.TemporaryDirectory() as tmpdir:
             work_dir = self._work_dir(tmpdir, segments)
-            units, chunk_starts, report = window.build_source_sentences(str(work_dir), {}, 60)
+            units, report = window.build_source_sentences(str(work_dir), {}, 60)
 
         text = "".join(s["text"] for s in segments)
         self.assertEqual("".join(units), text)
         self.assertEqual(report["cue_alignment"], "full")
         self.assertEqual(report["hard_cuts"], 0)
         self.assertGreater(report["cue_cuts"], 5)
-        self.assertEqual(chunk_starts, {"0": 1})
         offset, ends = 0, _cue_ends(segments)
         for unit in units:
             offset += len(unit)
@@ -684,7 +557,7 @@ class WindowCueSplitTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             # The text no longer matches the cues, so they cannot be used.
             work_dir = self._work_dir(tmpdir, segments, text="另外一段完全不同的文字没有标点" * 40)
-            units, _, report = window.build_source_sentences(str(work_dir), {}, 60)
+            units, report = window.build_source_sentences(str(work_dir), {}, 60)
         self.assertEqual(report["cue_alignment"], "failed")
         self.assertEqual(report["cue_cuts"], 0)
         self.assertGreater(report["hard_cuts"], 0)
@@ -692,12 +565,8 @@ class WindowCueSplitTests(unittest.TestCase):
 
     def test_work_dir_without_normalized_document_keeps_fixed_cuts(self):
         with tempfile.TemporaryDirectory() as tmpdir:
-            source = Path(tmpdir) / "raw.txt"
-            source.write_text("没有标点的自动字幕" * 80, encoding="utf-8")
-            work_dir = Path(tmpdir) / "chunks"
-            with mock.patch("sys.stdout", new_callable=io.StringIO):
-                utils.chunk_text(str(source), str(work_dir), 0, "cleanup_zh")
-            units, _, report = window.build_source_sentences(str(work_dir), {}, 60)
+            work_dir = chunk_plain_text("没有标点的自动字幕" * 80, Path(tmpdir) / "chunks")
+            units, report = window.build_source_sentences(str(work_dir), {}, 60)
         self.assertEqual(report["cue_alignment"], "none")
         self.assertEqual(units, window.split_source_sentences("没有标点的自动字幕" * 80, {}, 60))
 
@@ -710,7 +579,7 @@ class WindowCueSplitTests(unittest.TestCase):
         ]
         with tempfile.TemporaryDirectory() as tmpdir:
             work_dir = self._work_dir(tmpdir, segments)
-            units, _, report = window.build_source_sentences(str(work_dir), {}, 60)
+            units, report = window.build_source_sentences(str(work_dir), {}, 60)
         text = "".join(s["text"] for s in segments)
         self.assertEqual("".join(units), text)
         self.assertGreater(report["hard_cuts"], 0)
@@ -741,7 +610,7 @@ class WindowCueSplitTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             work_dir = self._work_dir(tmpdir, segments)
             chunks = window.load_source_chunks(str(work_dir))
-            units, chunk_starts, report = window.build_source_sentences(str(work_dir), {}, 60)
+            units, report = window.build_source_sentences(str(work_dir), {}, 60)
 
         self.assertGreater(len(chunks), 1)
         ends = _cue_ends(segments)
@@ -752,12 +621,6 @@ class WindowCueSplitTests(unittest.TestCase):
             offset += len(re.sub(r"\s+", "", unit))
             self.assertIn(offset, ends, unit)
         self.assertEqual(report["hard_cuts"], 0)
-        # The second chunk starts in the unit holding its first character.
-        starts = [chunk_starts[str(chunk_id)] for chunk_id, _ in chunks]
-        self.assertEqual(starts[0], 1)
-        before = sum(len(re.sub(r"\s+", "", unit)) for unit in units[:starts[1] - 1])
-        self.assertLessEqual(before, first_chunk_end)
-        self.assertGreater(before + len(re.sub(r"\s+", "", units[starts[1] - 1])), first_chunk_end)
 
     def test_chunk_boundary_at_a_cue_end_stays_a_unit_boundary(self):
         phrases = [phrase + ("。" if index % 6 == 5 else "") for index, phrase in enumerate(CUE_PHRASES * 40)]
@@ -766,16 +629,15 @@ class WindowCueSplitTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             work_dir = self._work_dir(tmpdir, segments)
             chunks = window.load_source_chunks(str(work_dir))
-            units, chunk_starts, _ = window.build_source_sentences(str(work_dir), {}, 60)
+            units, _ = window.build_source_sentences(str(work_dir), {}, 60)
         self.assertGreater(len(chunks), 1)
-        position = 0
-        unit_starts = {}
-        for number, unit in enumerate(units, start=1):
-            unit_starts[position] = number
+        unit_starts, position = set(), 0
+        for unit in units:
+            unit_starts.add(position)
             position += len(re.sub(r"\s+", "", unit))
         position = 0
-        for chunk_id, text in chunks:
-            self.assertEqual(chunk_starts[str(chunk_id)], unit_starts[position])
+        for _, text in chunks:
+            self.assertIn(position, unit_starts)
             position += len(re.sub(r"\s+", "", text))
 
     def test_dot_inside_a_domain_is_not_a_sentence_end(self):
@@ -827,7 +689,7 @@ class WindowOutlineTests(unittest.TestCase):
 
     def _merged(self, work_dir: Path, tmpdir: str) -> tuple[dict, str]:
         output = Path(tmpdir) / "optimized.md"
-        merge = utils.merge_content(str(work_dir), str(output))
+        merge = kernel_merge.merge_content(str(work_dir), str(output))
         return merge, output.read_text(encoding="utf-8")
 
     # --- parsing and validation -------------------------------------------
@@ -991,7 +853,7 @@ class WindowOutlineTests(unittest.TestCase):
             self.assertGreater(merged.index(_sentence(start + 2)), heading_at)
         for i in range(1, self.SENTENCE_COUNT + 1):
             self.assertEqual(merged.count(_sentence(i)), 1, i)
-        self.assertEqual(merge["chapters_inserted"], 3)
+        self.assertEqual(merge["sections"], 3)
         self.assertEqual(sum(len(p.get("sections", [])) for p in state["paragraphs"]), 3)
 
     def test_failed_outline_falls_back_to_headings_from_the_rounds(self):
@@ -1099,24 +961,33 @@ class WindowOutlineTests(unittest.TestCase):
         self.assertEqual(state["outline"]["parts"], len(prompts))
         self.assertEqual(result["outline"]["status"], "ok")
 
-    def test_chapter_plan_becomes_a_hint_and_is_not_inserted_again_at_merge(self):
+    def test_video_chapters_become_outline_hints_and_are_not_inserted_again_at_merge(self):
         llm, calls = self._llm(_outline_json([(1, "开场"), (60, "第二章细化")]))
+        segments = [{"id": i - 1, "text": _sentence(i), "start_time": (i - 1) * 3.0, "end_time": (i - 1) * 3.0 + 2.5}
+                    for i in range(1, 121)]
         with tempfile.TemporaryDirectory() as tmpdir:
-            work_dir = WindowExecutorTests._make_work_dir(self, tmpdir, count=120)
-            (work_dir / "chapter_plan.json").write_text(
-                json.dumps([{"start_chunk": 0, "title": "Opening"}, {"start_chunk": 1, "title": "Chapter Two"}]),
-                encoding="utf-8",
-            )
+            chapters = Path(tmpdir) / "chapters.json"
+            chapters.write_text(json.dumps({"chapters": [{"title": "Opening", "start_time": 0.0},
+                                                         {"title": "Chapter Two", "start_time": 180.0}]}),
+                                encoding="utf-8")
+            path = Path(tmpdir) / "normalized_document.json"
+            path.write_text(json.dumps({"content": {"text": "".join(s["text"] for s in segments),
+                                                    "preferred_chunk_source": "text"},
+                                        "segments": segments}, ensure_ascii=False), encoding="utf-8")
+            work_dir = Path(tmpdir) / "chunks"
+            with mock.patch("sys.stderr", new_callable=io.StringIO):
+                chunking.chunk_document(str(path), str(work_dir), "cleanup_zh", utils._default_config_values(),
+                                        chapters_path=str(chapters))
             result, _ = WindowExecutorTests._run(self, work_dir, self._config(), llm)
-            state = window.load_window_state(str(work_dir))
             _, merged = self._merged(work_dir, tmpdir)
 
         self.assertTrue(result["success"], result)
         self.assertIn("## Video Chapters", calls["outline"][0])
-        self.assertIn(f"- [S{state['chunk_starts']['1']}] Chapter Two", calls["outline"][0])
+        # 180s is the start of cue 60, which holds sentence 61.
+        self.assertIn("- [S61] Chapter Two", calls["outline"][0])
         self.assertEqual(result["outline"]["chapter_hints"], 2)
-        self.assertNotIn("Chapter Two", merged)
-        self.assertEqual(re.findall(r"^## (.+)$", merged, re.MULTILINE), ["开场", "第二章细化"])
+        self.assertEqual(len(re.findall(r"^## (.+)$", merged, re.MULTILINE)), 2, merged[:300])
+        self.assertNotIn("Opening", merged)
 
     def test_chapters_file_from_chunk_document_maps_to_units_by_cue_time(self):
         segments = [{"id": i, "text": f"第{i}条字幕说完了。", "start_time": i * 3.0, "end_time": i * 3.0 + 2.5}
@@ -1132,12 +1003,12 @@ class WindowOutlineTests(unittest.TestCase):
             path = Path(tmpdir) / "normalized_document.json"
             path.write_text(json.dumps(document, ensure_ascii=False), encoding="utf-8")
             work_dir = Path(tmpdir) / "chunks"
-            with mock.patch("sys.stdout", new_callable=io.StringIO):
-                utils.chunk_document(str(path), str(work_dir), 0, "cleanup_zh", chapters_path=str(chapters))
+            chunking.chunk_document(str(path), str(work_dir), "cleanup_zh", utils._default_config_values(),
+                                    chapters_path=str(chapters))
             manifest = json.loads((work_dir / "manifest.json").read_text(encoding="utf-8"))
             offsets: list = []
-            units, chunk_starts, _ = window.build_source_sentences(str(work_dir), {}, unit_offsets=offsets)
-            hints = window.load_chapter_hints(str(work_dir), offsets, chunk_starts)
+            units, _ = window.build_source_sentences(str(work_dir), {}, unit_offsets=offsets)
+            hints = window.load_chapter_hints(str(work_dir), offsets)
 
         self.assertEqual(manifest["chapters_path"], str(chapters.absolute()))
         self.assertEqual(len(offsets), len(units))
@@ -1168,10 +1039,8 @@ class WindowOutlineTests(unittest.TestCase):
             return _api_result(WindowBilingualTests._structure_writer(prompt))
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            source = Path(tmpdir) / "raw.txt"
-            source.write_text(" ".join(f"This is sentence number {i}." for i in range(1, 31)), encoding="utf-8")
-            work_dir = Path(tmpdir) / "chunks"
-            utils.chunk_text(str(source), str(work_dir), 0, "structure_only")
+            work_dir = chunk_plain_text(" ".join(f"This is sentence number {i}." for i in range(1, 31)),
+                                        Path(tmpdir) / "chunks", "structure_only")
             config = self._config()
             structure, _ = WindowExecutorTests._run(self, work_dir, config, llm, prompt_name="structure_only")
             translate, _ = WindowExecutorTests._run(self, work_dir, config, llm, prompt_name="translate_only",

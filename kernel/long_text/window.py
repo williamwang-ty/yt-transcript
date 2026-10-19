@@ -1,4 +1,4 @@
-"""Sliding-window long-text executor (`long_text_mode: window`).
+"""Sliding-window long-text executor: the text stage of `run`.
 
 Instead of cutting the source into fixed chunks up front, the executor keeps a
 cursor into numbered source units and moves it forward round by round:
@@ -43,24 +43,13 @@ import statistics
 import sys
 from pathlib import Path
 
-from ..task_runtime import lifecycle as runtime_lifecycle
-from ..task_runtime import runtime as kernel_runtime
-from ..task_runtime import state as kernel_state
+from ..files import atomic_write_text
 from . import agent_cli as kernel_agent_cli
 from . import glossary as kernel_glossary
 from . import outline as kernel_outline
 
-LONG_TEXT_MODES = ("chunks", "window")
-DEFAULT_LONG_TEXT_MODE = "window"
 RAW_STAGE = "raw_path"
 PROCESSED_STAGE = "processed_path"
-# Prompts the window executor runs, per input stage.
-WINDOW_PROMPTS = {
-    RAW_STAGE: ("cleanup_zh", "structure_only", "quick_cleanup"),
-    PROCESSED_STAGE: ("translate_only",),
-}
-# Fixed-chunk prompts whose outputs are side files, not the merged document.
-SIDE_CHUNK_PROMPTS = ("summarize",)
 
 DEFAULT_WINDOW_READ_TOKENS = 6000
 DEFAULT_WINDOW_WRITE_TOKENS = 3000
@@ -102,8 +91,6 @@ WINDOW_DIR_NAME = "window"
 PROCESSED_DIR_NAME = "processed"
 STATE_FILE_NAME = "state.json"
 STATE_SCHEMA_VERSION = 2
-EXECUTOR_MANIFEST_KEY = "long_text_executor"
-STAGE_MANIFEST_KEY = "long_text_window_stage"
 
 # Legacy per-paragraph markers; still stripped from output if a model writes them.
 MARKER_PATTERN = re.compile(r"<!--\s*S(\d+)\s*-->")
@@ -157,29 +144,8 @@ PREVIOUS_CONTEXT_BLOCK = """## Previous Output (context only, do not repeat)
 {tail}"""
 
 
-def resolve_long_text_mode(config: dict | None) -> str:
-    """Return `window` or `chunks` from config, defaulting to `window`."""
-    value = str((config or {}).get("long_text_mode", DEFAULT_LONG_TEXT_MODE) or "").strip().lower()
-    return value if value in LONG_TEXT_MODES else DEFAULT_LONG_TEXT_MODE
-
-
 def _stage(input_key: str) -> str:
     return PROCESSED_STAGE if (input_key or RAW_STAGE) == PROCESSED_STAGE else RAW_STAGE
-
-
-def window_supported(prompt_name: str, input_key: str = RAW_STAGE, work_dir: str = "") -> bool:
-    """Return whether the window executor handles this prompt and input stage.
-
-    The processed stage reads the raw stage's window output, so it is only
-    supported when the raw stage of `work_dir` finished in window mode.
-    """
-    stage = _stage(input_key)
-    if prompt_name not in WINDOW_PROMPTS[stage]:
-        return False
-    if stage == RAW_STAGE:
-        return True
-    return bool(work_dir) and manifest_uses_window(work_dir) and \
-        load_window_state(work_dir, RAW_STAGE).get("status") == "done"
 
 
 def stage_dir_for(work_dir: str, input_key: str = RAW_STAGE) -> Path:
@@ -200,8 +166,8 @@ def _read_manifest(work_dir: str) -> dict:
 
 
 def final_stage(work_dir: str) -> str:
-    """Return the stage of the latest window run, whose output merge-content uses."""
-    return _stage(_read_manifest(work_dir).get(STAGE_MANIFEST_KEY, RAW_STAGE))
+    """Return the stage of the latest window run, whose output the merge uses."""
+    return PROCESSED_STAGE if state_path_for(work_dir, PROCESSED_STAGE).exists() else RAW_STAGE
 
 
 def load_window_state(work_dir: str, input_key: str | None = None) -> dict:
@@ -217,57 +183,17 @@ def load_window_state(work_dir: str, input_key: str | None = None) -> dict:
     return payload if isinstance(payload, dict) else {}
 
 
-def manifest_uses_window(work_dir: str) -> bool:
-    """Return whether the latest executor run in this work dir was the window one."""
-    return _read_manifest(work_dir).get(EXECUTOR_MANIFEST_KEY) == "window"
-
-
-def has_chunk_progress(work_dir: str) -> bool:
-    """Return whether a fixed-chunk run already finished chunks in this work dir.
-
-    Such a run (for example one started before window became the default)
-    keeps the fixed-chunk executor so its done chunks are not redone.
-    """
-    manifest = _read_manifest(work_dir)
-    if manifest.get(EXECUTOR_MANIFEST_KEY) == "window":
-        return False
-    chunks = manifest.get("chunks") if isinstance(manifest.get("chunks"), list) else []
-    # Chunks finished by a side prompt (summarize writes summary_chunk_*.txt,
-    # which merge never reads) are not progress on the document itself.
-    return any(isinstance(chunk, dict) and chunk.get("status") == "done"
-               and str(chunk.get("output_prompt_name", "")).strip() not in SIDE_CHUNK_PROMPTS
-               for chunk in chunks)
-
-
-def set_manifest_executor(work_dir: str, executor: str, stage: str = "") -> None:
-    """Record which executor (and window stage) owns the work dir's output."""
-    manifest_path = Path(work_dir) / "manifest.json"
-    manifest = _read_manifest(work_dir)
-    if not manifest:
-        return
-    updates = {EXECUTOR_MANIFEST_KEY: executor}
-    if executor == "window" and stage:
-        updates[STAGE_MANIFEST_KEY] = _stage(stage)
-    current = {key: manifest.get(key, "chunks" if key == EXECUTOR_MANIFEST_KEY else None) for key in updates}
-    if current == updates:
-        return
-    manifest.update(updates)
-    kernel_state.write_manifest(manifest_path, manifest)
-
-
 # ---------------------------------------------------------------------------
 # Source units
 # ---------------------------------------------------------------------------
 
 def load_source_chunks(work_dir: str) -> list[tuple[int, str]]:
-    """Return `(chunk_id, raw_text)` for the manifest's active raw chunks, in order."""
-    import yt_transcript_utils as utils
-
+    """Return `(chunk_id, raw_text)` for the manifest's raw chunks, in order."""
     work_path = Path(work_dir)
     manifest = json.loads((work_path / "manifest.json").read_text(encoding="utf-8"))
     chunks = []
     for chunk in manifest.get("chunks", []):
-        if not isinstance(chunk, dict) or chunk.get("status") == utils.SUPERSEDED_CHUNK_STATUS:
+        if not isinstance(chunk, dict):
             continue
         raw_name = str(chunk.get("raw_path", "") or "").strip()
         raw_path = work_path / raw_name
@@ -438,15 +364,14 @@ def split_source_sentences(text: str, config: dict | None = None,
 
 def build_source_sentences(work_dir: str, config: dict | None = None,
                            max_sentence_tokens: int = DEFAULT_WINDOW_SENTENCE_MAX_TOKENS,
-                           unit_offsets: list | None = None) -> tuple[list[str], dict, dict]:
-    """Number the raw source; also return each raw chunk's first unit number and a split report.
+                           unit_offsets: list | None = None) -> tuple[list[str], dict]:
+    """Number the raw source; also return a split report.
 
     Each chunk is located in the subtitle cues (ignoring whitespace) so long
     unpunctuated sentences can be cut at cue pauses; a chunk that cannot be
     located falls back to fixed-size cuts. A chunk boundary stays a unit
     boundary, except one the chunker put inside a cue: those chunks are
-    joined and cut again at cue ends, and the later chunk starts at the unit
-    holding its first character.
+    joined and cut again at cue ends.
 
     When `unit_offsets` is given, it is filled with each unit's start in the
     whitespace-free cue text (None for units of an unaligned chunk), for
@@ -454,17 +379,17 @@ def build_source_sentences(work_dir: str, config: dict | None = None,
     """
     report = _new_split_report()
     cues = load_cue_stream(work_dir)
-    # Chunks split as one text. `members` holds (chunk_id, text, start offset
-    # in the run, whitespace ignored); `pauses` is None for an unaligned chunk.
+    # Chunks split as one text: `texts` are the chunks of a run, `pauses` is
+    # None for an unaligned chunk.
     runs: list[dict] = []
     stream_position = 0
-    for chunk_id, text in load_source_chunks(work_dir):
+    for _, text in load_source_chunks(work_dir):
         compact = re.sub(r"\s+", "", text)
         found = cues["text"].find(compact, stream_position) if cues else -1
         if found < 0:
             if cues:
                 report["unaligned_chunks"] += 1
-            runs.append({"members": [(chunk_id, text, 0)], "pauses": None, "start": None})
+            runs.append({"texts": [text], "pauses": None, "start": None})
             continue
         report["aligned_chunks"] += 1
         end = found + len(compact)
@@ -473,43 +398,36 @@ def build_source_sentences(work_dir: str, config: dict | None = None,
         if run and run["pauses"] is not None and run["end"] == found and found not in cues["pauses"]:
             # The chunker cut inside a cue here: keep both chunks in one run.
             offset = run["length"]
-            run["members"].append((chunk_id, text, offset))
+            run["texts"].append(text)
             run["pauses"].update({offset + position: pause for position, pause in pauses.items()})
         else:
             offset = 0
-            run = {"members": [(chunk_id, text, 0)], "pauses": pauses, "start": found}
+            run = {"texts": [text], "pauses": pauses, "start": found}
             runs.append(run)
         run["length"] = offset + len(compact)
         run["end"] = end
         stream_position = end
 
     sentences: list[str] = []
-    chunk_starts: dict = {}
     for run in runs:
-        members = run["members"]
-        text = members[0][1]
-        for _, chunk_text, _ in members[1:]:
+        text = run["texts"][0]
+        for chunk_text in run["texts"][1:]:
             ascii_join = text[-1:].isascii() and text[-1:].isalnum() and \
                 chunk_text[:1].isascii() and chunk_text[:1].isalnum()
             text += (" " if ascii_join else "") + chunk_text
         run_units = split_source_sentences(text, config, max_sentence_tokens, run["pauses"], report)
         if not run_units:
             continue
-        unit_ends, total = [], 0
-        for unit in run_units:
-            if unit_offsets is not None:
+        if unit_offsets is not None:
+            total = 0
+            for unit in run_units:
                 unit_offsets.append(None if run["start"] is None else run["start"] + total)
-            total += len(re.sub(r"\s+", "", unit))
-            unit_ends.append(total)
-        for chunk_id, _, offset in members:
-            unit_index = next((index for index, unit_end in enumerate(unit_ends) if offset < unit_end),
-                              len(run_units) - 1)
-            chunk_starts.setdefault(str(chunk_id), len(sentences) + unit_index + 1)
+                total += len(re.sub(r"\s+", "", unit))
         sentences.extend(run_units)
     if cues:
         report["cue_alignment"] = "full" if not report["unaligned_chunks"] else (
             "partial" if report["aligned_chunks"] else "failed")
-    return sentences, chunk_starts, report
+    return sentences, report
 
 
 def split_paragraph_units(text: str, config: dict | None = None,
@@ -546,26 +464,14 @@ def _group_sentences(sentences: list[str], max_tokens: int, config: dict | None)
     return groups
 
 
-def build_processed_units(work_dir: str, config: dict | None = None) -> tuple[list[str], dict]:
-    """Number the raw stage's window output by paragraph for the processed stage.
-
-    Chapter starts carry over: a chunk that started inside raw paragraph p now
-    starts at p's first unit.
-    """
+def build_processed_units(work_dir: str, config: dict | None = None) -> list[str]:
+    """Number the raw stage's window output by paragraph for the processed stage."""
     raw_state = load_window_state(work_dir, RAW_STAGE)
     raw_dir = stage_dir_for(work_dir, RAW_STAGE)
     units: list[str] = []
-    paragraph_first_unit = []
     for entry in raw_state.get("paragraphs", []):
-        paragraph_first_unit.append((int(entry.get("start", 0)), int(entry.get("end", 0)), len(units) + 1))
         units.extend(split_paragraph_units(_paragraph_text(raw_dir, entry), config))
-    chunk_starts = {}
-    for chunk_id, sentence_number in (raw_state.get("chunk_starts") or {}).items():
-        for start, end, first_unit in paragraph_first_unit:
-            if start <= int(sentence_number) <= end:
-                chunk_starts[str(chunk_id)] = first_unit
-                break
-    return units, chunk_starts
+    return units
 
 
 def sentences_digest(sentences: list[str]) -> str:
@@ -879,7 +785,7 @@ def _now_iso() -> str:
 
 def _write_state(out_dir: Path, state: dict) -> None:
     state["updated_at"] = _now_iso()
-    kernel_state.atomic_write_text(out_dir / STATE_FILE_NAME, json.dumps(state, ensure_ascii=False, indent=2))
+    atomic_write_text(out_dir / STATE_FILE_NAME, json.dumps(state, ensure_ascii=False, indent=2))
 
 
 def _paragraph_text(out_dir: Path, entry: dict) -> str:
@@ -946,7 +852,7 @@ def _commit_paragraphs(out_dir: Path, state: dict, paragraphs: list[dict], sente
         }
         if placed:
             entry["sections"] = placed
-        kernel_state.atomic_write_text(out_dir / file_name, content.strip() + "\n")
+        atomic_write_text(out_dir / file_name, content.strip() + "\n")
         state["paragraphs"].append(entry)
         state["cursor"] = paragraph["end"] + 1
     _write_state(out_dir, state)
@@ -1018,59 +924,21 @@ def efficiency_report(state: dict) -> dict:
     }
 
 
-def merged_window_text(work_dir: str, state: dict | None = None,
-                       chapter_starts: dict | None = None) -> tuple[str, int]:
-    """Join the latest stage's committed paragraphs, with chapter headings.
+def merged_window_text(work_dir: str, state: dict | None = None) -> tuple[str, int]:
+    """Join the latest stage's committed paragraphs; also return the number of section headings.
 
-    Markers are never stored in paragraph files. `chapter_starts` maps a raw
-    chunk id to its chapter list (from chapter_plan.json); a chapter's heading
-    goes before the paragraph that covers the chunk's first unit. When the
-    raw stage had an outline, its headings are already in the paragraph
-    files and `chapter_starts` is ignored.
-    Returns the body and the number of chapters inserted.
+    Markers are never stored in paragraph files; outline headings are.
     """
     state = state if state is not None else load_window_state(work_dir)
     out_dir = stage_dir_for(work_dir, state.get("input_key", RAW_STAGE))
-    raw_state = state if _stage(state.get("input_key", RAW_STAGE)) == RAW_STAGE else \
-        load_window_state(work_dir, RAW_STAGE)
-    if (raw_state.get("outline") or {}).get("status") == "ok":
-        # The outline already placed the headings, with the video chapters as hints.
-        chapter_starts = None
-    pending = []
-    for chunk_id, chapters in (chapter_starts or {}).items():
-        start = (state.get("chunk_starts") or {}).get(str(chunk_id))
-        if start:
-            pending.append((int(start), chapters))
-    pending.sort(key=lambda item: item[0])
-
     parts = []
-    inserted = 0
+    sections = 0
     for entry in state.get("paragraphs", []):
-        end = int(entry.get("end", 0) or 0)
-        while pending and pending[0][0] <= end:
-            _, chapters = pending.pop(0)
-            for chapter in chapters:
-                headings = _chapter_headings(chapter)
-                if headings:
-                    parts.append("\n".join(f"## {heading}" for heading in headings))
-                    inserted += 1
-        inserted += len(entry.get("sections", []))
+        sections += len(entry.get("sections", []))
         text = _paragraph_text(out_dir, entry)
         if text:
             parts.append(text)
-    return "\n\n".join(parts), inserted
-
-
-def _chapter_headings(chapter: dict) -> list[str]:
-    title = str(chapter.get("title", "")).strip()
-    title_en = str(chapter.get("title_en", "")).strip()
-    title_zh = str(chapter.get("title_zh", "")).strip()
-    headings = [title_en] if title_en else []
-    if title_zh and title_zh not in headings:
-        headings.append(title_zh)
-    if not headings and title:
-        headings.append(title)
-    return headings
+    return "\n\n".join(parts), sections
 
 
 # ---------------------------------------------------------------------------
@@ -1108,8 +976,8 @@ def run_window_rounds(work_dir: str, prompt_name: str, prompt_template: str, *, 
 
     `call_llm(prompt_text, max_output_tokens)` returns the backend result dict
     (`text`, optional `finish_reason`, `latency_ms`, `request_url`) and raises
-    `LLMRequestError` after its own retries. `should_stop()` returns a status
-    string (`aborted` / `paused`) to stop at a round boundary, or "".
+    `LLMRequestError` after its own retries. `should_stop()` returns "paused"
+    to stop at a round boundary, or "".
 
     When the state holds a usable outline (raw stage), each round gets the
     outline lines for its window and the outline's terms instead of the
@@ -1320,13 +1188,12 @@ def _glossary_text(glossary_payload: dict | None, source_text: str, max_terms: i
 
 
 def _prepare_state(work_dir: str, prompt_name: str, input_key: str, sentences: list[str], params: dict,
-                   force: bool, log, dry_run: bool = False) -> tuple[dict, bool]:
+                   log) -> tuple[dict, bool]:
     """Load a resumable state for the same source, or start a new one."""
     state = load_window_state(work_dir, input_key)
     digest = sentences_digest(sentences)
     resumable = (
-        not force
-        and state.get("schema_version") == STATE_SCHEMA_VERSION
+        state.get("schema_version") == STATE_SCHEMA_VERSION
         and state.get("prompt_name") == prompt_name
         and state.get("sentences_sha256") == digest
     )
@@ -1335,43 +1202,31 @@ def _prepare_state(work_dir: str, prompt_name: str, input_key: str, sentences: l
         state.setdefault("params", params)
         state.setdefault("sizing", initial_sizing(state["params"]))
         return state, True
-    if state and not dry_run:
-        reason = "--force" if force else "the source, prompt or state format changed"
-        log(f"ℹ️ Starting the window run over ({reason}).")
+    if state:
+        log("ℹ️ Starting the window run over (the source, prompt or state format changed).")
         for stale in stage_dir_for(work_dir, input_key).glob("out_*.md"):
             stale.unlink()
     return _new_state(prompt_name, input_key, sentences, params), False
 
 
-def load_chapter_hints(work_dir: str, unit_offsets: list, chunk_starts: dict) -> list[dict]:
-    """YouTube chapters as outline hints, mapped onto source units.
-
-    Uses the chapters file recorded in the manifest (mapped through the
-    subtitle cue times), else chapter_plan.json (at each start chunk's first unit).
-    """
-    work_path = Path(work_dir)
+def load_chapter_hints(work_dir: str, unit_offsets: list) -> list[dict]:
+    """YouTube chapters as outline hints, mapped onto source units through the subtitle cue times."""
     chapters_value = str(_read_manifest(work_dir).get("chapters_path", "") or "").strip()
     cues = load_cue_stream(work_dir)
-    if chapters_value and cues and cues.get("starts"):
-        try:
-            payload = json.loads(Path(chapters_value).read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            payload = None
-        chapters = payload.get("chapters", []) if isinstance(payload, dict) else payload
-        if isinstance(chapters, list):
-            hints = kernel_outline.hints_from_times([c for c in chapters if isinstance(c, dict)],
-                                                    cues["starts"], unit_offsets)
-            if hints:
-                return hints
+    if not (chapters_value and cues and cues.get("starts")):
+        return []
     try:
-        plan = json.loads((work_path / "chapter_plan.json").read_text(encoding="utf-8"))
+        payload = json.loads(Path(chapters_value).read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return []
-    return kernel_outline.hints_from_chunk_plan(plan, chunk_starts)
+    chapters = payload.get("chapters", []) if isinstance(payload, dict) else payload
+    if not isinstance(chapters, list):
+        return []
+    return kernel_outline.hints_from_times([c for c in chapters if isinstance(c, dict)], cues["starts"], unit_offsets)
 
 
 def _prepare_outline(work_dir: str, prompt_name: str, state: dict, sentences: list[str], config: dict,
-                     params: dict, call_llm, *, unit_offsets: list, chunk_starts: dict, log) -> None:
+                     params: dict, call_llm, *, unit_offsets: list, log) -> None:
     """Generate the run's outline into `state["outline"]`, or keep the one it already has.
 
     A run that already wrote output keeps whatever outline it started with,
@@ -1398,7 +1253,7 @@ def _prepare_outline(work_dir: str, prompt_name: str, state: dict, sentences: li
         state["outline"] = {"status": "skipped", "error": "the whole source fits in one round"}
         return
 
-    hints = load_chapter_hints(work_dir, unit_offsets, chunk_starts)
+    hints = load_chapter_hints(work_dir, unit_offsets)
     log(f"ℹ️ Building the outline and term list ({len(sentences)} units"
         f"{f', {len(hints)} video chapters as hints' if hints else ''}).")
 
@@ -1457,7 +1312,6 @@ def _build_result(work_dir: str, state: dict, outcome: dict, *, prompt_name: str
     success = status == "done"
     result = {
         "success": success,
-        "long_text_mode": "window",
         "prompt_name": prompt_name,
         "input_key": _stage(input_key),
         "status": status,
@@ -1478,30 +1332,18 @@ def _build_result(work_dir: str, state: dict, outcome: dict, *, prompt_name: str
         "llm_backend": backend_decision,
         "state_path": str(out_dir / STATE_FILE_NAME),
         "warnings": warnings,
-        "warning_count": len(warnings),
-        # Fields the chunk-path callers read; in window mode a "chunk" is one LLM request (round).
-        "processed_count": sum(1 for r in rounds if r.get("result") in {"ok", "fallback"}),
-        "failed_count": 0 if success or status in {"aborted", "paused"} else 1,
-        "skipped_count": 0,
-        "superseded_count": 0,
-        "total_chunks": len(rounds),
-        "output_files": [str(out_dir / p["file"]) for p in paragraphs],
-        "aborted": status == "aborted",
-        "aborted_reason": "Cancellation requested" if status == "aborted" else outcome.get("error", ""),
-        "paused": status == "paused",
     }
     if coverage["uncovered_ranges"] and success:
         warnings.append(f"Window run left source units without output: {', '.join(coverage['uncovered_ranges'][:5])}")
-        result["warning_count"] = len(warnings)
     if outcome.get("error"):
         result["error"] = outcome.get("error_type", "")
         result["message"] = outcome["error"]
     return result
 
 
-def _process_window_impl(work_dir: str, prompt_name: str, extra_instruction: str = "",
-                         config_path: str = None, dry_run: bool = False, force: bool = False,
-                         input_key: str = RAW_STAGE, stop_check=None, agent_handoff=None) -> dict:
+def process_window(work_dir: str, prompt_name: str, extra_instruction: str = "",
+                   config_path: str = None, input_key: str = RAW_STAGE, stop_check=None,
+                   agent_handoff=None) -> dict:
     """Run (or resume) the sliding-window executor for one stage of a work dir.
 
     `stop_check()` returns "paused" to stop at the next round boundary (the
@@ -1527,50 +1369,29 @@ def _process_window_impl(work_dir: str, prompt_name: str, extra_instruction: str
     if extra_instruction:
         prompt_template += f"\n\n**Additional Instructions**: {extra_instruction}\n"
 
-    config = utils._load_optional_config(config_path) if dry_run else utils.load_config(config_path)
+    config = utils.load_config(config_path)
     params = window_params(prompt_name, config)
     unit_offsets: list = []
     if stage == PROCESSED_STAGE:
-        sentences, chunk_starts = build_processed_units(work_dir, config)
+        sentences = build_processed_units(work_dir, config)
         unit_split = {}
         missing = "no finished raw-stage window output to process"
     else:
-        sentences, chunk_starts, unit_split = build_source_sentences(
-            work_dir, config, params["sentence_max_tokens"], unit_offsets)
+        sentences, unit_split = build_source_sentences(work_dir, config, params["sentence_max_tokens"], unit_offsets)
         missing = "no source text found in the raw chunks"
     if not sentences:
         print(f"Error: {missing} in {work_dir}", file=sys.stderr)
         sys.exit(1)
 
-    state, resumed = _prepare_state(work_dir, prompt_name, stage, sentences, params, force, log, dry_run=dry_run)
-    state["chunk_starts"] = chunk_starts
+    state, resumed = _prepare_state(work_dir, prompt_name, stage, sentences, params, log)
     if unit_split:
         state["unit_split"] = unit_split
     previous_backend = state.get("llm_backend") or None
-    backend_decision = kernel_agent_cli.resolve_llm_backend(config, probe=not dry_run, previous=previous_backend)
+    backend_decision = kernel_agent_cli.resolve_llm_backend(config, previous=previous_backend)
     api_request_url = utils._build_api_url(config.get("llm_base_url", ""), config.get("llm_api_format", "openai")) \
         if config.get("llm_base_url") else ""
     use_cli = backend_decision["backend"] == "cli"
     request_url = f"cli:{backend_decision['agent']}" if use_cli else api_request_url
-
-    if dry_run:
-        return {
-            "success": True,
-            "dry_run": True,
-            "long_text_mode": "window",
-            "prompt_name": prompt_name,
-            "input_key": stage,
-            "sentence_count": len(sentences),
-            "unit_split": unit_split,
-            "cursor": state.get("cursor", 0),
-            "resumed": resumed,
-            "params": state.get("params", params),
-            "sizing": state.get("sizing", {}),
-            "request_url": request_url,
-            "llm_backend": backend_decision,
-            "warnings": [],
-            "message": "Dry run: window executor ready",
-        }
 
     use_handoff = backend_decision["backend"] == "none" and agent_handoff is not None
     if backend_decision["backend"] == "none" and not use_handoff:
@@ -1640,18 +1461,8 @@ def _process_window_impl(work_dir: str, prompt_name: str, extra_instruction: str
             max_tokens=max_output_tokens,
         )
 
-    def should_stop() -> str:
-        if kernel_state.summarize_runtime_cancel_request(work_dir).get("requested", False):
-            kernel_state.consume_runtime_cancel(work_dir)
-            return "aborted"
-        if kernel_state.summarize_runtime_pause_request(work_dir).get("requested", False):
-            return "paused"
-        return stop_check() if stop_check else ""
-
-    set_manifest_executor(work_dir, "window", stage)
     out_dir = stage_dir_for(work_dir, stage)
     state["status"] = "running"
-    state["run_id"] = kernel_runtime.new_trace_id("process-window")
     state["llm_backend"] = backend_decision
     _write_state(out_dir, state)
     if resumed and state.get("cursor", 0):
@@ -1660,7 +1471,7 @@ def _process_window_impl(work_dir: str, prompt_name: str, extra_instruction: str
     outline_terms = None
     if stage == RAW_STAGE:
         _prepare_outline(work_dir, prompt_name, state, sentences, config, params, call_llm,
-                         unit_offsets=unit_offsets, chunk_starts=chunk_starts, log=log)
+                         unit_offsets=unit_offsets, log=log)
         _write_state(out_dir, state)
     else:
         raw_outline = load_window_state(work_dir, RAW_STAGE).get("outline") or {}
@@ -1676,7 +1487,7 @@ def _process_window_impl(work_dir: str, prompt_name: str, extra_instruction: str
         state=state,
         sentences=sentences,
         glossary_payload=glossary_payload,
-        should_stop=should_stop,
+        should_stop=stop_check,
         log=log,
         input_key=stage,
         outline_terms=outline_terms,
@@ -1684,45 +1495,3 @@ def _process_window_impl(work_dir: str, prompt_name: str, extra_instruction: str
     return _build_result(work_dir, state, outcome, prompt_name=prompt_name, input_key=stage,
                          request_url=request_url, backend_decision=backend_decision,
                          warnings=warnings, resumed=resumed)
-
-
-def process_window(work_dir: str, prompt_name: str, extra_instruction: str = "",
-                   config_path: str = None, dry_run: bool = False, force: bool = False,
-                   runtime_ownership: dict | None = None, input_key: str = RAW_STAGE,
-                   stop_check=None, agent_handoff=None) -> dict:
-    """Run the window executor under the same runtime ownership as process-chunks."""
-    import yt_transcript_utils as utils
-    from ..task_runtime import controller as kernel_controller
-
-    if not (Path(work_dir) / "manifest.json").exists():
-        print(f"Error: manifest.json not found in {work_dir}", file=sys.stderr)
-        sys.exit(1)
-
-    return runtime_lifecycle.execute_lifecycle_command(
-        "process-chunks",
-        lambda: kernel_controller.run_owned_mutation(
-            work_dir,
-            "process-chunks",
-            runtime_ownership=runtime_ownership,
-            conflict_result_builder=utils._build_process_ownership_conflict_result,
-            mutation_fn=lambda ownership: _process_window_impl(
-                work_dir,
-                prompt_name,
-                extra_instruction=extra_instruction,
-                config_path=config_path,
-                dry_run=dry_run,
-                force=force,
-                input_key=input_key,
-                stop_check=stop_check,
-                agent_handoff=agent_handoff,
-            ),
-        ),
-        context={
-            "work_dir": work_dir,
-            "prompt_name": prompt_name,
-            "long_text_mode": "window",
-            "input_key": _stage(input_key),
-            "extra_instruction": extra_instruction,
-            "force": force,
-        },
-    )

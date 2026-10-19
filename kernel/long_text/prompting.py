@@ -1,4 +1,4 @@
-"""Prompt assembly and chunking-context preparation helpers."""
+"""Prompt assembly helpers."""
 
 from __future__ import annotations
 
@@ -7,7 +7,6 @@ _LOCAL_NAMES = {
     '_inject_context_block',
     '_inject_glossary_context',
     '_build_chunk_prompt',
-    '_prepare_chunking_context'
 }
 
 
@@ -48,40 +47,3 @@ def _build_chunk_prompt(prompt_template: str, chunk_body: str,
     if "{STRUCTURED_TEXT}" in template:
         return template.replace("{STRUCTURED_TEXT}", chunk_body)
     return template.rstrip() + "\n\n" + chunk_body
-
-def _prepare_chunking_context(prompt_name: str = "", chunk_size: int = 0,
-                              config_path: str = None) -> dict:
-    """Prepare prompt and budget context used before chunk generation starts."""
-    _bind_utils_globals()
-    config = _load_optional_config(config_path)
-    prompt_template = ""
-    if prompt_name:
-        try:
-            prompt_path = _resolve_prompt_template_path(prompt_name)
-        except ValueError as error:
-            print(f"Error: {error}", file=sys.stderr)
-            print(f"Available prompts: {_available_prompt_names()}", file=sys.stderr)
-            sys.exit(1)
-        prompt_template = prompt_path.read_text(encoding="utf-8")
-
-    chunk_plan = _build_chunk_plan(prompt_name, chunk_size, config, prompt_template)
-    budget = chunk_plan["budget"]
-    chunk_mode = chunk_plan["chunk_mode"]
-    use_legacy_char_override = chunk_plan["use_legacy_char_override"]
-    recommended_chunk_size = chunk_plan["recommended_chunk_size"]
-    effective_chunk_size = chunk_plan["effective_chunk_size"]
-    hard_cap_size = chunk_plan["hard_cap_size"]
-    target_tokens = chunk_plan["target_tokens"]
-    hard_cap_tokens = chunk_plan["hard_cap_tokens"]
-    return {
-        "config": config,
-        "prompt_template": prompt_template,
-        "budget": budget,
-        "chunk_mode": chunk_mode,
-        "use_legacy_char_override": use_legacy_char_override,
-        "recommended_chunk_size": recommended_chunk_size,
-        "effective_chunk_size": effective_chunk_size,
-        "hard_cap_size": hard_cap_size,
-        "target_tokens": target_tokens,
-        "hard_cap_tokens": hard_cap_tokens,
-    }
