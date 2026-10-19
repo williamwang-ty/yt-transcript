@@ -49,7 +49,7 @@ Add a flag only when the user asked for that outcome. `--source` and `--mode` ar
 
 ## Several videos
 
-Process the URLs one at a time, in order, each with its own `run`, and finish handling one video's result before starting the next. If a `needs_user` reason would hit every video (cookies or login, rate limiting, a missing tool, Deepgram key or `output_dir`), stop and tell the user instead of trying the rest. End with a table: title, status, and the output file or the reason.
+Process the URLs one at a time, in order, each with its own `run`, and finish handling one video's result before starting the next. A `needs_user` result with reason `cookies_required`, `rate_limited`, `tool_missing` or `output_dir_missing` would hit the remaining videos too: stop there and tell the user. Every other result concerns only that video (for example `deepgram_key_missing` matters only for videos without usable subtitles): note it and go on with the next URL. End with a table: title, status, and the output file or the reason.
 
 ## Unfinished runs
 
