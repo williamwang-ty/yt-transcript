@@ -268,7 +268,7 @@ def _split_at_cues(sentence: str, pauses: dict[int, float], max_tokens: int,
     import yt_transcript_utils as utils
 
     def tokens(text: str) -> int:
-        return utils._estimate_tokens(text, "tokens", config)
+        return utils._estimate_tokens(text)
 
     visible = [index for index, char in enumerate(sentence) if not char.isspace()]
     cuts = sorted((visible[offset], pause) for offset, pause in pauses.items() if 0 < offset < len(visible))
@@ -341,7 +341,7 @@ def split_source_sentences(text: str, config: dict | None = None,
             continue
         sentence_start = offset
         offset += len(re.sub(r"\s+", "", sentence))
-        if max_sentence_tokens > 0 and utils._estimate_tokens(sentence, "tokens", config) > max_sentence_tokens:
+        if max_sentence_tokens > 0 and utils._estimate_tokens(sentence) > max_sentence_tokens:
             if cue_pauses:
                 local = {position - sentence_start: pause for position, pause in cue_pauses.items()
                          if sentence_start < position < offset}
@@ -352,7 +352,7 @@ def split_source_sentences(text: str, config: dict | None = None,
             # A forced split can leave a scrap of a few characters at the end;
             # the model folds it into the paragraph before without its tag, so
             # keep it with the previous piece instead of numbering it alone.
-            if len(parts) > 1 and utils._estimate_tokens(parts[-1], "tokens", config) < \
+            if len(parts) > 1 and utils._estimate_tokens(parts[-1]) < \
                     max_sentence_tokens * MIN_SPLIT_PIECE_SHARE:
                 parts[-2:] = [parts[-2] + parts[-1]]
             report["hard_cuts"] += len(parts) - 1
@@ -441,7 +441,7 @@ def split_paragraph_units(text: str, config: dict | None = None,
         if not block:
             continue
         if not block.startswith("#") and max_paragraph_tokens > 0 and \
-                utils._estimate_tokens(block, "tokens", config) > max_paragraph_tokens:
+                utils._estimate_tokens(block) > max_paragraph_tokens:
             units.extend(_group_sentences(split_source_sentences(block, config, 0), max_paragraph_tokens, config))
         else:
             units.append(block)
@@ -453,7 +453,7 @@ def _group_sentences(sentences: list[str], max_tokens: int, config: dict | None)
 
     groups, current, used = [], [], 0
     for sentence in sentences:
-        cost = utils._estimate_tokens(sentence, "tokens", config)
+        cost = utils._estimate_tokens(sentence)
         if current and used + cost > max_tokens:
             groups.append(" ".join(current))
             current, used = [], 0
@@ -809,7 +809,7 @@ def written_tail(out_dir: Path, state: dict, tail_tokens: int, config: dict | No
         if not text:
             continue
         pieces.insert(0, text)
-        used += utils._estimate_tokens(text, "tokens", config)
+        used += utils._estimate_tokens(text)
         if used >= tail_tokens:
             break
     return utils._truncate_tail_text_to_tokens("\n\n".join(pieces), tail_tokens, config)
@@ -997,11 +997,11 @@ def run_window_rounds(work_dir: str, prompt_name: str, prompt_template: str, *, 
 
     def unit_tokens(index: int) -> int:
         if index not in token_cache:
-            token_cache[index] = utils._estimate_tokens(sentences[index], "tokens", config)
+            token_cache[index] = utils._estimate_tokens(sentences[index])
         return token_cache[index]
 
     def estimate(text: str) -> int:
-        return utils._estimate_tokens(text, "tokens", config)
+        return utils._estimate_tokens(text)
 
     def span_tokens(start: int, end: int) -> int:
         return sum(unit_tokens(i) for i in range(start, end))
@@ -1247,7 +1247,7 @@ def _prepare_outline(work_dir: str, prompt_name: str, state: dict, sentences: li
     if not kernel_outline.outline_enabled(config):
         state["outline"] = {"status": "disabled"}
         return
-    total_tokens = sum(utils._estimate_tokens(sentence, "tokens", config) for sentence in sentences)
+    total_tokens = sum(utils._estimate_tokens(sentence) for sentence in sentences)
     if plan_round(initial_sizing(state["params"]), state["params"], total_tokens)["finish"]:
         # One round reads the whole source anyway; an outline would only add a request.
         state["outline"] = {"status": "skipped", "error": "the whole source fits in one round"}
@@ -1258,7 +1258,7 @@ def _prepare_outline(work_dir: str, prompt_name: str, state: dict, sentences: li
         f"{f', {len(hints)} video chapters as hints' if hints else ''}).")
 
     def estimate(text: str) -> int:
-        return utils._estimate_tokens(text, "tokens", config)
+        return utils._estimate_tokens(text)
 
     record = kernel_outline.generate_outline(
         sentences,

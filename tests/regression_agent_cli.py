@@ -70,7 +70,7 @@ class AgentCliRegressionTests(unittest.TestCase):
         """No detected agent and no API configured resolves to none."""
         decision = agent_cli.resolve_llm_backend({"llm_backend": "auto"}, env={}, which=_which_all)
         self.assertEqual(decision["backend"], "none")
-        self.assertIn("--agent-cli", decision["fallback_reason"])
+        self.assertIn("llm_agent_cli", decision["fallback_reason"])
 
     def test_missing_cli_binary_falls_back(self):
         """A detected agent whose CLI is not installed is skipped."""
@@ -81,7 +81,7 @@ class AgentCliRegressionTests(unittest.TestCase):
         self.assertIn("cursor-agent", decision["fallback_reason"])
 
     def test_explicit_command_beats_detection_and_previous_run_is_reused(self):
-        """--agent-cli (via env) wins over detection; a resumed run keeps its CLI."""
+        """An explicit command (via env) wins over detection; a resumed run keeps its CLI."""
         runner = mock.Mock(return_value=_completed("OK"))
         decision = agent_cli.resolve_llm_backend(
             {"llm_backend": "auto"},

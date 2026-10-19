@@ -701,55 +701,29 @@ class CoreRegressionTests(unittest.TestCase):
                 ["你好，", "第二行。"],
             )
 
-    def test_cleanup_zh_reuses_structure_only_chunk_tuning(self):
-        """Test cleanup_zh uses dedicated chunk sizing and budgets."""
-        override_config = {
-            "chunk_size_override": 0,
-            "chunk_tokens_structure_only": 777,
-            "output_ratio_structure_only": 1.23,
-            "max_output_tokens_structure_only": 1999,
-            "chunk_tokens_cleanup_zh": 888,
-            "output_ratio_cleanup_zh": 1.05,
-            "max_output_tokens_cleanup_zh": 3200,
-        }
-
-        self.assertEqual(utils._get_task_chunk_target("cleanup_zh", override_config), 888)
-        self.assertEqual(utils._get_task_output_ratio("cleanup_zh", override_config), 1.05)
-        self.assertEqual(utils._get_task_max_output_tokens("cleanup_zh", override_config), 3200)
-
-    def test_cleanup_zh_falls_back_to_legacy_structure_only_tuning(self):
-        """Test older cleanup_zh configs still inherit structure_only tuning."""
-        legacy_config = {
-            "chunk_size_override": 0,
-            "chunk_tokens_structure_only": 777,
-            "output_ratio_structure_only": 1.23,
-            "max_output_tokens_structure_only": 1999,
-        }
-
-        self.assertEqual(utils._get_task_chunk_target("cleanup_zh", legacy_config), 777)
-        self.assertEqual(utils._get_task_output_ratio("cleanup_zh", legacy_config), 1.23)
-        self.assertEqual(utils._get_task_max_output_tokens("cleanup_zh", legacy_config), 1999)
-
-    def test_load_config_cleanup_zh_falls_back_to_legacy_structure_only_tuning(self):
-        """Test real config parsing preserves cleanup_zh legacy tuning fallback."""
+    def test_each_task_reads_only_its_own_budget_keys(self):
+        """structure_only settings no longer stand in for cleanup_zh ones."""
         with tempfile.TemporaryDirectory() as tmpdir:
             config_path = Path(tmpdir) / "config.yaml"
             config_path.write_text(
                 f'output_dir: "{tmpdir}"\n'
                 'chunk_tokens_structure_only: "777"\n'
                 'output_ratio_structure_only: "1.23"\n'
-                'max_output_tokens_structure_only: "1999"\n',
+                'max_output_tokens_structure_only: "1999"\n'
+                'chunk_tokens_cleanup_zh: "888"\n',
                 encoding="utf-8",
             )
 
             config = utils.load_config(str(config_path))
 
-            self.assertEqual(config["chunk_tokens_cleanup_zh"], 777)
-            self.assertEqual(config["output_ratio_cleanup_zh"], 1.23)
-            self.assertEqual(config["max_output_tokens_cleanup_zh"], 1999)
-            self.assertEqual(utils._get_task_chunk_target("cleanup_zh", config), 777)
-            self.assertEqual(utils._get_task_output_ratio("cleanup_zh", config), 1.23)
-            self.assertEqual(utils._get_task_max_output_tokens("cleanup_zh", config), 1999)
+        self.assertEqual(utils._get_task_chunk_target("structure_only", config), 777)
+        self.assertEqual(utils._get_task_output_ratio("structure_only", config), 1.23)
+        self.assertEqual(utils._get_task_max_output_tokens("structure_only", config), 1999)
+        self.assertEqual(utils._get_task_chunk_target("cleanup_zh", config), 888)
+        self.assertEqual(utils._get_task_output_ratio("cleanup_zh", config),
+                         utils.TASK_OUTPUT_RATIO_DEFAULTS["cleanup_zh"])
+        self.assertEqual(utils._get_task_max_output_tokens("cleanup_zh", config),
+                         utils.TASK_MAX_OUTPUT_TOKEN_DEFAULTS["cleanup_zh"])
 
     def test_load_config_parses_llm_tuning_fields(self):
         """Test load config parses llm tuning fields."""

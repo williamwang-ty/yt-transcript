@@ -313,6 +313,31 @@ class RunCommandTests(unittest.TestCase):
                               text=True, env={**os.environ, pipeline.YT_DLP_UPDATE_ENV: "0"})
         self.assertEqual((0, "", ""), (proc.returncode, proc.stdout, proc.stderr))
 
+    def test_yt_dlp_settings_from_config_reach_download_sh(self):
+        cookies = self.root / "cookies.txt"
+        cookies.write_text("# Netscape HTTP Cookie File\n", encoding="utf-8")
+        config = self.write_config("cookies.yaml", yt_dlp_cookies_file=json.dumps(str(cookies)),
+                                   yt_dlp_socket_timeout_sec="7")
+        envs = []
+        real_run = subprocess.run
+
+        def spy(command, *args, **kwargs):
+            if str(command[1]).endswith("download.sh"):
+                envs.append(kwargs.get("env") or {})
+            return real_run(command, *args, **kwargs)
+
+        with mock.patch.dict(os.environ), mock.patch.object(pipeline.subprocess, "run", side_effect=spy):
+            for var in pipeline.YT_DLP_CONFIG_ENV:
+                os.environ.pop(var, None)
+            result = self.run_video(ENGLISH, config=config, stage="plan")
+
+        self.assertEqual("done", result["status"], result)
+        self.assertTrue(envs)
+        for env in envs:
+            self.assertEqual(str(cookies), env.get("YT_DLP_COOKIES_FILE"))
+            self.assertEqual("7", env.get("YT_DLP_SOCKET_TIMEOUT_SEC"))
+            self.assertEqual(str(utils.DEFAULT_YT_DLP_RETRIES), env.get("YT_DLP_RETRIES"))
+
     def test_no_llm_backend_hands_each_request_to_the_agent(self):
         expected = self.reference_article(LONG)
         config = self.write_config("handoff.yaml", llm_agent_cli=None)

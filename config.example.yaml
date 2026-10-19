@@ -68,103 +68,65 @@ llm_api_key: "your_llm_api_key_here"
 # Can be either provider root URL or a /v1 URL; the tool normalizes both.
 llm_base_url: "https://api.deepseek.com"
 llm_model: "deepseek-v4-pro"
-# Request hardening for chunk processing
+# Request hardening for API requests
 llm_timeout_sec: 180
 llm_max_retries: 3
 llm_backoff_sec: 1.5
 # Streaming mode: auto | true | false
 llm_stream: "auto"
-# Small probe used by preflight.sh --require-llm
-llm_probe_timeout_sec: 20
-llm_probe_max_tokens: 16
-# In auto streaming mode, process-chunks sends one non-streaming "OK" probe for
-# unknown OpenAI-compatible models. If the response exposes reasoning metadata,
-# later chunk calls run non-streaming so usage/reasoning tokens remain visible.
-llm_reasoning_probe_enabled: true
-# Stop batch if provider times out repeatedly
-llm_stop_after_consecutive_timeouts: 2
-# Re-run suspiciously short / malformed chunk outputs before surfacing warnings
-llm_chunk_recovery_attempts: 1
-llm_chunk_recovery_backoff_sec: 1.0
-# When a chunk response stops at max_tokens (finish_reason length / max_tokens /
-# max_output_tokens, from any provider), process-chunks retries it with a larger
-# ceiling: at least multiplier x the old one, and at least old + the reasoning
-# tokens the model reported, up to llm_output_retry_max_tokens. If the provider
-# rejects the larger value, the run keeps the last accepted one. A chunk still
-# cut off after that is flagged truncated_output instead of being accepted.
-# (Formerly llm_reasoning_retry_*; the old names still work but print a warning.)
-llm_output_retry_attempts: 2
-llm_output_retry_multiplier: 2.0
-llm_output_retry_max_tokens: 16384
 
-# Long-text executor: window | chunks
-# window (default): sliding window for cleanup_zh, quick_cleanup and the
-#         bilingual pair structure_only -> translate_only. Source units are
-#         numbered; each request reads from a cursor, aims to write about N
-#         tokens, and copies each unit's [S<n>] tag in front of its text,
-#         ending with <!--END-->. The program works out where each paragraph
-#         ends; without the end line the last paragraph is dropped, so a
-#         cut-off response just advances less. Sizes adapt per round: N starts at window_write_tokens (and
-#         never exceeds it), the read window is N divided by the measured
-#         output/source ratio plus 25% look-ahead, capped at window_read_tokens,
-#         and the last stretch is sent whole when one round can finish it.
-# chunks: legacy fixed chunks planned up front, one request per chunk. Other
-#         prompts (summarize) always use it, and so does a work dir that
-#         already finished chunks in this mode, so its done chunks are kept.
-long_text_mode: "window"
+# Long text runs through a sliding window (cleanup_zh, and the bilingual pair
+# structure_only -> translate_only). Source units are numbered; each request
+# reads from a cursor, aims to write about N tokens, and copies each unit's
+# [S<n>] tag in front of its text, ending with <!--END-->. The program works
+# out where each paragraph ends; without the end line the last paragraph is
+# dropped, so a cut-off response just advances less. Sizes adapt per round:
+# N starts at window_write_tokens (and never exceeds it), the read window is
+# N divided by the measured output/source ratio plus 25% look-ahead, capped
+# at window_read_tokens, and the last stretch is sent whole when one round
+# can finish it.
 window_read_tokens: 6000
 window_write_tokens: 3000
 # Tail of the already-written output sent as left context each round.
 window_tail_tokens: 400
 # Retries of a response without usable tags (or with far too little or too
 # much output for the source it claims) before that stretch is processed once
-# with the plain fixed-chunk prompt.
+# as a plain fixed chunk (chunk_tokens_<task> below).
 window_marker_retries: 1
-# Global outline (window mode, cleanup_zh and structure_only): before the
-# first round the whole numbered source goes to the model once and comes back
-# as a short JSON outline (section titles + first unit) and a list of names and
-# terms with their correct spellings. Rounds get the nearby outline lines and
-# the terms found in their window; section headings come only from the outline
-# (written by the model where the topic really starts, else placed by the
-# program). YouTube chapters (from chunk-document --chapters or
-# chapter_plan.json) are given as hints. If the outline fails, rounds place
-# their own headings as before. The source is outlined in parts when it is
-# longer than window_outline_read_tokens; raise it for long-context models.
+# Global outline (cleanup_zh and structure_only): before the first round the
+# whole numbered source goes to the model once and comes back as a short JSON
+# outline (section titles + first unit) and a list of names and terms with
+# their correct spellings. Rounds get the nearby outline lines and the terms
+# found in their window; section headings come only from the outline (written
+# by the model where the topic really starts, else placed by the program). The
+# video's YouTube chapters are given as hints. If the outline fails, rounds
+# place their own headings. The source is outlined in parts when it is longer
+# than window_outline_read_tokens; raise it for long-context models.
 window_outline: true
 window_outline_read_tokens: 16000
 window_outline_max_terms: 40
 
-# Chunk planning (chunk-text / chunk-segments / chunk-document). The window
-# executor reads its source from these chunk files and renumbers it, so chunk
-# size matters only to the fixed-chunk executor.
-# Default mode is token-aware. Set to "chars" for legacy character chunking.
-chunk_mode: "tokens"
-# Override the per-task chunk target in the active mode. 0 disables override.
+# The source is first cut into chunks of about chunk_tokens_<task> tokens at
+# sentence (or subtitle segment and chapter) boundaries. The window renumbers
+# the text across chunks, but a chunk boundary stays a unit boundary, and a
+# stretch the window cannot get tags for is processed as one such chunk.
+# Override the per-task chunk target. 0 disables override.
 chunk_size_override: 0
 chunk_tokens_structure_only: 1200
-chunk_tokens_quick_cleanup: 1000
 chunk_tokens_cleanup_zh: 1000
 chunk_tokens_translate_only: 900
-chunk_tokens_summarize: 2500
 # Soft target * multiplier for forced split guardrail. Valid range: 1.0-2.0.
 chunk_hard_cap_multiplier: 1.33
 # Most transcript glossary terms put into one request's prompt.
 chunk_glossary_max_prompt_terms: 8
-# Expected output/source token ratio per task. Fixed chunks use it for
-# sizing; the window uses it as the starting ratio for its read window and
-# for rejecting rounds whose output is far too short or long.
+# Expected output/source token ratio per task: the window's starting ratio for
+# its read window and for rejecting rounds whose output is far too short or long.
 output_ratio_structure_only: 1.15
-output_ratio_quick_cleanup: 1.05
 output_ratio_cleanup_zh: 1.05
 output_ratio_translate_only: 1.10
-output_ratio_summarize: 0.15
-# max_tokens ceiling per request (chunk or window round). It is a stop line,
-# not a budget: chunk size or the window write target decides how much a
-# request writes, and an unused ceiling costs nothing. Set a smaller value
-# only if your model rejects 8192.
+# max_tokens ceiling per request. It is a stop line, not a budget: the window
+# write target decides how much a request writes, and an unused ceiling costs
+# nothing. Set a smaller value only if your model rejects 8192.
 max_output_tokens_structure_only: 8192
-max_output_tokens_quick_cleanup: 8192
 max_output_tokens_cleanup_zh: 8192
 max_output_tokens_translate_only: 8192
-max_output_tokens_summarize: 8192
-enable_token_count_probe: true

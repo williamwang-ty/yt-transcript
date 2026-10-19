@@ -1,1 +1,1 @@
-"""Long-text kernel package with `task_runtime` and `long_text` layers."""
+"""Kernel package: the `run` pipeline and the long-text, subtitle and cleanup layers."""

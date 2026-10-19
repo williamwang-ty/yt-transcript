@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Run `yt_transcript_utils.py transcribe-deepgram` against a recorded response.
+"""Run `yt_transcript_utils.py` with Deepgram answered from a recorded response.
 
-Usage: fake_deepgram.py transcribe-deepgram <audio> --language ... [utils args]
+Usage: fake_deepgram.py run <url> [run args]
 
-Everything in transcribe-deepgram runs as usual except the HTTP request:
+Everything runs as usual except the Deepgram HTTP request:
 `_call_deepgram_api` returns $YT_TRANSCRIPT_E2E_FIXTURES/<video_id>/deepgram.json,
 where <video_id> is the audio file's stem (download.sh names it so).
 """

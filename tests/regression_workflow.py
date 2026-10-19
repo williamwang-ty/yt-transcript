@@ -1,10 +1,10 @@
-"""Regression tests for workflow-level state and planning behavior."""
+"""Regression tests for the shell scripts: download.sh and the yt-dlp update check."""
 
 from tests._support import *
 
 
-class WorkflowRegressionTests(unittest.TestCase):
-    """Regression coverage for workflow state, normalization, and planning paths."""
+class DownloadScriptTests(unittest.TestCase):
+    """download.sh metadata, subtitle-info, subtitles and audio modes, and update_yt_dlp.sh."""
     def test_download_metadata_returns_valid_json(self):
         """Test download metadata returns valid json."""
         with tempfile.TemporaryDirectory() as tmpdir:

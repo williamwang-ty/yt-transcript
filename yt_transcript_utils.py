@@ -217,8 +217,6 @@ def _now_iso() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime())
 
 
-PROMPT_BUDGET_ALIASES = {}
-
 TASK_CHUNK_TOKEN_DEFAULTS = {
     "structure_only": 1200,
     "cleanup_zh": 1000,
@@ -262,20 +260,6 @@ DEFAULT_DEEPGRAM_ENABLE_UTTERANCES = True
 DEFAULT_DEEPGRAM_PREFER_STRUCTURED_OUTPUT = True
 DEFAULT_DEEPGRAM_REQUEST_RETRIES = 2
 DEFAULT_DEEPGRAM_RETRY_BACKOFF_SEC = 1.0
-
-
-def _budget_prompt_name(prompt_name: str = "") -> str:
-    """Return the prompt family used for chunk-budget and sizing config lookups."""
-    prompt = (prompt_name or "").strip().lower()
-    return PROMPT_BUDGET_ALIASES.get(prompt, prompt)
-
-
-def _legacy_budget_prompt_names(prompt_name: str = "") -> list[str]:
-    """Return older prompt families that can still provide fallback config."""
-    prompt = (prompt_name or "").strip().lower()
-    if prompt == "cleanup_zh":
-        return ["structure_only"]
-    return []
 
 
 DEEPGRAM_CHUNK_CACHE_SCHEMA_VERSION = 1
@@ -364,43 +348,25 @@ def _get_task_chunk_target(prompt_name: str, config: dict | None = None) -> int:
     if override > 0:
         return override
 
-    prompt = _budget_prompt_name(prompt_name)
-    key = f"chunk_tokens_{prompt}"
+    prompt = (prompt_name or "").strip().lower()
     default = TASK_CHUNK_TOKEN_DEFAULTS.get(prompt, DEFAULT_UNKNOWN_CHUNK_TOKENS)
-    if key not in config:
-        for legacy_prompt in _legacy_budget_prompt_names(prompt_name):
-            legacy_key = f"chunk_tokens_{legacy_prompt}"
-            if legacy_key in config:
-                return max(1, _parse_int(config.get(legacy_key), default))
-    return max(1, _parse_int(config.get(key), default))
+    return max(1, _parse_int(config.get(f"chunk_tokens_{prompt}"), default))
 
 
 def _get_task_output_ratio(prompt_name: str, config: dict | None = None) -> float:
     """Return task output ratio."""
     config = config or {}
-    prompt = _budget_prompt_name(prompt_name)
-    key = f"output_ratio_{prompt}"
+    prompt = (prompt_name or "").strip().lower()
     default = TASK_OUTPUT_RATIO_DEFAULTS.get(prompt, DEFAULT_UNKNOWN_OUTPUT_RATIO)
-    if key not in config:
-        for legacy_prompt in _legacy_budget_prompt_names(prompt_name):
-            legacy_key = f"output_ratio_{legacy_prompt}"
-            if legacy_key in config:
-                return max(0.01, _parse_float(config.get(legacy_key), default))
-    return max(0.01, _parse_float(config.get(key), default))
+    return max(0.01, _parse_float(config.get(f"output_ratio_{prompt}"), default))
 
 
 def _get_task_max_output_tokens(prompt_name: str, config: dict | None = None) -> int:
     """Return task max output tokens."""
     config = config or {}
-    prompt = _budget_prompt_name(prompt_name)
-    key = f"max_output_tokens_{prompt}"
+    prompt = (prompt_name or "").strip().lower()
     default = TASK_MAX_OUTPUT_TOKEN_DEFAULTS.get(prompt, DEFAULT_UNKNOWN_MAX_OUTPUT_TOKENS)
-    if key not in config:
-        for legacy_prompt in _legacy_budget_prompt_names(prompt_name):
-            legacy_key = f"max_output_tokens_{legacy_prompt}"
-            if legacy_key in config:
-                return max(1, _parse_int(config.get(legacy_key), default))
-    return max(1, _parse_int(config.get(key), default))
+    return max(1, _parse_int(config.get(f"max_output_tokens_{prompt}"), default))
 
 
 def _is_cjk_char(char: str) -> bool:
@@ -459,11 +425,12 @@ def _advance_token_estimate_state(state: dict, char: str, next_char: str = "") -
     state["punct_count"] = punct_count + 1
 
 
-def _estimate_tokens_local(text: str, mode: str = "tokens", config: dict | None = None) -> int:
-    # Heuristic estimation only. This intentionally over-approximates common
-    # transcript shapes and is not a substitute for provider-side token counting.
-    """Estimate tokens local."""
-    del config
+def _estimate_tokens(text: str) -> int:
+    """Estimate tokens with a local heuristic.
+
+    It over-approximates common transcript shapes on purpose and is not a
+    substitute for provider-side token counting.
+    """
     if not text:
         return 0
 
@@ -474,20 +441,12 @@ def _estimate_tokens_local(text: str, mode: str = "tokens", config: dict | None 
     return max(1, state["tokens"])
 
 
-# Runtime chunk planning still uses the local estimator to avoid one remote
-# token-count round trip per sentence or segment. Provider probing is wired via
-# _count_tokens_via_provider()/test_token_count() and can be promoted later.
-def _estimate_tokens(text: str, mode: str = "tokens", config: dict | None = None) -> int:
-    """Estimate tokens."""
-    return _estimate_tokens_local(text, mode, config)
-
-
 def _truncate_tail_text_to_tokens(text: str, max_tokens: int,
                                   config: dict | None = None) -> str:
     """Keep the tail-most portion of text within a soft token cap."""
     if not text:
         return ""
-    if max_tokens <= 0 or _estimate_tokens(text, "tokens", config) <= max_tokens:
+    if max_tokens <= 0 or _estimate_tokens(text) <= max_tokens:
         return text.strip()
     segments = _force_split_text_by_tokens(text.strip(), max_tokens, config)
     return segments[-1].strip() if segments else text.strip()
@@ -1090,7 +1049,7 @@ def parse_vtt(vtt_path: str) -> str:
 def parse_vtt_segments(vtt_path: str, *, language: str = "") -> dict:
     """Parse a VTT file and return aligned segments with timing metadata.
 
-    Output schema matches `chunk-segments` expectations:
+    Output schema (the segments file the normalizer reads):
 
     {
       "source": "vtt",
@@ -3461,7 +3420,7 @@ def _estimate_single_pass_input_tokens(normalized_document_path: str, raw_text_p
             continue
         normalized_text = _normalize_text_body(text)
         if normalized_text:
-            return _estimate_tokens(normalized_text, 'tokens', config), len(normalized_text)
+            return _estimate_tokens(normalized_text), len(normalized_text)
     return 0, 0
 
 
@@ -3777,54 +3736,14 @@ def load_config(config_path: str = None, allow_missing: bool = False) -> dict:
     llm_timeout_sec = parse_int_field('llm_timeout_sec', 120, minimum=1)
     llm_max_retries = parse_int_field('llm_max_retries', 3, minimum=0)
     llm_backoff_sec = parse_float_field('llm_backoff_sec', 1.5, minimum=0.1)
-    def has_config_value(key: str) -> bool:
-        """Return whether a config key is explicitly set to a non-empty value."""
-        return key in config and str(config.get(key, "")).strip() != ""
-
-    chunk_tokens_structure_only = parse_int_field(
-        'chunk_tokens_structure_only',
-        TASK_CHUNK_TOKEN_DEFAULTS['structure_only'],
-        minimum=1,
-    )
-    chunk_tokens_cleanup_default = TASK_CHUNK_TOKEN_DEFAULTS['cleanup_zh']
-    if not has_config_value('chunk_tokens_cleanup_zh'):
-        if has_config_value('chunk_tokens_structure_only'):
-            chunk_tokens_cleanup_default = chunk_tokens_structure_only
-    chunk_tokens_cleanup_zh = parse_int_field(
-        'chunk_tokens_cleanup_zh',
-        chunk_tokens_cleanup_default,
-        minimum=1,
-    )
-
-    output_ratio_structure_only = parse_float_field(
-        'output_ratio_structure_only',
-        TASK_OUTPUT_RATIO_DEFAULTS['structure_only'],
-        minimum=0.01,
-    )
-    output_ratio_cleanup_default = TASK_OUTPUT_RATIO_DEFAULTS['cleanup_zh']
-    if not has_config_value('output_ratio_cleanup_zh'):
-        if has_config_value('output_ratio_structure_only'):
-            output_ratio_cleanup_default = output_ratio_structure_only
-    output_ratio_cleanup_zh = parse_float_field(
-        'output_ratio_cleanup_zh',
-        output_ratio_cleanup_default,
-        minimum=0.01,
-    )
-
-    max_output_tokens_structure_only = parse_int_field(
-        'max_output_tokens_structure_only',
-        TASK_MAX_OUTPUT_TOKEN_DEFAULTS['structure_only'],
-        minimum=1,
-    )
-    max_output_tokens_cleanup_default = TASK_MAX_OUTPUT_TOKEN_DEFAULTS['cleanup_zh']
-    if not has_config_value('max_output_tokens_cleanup_zh'):
-        if has_config_value('max_output_tokens_structure_only'):
-            max_output_tokens_cleanup_default = max_output_tokens_structure_only
-    max_output_tokens_cleanup_zh = parse_int_field(
-        'max_output_tokens_cleanup_zh',
-        max_output_tokens_cleanup_default,
-        minimum=1,
-    )
+    task_budgets = {}
+    for prompt in TASK_CHUNK_TOKEN_DEFAULTS:
+        task_budgets[f"chunk_tokens_{prompt}"] = parse_int_field(
+            f"chunk_tokens_{prompt}", TASK_CHUNK_TOKEN_DEFAULTS[prompt], minimum=1)
+        task_budgets[f"output_ratio_{prompt}"] = parse_float_field(
+            f"output_ratio_{prompt}", TASK_OUTPUT_RATIO_DEFAULTS[prompt], minimum=0.01)
+        task_budgets[f"max_output_tokens_{prompt}"] = parse_int_field(
+            f"max_output_tokens_{prompt}", TASK_MAX_OUTPUT_TOKEN_DEFAULTS[prompt], minimum=1)
 
     parsed = dict(defaults)
     parsed.update({
@@ -3859,9 +3778,6 @@ def load_config(config_path: str = None, allow_missing: bool = False) -> dict:
         "window_outline_read_tokens": parse_int_field('window_outline_read_tokens', kernel_outline.DEFAULT_OUTLINE_READ_TOKENS, minimum=1000),
         "window_outline_max_terms": parse_int_field('window_outline_max_terms', kernel_outline.DEFAULT_OUTLINE_MAX_TERMS, minimum=0),
         "chunk_size_override": parse_int_field('chunk_size_override', 0, minimum=0),
-        "chunk_tokens_structure_only": chunk_tokens_structure_only,
-        "chunk_tokens_cleanup_zh": chunk_tokens_cleanup_zh,
-        "chunk_tokens_translate_only": parse_int_field('chunk_tokens_translate_only', TASK_CHUNK_TOKEN_DEFAULTS['translate_only'], minimum=1),
         "chunk_hard_cap_multiplier": parse_float_field(
             'chunk_hard_cap_multiplier',
             DEFAULT_CHUNK_HARD_CAP_MULTIPLIER,
@@ -3869,12 +3785,7 @@ def load_config(config_path: str = None, allow_missing: bool = False) -> dict:
             maximum=MAX_CHUNK_HARD_CAP_MULTIPLIER,
         ),
         "chunk_glossary_max_prompt_terms": parse_int_field('chunk_glossary_max_prompt_terms', 8, minimum=0),
-        "output_ratio_structure_only": output_ratio_structure_only,
-        "output_ratio_cleanup_zh": output_ratio_cleanup_zh,
-        "output_ratio_translate_only": parse_float_field('output_ratio_translate_only', TASK_OUTPUT_RATIO_DEFAULTS['translate_only'], minimum=0.01),
-        "max_output_tokens_structure_only": max_output_tokens_structure_only,
-        "max_output_tokens_cleanup_zh": max_output_tokens_cleanup_zh,
-        "max_output_tokens_translate_only": parse_int_field('max_output_tokens_translate_only', TASK_MAX_OUTPUT_TOKEN_DEFAULTS['translate_only'], minimum=1),
+        **task_budgets,
         "config_path": str(path.absolute()),
         "config_warnings": config_warnings,
     })

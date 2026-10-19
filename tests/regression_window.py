@@ -550,7 +550,7 @@ class WindowCueSplitTests(unittest.TestCase):
             self.assertIn(offset, ends, unit)
             # The units cover whole thoughts: they end where the long pauses are.
             self.assertTrue(unit.endswith("来决定下一轮从哪里开始") or unit.endswith("其实它的核心思想很简单"), unit)
-            self.assertLessEqual(utils._estimate_tokens(unit, "tokens", {}), 60)
+            self.assertLessEqual(utils._estimate_tokens(unit), 60)
 
     def test_without_matching_cues_units_fall_back_to_fixed_cuts(self):
         segments = _cue_segments()

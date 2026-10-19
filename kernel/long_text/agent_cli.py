@@ -275,15 +275,14 @@ def api_is_configured(config: dict) -> bool:
     return all(str(config.get(key, "") or "").strip() for key in ("llm_api_key", "llm_base_url", "llm_model"))
 
 
-def resolve_llm_backend(config: dict, *, env: dict | None = None, override: str = "",
-                        probe: bool = True, previous: dict | None = None,
-                        which=shutil.which, runner=subprocess.run) -> dict:
-    """Pick the chunk backend: the host agent's CLI in auto mode, else the API.
+def resolve_llm_backend(config: dict, *, env: dict | None = None, probe: bool = True,
+                        previous: dict | None = None, which=shutil.which, runner=subprocess.run) -> dict:
+    """Pick the text backend: the host agent's CLI in auto mode, else the API.
 
-    Selection order in auto mode: an explicit command (`--agent-cli`,
-    `YT_TRANSCRIPT_AGENT_CLI`, or `llm_agent_cli`), a backend recorded by an
-    earlier run of the same work dir, then the detected host agent. A CLI is
-    used only after a probe call returns text; otherwise the API is used.
+    Selection order in auto mode: an explicit command (`YT_TRANSCRIPT_AGENT_CLI`
+    or `llm_agent_cli`), a backend recorded by an earlier run of the same work
+    dir, then the detected host agent. A CLI is used only after a probe call
+    returns text; otherwise the API is used.
     """
     config = config or {}
     env = os.environ if env is None else env
@@ -308,7 +307,6 @@ def resolve_llm_backend(config: dict, *, env: dict | None = None, override: str 
     selector = ""
     source = ""
     for candidate, candidate_source in (
-        (override, "argument"),
         (env.get(AGENT_CLI_ENV_VAR, ""), "env"),
         (config.get("llm_agent_cli", ""), "config"),
     ):
@@ -326,7 +324,7 @@ def resolve_llm_backend(config: dict, *, env: dict | None = None, override: str 
 
     if not selector:
         decision["fallback_reason"] = (
-            f"No host agent detected; pass --agent-cli or set {AGENT_CLI_ENV_VAR} to use the agent's own CLI"
+            f"No host agent detected; set llm_agent_cli in config.yaml or {AGENT_CLI_ENV_VAR} to use the agent's own CLI"
         )
         return decision
 
