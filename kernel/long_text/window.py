@@ -1586,7 +1586,7 @@ def _process_window_impl(work_dir: str, prompt_name: str, extra_instruction: str
         request_url = "agent:handoff"
         log(f"ℹ️ No LLM backend is reachable ({backend_decision['fallback_reason'] or 'none configured'}); "
             "window requests are handed to the agent.")
-    if use_cli:
+    elif use_cli:
         log(f"ℹ️ Window requests use the {backend_decision['agent']} CLI ({' '.join(backend_decision['command'])}).")
     elif backend_decision["mode"] == "auto" and backend_decision["fallback_reason"]:
         log(f"ℹ️ Window requests use the configured API: {backend_decision['fallback_reason']}")
