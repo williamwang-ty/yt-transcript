@@ -122,8 +122,12 @@ def prepare_resume(work_dir: str, prompt_name: str = "", config_path: str = None
 def process_chunks(work_dir: str, prompt_name: str, extra_instruction: str = "",
                    config_path: str = None, dry_run: bool = False,
                    input_key: str = "raw_path", force: bool = False,
-                   runtime_ownership: dict | None = None) -> dict:
-    """Run the main chunk-processing mutation under runtime ownership protection."""
+                   runtime_ownership: dict | None = None, stop_check=None, agent_handoff=None) -> dict:
+    """Run the main chunk-processing mutation under runtime ownership protection.
+
+    `stop_check` and `agent_handoff` reach the window executor only (see
+    `window._process_window_impl`); the fixed-chunk executor ignores them.
+    """
     import yt_transcript_utils as utils
 
     manifest_path = Path(work_dir) / "manifest.json"
@@ -141,6 +145,8 @@ def process_chunks(work_dir: str, prompt_name: str, extra_instruction: str = "",
             force=force,
             runtime_ownership=runtime_ownership,
             input_key=input_key,
+            stop_check=stop_check,
+            agent_handoff=agent_handoff,
         )
 
     return runtime_lifecycle.execute_lifecycle_command(

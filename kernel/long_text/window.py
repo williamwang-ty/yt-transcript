@@ -1149,7 +1149,13 @@ def run_window_rounds(work_dir: str, prompt_name: str, prompt_template: str, *, 
             return kernel_outline.round_terms_text(outline_terms, source_text, translation=translation_terms)
         return _glossary_text(glossary_payload, source_text, max_glossary_terms)
 
+    # Invalid rounds already recorded at the cursor count toward the fallback,
+    # so a resumed run still reaches it instead of retrying the same stretch forever.
     marker_failures = 0
+    for previous in reversed(state.get("rounds", [])):
+        if previous.get("result") != "invalid" or previous.get("cursor") != state["cursor"] + 1:
+            break
+        marker_failures += 1
     total = len(sentences)
 
     while state["cursor"] < total:
@@ -1494,8 +1500,14 @@ def _build_result(work_dir: str, state: dict, outcome: dict, *, prompt_name: str
 
 def _process_window_impl(work_dir: str, prompt_name: str, extra_instruction: str = "",
                          config_path: str = None, dry_run: bool = False, force: bool = False,
-                         input_key: str = RAW_STAGE) -> dict:
-    """Run (or resume) the sliding-window executor for one stage of a work dir."""
+                         input_key: str = RAW_STAGE, stop_check=None, agent_handoff=None) -> dict:
+    """Run (or resume) the sliding-window executor for one stage of a work dir.
+
+    `stop_check()` returns "paused" to stop at the next round boundary (the
+    `run` command's time budget). `agent_handoff(prompt_text, max_output_tokens)`
+    answers requests when no LLM backend is reachable: it returns a result like
+    the backends do, or raises to stop the run until the agent has answered.
+    """
     import yt_transcript_utils as utils
 
     log = lambda message: print(message, file=sys.stderr)  # noqa: E731
@@ -1559,7 +1571,8 @@ def _process_window_impl(work_dir: str, prompt_name: str, extra_instruction: str
             "message": "Dry run: window executor ready",
         }
 
-    if backend_decision["backend"] == "none":
+    use_handoff = backend_decision["backend"] == "none" and agent_handoff is not None
+    if backend_decision["backend"] == "none" and not use_handoff:
         print(
             "Error: no LLM backend available. "
             f"{backend_decision['fallback_reason'] or 'Agent CLI unavailable'}; "
@@ -1569,7 +1582,11 @@ def _process_window_impl(work_dir: str, prompt_name: str, extra_instruction: str
         sys.exit(1)
 
     warnings: list[str] = []
-    if use_cli:
+    if use_handoff:
+        request_url = "agent:handoff"
+        log(f"ℹ️ No LLM backend is reachable ({backend_decision['fallback_reason'] or 'none configured'}); "
+            "window requests are handed to the agent.")
+    elif use_cli:
         log(f"ℹ️ Window requests use the {backend_decision['agent']} CLI ({' '.join(backend_decision['command'])}).")
     elif backend_decision["mode"] == "auto" and backend_decision["fallback_reason"]:
         log(f"ℹ️ Window requests use the configured API: {backend_decision['fallback_reason']}")
@@ -1585,6 +1602,8 @@ def _process_window_impl(work_dir: str, prompt_name: str, extra_instruction: str
 
     def call_llm(prompt_text: str, max_output_tokens: int) -> dict:
         nonlocal use_cli, request_url
+        if use_handoff:
+            return agent_handoff(prompt_text, max_output_tokens)
         if use_cli:
             try:
                 return kernel_agent_cli.call_cli_llm(
@@ -1626,7 +1645,7 @@ def _process_window_impl(work_dir: str, prompt_name: str, extra_instruction: str
             return "aborted"
         if kernel_state.summarize_runtime_pause_request(work_dir).get("requested", False):
             return "paused"
-        return ""
+        return stop_check() if stop_check else ""
 
     set_manifest_executor(work_dir, "window", stage)
     out_dir = stage_dir_for(work_dir, stage)
@@ -1668,7 +1687,8 @@ def _process_window_impl(work_dir: str, prompt_name: str, extra_instruction: str
 
 def process_window(work_dir: str, prompt_name: str, extra_instruction: str = "",
                    config_path: str = None, dry_run: bool = False, force: bool = False,
-                   runtime_ownership: dict | None = None, input_key: str = RAW_STAGE) -> dict:
+                   runtime_ownership: dict | None = None, input_key: str = RAW_STAGE,
+                   stop_check=None, agent_handoff=None) -> dict:
     """Run the window executor under the same runtime ownership as process-chunks."""
     import yt_transcript_utils as utils
     from ..task_runtime import controller as kernel_controller
@@ -1692,6 +1712,8 @@ def process_window(work_dir: str, prompt_name: str, extra_instruction: str = "",
                 dry_run=dry_run,
                 force=force,
                 input_key=input_key,
+                stop_check=stop_check,
+                agent_handoff=agent_handoff,
             ),
         ),
         context={

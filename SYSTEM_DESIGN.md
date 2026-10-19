@@ -157,7 +157,7 @@ Notes:
 - **Idempotent stages.** Rerunning an unfinished stage starts that stage over, except that expensive sub-steps keep their results inside the stage (downloaded audio, Deepgram chunk results, the outline, finished window rounds), so an interrupted stage never pays twice.
 - **No separate preflight.** Each stage checks what it needs right before it needs it: yt-dlp before `metadata`, the Deepgram key only when `source` chooses Deepgram, an LLM backend only at `text`. Cheap paths stay cheap.
 - **The source is final before any LLM call.** The subtitle quality reroute moves from planning into `source`, so `normalize` and everything after it work on accepted text.
-- **One path for every length.** Short and long videos go through the same stages. A short video's text fits one window round, and the outline pass is skipped when the whole text fits one round.
+- **One path for every length.** Short and long videos go through the same stages. A short video's text fits one window round, and the outline pass is skipped when the whole text fits one round. YouTube chapters are passed to the outline as hints when the plan says `long`; a short text has no outline to use them.
 - **Free routing check.** `--stage plan` runs `metadata` through `plan` without spending money. If the route needs Deepgram, it records that decision and stops after the decision in `source`, without transcribing.
 
 ### 6.3 Source selection
@@ -182,15 +182,17 @@ Each video has one work directory:
 ```text
 /tmp/yt-transcript/<video_id>/
   state.json                 the only state file
-  run.lock                   held while a run is active
-  metadata.json
-  source/                    track list, downloaded track or audio, Deepgram JSON and chunk cache
+  .runtime_owner.json        the lock, held while a run is active
+  metadata.json  chapters.json
+  source/                    downloaded track or audio, subtitle quality check, Deepgram JSON and chunk cache
   raw_text.txt  segments.json  normalized_document.json
   plan.json
-  text/<task>/               window executor state per task (cursor, outline, sizes, paragraphs)
+  text/                      window executor state for every task (cursor, outline, sizes, paragraphs)
   agent_task/                present only while a needs_agent_text task is open
   optimized.md  quality.json
 ```
+
+`YT_TRANSCRIPT_WORK_ROOT` replaces `/tmp/yt-transcript` and `YT_TRANSCRIPT_OUTPUT_DIR` replaces the configured `output_dir`; the regression runner uses both so it never touches real runs or the vault.
 
 `state.json` is written atomically after every stage and every window round. Its shape:
 
@@ -232,7 +234,7 @@ Rules:
 - **Resume** means rerunning the same command: `run` reads `state.json` and starts at the first stage that is not `done`. Inside `text`, the window executor resumes at its cursor.
 - **Finished runs stay finished.** `cleanup` keeps `state.json`, so rerunning `run` on a finished video returns `done` with the existing article at once, as long as that file still exists (if it was deleted, the run starts over). Rerunning a whole batch therefore only does the unfinished videos. `--restart` produces the article again.
 - **Overrides are sticky.** `--source` and `--mode` are saved in `state.json` and stay in effect on reruns of that video until `--restart`, so a resume never silently flips the route.
-- **Config is read on every run**, but finished stages are not redone when it changes. `--from <stage>` redoes them.
+- **Config is read on every run**, but finished stages are not redone when it changes. `--from <stage>` redoes them. After `cleanup` the intermediate files are gone, so `--from` on a finished run redoes every stage; it is meant for unfinished runs (for example `--from text` after a quality failure).
 - **The lock** keeps two processes from writing one work directory. A second `run` on a locked video returns `failed` with reason `locked`; a lock left by a dead process is taken over. Different videos can run in parallel because they share no files.
 - **What it replaces**: the hand-written `state.md`, `machine_state.json`, the chunk `manifest.json`, `telemetry.jsonl`, and the scattered `/tmp/<video_id>_*` files. Downloads and the normalized document move under the video's own directory, so runs never collide on shared paths.
 - **Hygiene**: `video_id` must match `[A-Za-z0-9_-]+` before it becomes a path. `state.json` never holds API keys; it records the backend's name, not its credentials.
@@ -246,7 +248,7 @@ Every `run` call prints exactly one JSON object on stdout and exits with a fixed
 |---|---|---|---|
 | `done` | 0 | Article written, or `--stage plan` finished | Report `output_file`, route, warnings, and LLM usage |
 | `failed` | 1 | A stage failed: `stage`, `reason`, `message`, `retryable`, `next_command` | Retry once if `retryable`, otherwise report; may suggest an override |
-| `needs_user` | 3 | Only the user can fix it: `cookies_required`, `login_required`, `rate_limited`, `deepgram_key_missing`, `tool_missing` | Tell the user exactly what to do; rerun after they do it |
+| `needs_user` | 3 | Only the user can fix it: `cookies_required`, `login_required`, `rate_limited`, `deepgram_key_missing`, `tool_missing`, `output_dir_missing` | Tell the user exactly what to do; rerun after they do it |
 | `unsupported` | 4 | The spoken language is not supported | Report; do not retry |
 | `needs_agent_text` | 5 | No LLM backend is reachable; one text request is handed over | Do the task, write the output file, rerun the same command |
 | `in_progress` | 6 | The `--max-seconds` budget ran out at a clean boundary: `stage`, progress | Rerun the same command; optionally tell the user the progress |
@@ -267,7 +269,7 @@ A `done` result:
 }
 ```
 
-A `needs_agent_text` result names a prompt file, an input file, and an output file:
+A `needs_agent_text` result names a prompt file (the whole request, numbered units included) and an output file:
 
 ```json
 {
@@ -276,7 +278,6 @@ A `needs_agent_text` result names a prompt file, an input file, and an output fi
   "stage": "text",
   "task": {
     "prompt_file": "/tmp/yt-transcript/abc123/agent_task/prompt.md",
-    "input_file": "/tmp/yt-transcript/abc123/agent_task/input.txt",
     "output_file": "/tmp/yt-transcript/abc123/agent_task/output.txt"
   },
   "next_command": "run https://www.youtube.com/watch?v=abc123"
@@ -293,7 +294,7 @@ The task is exactly one LLM request: an outline pass or one window round, with t
 | `--mode chinese\|bilingual` | yes | Force the output form. The mode follows the source text (Chinese text gives `chinese`, English text gives `bilingual`), so this picks the track: on an English video, `bilingual` uses the English subtitles even when human Chinese subtitles exist, and `chinese` uses the human Chinese subtitles. Redoes `source` and every later stage. |
 | `--from <stage>` | no | Mark that stage and every later stage not done, then run. For recovery and debugging. |
 | `--stage plan` | no | Stop after `plan`: the free routing check. |
-| `--max-seconds <n>` | no | Start no new stage or window round after n seconds; return `in_progress`. |
+| `--max-seconds <n>` | no | Start no new stage or window round after n seconds, once the call has finished at least one; return `in_progress`. |
 | `--restart` | no | Delete the work directory, including saved overrides, and start over. |
 
 These are the agent's escape hatches. A user request like "use Deepgram for this one" or "just give me Chinese" maps to a flag, not to hand-run steps. A combination that cannot be honored (`--mode bilingual` on a Chinese video, `--mode chinese` on an English video without human Chinese subtitles, `--source subtitles` when no trusted track exists) returns `failed` with reason `override_not_applicable`; nothing is guessed.
@@ -761,7 +762,7 @@ agent 从不编辑状态文件，也从不手动执行内部阶段。需要不�
 - **阶段幂等。** 重跑一个未完成的阶段，会把这个阶段从头做一遍；但昂贵的子步骤在阶段内部保留结果（下载好的音频、Deepgram 分段结果、大纲、已完成的窗口轮次），所以中断的阶段不会重复花钱。
 - **没有单独的 preflight。** 每个阶段在真正需要之前才检查它需要的东西：`metadata` 之前检查 yt-dlp，`source` 选了 Deepgram 才检查 Deepgram 密钥，到 `text` 才检查 LLM 后端。便宜的路径保持便宜。
 - **第一次调用 LLM 之前来源已经定下来。** 字幕质量改道从规划阶段移到 `source`，所以 `normalize` 及之后的阶段处理的都是已经认可的文字。
-- **长短视频一条路径。** 短视频和长视频走同样的阶段。短视频的文字一轮窗口就能处理完，全文一轮能写完时也会跳过大纲调用。
+- **长短视频一条路径。** 短视频和长视频走同样的阶段。短视频的文字一轮窗口就能处理完，全文一轮能写完时也会跳过大纲调用。规划结果为 `long` 时，YouTube 章节作为提示交给大纲；短文本没有大纲，也就用不上章节。
 - **免费的路由检查。** `--stage plan` 执行 `metadata` 到 `plan`，不花钱。如果路由需要 Deepgram，就记下这个决定，在 `source` 做完决定后停下，不做转写。
 
 ### 6.3 来源选择
@@ -786,15 +787,17 @@ agent 从不编辑状态文件，也从不手动执行内部阶段。需要不�
 ```text
 /tmp/yt-transcript/<video_id>/
   state.json                 唯一的状态文件
-  run.lock                   运行期间持有的锁
-  metadata.json
-  source/                    字幕轨列表、下载的字幕或音频、Deepgram JSON 及分段缓存
+  .runtime_owner.json        锁，运行期间持有
+  metadata.json  chapters.json
+  source/                    下载的字幕或音频、字幕质量检查、Deepgram JSON 及分段缓存
   raw_text.txt  segments.json  normalized_document.json
   plan.json
-  text/<task>/               每个任务的窗口执行器状态（游标、大纲、大小、段落）
+  text/                      所有任务的窗口执行器状态（游标、大纲、大小、段落）
   agent_task/                只在有未完成的 needs_agent_text 任务时存在
   optimized.md  quality.json
 ```
+
+`YT_TRANSCRIPT_WORK_ROOT` 可以代替 `/tmp/yt-transcript`，`YT_TRANSCRIPT_OUTPUT_DIR` 可以代替配置里的 `output_dir`；回归脚本两个都用，所以不会碰到真实的运行目录和笔记库。
 
 每个阶段、每轮窗口之后都原子地写一次 `state.json`。它的形状：
 
@@ -836,7 +839,7 @@ agent 从不编辑状态文件，也从不手动执行内部阶段。需要不�
 - **续跑**就是重跑同一条命令：`run` 读 `state.json`，从第一个不是 `done` 的阶段开始。在 `text` 阶段内部，窗口执行器从游标处继续。
 - **完成的就保持完成。** `cleanup` 保留 `state.json`，所以对已完成的视频重跑 `run`，会立即返回 `done` 和已有的文章，前提是这篇文章还在（被删掉了就从头再做）。因此整批重跑时只会处理没完成的视频。要重新生成文章就用 `--restart`。
 - **覆盖参数会保留。** `--source` 和 `--mode` 存进 `state.json`，在这个视频之后的重跑里一直有效，直到 `--restart`，所以续跑不会悄悄改变路由。
-- **每次运行都会读配置**，但配置改了，已完成的阶段也不会重做；要重做就用 `--from <阶段>`。
+- **每次运行都会读配置**，但配置改了，已完成的阶段也不会重做；要重做就用 `--from <阶段>`。`cleanup` 之后中间文件已经删掉，所以对已完成的运行用 `--from` 会重做所有阶段；它是给未完成的运行用的（比如质量检查失败后 `--from text`）。
 - **运行锁**防止两个进程同时写一个工作目录。对一个被锁住的视频再执行 `run`，返回 `failed`，原因是 `locked`；已退出进程留下的锁会被接管。不同视频之间不共享文件，可以并行运行。
 - **取代的东西**：手写的 `state.md`、`machine_state.json`、分块的 `manifest.json`、`telemetry.jsonl`，以及散落的 `/tmp/<video_id>_*` 文件。下载文件和规范化文档都移到该视频自己的目录下，不同运行之间不会在共享路径上撞车。
 - **安全**：`video_id` 必须匹配 `[A-Za-z0-9_-]+` 才能用作路径。`state.json` 不存 API 密钥，只记后端名字，不记凭据。
@@ -850,7 +853,7 @@ agent 从不编辑状态文件，也从不手动执行内部阶段。需要不�
 |---|---|---|---|
 | `done` | 0 | 文章已写出，或 `--stage plan` 已完成 | 汇报 `output_file`、路由、警告和 LLM 用量 |
 | `failed` | 1 | 某个阶段失败：`stage`、`reason`、`message`、`retryable`、`next_command` | `retryable` 时重试一次，否则汇报；可以建议某个覆盖参数 |
-| `needs_user` | 3 | 只有用户能解决：`cookies_required`、`login_required`、`rate_limited`、`deepgram_key_missing`、`tool_missing` | 准确告诉用户要做什么；用户做完后重跑 |
+| `needs_user` | 3 | 只有用户能解决：`cookies_required`、`login_required`、`rate_limited`、`deepgram_key_missing`、`tool_missing`、`output_dir_missing` | 准确告诉用户要做什么；用户做完后重跑 |
 | `unsupported` | 4 | 口语语言不受支持 | 汇报；不重试 |
 | `needs_agent_text` | 5 | 没有可用的 LLM 后端，交出一次文字请求 | 完成任务、写出输出文件、重跑同一条命令 |
 | `in_progress` | 6 | `--max-seconds` 时间用完，在干净的边界停下：`stage`、进度 | 重跑同一条命令；可以顺便告诉用户进度 |
@@ -871,7 +874,7 @@ agent 从不编辑状态文件，也从不手动执行内部阶段。需要不�
 }
 ```
 
-`needs_agent_text` 结果给出一个 prompt 文件、一个输入文件和一个输出文件：
+`needs_agent_text` 结果给出一个 prompt 文件（完整的请求，包括编号单元）和一个输出文件：
 
 ```json
 {
@@ -880,7 +883,6 @@ agent 从不编辑状态文件，也从不手动执行内部阶段。需要不�
   "stage": "text",
   "task": {
     "prompt_file": "/tmp/yt-transcript/abc123/agent_task/prompt.md",
-    "input_file": "/tmp/yt-transcript/abc123/agent_task/input.txt",
     "output_file": "/tmp/yt-transcript/abc123/agent_task/output.txt"
   },
   "next_command": "run https://www.youtube.com/watch?v=abc123"
@@ -897,7 +899,7 @@ agent 从不编辑状态文件，也从不手动执行内部阶段。需要不�
 | `--mode chinese\|bilingual` | 是 | 强制输出形式。模式跟着来源文字走（中文文字对应 `chinese`，英文文字对应 `bilingual`），所以这个参数实际上决定用哪条字幕轨：英文视频上，`bilingual` 即使有人工中文字幕也用英文字幕，`chinese` 用人工中文字幕。从 `source` 起重做后面所有阶段。 |
 | `--from <阶段>` | 否 | 把该阶段及之后的阶段标为未完成，然后运行。用于恢复和调试。 |
 | `--stage plan` | 否 | 做完 `plan` 就停：免费的路由检查。 |
-| `--max-seconds <n>` | 否 | n 秒后不再开始新的阶段或新一轮窗口，返回 `in_progress`。 |
+| `--max-seconds <n>` | 否 | n 秒后、且本次调用至少完成了一个阶段或一轮窗口时，不再开始新的阶段或新一轮窗口，返回 `in_progress`。 |
 | `--restart` | 否 | 删除工作目录（包括保存的覆盖参数），从头开始。 |
 
 这些是 agent 的逃生口。用户说"这个用 Deepgram"或"只要中文"，对应的是一个参数，而不是手动执行几步。无法满足的组合（中文视频上用 `--mode bilingual`，没有人工中文字幕的英文视频上用 `--mode chinese`，没有可信字幕轨时用 `--source subtitles`）返回 `failed`，原因是 `override_not_applicable`；不做任何猜测。
