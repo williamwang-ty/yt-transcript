@@ -4,6 +4,7 @@ from tests.regression_agent_cli import AgentCliRegressionTests
 from tests.regression_core import CoreRegressionTests
 from tests.regression_e2e import EndToEndFixtureTests
 from tests.regression_language import LanguageRegressionTests
+from tests.regression_run import RunCommandTests
 from tests.regression_runtime import RuntimeRegressionTests
 from tests.regression_window import (
     WindowBilingualTests,
@@ -20,6 +21,7 @@ __all__ = [
     "CoreRegressionTests",
     "EndToEndFixtureTests",
     "LanguageRegressionTests",
+    "RunCommandTests",
     "RuntimeRegressionTests",
     "WindowBilingualTests",
     "WindowCueSplitTests",

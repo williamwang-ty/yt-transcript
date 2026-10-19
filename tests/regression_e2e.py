@@ -1,9 +1,10 @@
 """End-to-end regression over recorded fixtures (no network, no real LLM or Deepgram).
 
-Each case runs `scripts/run_regression.py --fixtures tests/fixtures/e2e` in a
-copy of the skill with an empty config, so a local config.yaml cannot change
-routing or the LLM backend. The fakes are in tests/e2e/ and tests/fake_llm.py;
-fixtures are recorded with tests/e2e/record_fixtures.py.
+Each case runs `scripts/run_regression.py --fixtures tests/fixtures/e2e`
+(which calls `yt_transcript_utils.py run`) in a copy of the skill with an
+empty config, so a local config.yaml cannot change routing or the LLM
+backend. The fakes are in tests/e2e/ and tests/fake_llm.py; fixtures are
+recorded with tests/e2e/record_fixtures.py.
 
 The observed behaviour of every case is compared with
 tests/fixtures/e2e/baseline.json. After an intended change, regenerate it with
@@ -24,6 +25,7 @@ import unittest
 from pathlib import Path
 
 from kernel.long_text import agent_cli as _agent_cli
+from kernel.pipeline import STAGES
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 FIXTURES = PROJECT_ROOT / "tests" / "fixtures" / "e2e"
@@ -170,9 +172,13 @@ class EndToEndFixtureTests(unittest.TestCase):
                 result = self.results[vid]
                 item, vdir = result["report"], result["vdir"]
                 self.assertEqual("ok", item["status"], f"{item.get('error')}\n{result['stderr'][-2000:]}")
-                for name in (f"{vid}_raw_text.txt", f"{vid}_segments.json", f"{vid}_optimized.txt",
-                             "verify_quality.json", "plan.json"):
-                    self.assertTrue((vdir / name).is_file(), name)
+                state = json.loads((vdir / "state.json").read_text(encoding="utf-8"))
+                self.assertEqual("done", state["status"])
+                self.assertEqual(STAGES, tuple(state["stages"]))
+                self.assertTrue(all(stage["status"] == "done" for stage in state["stages"].values()))
+                # The cleanup stage leaves only state.json in the video's work dir.
+                self.assertEqual(["state.json"], sorted(p.name for p in (vdir.parent / "work" / vid).iterdir()))
+                self.assertEqual(vdir / "output" / item["output_file"], Path(state["output_file"]))
                 self.assertTrue(item["verify"]["passed"])
                 self.assertEqual([], item["verify"]["hard_failures"])
                 self.assertNotIn("unexpected", result["observed"]["llm_calls"])

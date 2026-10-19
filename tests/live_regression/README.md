@@ -1,9 +1,9 @@
 # Live regression set
 
 `videos.json` lists real YouTube videos that cover the subtitle cases the
-pipeline has to handle. `scripts/run_regression.py` runs the scripted pipeline
-on each one and writes a report, so a change can be compared with the run
-before it.
+pipeline has to handle. `scripts/run_regression.py` runs
+`yt_transcript_utils.py run` on each one and writes a report, so a change can
+be compared with the run before it.
 
 | Case | Videos |
 |---|---|
@@ -23,41 +23,43 @@ that language, or `auto` detection when the metadata has none.
 video's yt-dlp metadata so the unit tests cover the same cases offline.
 
 The selected source is not fully deterministic. When YouTube rate-limits a
-preferred track, `download.sh` falls back to the next trusted one (for example
-nmgFG7PUHfo from manual `en` to the English ASR track). The Notes column lists
-blocked tracks, and `--compare` labels a source change as flaky when a track
-was blocked in either run.
+preferred track, `run` stops with `needs_user` (reason `rate_limited`) and
+names the fallback track; the regression runner then accepts that track with
+`--mode` (for example nmgFG7PUHfo from manual `en` to the English ASR track),
+as the agent-driven flow used to do silently. The Notes column lists blocked
+tracks, and `--compare` labels a source change as flaky when a track was
+blocked in either run.
 
-When `plan-optimization` rates the subtitles critical and recommends Deepgram,
-the full stage follows it like the skill does: it transcribes the audio and plans again, and Notes says
-`rerouted from ...`. With `--no-deepgram` the video stops with status
-`rerouted` instead of sending those subtitles to the LLM. The plan stage only
-records the recommendation.
+When the `source` stage rates the subtitles critical, `run` switches to
+Deepgram before any LLM call, and Notes says `rerouted from ...`. With
+`--stage plan` or `--no-deepgram` Deepgram never runs: such a video ends with
+status `rerouted`, and a video without usable subtitles with `skipped`.
 
 ## Running
 
-Run from the skill root, with a working `config.yaml` (LLM key, and a
-Deepgram key for the no-subtitle videos):
+Run from the skill root. The runs use the skill's `config.yaml` unless
+`--config-path` names another one (for example a temporary config whose
+`llm_agent_cli` picks a cheaper model). A Deepgram key is needed only for the
+no-subtitle videos.
 
 ```bash
-# Free: subtitle selection + routing plan only (Deepgram still runs for no-subtitle videos unless --no-deepgram)
-python3 scripts/run_regression.py --stage plan --no-deepgram
+# Free: subtitle selection, subtitle quality and the text plan (`run --stage plan`; no LLM, no Deepgram)
+python3 scripts/run_regression.py --stage plan
 
-# Full: chunked LLM optimization + merge + verify-quality (paid)
+# Full: `run` to the finished article (paid)
 python3 scripts/run_regression.py
+
+# Full, but stop where a video would need Deepgram
+python3 scripts/run_regression.py --no-deepgram --config-path /tmp/regression_config.yaml
 
 # One video, compared with an earlier run
 python3 scripts/run_regression.py --only H_peyIigkkc --compare /tmp/yt_regression/<earlier>/report.json
 ```
 
-Each run writes `/tmp/yt_regression/<timestamp>/report.md`, `report.json`, and
-one folder per video with every intermediate file (including a copy of the
-selected subtitle track) and a log per command. `download.sh` itself still
-downloads into `/tmp/<video_id>_downloads` and clears that folder first, so
-don't run the regression set while a real transcription of one of these
-videos is in progress. The
-exit code is non-zero when any video errors or fails `verify-quality`.
-
-The full stage always uses the chunked path (`process-chunks` + `merge-content`),
-even when `plan-optimization` says `video_path=short`, because the short path is
-in-agent prompting that a script cannot reproduce. Both paths use the same prompts.
+Each run writes `/tmp/yt_regression/<timestamp>/report.md`, `report.json`, a
+work root `work/` with each video's `state.json`, and one folder per video
+with the run log (`run.log`), the last result (`result.json`), a copy of
+`state.json` and the article (`output/`). The runs use their own work root and
+output folder, so a real transcription of the same video is not disturbed
+and nothing is written to the configured `output_dir`. The exit code is
+non-zero when any video errors or fails the quality check.

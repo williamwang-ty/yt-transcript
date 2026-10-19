@@ -49,6 +49,9 @@ Commands:
     find-unfinished                List interrupted runs whose state and work files are kept for resume
     subtitle-info                  Detect the spoken language and pick subtitle candidates from yt-dlp metadata on stdin
     plan-optimization <state_path> Generate a structured optimization plan from workflow state
+    run <url>                      Run or continue the whole pipeline for one video (state.json per video)
+    status [video_id]              Show the runs under the work root, or one video's state.json
+    cleanup <video_id>             Remove a video's work directory (--force for an unfinished run)
 
 Global flags:
     --api-envelope               Emit stable `yt_transcript.command_result/v1` envelopes for kernel commands
@@ -58,6 +61,7 @@ from __future__ import annotations
 
 import argparse
 import bisect
+import contextlib
 import hashlib
 import http.client
 import json
@@ -6081,6 +6085,10 @@ def normalize_document(state_ref: str, output_path: str = "", prefer: str = "aut
     compat = sync_result["compat_fields"]
     machine_state_path = sync_result["machine_state_path"]
     machine_state = _read_machine_state(machine_state_path)
+    state_paths = {
+        "machine_state_path": machine_state_path,
+        "legacy_state_path": sync_result["legacy_state_path"],
+    }
     document_id = str(compat.get("vid", machine_state.get("document_id", ""))).strip()
     normalized_document_path = str(output_path or _default_normalized_document_path(document_id)).strip()
     if not document_id:
@@ -6088,8 +6096,7 @@ def normalize_document(state_ref: str, output_path: str = "", prefer: str = "aut
             "passed": False,
             "warnings": [],
             "hard_failures": ["Missing document id for normalization"],
-            "machine_state_path": machine_state_path,
-            "legacy_state_path": sync_result["legacy_state_path"],
+            **state_paths,
             "normalized_document_path": normalized_document_path,
             "materialized": False,
         }
@@ -6100,8 +6107,7 @@ def normalize_document(state_ref: str, output_path: str = "", prefer: str = "aut
             "passed": False,
             "warnings": [],
             "hard_failures": [f"Unsupported normalization preference: {prefer}"],
-            "machine_state_path": machine_state_path,
-            "legacy_state_path": sync_result["legacy_state_path"],
+            **state_paths,
             "normalized_document_path": normalized_document_path,
             "materialized": False,
         }
@@ -6111,21 +6117,73 @@ def normalize_document(state_ref: str, output_path: str = "", prefer: str = "aut
     segments_path = str(compat.get("segments_path") or machine_artifacts.get("segments_path") or f"/tmp/{document_id}_segments.json").strip()
     normalized_document_path = str(output_path or machine_artifacts.get("normalized_document") or normalized_document_path).strip()
 
+    result = build_normalized_document(
+        document_id=document_id,
+        raw_text_path=raw_text_path,
+        segments_path=segments_path,
+        normalized_document_path=normalized_document_path,
+        source_payload=machine_state.get("source", {}),
+        workflow_payload=machine_state.get("workflow", {}),
+        prefer=preference,
+        allow_missing=allow_missing,
+        recorded_mode=compat.get("mode", ""),
+    )
+    if result.get("materialized"):
+        _update_machine_state_normalization(
+            machine_state_path,
+            normalized_document_path=normalized_document_path,
+            source_adapter=result["source_adapter"],
+            preferred_chunk_source=result["preferred_chunk_source"],
+            segment_count=result["segment_count"],
+            char_count=result["char_count"],
+            raw_text_path=result["raw_text_path"],
+            segments_path=result["segments_path"],
+        )
+    result.pop("raw_text_path", None)
+    result.pop("segments_path", None)
+    return {**result, **state_paths}
+
+
+def build_normalized_document(*, document_id: str, raw_text_path: str, segments_path: str,
+                              normalized_document_path: str, source_payload: dict | None = None,
+                              workflow_payload: dict | None = None, prefer: str = "auto",
+                              allow_missing: bool = False, recorded_mode: str = "") -> dict:
+    """Write the normalized document from a raw text file and/or a segments file.
+
+    `source_payload` says where the text came from (`type` youtube or deepgram,
+    `subtitle_source`, title, channel, ...) and `workflow_payload` carries the
+    output `mode`; together they decide how the text is cleaned, whether
+    chunking prefers text over timed segments, and whether the subtitle
+    quality score applies. `recorded_mode` is the document's `workflow.mode`
+    when `workflow_payload` has none (state.md's mode in the legacy path).
+    The result also names the raw text and segments files that were actually
+    used (`raw_text_path`, `segments_path`).
+    """
+    source_payload = source_payload if isinstance(source_payload, dict) else {}
+    workflow_payload = workflow_payload if isinstance(workflow_payload, dict) else {}
+
+    def failure(message: str) -> dict:
+        return {
+            "passed": False,
+            "warnings": [],
+            "hard_failures": [message],
+            "normalized_document_path": normalized_document_path,
+            "materialized": False,
+        }
+
+    if not document_id:
+        return failure("Missing document id for normalization")
+    preference = str(prefer or "auto").strip().lower()
+    if preference not in {"auto", "segments", "raw_text"}:
+        return failure(f"Unsupported normalization preference: {prefer}")
+
     raw_text_file = Path(raw_text_path) if raw_text_path else None
     segments_file = Path(segments_path) if segments_path else None
     use_segments = False
     if preference in {"auto", "segments"} and segments_file and segments_file.exists():
         use_segments = True
     elif preference == "segments":
-        return {
-            "passed": False,
-            "warnings": [],
-            "hard_failures": [f"Segments artifact not found: {segments_path}"],
-            "machine_state_path": machine_state_path,
-            "legacy_state_path": sync_result["legacy_state_path"],
-            "normalized_document_path": normalized_document_path,
-            "materialized": False,
-        }
+        return failure(f"Segments artifact not found: {segments_path}")
 
     if not use_segments and not (raw_text_file and raw_text_file.exists()):
         if allow_missing:
@@ -6133,26 +6191,14 @@ def normalize_document(state_ref: str, output_path: str = "", prefer: str = "aut
                 "passed": True,
                 "warnings": ["Normalization skipped: no raw text or segments artifact found"],
                 "hard_failures": [],
-                "machine_state_path": machine_state_path,
-                "legacy_state_path": sync_result["legacy_state_path"],
                 "normalized_document_path": normalized_document_path,
                 "materialized": False,
                 "source_adapter": "",
                 "preferred_chunk_source": "",
                 "segment_count": 0,
             }
-        return {
-            "passed": False,
-            "warnings": [],
-            "hard_failures": [f"Raw text artifact not found: {raw_text_path}"],
-            "machine_state_path": machine_state_path,
-            "legacy_state_path": sync_result["legacy_state_path"],
-            "normalized_document_path": normalized_document_path,
-            "materialized": False,
-        }
+        return failure(f"Raw text artifact not found: {raw_text_path}")
 
-    source_payload = machine_state.get("source", {}) if isinstance(machine_state.get("source", {}), dict) else {}
-    workflow_payload = machine_state.get("workflow", {}) if isinstance(machine_state.get("workflow", {}), dict) else {}
     prefer_text_chunking = _prefer_text_chunking_for_source(source_payload, workflow_payload)
 
     normalized_segments = []
@@ -6166,25 +6212,9 @@ def normalize_document(state_ref: str, output_path: str = "", prefer: str = "aut
         try:
             payload = json.loads(segments_file.read_text(encoding="utf-8"))
         except Exception as e:
-            return {
-                "passed": False,
-                "warnings": [],
-                "hard_failures": [f"Cannot read segments artifact: {e}"],
-                "machine_state_path": machine_state_path,
-                "legacy_state_path": sync_result["legacy_state_path"],
-                "normalized_document_path": normalized_document_path,
-                "materialized": False,
-            }
+            return failure(f"Cannot read segments artifact: {e}")
         if not isinstance(payload, dict) or not isinstance(payload.get("segments", []), list):
-            return {
-                "passed": False,
-                "warnings": [],
-                "hard_failures": ["Segments artifact must be a JSON object with a segments list"],
-                "machine_state_path": machine_state_path,
-                "legacy_state_path": sync_result["legacy_state_path"],
-                "normalized_document_path": normalized_document_path,
-                "materialized": False,
-            }
+            return failure("Segments artifact must be a JSON object with a segments list")
         payload_diagnostics = payload.get("diagnostics", {}) if isinstance(payload.get("diagnostics", {}), dict) else {}
         if _is_youtube_subtitle_source(source_payload) or str(payload.get("source", "")).strip().lower() == "vtt":
             cleanup_diagnostics = payload_diagnostics
@@ -6224,16 +6254,10 @@ def normalize_document(state_ref: str, output_path: str = "", prefer: str = "aut
                 source_payload,
             )
         except Exception as e:
-            return {
-                "passed": False,
-                "warnings": [],
-                "hard_failures": [f"Cannot read raw text artifact: {e}"],
-                "machine_state_path": machine_state_path,
-                "legacy_state_path": sync_result["legacy_state_path"],
-                "normalized_document_path": normalized_document_path,
-                "materialized": False,
-            }
+            return failure(f"Cannot read raw text artifact: {e}")
 
+    used_raw_text = raw_text_path if raw_text_file and raw_text_file.exists() else ""
+    used_segments = segments_path if segments_file and segments_file.exists() else ""
     normalized_doc = {
         "schema_version": NORMALIZED_DOCUMENT_SCHEMA_VERSION,
         "format": NORMALIZED_DOCUMENT_FORMAT,
@@ -6251,11 +6275,11 @@ def normalize_document(state_ref: str, output_path: str = "", prefer: str = "aut
             "subtitle_source": source_payload.get("subtitle_source", ""),
         },
         "workflow": {
-            "mode": workflow_payload.get("mode", compat.get("mode", "")),
+            "mode": workflow_payload.get("mode", recorded_mode),
         },
         "artifacts": {
-            "raw_text": raw_text_path if raw_text_file and raw_text_file.exists() else "",
-            "segments_path": segments_path if segments_file and segments_file.exists() else "",
+            "raw_text": used_raw_text,
+            "segments_path": used_segments,
             "normalized_document": normalized_document_path,
         },
         "content": {
@@ -6282,22 +6306,10 @@ def normalize_document(state_ref: str, output_path: str = "", prefer: str = "aut
         if subtitle_quality.get("applicable"):
             normalized_doc["diagnostics"]["subtitle_quality"] = subtitle_quality
     _atomic_write_text(Path(normalized_document_path), json.dumps(normalized_doc, ensure_ascii=False, indent=2))
-    _update_machine_state_normalization(
-        machine_state_path,
-        normalized_document_path=normalized_document_path,
-        source_adapter=source_adapter,
-        preferred_chunk_source=preferred_chunk_source,
-        segment_count=len(normalized_segments),
-        char_count=len(normalized_text),
-        raw_text_path=raw_text_path if raw_text_file and raw_text_file.exists() else "",
-        segments_path=segments_path if segments_file and segments_file.exists() else "",
-    )
     return {
         "passed": True,
         "warnings": warnings,
         "hard_failures": [],
-        "machine_state_path": machine_state_path,
-        "legacy_state_path": sync_result["legacy_state_path"],
         "normalized_document_path": normalized_document_path,
         "materialized": True,
         "source_adapter": source_adapter,
@@ -6307,6 +6319,8 @@ def normalize_document(state_ref: str, output_path: str = "", prefer: str = "aut
         "char_count": len(normalized_text),
         "cleanup_diagnostics": cleanup_diagnostics,
         "subtitle_quality": subtitle_quality,
+        "raw_text_path": used_raw_text,
+        "segments_path": used_segments,
     }
 
 
@@ -6570,15 +6584,41 @@ def plan_optimization(state_path: str) -> dict:
         duration = int(state.get("duration", "0") or 0)
     except ValueError:
         duration = 0
-
-    mode = state.get("mode", "")
-    source = state.get("src", "")
-    work_dir = state.get("work_dir", "/tmp/unknown_chunks")
     video_id = state.get("vid", "")
-    planner_config = load_config(None, allow_missing=True)
+    plan = plan_text_operations(
+        video_id=video_id,
+        duration=duration,
+        mode=state.get("mode", ""),
+        source=state.get("src", ""),
+        normalization=normalization,
+        raw_text_path=str(state.get("raw_text", "") or f"/tmp/{video_id}_raw_text.txt"),
+        segments_path=str(state.get("segments_path", "") or f"/tmp/{video_id}_segments.json"),
+        work_dir=state.get("work_dir", "/tmp/unknown_chunks"),
+        structured_text=str(state.get("structured_text", "") or f"/tmp/{video_id}_structured.txt"),
+        optimized_text=str(state.get("optimized_text", "") or f"/tmp/{video_id}_optimized.txt"),
+        config=load_config(None, allow_missing=True),
+    )
+    return {
+        "passed": True,
+        "machine_state_path": validation.get("machine_state_path", ""),
+        "legacy_state_path": validation.get("legacy_state_path", ""),
+        **plan,
+    }
+
+
+def plan_text_operations(*, video_id: str, duration: int, mode: str, source: str, normalization: dict,
+                         raw_text_path: str, segments_path: str, work_dir: str, structured_text: str,
+                         optimized_text: str, config: dict | None = None) -> dict:
+    """Choose the text operations for a source and estimate their size.
+
+    `normalization` is the result of `build_normalized_document` (or
+    `normalize_document`) for that source; `source` is youtube or deepgram and
+    `mode` chinese or bilingual. Returns the plan fields of `plan-optimization`.
+    """
+    planner_config = config or {}
     bilingual_quality_gate = mode == "bilingual"
     duration_bucket = "long" if duration >= 1800 else "short"
-    raw_text_output = str(state.get("raw_text", "") or f"/tmp/{video_id}_raw_text.txt")
+    raw_text_output = raw_text_path
     estimated_input_tokens, estimated_input_chars = _estimate_single_pass_input_tokens(
         normalization.get("normalized_document_path", ""),
         raw_text_output,
@@ -6622,8 +6662,8 @@ def plan_optimization(state_path: str) -> dict:
 
     outputs = {
         "raw_text": raw_text_output,
-        "structured_text": str(state.get("structured_text", "") or f"/tmp/{video_id}_structured.txt"),
-        "optimized_text": str(state.get("optimized_text", "") or f"/tmp/{video_id}_optimized.txt"),
+        "structured_text": structured_text,
+        "optimized_text": optimized_text,
         "normalized_document": normalization.get("normalized_document_path", ""),
         "work_dir": work_dir,
     }
@@ -6719,7 +6759,7 @@ def plan_optimization(state_path: str) -> dict:
                 }
             )
 
-    chunk_driver = "chunk-document" if normalization.get("materialized") else ("chunk-segments" if Path(str(state.get("segments_path", "") or f"/tmp/{video_id}_segments.json")).exists() else "chunk-text")
+    chunk_driver = "chunk-document" if normalization.get("materialized") else ("chunk-segments" if Path(str(segments_path or "")).exists() else "chunk-text")
     chunking = {
         "driver": chunk_driver,
         "normalized_document_path": normalization.get("normalized_document_path", ""),
@@ -6729,9 +6769,6 @@ def plan_optimization(state_path: str) -> dict:
     }
 
     return {
-        "passed": True,
-        "machine_state_path": validation.get("machine_state_path", ""),
-        "legacy_state_path": validation.get("legacy_state_path", ""),
         "checks": {
             "state_stage": "post-source",
             "duration": duration,
@@ -7602,6 +7639,41 @@ def main():
     )
     plan_parser.add_argument('state_path', help='Path to state markdown file')
 
+    # run command
+    from kernel import pipeline as kernel_pipeline
+    run_parser = subparsers.add_parser(
+        'run',
+        help='Run or continue the whole pipeline for one video (one JSON result, fixed exit codes)'
+    )
+    run_parser.add_argument('url', help='YouTube video URL (or an 11-character video id)')
+    run_parser.add_argument('--source', choices=['subtitles', 'deepgram'], default=None,
+                            help='Force the text source; remembered for later reruns of this video')
+    run_parser.add_argument('--mode', choices=['chinese', 'bilingual'], default=None,
+                            help='Force the article mode; remembered for later reruns of this video')
+    run_parser.add_argument('--from', dest='from_stage', choices=list(kernel_pipeline.STAGES), default=None,
+                            help='Redo this stage and every later one')
+    run_parser.add_argument('--stage', choices=[kernel_pipeline.PLAN_STAGE], default=None,
+                            help='Stop after the plan stage (routing check; no LLM, no Deepgram)')
+    run_parser.add_argument('--max-seconds', type=float, default=None,
+                            help='Return in_progress at the next safe point after this many seconds')
+    run_parser.add_argument('--restart', action='store_true', help="Discard this video's work directory first")
+    run_parser.add_argument('--config-path', default=None, help='Path to config.yaml')
+
+    # status command
+    status_parser = subparsers.add_parser(
+        'status',
+        help='Show the runs under the work root, or one video\'s state.json'
+    )
+    status_parser.add_argument('video_id', nargs='?', default='', help='Video id (omit to list every run)')
+
+    # cleanup command
+    cleanup_parser = subparsers.add_parser(
+        'cleanup',
+        help="Remove a video's work directory (an unfinished run needs --force)"
+    )
+    cleanup_parser.add_argument('video_id', help='Video id')
+    cleanup_parser.add_argument('--force', action='store_true', help='Also remove an unfinished run')
+
     args = parser.parse_args()
 
     if args.command == 'parse-vtt':
@@ -8046,6 +8118,34 @@ def main():
         print(json.dumps(envelope if args.api_envelope else result, ensure_ascii=False))
         if not result['passed']:
             sys.exit(1)
+
+    elif args.command == 'run':
+        # Progress goes to stderr; stdout carries exactly one JSON result.
+        stderr_tail = kernel_pipeline._StderrTail(sys.stderr)
+        with contextlib.redirect_stderr(stderr_tail), contextlib.redirect_stdout(stderr_tail):
+            result, code = kernel_pipeline.run(
+                args.url,
+                source=args.source,
+                mode=args.mode,
+                from_stage=args.from_stage,
+                stage=args.stage,
+                max_seconds=args.max_seconds,
+                restart=args.restart,
+                config_path=args.config_path,
+                stderr_tail=stderr_tail,
+            )
+        print(json.dumps(result, ensure_ascii=False))
+        sys.exit(code)
+
+    elif args.command == 'status':
+        result, code = kernel_pipeline.status(args.video_id)
+        print(json.dumps(result, ensure_ascii=False))
+        sys.exit(code)
+
+    elif args.command == 'cleanup':
+        result, code = kernel_pipeline.cleanup(args.video_id, force=args.force)
+        print(json.dumps(result, ensure_ascii=False))
+        sys.exit(code)
 
     else:
         parser.print_help()

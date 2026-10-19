@@ -36,6 +36,12 @@ YTDLP_DEFAULT_RETRIES=1
 YTDLP_DEFAULT_EXTRACTOR_RETRIES=1
 METADATA_JSON_CACHE=""
 METADATA_JSON_LOADED=false
+# Set by `yt_transcript_utils.py run`: cache file for the `yt-dlp -J` metadata,
+# the folder that holds subtitles/ and audio/, and the output mode whose
+# subtitle tracks may be used (chinese | bilingual; empty means any).
+YT_TRANSCRIPT_INFO_JSON="${YT_TRANSCRIPT_INFO_JSON:-}"
+YT_TRANSCRIPT_DOWNLOAD_DIR="${YT_TRANSCRIPT_DOWNLOAD_DIR:-}"
+YT_TRANSCRIPT_SUBTITLE_MODE="${YT_TRANSCRIPT_SUBTITLE_MODE:-}"
 
 if [ -n "$CONFIG_JSON" ]; then
     if [ -z "$YT_DLP_SOCKET_TIMEOUT_SEC" ]; then
@@ -368,9 +374,19 @@ video_id_for_url() {
 }
 
 # Fetch `yt-dlp -J` metadata once per invocation and reuse it inside the script.
+# With YT_TRANSCRIPT_INFO_JSON set, the metadata is read from that file when it
+# exists, and saved there after a fetch, so one run calls `yt-dlp -J` once.
 metadata_json_for_url() {
     if [ "$METADATA_JSON_LOADED" != true ]; then
-        METADATA_JSON_CACHE=$(yt_dlp -J "$VIDEO_URL" 2>/dev/null || true)
+        if [ -n "$YT_TRANSCRIPT_INFO_JSON" ] && [ -s "$YT_TRANSCRIPT_INFO_JSON" ]; then
+            METADATA_JSON_CACHE=$(cat "$YT_TRANSCRIPT_INFO_JSON")
+        else
+            METADATA_JSON_CACHE=$(yt_dlp -J "$VIDEO_URL" 2>/dev/null || true)
+            if [ -n "$YT_TRANSCRIPT_INFO_JSON" ] && [ -n "$METADATA_JSON_CACHE" ]; then
+                printf '%s' "$METADATA_JSON_CACHE" > "${YT_TRANSCRIPT_INFO_JSON}.tmp"
+                mv "${YT_TRANSCRIPT_INFO_JSON}.tmp" "$YT_TRANSCRIPT_INFO_JSON"
+            fi
+        fi
         METADATA_JSON_LOADED=true
     fi
     printf '%s' "$METADATA_JSON_CACHE"
@@ -444,7 +460,11 @@ require_valid_video_id() {
 # Compute the work directory used for one video download/transcription job.
 download_root_for_video() {
     local video_id="$1"
-    printf '/tmp/%s_downloads' "$video_id"
+    if [ -n "$YT_TRANSCRIPT_DOWNLOAD_DIR" ]; then
+        printf '%s' "$YT_TRANSCRIPT_DOWNLOAD_DIR"
+    else
+        printf '/tmp/%s_downloads' "$video_id"
+    fi
 }
 
 # Reset the download directory so one acquisition mode starts from clean state.
@@ -628,11 +648,14 @@ import os
 import sys
 
 sub_info = json.loads(os.environ['SUB_INFO_JSON'])
+wanted_mode = os.environ.get('YT_TRANSCRIPT_SUBTITLE_MODE', '').strip()
 candidates = []
 for candidate in sub_info.get('listed_candidates', []):
     language = str(candidate.get('language', '') or '').strip()
     mode = str(candidate.get('mode', '') or '').strip()
     source_kind = str(candidate.get('source_kind', '') or '').strip()
+    if wanted_mode and mode != wanted_mode:
+        continue
     if language and mode and source_kind:
         candidates.append({
             "language": language,

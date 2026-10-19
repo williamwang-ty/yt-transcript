@@ -1,25 +1,27 @@
 #!/usr/bin/env python3
 """Live regression runner for yt-transcript.
 
-Runs the scripted pipeline on a fixed set of real YouTube videos and writes a
-report so behaviour can be compared before and after a change.
+Runs `yt_transcript_utils.py run` on a fixed set of real YouTube videos and
+writes a report so behaviour can be compared before and after a change.
 
 Stages (pick with --stage):
-    source    metadata, subtitle selection (or Deepgram), raw text + segments
-    plan      source + validate-state + plan-optimization (no paid API calls
-              unless a video needs Deepgram)
-    full      plan + chunked LLM optimization + merge + verify-quality +
-              assemble-final (default)
+    plan      `run --stage plan`: metadata, subtitle selection, subtitle
+              quality, normalization and the text plan. No LLM requests and
+              no Deepgram; a video that needs audio transcription is reported
+              as skipped (no usable subtitles) or rerouted (subtitle quality).
+    full      `run` to the finished article (default). With --no-deepgram it
+              runs `--stage plan` first and stops there when the route needs
+              Deepgram.
 
-The full stage always runs the chunked path (chunk-document/segments/text,
-process-chunks, merge-content), even when plan-optimization says
-video_path=short. The short path is in-agent prompting, which a script cannot
-reproduce; the chunked path is its scripted equivalent and uses the same prompts.
+Every run uses its own work root (<out-dir>/work) and writes the article to
+<out-dir>/<video_id>/output, so it never touches /tmp/yt-transcript or the
+configured output_dir.
 
 Usage:
     python3 scripts/run_regression.py
     python3 scripts/run_regression.py --stage plan --only H_peyIigkkc
     python3 scripts/run_regression.py --compare /tmp/yt_regression/<old>/report.json
+    python3 scripts/run_regression.py --config-path /tmp/regression_config.yaml
     python3 scripts/run_regression.py --fixtures tests/fixtures/e2e
 
 --fixtures replays recorded videos offline (see tests/e2e/): a fake yt-dlp
@@ -29,7 +31,8 @@ Every other step runs the real code. tests/regression_e2e.py runs it in a
 copy of the skill with its own config.yaml.
 
 Each run writes <out-dir>/report.json, <out-dir>/report.md and one folder per
-video with every intermediate file and command output.
+video with the run log (run.log), the last result (result.json), the final
+state.json and the article.
 """
 
 from __future__ import annotations
@@ -47,11 +50,13 @@ from pathlib import Path
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
 UTILS = ROOT_DIR / "yt_transcript_utils.py"
-DOWNLOAD_SH = ROOT_DIR / "scripts" / "download.sh"
 DEFAULT_VIDEOS = ROOT_DIR / "tests" / "live_regression" / "videos.json"
 E2E_DIR = ROOT_DIR / "tests" / "e2e"
 FAKE_LLM = ROOT_DIR / "tests" / "fake_llm.py"
-STAGES = ("source", "plan", "full")
+STAGES = ("plan", "full")
+# Same names as kernel/pipeline.py; this script only talks to the CLI.
+WORK_ROOT_ENV = "YT_TRANSCRIPT_WORK_ROOT"
+OUTPUT_DIR_ENV = "YT_TRANSCRIPT_OUTPUT_DIR"
 
 # verify-quality checks worth tracking across runs.
 TRACKED_CHECKS = (
@@ -68,28 +73,20 @@ TRACKED_CHECKS = (
     "semantic_missing_count",
 )
 
-
-class UnsupportedLanguage(RuntimeError):
-    """The video is spoken in a language the pipeline does not support yet."""
-
-
-class StepError(RuntimeError):
-    """A pipeline step failed; the message is shown in the report."""
-
-
-# Environment for every command; fixture mode adds the fakes (see fixture_env).
+# Environment for every run; fixture mode adds the fakes (see fixture_env).
 CMD_ENV: dict | None = None
-# Fixture mode: transcribe-deepgram goes through tests/e2e/fake_deepgram.py.
+# Fixture mode: `run` goes through tests/e2e/fake_deepgram.py.
 FIXTURE_MODE = False
-# Extra args for the commands that read config.yaml for LLM settings.
+# --config-path for every run (fixture mode writes its own config).
 CONFIG_ARGS: list[str] = []
 
 
 def write_fixture_config(path: Path) -> None:
-    """Config for fixture runs: the LLM is the fake agent CLI, no API."""
+    """Config for fixture runs: the LLM is the fake agent CLI, no API; Deepgram is faked."""
     path.write_text(
         "llm_backend: auto\n"
-        f"llm_agent_cli: {json.dumps(shlex.join([sys.executable, str(FAKE_LLM)]))}\n",
+        f"llm_agent_cli: {json.dumps(shlex.join([sys.executable, str(FAKE_LLM)]))}\n"
+        "deepgram_api_key: fixture\n",
         encoding="utf-8",
     )
 
@@ -103,75 +100,150 @@ def fixture_env(fixtures_dir: Path) -> dict:
     return env
 
 
-def run_cmd(args: list[str], log_path: Path, timeout: int, ok_codes: tuple[int, ...] = (0,)) -> str:
-    """Run a command, save stdout/stderr to log_path, return stdout."""
+def run_args(url: str, *extra: str) -> list[str]:
+    script = E2E_DIR / "fake_deepgram.py" if FIXTURE_MODE else UTILS
+    return [sys.executable, str(script), "run", url, *extra, *CONFIG_ARGS]
+
+
+def call_run(args: list[str], log_path: Path, env: dict, timeout: int) -> dict:
+    """Run one `run` call, append its output to log_path, return its JSON result."""
     started = time.monotonic()
+    with log_path.open("a", encoding="utf-8") as log:
+        log.write(f"$ {shlex.join(args)}\n")
+        try:
+            proc = subprocess.run(args, cwd=ROOT_DIR, capture_output=True, text=True, timeout=timeout, env=env)
+        except subprocess.TimeoutExpired as exc:
+            stderr = exc.stderr.decode("utf-8", "replace") if isinstance(exc.stderr, bytes) else (exc.stderr or "")
+            log.write(f"TIMEOUT after {timeout}s\n{stderr}\n")
+            return {"status": "failed", "reason": "timeout", "message": f"run timed out after {timeout}s"}
+        log.write(f"# exit={proc.returncode} elapsed={time.monotonic() - started:.1f}s\n"
+                  f"## stdout\n{proc.stdout}\n## stderr\n{proc.stderr}\n")
+    lines = proc.stdout.strip().splitlines()
     try:
-        proc = subprocess.run(
-            args, cwd=ROOT_DIR, capture_output=True, text=True, timeout=timeout, env=CMD_ENV,
-        )
-    except subprocess.TimeoutExpired as exc:
-        stderr = exc.stderr.decode("utf-8", "replace") if isinstance(exc.stderr, bytes) else (exc.stderr or "")
-        log_path.write_text(f"$ {' '.join(args)}\nTIMEOUT after {timeout}s\n{stderr}", encoding="utf-8")
-        raise StepError(f"{log_path.stem} timed out after {timeout}s")
-    elapsed = time.monotonic() - started
-    log_path.write_text(
-        f"$ {' '.join(args)}\n# exit={proc.returncode} elapsed={elapsed:.1f}s\n"
-        f"## stdout\n{proc.stdout}\n## stderr\n{proc.stderr}",
-        encoding="utf-8",
-    )
-    if proc.returncode not in ok_codes:
-        tail = (proc.stderr or proc.stdout).strip().splitlines()[-3:]
-        raise StepError(f"{log_path.stem} exited {proc.returncode}: {' | '.join(tail)}")
-    return proc.stdout
-
-
-def run_json(args: list[str], log_path: Path, timeout: int, ok_codes: tuple[int, ...] = (0,)) -> dict:
-    """Run a command whose stdout ends with a JSON object."""
-    out = run_cmd(args, log_path, timeout, ok_codes).strip()
-    start = out.find("{")
-    if start < 0:
-        raise StepError(f"{log_path.stem} printed no JSON")
-    try:
-        return json.loads(out[start:])
+        result = json.loads(lines[-1]) if lines else None
     except json.JSONDecodeError:
-        # Some helpers print progress lines before the JSON payload.
-        for line in reversed(out.splitlines()):
-            line = line.strip()
-            if line.startswith("{"):
-                try:
-                    return json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-        raise StepError(f"{log_path.stem} printed invalid JSON")
+        result = None
+    if not isinstance(result, dict):
+        tail = (proc.stderr or proc.stdout).strip().splitlines()[-3:]
+        return {"status": "failed", "reason": "no_result",
+                "message": f"run exited {proc.returncode} without a result: {' | '.join(tail)}"}
+    return result
 
 
-def utils(*args: str) -> list[str]:
-    return [sys.executable, str(UTILS), *args]
+def read_state(path: Path) -> dict:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
 
 
-def download(url: str, mode: str) -> list[str]:
-    return ["bash", str(DOWNLOAD_SH), url, mode]
+def needs_deepgram(state: dict) -> bool:
+    """The route needs audio transcription that has not run (plan-only runs stop there)."""
+    return (state.get("route") or {}).get("source") == "deepgram" \
+        and (state.get("stages") or {}).get("source", {}).get("status") != "done"
 
 
-def deepgram(*args: str) -> list[str]:
-    if FIXTURE_MODE:
-        return [sys.executable, str(E2E_DIR / "fake_deepgram.py"), "transcribe-deepgram", *args,
-                "--api-key", "fixture"]
-    return utils("transcribe-deepgram", *args)
+def track_case(language: str, kind: str) -> str:
+    family = "zh" if language.startswith("zh") else ("en" if language.startswith("en") else language)
+    return f"{family}_{kind}" if kind else family
 
 
-def iso_date(upload_date: str) -> str:
-    """yyyymmdd -> yyyy-mm-dd, the date format for output filenames."""
-    text = str(upload_date or "")
-    return f"{text[:4]}-{text[4:6]}-{text[6:8]}" if len(text) == 8 and text.isdigit() else text
+def report_item(video: dict, result: dict, state: dict, blocked: list[str] | None = None) -> dict:
+    """One report row from the last `run` result and the video's state.json.
 
+    `blocked` names preferred tracks YouTube refused before the run accepted
+    the fallback track (see run_video).
+    """
+    route = state.get("route") or {}
+    stages = state.get("stages") or {}
+    meta = state.get("metadata") or {}
+    item: dict = {
+        "id": video["id"],
+        "label": video.get("label", ""),
+        "expected_case": video.get("expected_case", ""),
+        "status": "",
+        "failed_step": "",
+        "error": "",
+        "timings_sec": {name: record["seconds"] for name, record in stages.items() if "seconds" in record},
+        "title": meta.get("title", ""),
+        "duration": meta.get("duration", 0),
+        "result": {key: result.get(key) for key in ("status", "stage", "reason") if key in result},
+        "route_reason": route.get("reason", ""),
+    }
+    rerouted = route.get("rerouted_from") or {}
+    skipped_audio = needs_deepgram(state)
+    if route.get("source") == "subtitles" or (skipped_audio and rerouted):
+        # A rerouted video that was not transcribed reports the subtitle track it checked.
+        track = rerouted if route.get("source") == "deepgram" else route
+        item["source"] = {
+            "src": "youtube",
+            "language": track.get("track") or "",
+            "kind": track.get("track_kind") or "",
+            "mode": track.get("mode") or "",
+            "fallback_used": route.get("fallback_used"),
+            # e.g. "zh-Hans:rate_limited"; a non-empty list means YouTube refused a
+            # preferred track this run, so the selected source can differ between runs.
+            "blocked": list(blocked or []) + list(route.get("blocked_tracks") or []),
+        }
+    elif route.get("source") == "deepgram":
+        item["source"] = {"src": "deepgram", "language": route.get("language") or "", "kind": "audio",
+                          "mode": route.get("mode") or ""}
+        item["source"].update(route.get("deepgram") or {})
+        if rerouted:
+            item["source"]["rerouted_from"] = track_case(str(rerouted.get("track") or ""),
+                                                         str(rerouted.get("track_kind") or ""))
+    if "raw_chars" in state:
+        item["raw_chars"] = state["raw_chars"]
 
-def write_state(path: Path, fields: dict) -> None:
-    lines = ["# State"]
-    lines += [f"{key}: {value}" for key, value in fields.items()]
-    lines += ["", "# Progress", "step: 3", "last_action: regression source ready"]
-    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    plan = (stages.get("plan") or {}).get("summary") or {}
+    if plan:
+        item["plan"] = {key: plan.get(key) for key in (
+            "video_path", "routing_reason", "subtitle_quality_score", "subtitle_quality_band",
+            "reroute_recommended", "reroute_target")}
+        item["plan"]["prompts"] = [task["prompt"] for task in plan.get("tasks", [])]
+        item["plan"]["warnings"] = plan.get("warnings", [])
+    elif rerouted:
+        quality = rerouted.get("subtitle_quality") or {}
+        item["plan"] = {"subtitle_quality_score": quality.get("score"), "subtitle_quality_band": quality.get("band"),
+                        "reroute_recommended": True, "reroute_target": "deepgram"}
+
+    tasks = (stages.get("text") or {}).get("tasks") or {}
+    if tasks:
+        item["llm_runs"] = [
+            {"prompt": prompt, "success": record.get("status") == "done",
+             **{key: record.get(key) for key in ("long_text_mode", "total_chunks", "processed_count", "failed_count")}}
+            for prompt, record in ((task["prompt"], tasks.get(task["prompt"], {})) for task in plan.get("tasks", []))
+        ]
+    verify = (stages.get("verify") or {}).get("summary") or {}
+    if verify:
+        checks = verify.get("checks") or {}
+        item["verify"] = {
+            "passed": verify.get("passed"),
+            "hard_failures": verify.get("hard_failures") or [],
+            "warnings": verify.get("warnings") or [],
+            "checks": {key: checks[key] for key in TRACKED_CHECKS if key in checks},
+        }
+    if state.get("output_file"):
+        item["output_file"] = Path(state["output_file"]).name
+    item["llm"] = state.get("llm") or {}
+
+    status = result.get("status")
+    if status == "done" and skipped_audio:
+        item["status"] = "rerouted" if rerouted else "skipped"
+        item["error"] = ("subtitle quality is critical; the route moves to Deepgram, which this run does not call"
+                         if rerouted else "no usable subtitles; the route needs Deepgram, which this run does not call")
+    elif status == "done":
+        item["status"] = "ok"
+    elif status == "failed" and result.get("reason") == "quality_hard_failure":
+        item["status"] = "quality_failed"
+    elif status == "unsupported":
+        item["status"] = "unsupported"
+        item["error"] = result.get("message", "")
+    else:
+        item["status"] = "error"
+        item["failed_step"] = result.get("stage", "")
+        item["error"] = f"{status} ({result.get('reason') or 'no reason'}): {result.get('message', '')}".rstrip(": ")
+    return item
 
 
 def run_video(video: dict, out_dir: Path, stage: str, allow_deepgram: bool, timeout: int) -> dict:
@@ -180,280 +252,32 @@ def run_video(video: dict, out_dir: Path, stage: str, allow_deepgram: bool, time
     vdir = out_dir / vid
     if vdir.exists():
         shutil.rmtree(vdir)
-    vdir.mkdir(parents=True)
-    logs = vdir / "logs"
-    logs.mkdir()
+    (vdir / "output").mkdir(parents=True)
+    env = dict(CMD_ENV or os.environ)
+    env[WORK_ROOT_ENV] = str(out_dir / "work")
+    env[OUTPUT_DIR_ENV] = str(vdir / "output")
+    log = vdir / "run.log"
+    state_path = out_dir / "work" / vid / "state.json"
 
-    result: dict = {
-        "id": vid,
-        "label": video.get("label", ""),
-        "expected_case": video.get("expected_case", ""),
-        "status": "running",
-        "failed_step": "",
-        "error": "",
-        "timings_sec": {},
-    }
+    plan_first = stage == "plan" or not allow_deepgram
+    plan_args = ["--stage", "plan"] if plan_first else []
+    result = call_run(run_args(url, "--restart", *plan_args), log, env, timeout)
+    blocked = []
+    if result.get("status") == "needs_user" and result.get("fallback_track"):
+        # YouTube refused the preferred track. Take the fallback as the agent-driven
+        # flow used to, so the report stays comparable; Notes lists the blocked track.
+        blocked = [f"{(result.get('preferred_track') or {}).get('track', '')}:{result.get('reason', '')}"]
+        result = call_run(run_args(url, "--mode", result["fallback_track"]["mode"], *plan_args), log, env, timeout)
+    state = read_state(state_path)
+    if stage == "full" and plan_first and result.get("status") == "done" and not needs_deepgram(state):
+        # The plan run stopped before the text stage; this call continues from there.
+        result = call_run(run_args(url), log, env, timeout)
+        state = read_state(state_path)
 
-    def step(name: str):
-        result["_step"] = name
-        result["_t0"] = time.monotonic()
-
-    def done():
-        name = result.pop("_step")
-        result["timings_sec"][name] = round(time.monotonic() - result.pop("_t0"), 1)
-
-    raw_text = vdir / f"{vid}_raw_text.txt"
-    segments = vdir / f"{vid}_segments.json"
-
-    def transcribe_audio(language: str) -> None:
-        """Download audio and transcribe it with Deepgram into raw_text/segments.
-
-        `language` is subtitle-info's source_language, or "auto" to let Deepgram
-        detect it (same rule as workflows/deepgram_transcribe.md).
-        """
-        step("audio")
-        audio = run_json(download(url, "audio"), logs / "audio.log", timeout)
-        done()
-        step("deepgram")
-        dg = run_json(
-            deepgram(audio["audio_file"], "--language", language,
-                  "--output-json", str(vdir / f"{vid}_deepgram.json"),
-                  "--output-text", str(raw_text),
-                  "--output-segments", str(segments)),
-            logs / "deepgram.log", max(timeout, 900),
-        )
-        language = dg.get("language") or language
-        if not (language.startswith("zh") or language.startswith("en")):
-            raise UnsupportedLanguage(f"Deepgram detected unsupported language {language!r}")
-        result["source"] = {
-            "src": "deepgram",
-            "language": language,
-            "kind": "audio",
-            "mode": "chinese" if language.startswith("zh") else "bilingual",
-            "speaker_count": dg.get("speaker_count"),
-            "chunk_count": dg.get("chunk_count"),
-        }
-        done()
-
-    try:
-        step("metadata")
-        meta = run_json(download(url, "metadata"), logs / "metadata.log", timeout)
-        result.update(title=meta.get("title", ""), duration=meta.get("duration", 0))
-        done()
-
-        step("subtitle_info")
-        sub_info = run_json(download(url, "subtitle-info"), logs / "subtitle_info.log", timeout)
-        result["subtitle_info"] = {
-            k: sub_info.get(k)
-            for k in ("has_any", "has_manual", "has_auto", "chinese_available",
-                      "english_available", "preferred_source_language", "mode",
-                      "source_language", "source_language_signal", "source_language_supported")
-        }
-        done()
-        if not sub_info.get("has_any") and sub_info.get("source_language_supported") is False:
-            raise UnsupportedLanguage(sub_info.get("unsupported_reason") or "unsupported spoken language")
-        audio_language = sub_info.get("source_language") or "auto"
-
-        if sub_info.get("has_any"):
-            step("subtitles")
-            subs = run_json(download(url, "subtitles"), logs / "subtitles.log", timeout)
-            vtt = subs.get("selected_source_vtt") or ""
-            if not vtt:
-                raise StepError("subtitles: no selected_source_vtt")
-            # download.sh reuses /tmp/<vid>_downloads, so keep our own copy of the track.
-            source_vtt = vdir / Path(vtt).name
-            shutil.copyfile(vtt, source_vtt)
-            vtt = str(source_vtt)
-            language = subs.get("selected_source_language") or ""
-            mode = subs.get("resolved_mode") or sub_info.get("mode") or ""
-            result["source"] = {
-                "src": "youtube",
-                "language": language,
-                "kind": subs.get("selected_source_kind", ""),
-                "mode": mode,
-                "preferred_language": subs.get("preferred_source_language", ""),
-                "fallback_used": subs.get("fallback_used"),
-                # e.g. "zh-Hans:rate_limited"; a non-empty list means YouTube refused a
-                # preferred track this run, so the selected source can differ between runs.
-                "blocked": [
-                    f"{c.get('language', '')}:{c.get('failure_reason', 'blocked')}"
-                    for c in subs.get("blocked_candidates", []) or []
-                ],
-            }
-            done()
-
-            step("parse_vtt")
-            raw_text.write_text(run_cmd(utils("parse-vtt", vtt), logs / "parse_vtt.log", timeout), encoding="utf-8")
-            seg_json = run_json(utils("parse-vtt-segments", vtt, "--language", language),
-                                logs / "parse_vtt_segments.log", timeout)
-            segments.write_text(json.dumps(seg_json, ensure_ascii=False), encoding="utf-8")
-            done()
-            subtitle_source = "YouTube Subtitles"
-            src = "youtube"
-        else:
-            if not allow_deepgram:
-                result["source"] = {"src": "deepgram", "language": audio_language, "kind": "audio", "mode": ""}
-                result["status"] = "skipped"
-                result["error"] = "no usable subtitles and --no-deepgram set"
-                return result
-            transcribe_audio(audio_language)
-            mode, language = result["source"]["mode"], result["source"]["language"]
-            subtitle_source = "Deepgram Transcription"
-            src = "deepgram"
-
-        result["raw_chars"] = len(raw_text.read_text(encoding="utf-8")) if raw_text.exists() else 0
-        if stage == "source":
-            result["status"] = "ok"
-            return result
-
-        state_path = vdir / f"{vid}_state.md"
-        chunks_dir = vdir / "chunks"
-
-        def make_plan(log_name: str) -> dict:
-            write_state(state_path, {
-                "vid": vid,
-                "url": url,
-                "title": str(meta.get("title", "")).replace("\n", " "),
-                "channel": str(meta.get("channel", "")).replace("\n", " "),
-                "upload_date": meta.get("upload_date", ""),
-                "duration": meta.get("duration", 0),
-                "output_dir": str(vdir),
-                "mode": mode,
-                "src": src,
-                "source_language": language,
-                "subtitle_source": subtitle_source,
-                "language_mode": mode,
-                "work_dir": str(chunks_dir),
-                "raw_text": str(raw_text),
-                "segments_path": str(segments),
-            })
-
-            step(log_name)
-            validation = run_json(utils("validate-state", str(state_path), "--stage", "post-source"),
-                                  logs / "validate_state.log", timeout)
-            if validation.get("hard_failures"):
-                raise StepError(f"validate-state: {validation['hard_failures']}")
-            plan = run_json(utils("plan-optimization", str(state_path)), logs / f"{log_name}.log", timeout)
-            (vdir / f"{log_name}.json").write_text(json.dumps(plan, ensure_ascii=False, indent=2), encoding="utf-8")
-            if plan.get("hard_failures"):
-                raise StepError(f"plan-optimization: {plan['hard_failures']}")
-            result["plan"] = {
-                k: plan.get(k)
-                for k in ("video_path", "routing_reason", "subtitle_quality_score",
-                          "subtitle_quality_band", "reroute_recommended", "reroute_target")
-            }
-            result["plan"]["prompts"] = [op.get("prompt") for op in plan.get("operations", [])]
-            result["plan"]["warnings"] = plan.get("warnings", [])
-            done()
-            return plan
-
-        plan = make_plan("plan")
-        if plan.get("reroute_recommended") and plan.get("reroute_target") == "deepgram" and stage == "full":
-            # The skill stops the subtitle path here and transcribes audio instead;
-            # sending critical-quality subtitles to the LLM would only waste calls.
-            rerouted_from = observed_case(result)
-            if not allow_deepgram:
-                result["status"] = "rerouted"
-                result["error"] = "subtitle quality is critical; plan reroutes to Deepgram but --no-deepgram is set"
-                return result
-            transcribe_audio(audio_language)
-            result["source"]["rerouted_from"] = rerouted_from
-            mode, src, language = result["source"]["mode"], "deepgram", result["source"]["language"]
-            subtitle_source = "Deepgram Transcription"
-            plan = make_plan("plan_after_reroute")
-
-        if stage == "plan":
-            result["status"] = "ok"
-            return result
-
-        operations = plan.get("operations", [])
-        if not operations:
-            raise StepError("plan-optimization returned no operations")
-        first_prompt = operations[0]["prompt"]
-
-        step("chunk")
-        normalization = plan.get("normalization", {}) or {}
-        doc_path = normalization.get("normalized_document_path", "")
-        if normalization.get("materialized") and doc_path and Path(doc_path).exists():
-            chunk_args = utils("chunk-document", doc_path, str(chunks_dir), "--prompt", first_prompt)
-        elif segments.exists():
-            chunk_args = utils("chunk-segments", str(segments), str(chunks_dir), "--prompt", first_prompt)
-        else:
-            chunk_args = utils("chunk-text", str(raw_text), str(chunks_dir), "--prompt", first_prompt)
-        run_cmd(chunk_args + CONFIG_ARGS, logs / "chunk.log", timeout)
-        done()
-
-        step("llm")
-        llm_runs = []
-        for index, op in enumerate(operations):
-            input_key = op.get("input_key") or ("raw_path" if index == 0 else "processed_path")
-            args = utils("process-chunks", str(chunks_dir), "--prompt", op["prompt"], "--input-key", input_key,
-                         *CONFIG_ARGS)
-            if op.get("extra_instruction"):
-                args += ["--extra-instruction", op["extra_instruction"]]
-            pc = run_json(args, logs / f"process_chunks_{index}_{op['prompt']}.log", max(timeout, 3600))
-            llm_runs.append({"prompt": op["prompt"], **{k: pc.get(k) for k in (
-                "success", "long_text_mode", "total_chunks", "processed_count", "failed_count")}})
-            if not pc.get("success"):
-                raise StepError(f"process-chunks {op['prompt']}: failed_count={pc.get('failed_count')} "
-                                f"{pc.get('message') or pc.get('aborted_reason') or ''}".rstrip())
-        result["llm_runs"] = llm_runs
-        done()
-
-        step("merge")
-        optimized = vdir / f"{vid}_optimized.txt"
-        run_cmd(utils("merge-content", str(chunks_dir), str(optimized)), logs / "merge.log", timeout)
-        done()
-
-        step("verify")
-        vq_args = utils("verify-quality", str(optimized), "--raw-text", str(raw_text), "--work-dir", str(chunks_dir))
-        if mode == "bilingual":
-            vq_args.append("--bilingual")
-        # verify-quality exits 1 when it fails; that is a result to report, not a crash.
-        vq = run_json(vq_args, logs / "verify_quality.log", timeout, ok_codes=(0, 1))
-        (vdir / "verify_quality.json").write_text(json.dumps(vq, ensure_ascii=False, indent=2), encoding="utf-8")
-        checks = vq.get("checks", {})
-        result["verify"] = {
-            "passed": vq.get("passed"),
-            "hard_failures": vq.get("hard_failures", []),
-            "warnings": vq.get("warnings", []),
-            "checks": {k: checks[k] for k in TRACKED_CHECKS if k in checks},
-        }
-        done()
-
-        if not vq.get("passed"):
-            result["status"] = "quality_failed"
-            return result
-
-        # Same call as SKILL.md Step 5; the date in the filename is yyyy-mm-dd.
-        step("assemble")
-        date = iso_date(meta.get("upload_date", ""))
-        clean_title = run_cmd(utils("sanitize-filename", str(meta.get("title", ""))),
-                              logs / "sanitize_filename.log", timeout).strip()
-        output_file = vdir / "output" / f"{date}. {clean_title}.md"
-        output_file.parent.mkdir(exist_ok=True)
-        af_args = utils("assemble-final", str(optimized), str(output_file),
-                        "--title", str(meta.get("title", "")), "--source", url,
-                        "--channel", str(meta.get("channel", "")), "--date", str(meta.get("upload_date", "")),
-                        "--created", date, "--duration", str(meta.get("duration", 0) or 0),
-                        "--transcript-source", subtitle_source)
-        if mode == "bilingual":
-            af_args.append("--bilingual")
-        run_cmd(af_args, logs / "assemble.log", timeout)
-        result["output_file"] = output_file.name
-        done()
-        result["status"] = "ok"
-    except UnsupportedLanguage as exc:
-        result["status"] = "unsupported"
-        result["error"] = str(exc)
-    except StepError as exc:
-        result["status"] = "error"
-        result["failed_step"] = result.get("_step", "")
-        result["error"] = str(exc)
-    finally:
-        result.pop("_step", None)
-        result.pop("_t0", None)
-    return result
+    (vdir / "result.json").write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    if state_path.exists():
+        shutil.copyfile(state_path, vdir / "state.json")
+    return report_item(video, result, state, blocked)
 
 
 def observed_case(item: dict) -> str:
@@ -466,8 +290,7 @@ def observed_case(item: dict) -> str:
     kind = str(source.get("kind", ""))
     if not lang:
         return ""
-    family = "zh" if lang.startswith("zh") else ("en" if lang.startswith("en") else lang)
-    return f"{family}_{kind}" if kind else family
+    return track_case(lang, kind)
 
 
 def source_notes(item: dict) -> str:
@@ -589,7 +412,8 @@ def main() -> int:
     parser.add_argument("--out-dir", default="", help="Default: /tmp/yt_regression/<timestamp>")
     parser.add_argument("--compare", default="", help="Earlier report.json to diff against")
     parser.add_argument("--no-deepgram", action="store_true", help="Skip videos that need audio transcription")
-    parser.add_argument("--timeout", type=int, default=300, help="Per-command timeout in seconds")
+    parser.add_argument("--timeout", type=int, default=5400, help="Per-video timeout of each run call, in seconds")
+    parser.add_argument("--config-path", default="", help="config.yaml for every run (default: the skill's own)")
     parser.add_argument("--fixtures", default="",
                         help="Replay recorded fixtures offline (default video set: <dir>/videos.json)")
     args = parser.parse_args()
@@ -615,6 +439,8 @@ def main() -> int:
     if FIXTURE_MODE:
         write_fixture_config(out_dir / "fixture_config.yaml")
         CONFIG_ARGS[:] = ["--config-path", str(out_dir / "fixture_config.yaml")]
+    elif args.config_path:
+        CONFIG_ARGS[:] = ["--config-path", str(Path(args.config_path).expanduser().resolve())]
 
     results = []
     for video in videos:

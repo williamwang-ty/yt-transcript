@@ -7,7 +7,8 @@ stdin. It answers the requests the pipeline makes:
 
 - the backend probe ("Reply with OK only.") with OK;
 - an outline pass with a valid outline JSON: one section every
-  SECTION_EVERY units (YouTube chapter hints win when given), no terms;
+  SECTION_EVERY units (YouTube chapter hints win when given, with
+  placeholder chapter titles replaced), no terms;
 - a window round by copying its `[Sn]` units back unchanged, roughly as many
   characters as the round asks for, in paragraphs of PARAGRAPH_UNITS units,
   with `## ` headings from the round's outline block (or one placeholder
@@ -18,6 +19,8 @@ stdin. It answers the requests the pipeline makes:
 
 Any other prompt exits 1, so a fallback path the test did not expect fails
 loudly. With FAKE_LLM_LOG set, each call appends one JSON line describing it.
+With FAKE_LLM_FAIL_FROM_UNIT=<n>, a window round starting at unit n or later
+exits 1, like an LLM outage in the middle of a run.
 """
 
 from __future__ import annotations
@@ -87,7 +90,10 @@ def outline(prompt: str) -> str:
     starts = [n for n, _ in hints] or list(range(first, numbers[-1] + 1, SECTION_EVERY))
     sections = []
     for index, start in enumerate(starts, start=1):
-        title = hints[index - 1][1] if hints else (f"Part {start}" if bilingual else zh_title(start))
+        title = hints[index - 1][1] if hints else ""
+        if not title or title.startswith("<Untitled Chapter"):
+            # The outline prompt asks to replace yt-dlp's placeholder chapter titles.
+            title = f"Part {start}" if bilingual else zh_title(start)
         section = {"start": start, "title": title}
         if bilingual:
             section["title_zh"] = zh_title(start)
@@ -98,6 +104,10 @@ def outline(prompt: str) -> str:
 
 def window_round(prompt: str) -> str:
     first = int(re.search(r"- Start at \[S(\d+)\]", prompt).group(1))
+    fail_from = int(os.environ.get("FAKE_LLM_FAIL_FROM_UNIT") or 0)
+    if fail_from and first >= fail_from:
+        log({"kind": "failed", "first": first})
+        raise SystemExit(f"fake_llm: simulated outage at [S{first}]")
     units = units_after(prompt.split("## Sliding-Window Protocol", 1)[1], first)
     if not units:
         raise SystemExit("fake_llm: window prompt has no units")

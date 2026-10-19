@@ -8,7 +8,9 @@ video's fixtures live in $YT_TRANSCRIPT_E2E_FIXTURES/<video_id>/:
     subs/<lang>.vtt  subtitle tracks that downloaded when the fixture was recorded
 
 A subtitle language without a recorded track fails like a blocked download,
-so download.sh moves on to its next candidate as it would on YouTube. Audio
+so download.sh moves on to its next candidate as it would on YouTube; a
+language listed in $FAKE_YT_DLP_RATE_LIMITED (comma-separated) fails with
+HTTP 429 the way YouTube rate-limits a track. Audio
 downloads write a small placeholder file; tests/e2e/fake_deepgram.py answers
 the transcription from the recorded Deepgram response.
 """
@@ -23,6 +25,7 @@ import urllib.parse
 from pathlib import Path
 
 FIXTURES_ENV = "YT_TRANSCRIPT_E2E_FIXTURES"
+RATE_LIMITED_ENV = "FAKE_YT_DLP_RATE_LIMITED"
 # Options that take a value; everything else is a flag.
 VALUE_OPTIONS = {
     "--sub-lang", "--sub-langs", "--sub-format", "-o", "--output", "-f", "--format", "--print",
@@ -95,6 +98,8 @@ def main(argv: list[str]) -> int:
     output = options.get("-o") or options.get("--output") or ""
     if "--write-sub" in flags or "--write-auto-sub" in flags:
         lang = options.get("--sub-lang") or options.get("--sub-langs") or ""
+        if lang in os.environ.get(RATE_LIMITED_ENV, "").split(","):
+            return fail(f"Unable to download video subtitles for '{lang}': HTTP Error 429: Too Many Requests")
         track = vdir / "subs" / f"{lang}.vtt"
         if not track.exists():
             return fail(f"Unable to download video subtitles for '{lang}': HTTP Error 404: Not Found")

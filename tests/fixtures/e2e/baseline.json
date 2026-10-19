@@ -193,11 +193,11 @@
         "Chinese punctuation density looks unusually low (density 0.001)"
       ],
       "checks": {
-        "size_ratio_vs_raw": 1.01,
-        "section_count": 3,
-        "paragraph_count": 24,
-        "total_chars": 11203,
-        "header_density": 0.125,
+        "size_ratio_vs_raw": 1.05,
+        "section_count": 16,
+        "paragraph_count": 29,
+        "total_chars": 11586,
+        "header_density": 0.552,
         "chunk_seam_warning_count": 0,
         "glossary_drift_count": 0,
         "semantic_missing_count": 0
@@ -218,8 +218,21 @@
       "headings": [
         "# E255｜模型越来越强，为什么用户没感觉？再访阿里国际站总裁张阔",
         "## 第1部分",
-        "## 第41部分",
-        "## 第81部分"
+        "## AI同事市场：编程之外，专业工作走到了哪一步？",
+        "## 商业任务为什么比编程更难？",
+        "## 从采购搜索到日常经营，Accio Work的任务边界如何扩展",
+        "## 商家案例：植物监测产品，从创意走到设计、供应链和销售",
+        "## 找工厂、比报价、拿样品：采购流程里，人和AI如何协作",
+        "## 中美Agent生态的差异：垂直SaaS与平台工具",
+        "## AI会替代SaaS吗？",
+        "## 独立站与平台电商：不同市场如何影响产品设计",
+        "## Agent公式：模型 × 工程框架 × 上下文",
+        "## 模型与工程联合优化，不能只等模型升级",
+        "## 107个真实任务：无人干预条件下，最前沿模型通过率约61",
+        "## 报价、钓鱼邮件、订船和纠纷：怎样才算真正完成任务？",
+        "## 新版本也可能退步，评测必须持续做",
+        "## 多平台经营：有流水，不代表有利润",
+        "## 产品品味、市场判断与预算分配：老板仍要做的选择"
       ]
     }
   },
