@@ -355,6 +355,18 @@ class RunCommandTests(unittest.TestCase):
                 self.assertEqual(("failed", "source", "override_not_applicable"),
                                  (result["status"], result["stage"], result["reason"]))
                 self.assertFalse(result["retryable"])
+                # The rejected override is not remembered: a plain rerun takes the normal route.
+                self.assertEqual({"source": None, "mode": None}, self.state(video)["overrides"])
+                self.assert_finished(video, self.run_video(video))
+
+    def test_rejected_override_keeps_the_earlier_one(self):
+        self.assert_finished(ENGLISH, self.run_video(ENGLISH, source="subtitles"))
+        result = self.run_video(ENGLISH, mode="chinese")
+        self.assertEqual("override_not_applicable", result["reason"])
+        self.assertEqual({"source": "subtitles", "mode": None}, self.state(ENGLISH)["overrides"])
+        rerun = self.run_video(ENGLISH)
+        self.assert_finished(ENGLISH, rerun)
+        self.assertEqual("bilingual", rerun["route"]["mode"])
 
     def test_quality_failure_stops_in_verify_and_from_text_redoes_the_text(self):
         failing = {"passed": False, "hard_failures": ["size ratio too low"], "warnings": [], "checks": {}}

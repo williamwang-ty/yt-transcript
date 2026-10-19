@@ -363,6 +363,7 @@ class _Run:
 
         changed = [key for key, value in self.requested_overrides.items()
                    if value is not None and value != self.overrides.get(key)]
+        previous_overrides = dict(self.overrides)
         for key in changed:
             self.overrides[key] = self.requested_overrides[key]
         from_stage = self.from_stage
@@ -398,6 +399,9 @@ class _Run:
             except Stop as stop:
                 if stop.status == "plan_stop":
                     return self.plan_result()
+                if stop.reason == "override_not_applicable":
+                    # Remember only overrides that apply, or a plain rerun would keep failing.
+                    self.state["overrides"] = previous_overrides
                 return self.finish(stop.status, stage=name, reason=stop.reason, message=stop.message,
                                    **stop.fields)
             upstream_ran = True
