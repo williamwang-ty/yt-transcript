@@ -31,7 +31,7 @@ Exit code 2 means the command line was wrong (for example, not a YouTube URL).
 Rules:
 
 - Do not run the internal steps yourself (`download.sh`, `process-chunks`, `assemble-final` and so on), do not edit anything in the work directory except `task.output_file`, and do not write or rewrite the article yourself. To change the outcome, rerun `run` with a flag below.
-- Rerunning the same command resumes an interrupted or failed run where it stopped. A video that is already done returns `done` at once with the existing article.
+- Rerunning the same command resumes an interrupted or failed run where it stopped, including one your shell killed before it printed a result. A video that is already done returns `done` at once with the existing article.
 - The article is final. Do not summarize it, rewrite it, or pass it through another digest step unless the user asks, and do not read it into the conversation unless they ask (it can be long).
 
 ## User requests and flags
@@ -49,7 +49,7 @@ Add a flag only when the user asked for that outcome. `--source` and `--mode` ar
 
 ## Several videos
 
-Process the URLs one at a time, in order, each with its own `run`, and finish handling one video's result before starting the next. A `needs_user` result with reason `cookies_required`, `rate_limited`, `tool_missing` or `output_dir_missing` would hit the remaining videos too: stop there and tell the user. Every other result concerns only that video (for example `deepgram_key_missing` matters only for videos without usable subtitles): note it and go on with the next URL. End with a table: title, status, and the output file or the reason.
+Process the URLs one at a time, in order, each with its own `run`, and finish handling one video's result before starting the next. A `needs_user` result with reason `cookies_required`, `rate_limited`, `tool_missing` or `output_dir_missing` would hit the remaining videos too: stop there and tell the user. Every other result concerns only that video (for example `deepgram_key_missing` matters only for videos without usable subtitles): note it and go on with the next URL. End with a table: title (or the URL when the result has none), status, and the output file or the reason.
 
 ## Unfinished runs
 
