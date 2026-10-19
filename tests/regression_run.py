@@ -50,6 +50,7 @@ class RunCommandTests(unittest.TestCase):
             fake_deepgram.FIXTURES_ENV: str(FIXTURES),
             pipeline.WORK_ROOT_ENV: str(self.root / "work"),
             pipeline.OUTPUT_DIR_ENV: str(self.root / "out"),
+            pipeline.YT_DLP_UPDATE_ENV: "0",
             "FAKE_LLM_LOG": str(self.llm_log),
         })
         patcher.start()
@@ -284,6 +285,34 @@ class RunCommandTests(unittest.TestCase):
             result = self.run_video(ENGLISH)
         self.assertEqual(("needs_user", "metadata", "tool_missing"),
                          (result["status"], result["stage"], result["reason"]))
+
+    def test_yt_dlp_update_check_runs_once_before_the_metadata_fetch(self):
+        real_run = subprocess.run
+        calls = []
+
+        def fake_run(args, *rest, **kwargs):
+            command = " ".join(str(arg) for arg in args)
+            calls.append("update" if command.endswith("update_yt_dlp.sh") else
+                         "download" if "download.sh" in command else "other")
+            if calls[-1] == "update":
+                return subprocess.CompletedProcess(args, 0, stdout="✅ yt-dlp is up to date\n", stderr="")
+            return real_run(args, *rest, **kwargs)
+
+        os.environ[pipeline.YT_DLP_UPDATE_ENV] = "1"
+        with mock.patch("kernel.pipeline.subprocess.run", side_effect=fake_run):
+            self.assert_finished(ENGLISH, self.run_video(ENGLISH))
+            self.assertEqual(["update", "download"], calls[:2])
+            self.assertEqual(1, calls.count("update"))
+            self.assertEqual("done", self.run_video(ENGLISH)["status"])
+            self.assertEqual(1, calls.count("update"))
+            os.environ[pipeline.YT_DLP_UPDATE_ENV] = "0"
+            self.run_video(ENGLISH, restart=True)
+        self.assertEqual(1, calls.count("update"))
+
+    def test_update_script_does_nothing_when_disabled(self):
+        proc = subprocess.run(["bash", str(PROJECT_ROOT / "scripts" / "update_yt_dlp.sh")], capture_output=True,
+                              text=True, env={**os.environ, pipeline.YT_DLP_UPDATE_ENV: "0"})
+        self.assertEqual((0, "", ""), (proc.returncode, proc.stdout, proc.stderr))
 
     def test_no_llm_backend_hands_each_request_to_the_agent(self):
         expected = self.reference_article(LONG)

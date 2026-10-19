@@ -3,7 +3,7 @@
 ## English Version
 
 > [!IMPORTANT]
-> **This document describes the target architecture.** It is being implemented step by step under tracker [#23](https://github.com/williamwang-ty/yt-transcript/issues/23). Until the later stages land, the repository still runs the old flow, in which the agent follows `SKILL.md` and `workflows/*.md` command by command. Section 9 maps today's code to the target, names the stage that moves each piece, and lists the behavior changes.
+> **This document describes the target architecture.** It is being implemented step by step under tracker [#23](https://github.com/williamwang-ty/yt-transcript/issues/23). Since stage 3, `SKILL.md` has the agent drive everything through `run`; the old step-by-step commands stay in the repository until stage 4 removes them. Section 9 maps today's code to the target, names the stage that moves each piece, and lists the behavior changes.
 
 ## 1. Document Positioning
 
@@ -155,7 +155,7 @@ The agent never edits the state file and never runs internal stages by hand. If 
 Notes:
 
 - **Idempotent stages.** Rerunning an unfinished stage starts that stage over, except that expensive sub-steps keep their results inside the stage (downloaded audio, Deepgram chunk results, the outline, finished window rounds), so an interrupted stage never pays twice.
-- **No separate preflight.** Each stage checks what it needs right before it needs it: yt-dlp before `metadata`, the Deepgram key only when `source` chooses Deepgram, an LLM backend only at `text`. Cheap paths stay cheap.
+- **No separate preflight.** Each stage checks what it needs right before it needs it: yt-dlp before `metadata` (including the update check preflight used to run, at most hourly, because YouTube keeps breaking older yt-dlp releases), the Deepgram key only when `source` chooses Deepgram, an LLM backend only at `text`. Cheap paths stay cheap.
 - **The source is final before any LLM call.** The subtitle quality reroute moves from planning into `source`, so `normalize` and everything after it work on accepted text.
 - **One path for every length.** Short and long videos go through the same stages. A short video's text fits one window round, and the outline pass is skipped when the whole text fits one round. YouTube chapters are passed to the outline as hints when the plan says `long`; a short text has no outline to use them.
 - **Free routing check.** `--stage plan` runs `metadata` through `plan` without spending money. If the route needs Deepgram, it records that decision and stops after the decision in `source`, without transcribing.
@@ -608,7 +608,7 @@ Behavior changes the user will notice:
 ## 中文版
 
 > [!IMPORTANT]
-> **本文描述的是目标架构**，按 tracker [#23](https://github.com/williamwang-ty/yt-transcript/issues/23) 逐步实现。在后续阶段完成之前，仓库仍按旧流程运行：agent 读 `SKILL.md` 和 `workflows/*.md`，一条命令一条命令地执行。第 9 节列出现有代码和目标的对应关系、每一部分在哪个阶段迁移，以及用户能感觉到的行为变化。
+> **本文描述的是目标架构**，按 tracker [#23](https://github.com/williamwang-ty/yt-transcript/issues/23) 逐步实现。从第 3 阶段起，`SKILL.md` 让 agent 只通过 `run` 处理视频；旧的逐步命令暂时留在仓库里，第 4 阶段删除。第 9 节列出现有代码和目标的对应关系、每一部分在哪个阶段迁移，以及用户能感觉到的行为变化。
 
 ## 1. 文档定位
 
@@ -760,7 +760,7 @@ agent 从不编辑状态文件，也从不手动执行内部阶段。需要不�
 说明：
 
 - **阶段幂等。** 重跑一个未完成的阶段，会把这个阶段从头做一遍；但昂贵的子步骤在阶段内部保留结果（下载好的音频、Deepgram 分段结果、大纲、已完成的窗口轮次），所以中断的阶段不会重复花钱。
-- **没有单独的 preflight。** 每个阶段在真正需要之前才检查它需要的东西：`metadata` 之前检查 yt-dlp，`source` 选了 Deepgram 才检查 Deepgram 密钥，到 `text` 才检查 LLM 后端。便宜的路径保持便宜。
+- **没有单独的 preflight。** 每个阶段在真正需要之前才检查它需要的东西：`metadata` 之前检查 yt-dlp（包括原来由 preflight 做的更新检查，最多每小时一次，因为 YouTube 经常让旧版 yt-dlp 失效），`source` 选了 Deepgram 才检查 Deepgram 密钥，到 `text` 才检查 LLM 后端。便宜的路径保持便宜。
 - **第一次调用 LLM 之前来源已经定下来。** 字幕质量改道从规划阶段移到 `source`，所以 `normalize` 及之后的阶段处理的都是已经认可的文字。
 - **长短视频一条路径。** 短视频和长视频走同样的阶段。短视频的文字一轮窗口就能处理完，全文一轮能写完时也会跳过大纲调用。规划结果为 `long` 时，YouTube 章节作为提示交给大纲；短文本没有大纲，也就用不上章节。
 - **免费的路由检查。** `--stage plan` 执行 `metadata` 到 `plan`，不花钱。如果路由需要 Deepgram，就记下这个决定，在 `source` 做完决定后停下，不做转写。

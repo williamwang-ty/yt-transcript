@@ -1,371 +1,76 @@
 ---
 name: yt-transcript
-description: Transcribe YouTube videos into formatted Markdown articles. Supports subtitle download or Deepgram speech-to-text. Use this skill when a user provides a YouTube link and wants a text version.
+description: Transcribe YouTube videos into formatted Markdown articles (a Chinese article, or English text with a Chinese translation). Uses the video's subtitles, or Deepgram speech-to-text when there are none. Use this skill when a user provides a YouTube link and wants a text version.
 ---
 
 # YouTube Video Transcription
 
-Transcribe YouTube videos into formatted Markdown articles with optional bilingual support.
-
-> [!IMPORTANT]
-> This skill uses script-first workflows. Prefer the helper scripts' JSON output over manual parsing or ad-hoc shell heuristics.
-> In InfoHub, this skill owns the full YouTube path: fetch metadata/subtitles,
-> optimize transcript text, run quality checks, and assemble the final Markdown
-> article directly into the configured `output_dir`. Do not send its output
-> through a separate generic digest pass unless the user explicitly asks for
-> reformatting or metadata repair.
-
-> [!NOTE]
-> Intentional product decisions:
-> - `bilingual` always means English source text plus Chinese translation
-> - `subtitle-info` first decides the spoken language (`source_language`); only human subtitles and the spoken-language ASR track are trusted, never YouTube's auto-translated tracks
-> - Human (manual) Chinese subtitles take precedence as the single source text track for any video
-> - Otherwise Chinese videos use Chinese subtitles and English videos use English subtitles
-> - Videos spoken in other languages are not supported yet (`source_language_supported=false`); stop and report instead of transcribing them
-> - `scripts/preflight.sh` is intentionally staged so subtitle-only paths do not require Deepgram or LLM credentials
-
----
-
-## Core Rules
-
-1. Always start with `scripts/preflight.sh`
-2. Use `scripts/download.sh` JSON output to make decisions
-3. Persist all workflow state to `/tmp/${VIDEO_ID}_state.md`
-4. Read values from state before every irreversible action
-5. Do not read large optimized files into context; use utility scripts instead
-6. Use `validate-state` and `verify-quality` JSON output for stop/go decisions
-7. Use `plan-optimization` for text-processing decisions instead of re-deriving prompt branches in the workflow
-8. Final output filenames must use `yyyy-mm-dd` for any date fragment; convert metadata `upload_date` from `yyyymmdd` before constructing `${DATE}`
-9. Never delete state or work files of an unfinished run; `cleanup.sh` refuses (exit code `3`) until `output_file` exists, and `--force` is only for an explicit user request to discard the run
-
----
-
-## State File Schema
-
-Create `/tmp/${VIDEO_ID}_state.md` after metadata is loaded.
-
-```markdown
-# State
-vid: ${VIDEO_ID}
-url: ${VIDEO_URL}
-title: ${TITLE}
-channel: ${CHANNEL}
-upload_date: ${UPLOAD_DATE}
-duration: ${DURATION}
-output_dir: ${OUTPUT_DIR}
-mode: unknown
-src: unknown
-source_language: unknown
-subtitle_source: unknown
-language_mode: unknown
-output_file:
-work_dir: /tmp/${VIDEO_ID}_chunks
-
-# Progress
-step: 1
-chunk: 0
-total: 0
-last_action: got metadata
-
-# Rules
-- On error: STOP and report; do not run cleanup.sh
-- Always trust state over memory
-- Final output filenames must format dates as yyyy-mm-dd
-```
-
----
-
-## Quick Mode
-
-Use this streamlined path only when all conditions are true:
-
-- Video duration `< 900` seconds
-- `subtitle-info` reports `has_any=true` for a usable Chinese or English subtitle source
-- No chapter planning or multi-speaker output is required
-
-Quick Mode is an optional fast path inside the broader short-duration bucket. `plan-optimization` still records `< 1800s` as `duration_bucket=short`, but it may escalate oversized short transcripts to chunked execution (`video_path=long`, `routing_reason=oversized_short_input`) when single-pass prompting would be too large or too slow.
-
-### Quick Mode Steps
-
-1. Run base preflight:
-   ```bash
-   bash <skill-root>/scripts/preflight.sh
-   ```
-
-2. Fetch metadata:
-   ```bash
-   META_JSON=$(bash <skill-root>/scripts/download.sh "$VIDEO_URL" metadata)
-   ```
-   Record `video_id`, `title`, `channel`, `upload_date`, `duration`.
-
-3. Load config:
-   ```bash
-   CONFIG_JSON=$(python3 <skill-root>/yt_transcript_utils.py load-config)
-   ```
-   Record `output_dir`.
-
-4. Run `find-unfinished --video-id "$VIDEO_ID"` (see Step 1 of the Full Workflow); resume an unfinished run instead of starting over. Otherwise create the state file using the schema above.
-
-5. Inspect subtitles:
-   ```bash
-   SUB_INFO_JSON=$(bash <skill-root>/scripts/download.sh "$VIDEO_URL" subtitle-info)
-   ```
-   Record:
-   - `has_any`
-   - `mode` (`chinese` or `bilingual`; provisional before actual download)
-   - `listed_candidates`
-   - `preferred_source_language`
-   - `source_language`, `source_language_supported`
-
-   Exit Quick Mode if `has_any=false`, and handle it as in Step 2 of the Full Workflow.
-
-6. Download subtitles:
-   ```bash
-   SUB_DOWNLOAD_JSON=$(bash <skill-root>/scripts/download.sh "$VIDEO_URL" subtitles)
-   ```
-
-7. Read subtitle selection from JSON:
-   - `listed_candidates`
-   - `attempted_candidates`
-   - `blocked_candidates`
-   - `selected_source_vtt`
-   - `selected_source_language`
-   - `selected_source_kind`
-   - `fallback_used`
-   - `resolved_mode`
-
-8. Parse source VTT:
-   ```bash
-   python3 <skill-root>/yt_transcript_utils.py parse-vtt "$SELECTED_SOURCE_VTT" > /tmp/${VIDEO_ID}_raw_text.txt
-   ```
-
-9. Optimize text:
-   - If `resolved_mode=chinese`, use `prompts/cleanup_zh.md` and save to `/tmp/${VIDEO_ID}_optimized.txt`
-   - If `resolved_mode=bilingual`, first run `prompts/structure_only.md` to `/tmp/${VIDEO_ID}_structured.txt`, then `prompts/translate_only.md` to `/tmp/${VIDEO_ID}_optimized.txt`
-
-10. Assemble final file:
-   Set `DATE` to `yyyy-mm-dd` before constructing the output filename.
-   Do not use raw `upload_date` (`yyyymmdd`) in filenames.
-   `assemble-final` also normalizes compact `yyyymmdd` date metadata in YAML
-   frontmatter when older workflow state still provides it.
-
-   ```bash
-   python3 <skill-root>/yt_transcript_utils.py assemble-final \
-       /tmp/${VIDEO_ID}_optimized.txt \
-       "$OUTPUT_DIR/${DATE}. ${CLEAN_TITLE}.md" \
-       --title "$TITLE" \
-       --source "$VIDEO_URL" \
-       --channel "$CHANNEL" \
-       --date "$UPLOAD_DATE" \
-       --created "$DATE" \
-       --duration "$DURATION" \
-       --transcript-source "YouTube Subtitles"
-   ```
-   Add `--bilingual` if `resolved_mode=bilingual`.
-
-   Write `output_file` to state; cleanup refuses to run until it points at the assembled file.
-
-11. Cleanup:
-   ```bash
-   bash <skill-root>/scripts/cleanup.sh "$VIDEO_ID"
-   ```
-
----
-
-## Full Workflow
-
-### Step 0: Base Preflight
+One command does the whole job for one video: it picks the subtitle track or Deepgram, processes the text with an LLM, checks the quality, and writes the article into the configured `output_dir`. Your part is to start it, act on the result it returns, and report to the user.
 
 ```bash
-bash <skill-root>/scripts/preflight.sh
+python3 <skill-root>/yt_transcript_utils.py run "<youtube-url>" --max-seconds 300
 ```
 
-If this fails, STOP.
+- `<skill-root>` is the directory that contains this SKILL.md.
+- Give this shell command a 10-minute timeout if your shell tool lets you set one (for example `timeout: 600000`). If your shell limit is shorter, pass about half of it as `--max-seconds`.
+- `run` prints progress on stderr and exactly one JSON object on stdout; the exit code matches its `status`.
 
-### Step 1: Metadata
+## Act on the result
 
-```bash
-META_JSON=$(bash <skill-root>/scripts/download.sh "$VIDEO_URL" metadata)
-CONFIG_JSON=$(python3 <skill-root>/yt_transcript_utils.py load-config)
-```
+| `status` (exit code) | What to do |
+|---|---|
+| `done` (0) | Report it (see Reporting below). |
+| `in_progress` (6) | Not an error: the time budget ran out at a safe point. Run `next_command` again at once, and keep going until the status changes. |
+| `needs_agent_text` (5) | No LLM backend was reachable, so one text request is handed to you. Read `task.prompt_file` and do exactly what it asks (keep every `[S<n>]` tag, end with the `<!--END-->` line it describes). Write only your answer to `task.output_file`, then run `next_command`. A video can need several such requests; repeat until the status changes. |
+| `needs_user` (3) | Only the user can fix this. Tell them what `message` says and stop. For reason `rate_limited` with an `accept_command`: ask whether to wait and retry later, or accept the `fallback_track` now; run `accept_command` only if they accept. |
+| `unsupported` (4) | Tell the user the video's spoken language is not supported (only Chinese and English are). Do not retry or force another source. |
+| `failed` (1) | If `retryable` is true, run `next_command` once more. Otherwise, or if it fails again, report `stage`, `reason` and `message`. `locked`: another run of this video is still active; do not start a second one. `override_not_applicable`: the flag the user asked for cannot apply to this video; say why. |
 
-Before creating the state file, check for an interrupted earlier run of the same video:
+Exit code 2 means the command line was wrong (for example, not a YouTube URL).
 
-```bash
-python3 <skill-root>/yt_transcript_utils.py find-unfinished --video-id "$VIDEO_ID"
-```
+Rules:
 
-If `unfinished` is non-empty, reuse its state file instead of creating a new one and continue from `resume_from_step` as described by `next_action` (for a window run this is re-running `process-chunks` on the existing `work_dir`, which resumes at the saved cursor; for a fixed-chunk run it is `prepare-resume` first; either way finished work is not reprocessed). Start fresh only when the user asks; then discard the old run with `cleanup.sh "$VIDEO_ID" --force` first. If the video only appears under `completed`, an earlier run finished without cleanup: run `cleanup.sh "$VIDEO_ID"` before starting, so its old work files are not mixed into the new run. When the user asks what was left unfinished, run `find-unfinished` without `--video-id` to list every interrupted run.
+- Do not run the internal steps yourself (`download.sh`, `process-chunks`, `assemble-final` and so on), do not edit anything in the work directory except `task.output_file`, and do not write or rewrite the article yourself. To change the outcome, rerun `run` with a flag below.
+- Rerunning the same command resumes an interrupted or failed run where it stopped. A video that is already done returns `done` at once with the existing article.
+- The article is final. Do not summarize it, rewrite it, or pass it through another digest step unless the user asks, and do not read it into the conversation unless they ask (it can be long).
 
-Otherwise, create the state file immediately with:
+## User requests and flags
 
-- `vid`
-- `url`
-- `title`
-- `channel`
-- `upload_date`
-- `duration`
-- `output_dir`
-- placeholders for `mode`, `src`, `source_language`, `subtitle_source`, `language_mode`, `output_file`
+| The user asks for | Add to `run` |
+|---|---|
+| speech-to-text (Deepgram) instead of subtitles | `--source deepgram` |
+| the subtitles, even if their quality looks poor | `--source subtitles` |
+| a Chinese article only / English text with a Chinese translation | `--mode chinese` / `--mode bilingual` |
+| doing a video again from scratch | `--restart` |
+| only checking which source and mode would be used, without spending anything | `--stage plan` |
+| redoing the text after a quality failure | `--from text` |
 
-Then validate:
+Add a flag only when the user asked for that outcome. `--source` and `--mode` are remembered for that video, so later reruns keep them until `--restart`.
 
-```bash
-python3 <skill-root>/yt_transcript_utils.py validate-state /tmp/${VIDEO_ID}_state.md --stage metadata
-```
+## Several videos
 
-### Step 2: Subtitle Availability
+Process the URLs one at a time, in order, each with its own `run`, and finish handling one video's result before starting the next. If a `needs_user` reason would hit every video (cookies or login, rate limiting, a missing tool, Deepgram key or `output_dir`), stop and tell the user instead of trying the rest. End with a table: title, status, and the output file or the reason.
 
-```bash
-SUB_INFO_JSON=$(bash <skill-root>/scripts/download.sh "$VIDEO_URL" subtitle-info)
-```
+## Unfinished runs
 
-Decision:
+`python3 <skill-root>/yt_transcript_utils.py status` lists interrupted runs, each with its `next_command`; `status <video_id>` shows one video. Run `next_command` to continue one. Discard a run only when the user asks: `python3 <skill-root>/yt_transcript_utils.py cleanup <video_id> --force`. Work files live under `/tmp/yt-transcript/`, so a reboot loses unfinished runs.
 
-- `has_any=true` → Step 3A Subtitle Path
-- `has_any=false` and `source_language_supported=false` → STOP and report `unsupported_reason` (the video is spoken in a language other than Chinese or English); do not run Deepgram
-- `has_any=false` otherwise → Step 3B Deepgram Path; pass `source_language` along (empty means unknown)
+## Reporting
 
-Write `step: 2` to state.
-
-### Step 3A: Subtitle Path
-
-Load and follow [workflows/subtitle_download.md](workflows/subtitle_download.md).
-
-### Step 3B: Deepgram Path
-
-Deepgram transcription defaults to `nova-3`; legacy `nova-2` / `nova-2-*` settings are upgraded to `nova-3` before requests are sent.
-
-Before entering this path:
-
-```bash
-bash <skill-root>/scripts/preflight.sh --require-deepgram
-```
-
-Then load and follow [workflows/deepgram_transcribe.md](workflows/deepgram_transcribe.md).
-
-### Checkpoint After Step 3
-
-```bash
-python3 <skill-root>/yt_transcript_utils.py validate-state /tmp/${VIDEO_ID}_state.md --stage post-source
-```
-
-If `hard_failures` is non-empty, STOP.
-
-### Step 4: Text Optimization
-
-Load and follow [workflows/text_optimization.md](workflows/text_optimization.md).
-
-If `plan-optimization` returns `reroute_recommended=true` with `reroute_target=deepgram`, stop the subtitle path here and switch to Step 3B Deepgram Path before any prompt execution.
-
-### Checkpoint After Step 4
-
-```bash
-python3 <skill-root>/yt_transcript_utils.py verify-quality \
-    /tmp/${VIDEO_ID}_optimized.txt \
-    --raw-text /tmp/${VIDEO_ID}_raw_text.txt
-```
-
-Add `--bilingual` if `mode=bilingual`.
-
-If `hard_failures` is non-empty, STOP.
-
-Warnings are advisory only and should trigger manual review, not an automatic stop.
-
-### Step 5: Assemble and Save Final File
-
-Read all metadata from state, not from memory.
-
-Set `DATE` to `yyyy-mm-dd` before constructing the output filename.
-Do not use raw `upload_date` (`yyyymmdd`) in filenames.
-
-Before assembling:
-
-```bash
-python3 <skill-root>/yt_transcript_utils.py validate-state /tmp/${VIDEO_ID}_state.md --stage pre-assemble
-```
-
-If `hard_failures` is non-empty, STOP.
-
-```bash
-python3 <skill-root>/yt_transcript_utils.py assemble-final \
-    /tmp/${VIDEO_ID}_optimized.txt \
-    "$OUTPUT_DIR/${DATE}. ${CLEAN_TITLE}.md" \
-    --title "$TITLE" \
-    --source "$VIDEO_URL" \
-    --channel "$CHANNEL" \
-    --date "$UPLOAD_DATE" \
-    --created "$DATE" \
-    --duration "$DURATION" \
-    --transcript-source "$SUBTITLE_SOURCE"
-```
-
-Add `--bilingual` if `mode=bilingual`.
-
-Write `output_file` to state.
-
-Then validate:
-
-```bash
-python3 <skill-root>/yt_transcript_utils.py validate-state /tmp/${VIDEO_ID}_state.md --stage final
-```
-
-### Step 6: Cleanup
-
-```bash
-bash <skill-root>/scripts/cleanup.sh "$VIDEO_ID"
-```
-
-No separate `rm` is needed; the cleanup script removes the state file by default.
-Cleanup only proceeds after Step 5 wrote `output_file` to state and that file exists. If it exits with code `3`, the run is unfinished: go back and finish it instead of forcing cleanup.
-
-### Step 7: Report Success
-
-Return:
+Reply in the user's language. For `done`, give the title, `output_file`, the route, and any `warnings` (advisory only; the article was written):
 
 ```text
-✅ Video transcription complete
-   Title: $TITLE
-   Language mode: $MODE
-   Transcript source: $SUBTITLE_SOURCE
-   Output file: $OUTPUT_FILE
+✅ Transcription complete
+   Title: <title>
+   Source: <route.source: YouTube subtitles or Deepgram>
+   Mode: <route.mode: chinese = Chinese article, bilingual = English text with Chinese translation>
+   Output file: <output_file>
 ```
 
----
+If you answered `needs_agent_text` requests, say so: setting up an LLM backend (`llm_*` in `config.yaml`) lets later runs finish without you.
 
-## Multi-Link Processing
+Product decisions you may need to explain:
 
-When processing multiple URLs:
-
-1. Process serially
-2. Complete cleanup between videos; a video that failed keeps its state for a later resume and is reported as unfinished
-3. Track results in a table
-
----
-
-## Error Handling Policy
-
-- Any failure below leaves state and work files in place; resume later via `find-unfinished`
-- `yt-dlp` failure: stop and report
-- Deepgram failure: stop and ask whether to retry
-- Missing state fields: stop and repair state before continuing
-- Non-empty `hard_failures` from `verify-quality`: stop before assembly
-- `warnings` from `verify-quality`: continue only after manual review
-
----
-
-## Troubleshooting
-
-| Symptom | Likely Cause | Action |
-|---------|--------------|--------|
-| `download.sh metadata` or `subtitle-info` fails | `yt-dlp` unavailable, outdated, or video unavailable | Run `bash <skill-root>/scripts/preflight.sh`, then retry once |
-| `yt-dlp` says "Sign in to confirm you’re not a bot" | YouTube requires cookies/login for this IP or video | Let `download.sh` auto-retry with Chrome (up to 3 attempts); if it still fails, export a Netscape `cookies.txt`, set `yt_dlp_cookies_file`, then retry |
-| Automatic Chrome cookies retry failed | Chrome is unavailable, not logged in, or inaccessible in this environment | Export `youtube.com` cookies from a logged-in browser, copy the file here, set `yt_dlp_cookies_file` or `YT_DLP_COOKIES_FILE`, then retry |
-| `subtitle-info` returns `has_any=false` and `source_language_supported=false` | The video is spoken in another language (for example `ja`) and has no human Chinese subtitles | Stop and tell the user this language is not supported yet |
-| `subtitle-info` returns `has_any=false` otherwise | No trusted subtitle track in the spoken language (auto-translated tracks are ignored on purpose) | Switch to Deepgram path and run `bash <skill-root>/scripts/preflight.sh --require-deepgram` |
-| Deepgram transcription fails | Invalid key, network issue, or API rejection | Stop, surface the error, and ask whether to retry |
-| `verify-quality` returns non-empty `hard_failures` | Hard structural gate failed | Do not assemble final output; fix the optimization step |
-| `verify-quality` returns only `warnings` | Soft quality concern | Review the warnings, then decide whether to proceed |
-| State file is missing or fields are empty | Interrupted run or incomplete manual recovery | Rebuild the state from metadata/config before resuming |
-| `cleanup.sh` exits with code `3` | Run is not finished (no existing `output_file` in state) | Run `find-unfinished --video-id "$VIDEO_ID"` and resume; use `--force` only if the user wants to discard the run |
-| `find-unfinished` no longer lists a run that was interrupted earlier | State and work files live under `/tmp`, which is emptied on restart, so resume only survives within the same boot | Tell the user the run must start over; this is a known limitation, not a bug |
+- Human Chinese subtitles win for any video. Otherwise a Chinese video gives a Chinese article and an English video gives English text with a Chinese translation.
+- YouTube's machine-translated subtitle tracks are never used. A video without trusted subtitles in its spoken language, or whose Chinese subtitles are very poor, is transcribed with Deepgram automatically.
+- Videos spoken in other languages are not supported yet.
