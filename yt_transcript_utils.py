@@ -1,60 +1,22 @@
 #!/usr/bin/env python3
 """
-Provides VTT parsing, Deepgram result processing, audio splitting, filename sanitization, etc.
+yt-transcript: one YouTube video to one Markdown article.
 
-This module also owns the script-first workflow checkpoints:
-- `validate-state` for stage-based state validation
-- `plan-optimization` for canonical short/long routing
-- `verify-quality` for final stop/go gating
+`run` drives the whole flow (kernel/pipeline.py); the rest of this module holds
+the functions its stages call: VTT parsing, Deepgram transcription, the text
+plan, normalization, merge, the quality check and article assembly.
 
 Usage:
-    python3 yt_transcript_utils.py [--api-envelope] <command> [args]
+    python3 yt_transcript_utils.py <command> [args]
 
 Commands:
-    parse-vtt <vtt_path>           Parse VTT subtitle file, output plain text
-    parse-vtt-segments <vtt_path>  Parse VTT subtitle file, output aligned segments JSON
-    process-deepgram <json_path>   Process Deepgram JSON, output cleaned text
-    transcribe-deepgram <audio_path>  Call Deepgram API and auto-merge split chunks
-    sanitize-filename "<title>"    Clean illegal filename characters
-    test-deepgram-api <api_key>    Test Deepgram API key validity
-    test-llm-api                   Probe configured LLM API reachability
-    test-token-count               Probe provider token counting support with local fallback
-    split-audio <audio_path>       Split large audio at silence points (--max-size, --max-deviation)
-    chunk-text <input> <output_dir> Split text file into chunks by sentence boundary
-    chunk-segments <segments_json> <output_dir> Split aligned source segments into timed chunks (--chapters for chapter-aware boundaries)
-    chunk-document <normalized_document> <output_dir> Chunk a normalized document using its preferred source shape
-    get-chapters <video_url>       Fetch YouTube video chapter metadata
-    build-chapter-plan <chapters_json> <work_dir> <output_json>  Map YouTube chapters onto timed chunks
-    merge-content <work_dir> <output_file>  Merge processed chunks with chapter headers
-    create-run <work_dir>          Persist a stable runtime task record for outer-agent orchestration
-    inspect-run <work_dir>         Inspect run/task state through the stable runtime-facing API
-    advance-run <work_dir>         Advance the runtime through the preferred bounded control path
-    apply-control <work_dir>       Apply pause or cancel through the stable runtime-facing API
-    finalize-run <work_dir>        Finalize a run summary and optionally materialize merged output
-    process-chunks <work_dir> --prompt <name>  Run one long-text stage: sliding window by default, fixed chunks with long_text_mode: chunks (--input-key for chained processing)
-    resolve-llm-backend            Show whether chunks go to the calling agent's CLI or the configured API
-    prepare-resume <work_dir>      Repair stale chunk/runtime state before resuming a run
-    runtime-status <work_dir>      Inspect manifest runtime, ownership, and local runtime-control status
-    cancel-run <work_dir>          Request local cancellation for an active chunk-processing run
-    pause-run <work_dir>           Request a safe-boundary pause for an active chunk-processing run
-    resume-run <work_dir>          Clear a local pause request and restore resumable runtime state
-    telemetry-summary <ref>        Summarize local telemetry journal from a work_dir or telemetry.jsonl path
-    telemetry-events <ref>         Query local telemetry journal events from a work_dir or telemetry.jsonl path
-    build-glossary <work_dir>      Build a local glossary artifact for terminology consistency
-    assemble-final <optimized_text> <output_file>  Assemble final markdown from optimized text + metadata
-    verify-quality <optimized_text>  Verify quality of optimized text (structural checks)
-    sync-state <state_ref>         Sync legacy state.md and authoritative machine_state.json
-    normalize-document <state_ref> Materialize normalized_document.json from raw text or segments
-    validate-state <state_path>    Validate workflow state fields for a given stage
-    find-unfinished                List interrupted runs whose state and work files are kept for resume
-    subtitle-info                  Detect the spoken language and pick subtitle candidates from yt-dlp metadata on stdin
-    plan-optimization <state_path> Generate a structured optimization plan from workflow state
     run <url>                      Run or continue the whole pipeline for one video (state.json per video)
     status [video_id]              Show the runs under the work root, or one video's state.json
     cleanup <video_id>             Remove a video's work directory (--force for an unfinished run)
 
-Global flags:
-    --api-envelope               Emit stable `yt_transcript.command_result/v1` envelopes for kernel commands
+Debug commands:
+    subtitle-info                  Detect the spoken language and pick subtitle candidates from yt-dlp metadata on stdin
+    verify-quality <optimized_text>  Rerun the quality check on any file
 """
 
 from __future__ import annotations
@@ -7151,496 +7113,15 @@ def load_config(config_path: str = None, allow_missing: bool = False) -> dict:
 
 def main():
     """Main."""
+    from kernel import pipeline as kernel_pipeline
+
     parser = argparse.ArgumentParser(
         description='yt-transcript utility script',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__
     )
-    parser.add_argument(
-        '--api-envelope',
-        action='store_true',
-        help='Emit stable kernel-command result envelopes instead of legacy flat JSON for kernel commands',
-    )
     subparsers = parser.add_subparsers(dest='command', help='Available commands')
 
-    # parse-vtt command
-    vtt_parser = subparsers.add_parser(
-        'parse-vtt',
-        help='Parse VTT subtitle file, output plain text'
-    )
-    vtt_parser.add_argument('vtt_path', help='VTT file path')
-
-    # parse-vtt-segments command
-    vtt_segments_parser = subparsers.add_parser(
-        'parse-vtt-segments',
-        help='Parse VTT subtitle file, output aligned segments JSON'
-    )
-    vtt_segments_parser.add_argument('vtt_path', help='VTT file path')
-    vtt_segments_parser.add_argument('--language', default='',
-                                     help='Optional language override for output metadata')
-
-    # process-deepgram command
-    dg_parser = subparsers.add_parser(
-        'process-deepgram',
-        help='Process Deepgram JSON, output cleaned text and speaker count'
-    )
-    dg_parser.add_argument('json_path', help='Deepgram JSON file path')
-    dg_parser.set_defaults(prefer_structured_output=DEFAULT_DEEPGRAM_PREFER_STRUCTURED_OUTPUT)
-    dg_output_group = dg_parser.add_mutually_exclusive_group()
-    dg_output_group.add_argument('--prefer-structured-output', dest='prefer_structured_output', action='store_true',
-                                 help='Prefer utterances/sentence text when processing Deepgram JSON (default)')
-    dg_output_group.add_argument('--legacy-flat-output', dest='prefer_structured_output', action='store_false',
-                                 help='Force legacy flat transcript assembly when processing Deepgram JSON')
-
-    # sanitize-filename command
-    fn_parser = subparsers.add_parser(
-        'sanitize-filename',
-        help='Clean illegal filename characters'
-    )
-    fn_parser.add_argument('title', help='Original title')
-
-    # transcribe-deepgram command
-    tdg_parser = subparsers.add_parser(
-        'transcribe-deepgram',
-        help='Call Deepgram API and merge split chunks automatically'
-    )
-    tdg_parser.add_argument('audio_path', help='Audio file path')
-    tdg_parser.add_argument('--language', required=True,
-                            help="Transcription language code, or 'auto' to let Deepgram detect it (reported as detected_language)")
-    tdg_parser.add_argument('--config-path', default=None, help='Optional path to config.yaml')
-    tdg_parser.add_argument('--api-key', default='', help='Optional Deepgram API key override')
-    tdg_parser.add_argument('--max-size', type=float, default=10.0,
-                            help='Max chunk size in MB before splitting (default: 10)')
-    tdg_parser.add_argument('--max-deviation', type=float, default=60.0,
-                            help='Max deviation from silence split point in seconds (default: 60)')
-    tdg_parser.add_argument('--timeout', type=int, default=300, help='Request timeout in seconds')
-    tdg_parser.add_argument('--output-json', default='', help='Optional JSON output path; split mode also writes sibling chunk payload files')
-    tdg_parser.add_argument('--output-text', default='', help='Optional path to write merged transcript text')
-    tdg_parser.add_argument('--output-segments', default='', help='Optional path to write aligned source segments JSON')
-    tdg_parser.add_argument('--model', default='',
-                            help='Optional Deepgram model override; nova-2 variants are upgraded to nova-3')
-    tdg_parser.add_argument('--resume-existing-chunks', action='store_true',
-                            help='Reuse existing sibling *_chunk_XXX.json payloads when resuming a split Deepgram run')
-    tdg_parser.set_defaults(enable_utterances_override=None, prefer_structured_output_override=None)
-    tdg_utterance_group = tdg_parser.add_mutually_exclusive_group()
-    tdg_utterance_group.add_argument('--enable-utterances', dest='enable_utterances_override', action='store_true',
-                                     help='Force Deepgram utterances=true speaker-aware output (default)')
-    tdg_utterance_group.add_argument('--disable-utterances', dest='enable_utterances_override', action='store_false',
-                                     help='Disable Deepgram utterances when comparing against the flatter legacy response shape')
-    tdg_output_group = tdg_parser.add_mutually_exclusive_group()
-    tdg_output_group.add_argument('--prefer-structured-output', dest='prefer_structured_output_override', action='store_true',
-                                  help='Prefer utterances/sentence text over the legacy flat transcript when building output text and segments (default)')
-    tdg_output_group.add_argument('--legacy-flat-output', dest='prefer_structured_output_override', action='store_false',
-                                  help='Force legacy flat transcript assembly for compatibility/debugging checks')
-
-    # test-deepgram-api command
-    api_parser = subparsers.add_parser(
-        'test-deepgram-api',
-        help='Test Deepgram API key validity'
-    )
-    api_parser.add_argument('api_key', help='Deepgram API key')
-
-    # test-llm-api command
-    llm_api_parser = subparsers.add_parser(
-        'test-llm-api',
-        help='Test configured LLM API reachability and latency'
-    )
-    llm_api_parser.add_argument('--config-path', default=None, help='Optional path to config.yaml')
-    llm_api_parser.add_argument('--api-key', default='', help='Optional LLM API key override')
-    llm_api_parser.add_argument('--base-url', default='', help='Optional LLM base URL override')
-    llm_api_parser.add_argument('--model', default='', help='Optional model override')
-    llm_api_parser.add_argument('--api-format', default='', help='Optional API format override')
-    llm_api_parser.add_argument('--timeout', type=int, default=0, help='Probe timeout in seconds')
-    llm_api_parser.add_argument('--stream', default='', help='Streaming mode override: auto|true|false')
-
-    backend_parser = subparsers.add_parser(
-        'resolve-llm-backend',
-        help='Show which backend chunk processing will use (agent CLI or API)'
-    )
-    backend_parser.add_argument('--config-path', default=None, help='Optional path to config.yaml')
-    backend_parser.add_argument('--agent-cli', default='',
-                                help='Agent name (claude-code, codex, opencode, pi, gemini, cursor) or a non-interactive command')
-    backend_parser.add_argument('--no-probe', action='store_true', help='Skip the CLI probe call')
-
-    token_probe_parser = subparsers.add_parser(
-        'test-token-count',
-        help='Probe provider token counting support with local fallback'
-    )
-    token_probe_parser.add_argument('--config-path', default=None, help='Optional path to config.yaml')
-    token_probe_parser.add_argument('--api-key', default='', help='Optional LLM API key override')
-    token_probe_parser.add_argument('--base-url', default='', help='Optional LLM base URL override')
-    token_probe_parser.add_argument('--model', default='', help='Optional model override')
-    token_probe_parser.add_argument('--api-format', default='', help='Optional API format override')
-    token_probe_parser.add_argument('--timeout', type=int, default=0, help='Probe timeout in seconds')
-    token_probe_parser.add_argument('--sample-text', default='Reply with OK only.', help='Sample text for token probe')
-
-    # split-audio command
-    split_parser = subparsers.add_parser(
-        'split-audio',
-        help='Split large audio file at silence points'
-    )
-    split_parser.add_argument('audio_path', help='Audio file path')
-    split_parser.add_argument('--max-size', type=float, default=10.0,
-                              help='Max chunk size in MB (default: 10)')
-    split_parser.add_argument('--max-deviation', type=float, default=60.0,
-                              help='Max deviation from split point in seconds (default: 60)')
-
-    # chunk-text command
-    chunk_parser = subparsers.add_parser(
-        'chunk-text',
-        help='Split text file into chunks by sentence boundary'
-    )
-    chunk_parser.add_argument('input_path', help='Input text file path')
-    chunk_parser.add_argument('output_dir', help='Output directory for chunks')
-    chunk_parser.add_argument('--chunk-size', type=int, default=0,
-                              help='Target chunk size in the active chunk_mode; without --prompt it keeps legacy character sizing')
-    chunk_parser.add_argument('--prompt', default='',
-                              help='Optional prompt name for task-aware auto chunk sizing')
-    chunk_parser.add_argument('--config-path', default=None,
-                              help='Optional path to config file for chunk planning')
-
-    # chunk-segments command
-    chunk_segments_parser = subparsers.add_parser(
-        'chunk-segments',
-        help='Split aligned source segments into timed chunks'
-    )
-    chunk_segments_parser.add_argument('segments_path', help='Aligned source segments JSON path')
-    chunk_segments_parser.add_argument('output_dir', help='Output directory for chunks')
-    chunk_segments_parser.add_argument('--chunk-size', type=int, default=0,
-                                       help='Target chunk size in the active chunk_mode; without --prompt it keeps legacy character sizing')
-    chunk_segments_parser.add_argument('--prompt', default='',
-                                       help='Optional prompt name for task-aware auto chunk sizing')
-    chunk_segments_parser.add_argument('--config-path', default=None,
-                                       help='Optional path to config file for chunk planning')
-    chunk_segments_parser.add_argument('--chapters', default='',
-                                       help='Optional YouTube chapters JSON path; forces chunk boundaries at chapter starts')
-
-    # chunk-document command
-    chunk_document_parser = subparsers.add_parser(
-        'chunk-document',
-        help='Chunk a normalized document using its preferred source shape'
-    )
-    chunk_document_parser.add_argument('normalized_document_path', help='normalized_document.json path')
-    chunk_document_parser.add_argument('output_dir', help='Output directory for chunks')
-    chunk_document_parser.add_argument('--chunk-size', type=int, default=0,
-                                       help='Target chunk size in the active chunk_mode; without --prompt it keeps legacy character sizing')
-    chunk_document_parser.add_argument('--prompt', default='',
-                                       help='Optional prompt name for task-aware auto chunk sizing')
-    chunk_document_parser.add_argument('--config-path', default=None,
-                                       help='Optional path to config file for chunk planning')
-    chunk_document_parser.add_argument('--chapters', default='',
-                                       help='Optional YouTube chapters JSON path; forces chunk boundaries at chapter starts when timed segments exist')
-    chunk_document_parser.add_argument('--prefer', default='auto', choices=['auto', 'segments', 'text'],
-                                       help='Preferred normalized source shape for chunking')
-
-    # get-chapters command
-    chapters_parser = subparsers.add_parser(
-        'get-chapters',
-        help='Fetch YouTube video chapter metadata'
-    )
-    chapters_parser.add_argument('video_url', help='YouTube video URL')
-
-    # build-chapter-plan command
-    chapter_plan_parser = subparsers.add_parser(
-        'build-chapter-plan',
-        help='Map YouTube chapters onto timed chunks'
-    )
-    chapter_plan_parser.add_argument('chapters_path', help='Chapters JSON path')
-    chapter_plan_parser.add_argument('manifest_ref', help='Manifest path or work directory containing manifest.json')
-    chapter_plan_parser.add_argument('output_path', help='Output chapter_plan.json path')
-
-    # merge-content command
-    merge_parser = subparsers.add_parser(
-        'merge-content',
-        help='Merge processed chunks with chapter headers'
-    )
-    merge_parser.add_argument('work_dir', help='Working directory with manifest.json')
-    merge_parser.add_argument('output_file', help='Output file path')
-    merge_parser.add_argument('--header', default='', help='Optional header content to prepend')
-
-    # create-run command
-    create_run_parser = subparsers.add_parser(
-        'create-run',
-        help='Persist a stable runtime task record for outer-agent orchestration'
-    )
-    create_run_parser.add_argument('work_dir', help='Working directory to bind to the runtime task')
-    create_run_parser.add_argument('--task-spec-json', default='', help='Optional inline JSON object with task_spec fields')
-    create_run_parser.add_argument('--task-spec-file', default='', help='Optional JSON file with task_spec fields')
-    create_run_parser.add_argument('--task-id', default='', help='Optional stable task identifier override')
-    create_run_parser.add_argument('--source-ref', default='', help='Optional source reference; defaults to work_dir')
-    create_run_parser.add_argument('--output-mode', default='markdown', help='Task output mode (default: markdown)')
-    create_run_parser.add_argument('--bilingual', action='store_true', help='Record bilingual output intent in the task spec')
-    create_run_parser.add_argument('--quality-profile', default='balanced', help='Quality profile recorded in task spec')
-    create_run_parser.add_argument('--speed-priority', default='balanced', help='Speed priority recorded in task spec')
-    create_run_parser.add_argument('--cost-budget', type=float, default=0.0, help='Optional cost budget recorded in task spec')
-    create_run_parser.add_argument('--latency-budget', type=float, default=0.0, help='Optional latency budget recorded in task spec')
-    create_run_parser.add_argument('--allowed-fallback', dest='allowed_fallbacks', action='append', default=[], help='Repeatable allowed fallback entry')
-    create_run_parser.add_argument('--human-escalation-policy', default='on_blocking_failure', help='Human escalation policy recorded in task spec')
-    create_run_parser.add_argument('--policy-profile', default='default', help='Policy profile recorded in run state')
-    create_run_parser.add_argument('--migration-mode', choices=['runtime_api', 'legacy_cli'], default='', help='Optional runtime API migration mode override')
-
-    # inspect-run command
-    inspect_run_parser = subparsers.add_parser(
-        'inspect-run',
-        help='Inspect run/task state through the stable runtime-facing API'
-    )
-    inspect_run_parser.add_argument('work_dir', help='Working directory to inspect')
-    inspect_run_parser.add_argument('--run-id', default='', help='Optional run identifier assertion for the persisted runtime task')
-    inspect_run_parser.add_argument('--policy-profile', default='default', help='Policy profile used for allowed-action derivation')
-
-    # advance-run command
-    advance_run_parser = subparsers.add_parser(
-        'advance-run',
-        help='Advance the runtime through the preferred bounded control path'
-    )
-    advance_run_parser.add_argument('work_dir', help='Working directory with manifest.json')
-    advance_run_parser.add_argument('--run-id', default='', help='Optional run identifier assertion for the persisted runtime task')
-    advance_run_parser.add_argument('--prompt', default='', help='Optional prompt override; defaults to manifest/runtime metadata')
-    advance_run_parser.add_argument('--action', choices=['auto', 'process', 'process-chunks', 'prepare-resume'], default='auto', help='Runtime action to execute (default: auto)')
-    advance_run_parser.add_argument('--extra-instruction', default='', help='Additional instruction to append to prompt')
-    advance_run_parser.add_argument('--config-path', default=None, help='Optional path to config file')
-    advance_run_parser.add_argument('--dry-run', action='store_true', help='Validate setup without calling the model API')
-    advance_run_parser.add_argument('--input-key', default='raw_path', help='Manifest key for input files')
-    advance_run_parser.add_argument('--force', action='store_true', help='Reprocess work even when manifest state is already done')
-    advance_run_parser.add_argument('--policy-profile', default='default', help='Policy profile used for allowed-action derivation')
-
-    # apply-control command
-    apply_control_parser = subparsers.add_parser(
-        'apply-control',
-        help='Apply pause or cancel through the stable runtime-facing API'
-    )
-    apply_control_parser.add_argument('work_dir', help='Working directory to control')
-    apply_control_parser.add_argument('--run-id', default='', help='Optional run identifier assertion for the persisted runtime task')
-    apply_control_parser.add_argument('--signal', choices=['pause', 'cancel'], required=True, help='Control signal to apply')
-    apply_control_parser.add_argument('--reason', default='', help='Optional operator reason for the control signal')
-    apply_control_parser.add_argument('--policy-profile', default='default', help='Policy profile used for allowed-action derivation')
-
-    # finalize-run command
-    finalize_run_parser = subparsers.add_parser(
-        'finalize-run',
-        help='Finalize a run summary and optionally materialize merged output'
-    )
-    finalize_run_parser.add_argument('work_dir', help='Working directory to finalize')
-    finalize_run_parser.add_argument('--run-id', default='', help='Optional run identifier assertion for the persisted runtime task')
-    finalize_run_parser.add_argument('--output-file', default='', help='Optional merged output path; omit for inspection-only finalization')
-    finalize_run_parser.add_argument('--header', default='', help='Optional header content passed to merge-content when output-file is set')
-    finalize_run_parser.add_argument('--inspect-only', action='store_true', help='Return an inspection-only final summary without merging output')
-    finalize_run_parser.add_argument('--policy-profile', default='default', help='Policy profile used for allowed-action derivation')
-
-    # process-chunks command
-    pc_parser = subparsers.add_parser(
-        'process-chunks',
-        help='Process chunks with isolated LLM API calls'
-    )
-    pc_parser.add_argument('work_dir', help='Working directory with manifest.json')
-    pc_parser.add_argument('--prompt', required=True,
-                           help='Prompt template name (e.g., cleanup_zh, structure_only, translate_only, summarize)')
-    pc_parser.add_argument('--extra-instruction', default='',
-                           help='Additional instruction to append to prompt')
-    pc_parser.add_argument('--input-key', default='raw_path',
-                           help='Manifest key for input files (default: raw_path, use processed_path for chained processing)')
-    pc_parser.add_argument('--config-path', default=None,
-                           help='Optional path to config file')
-    pc_parser.add_argument('--dry-run', action='store_true',
-                           help='Validate setup without calling API')
-    pc_parser.add_argument('--force', action='store_true',
-                           help='Reprocess chunks even if manifest status is done and output exists')
-    pc_parser.add_argument('--agent-cli', default='',
-                           help='With llm_backend=auto: the calling agent\'s name or its non-interactive command')
-
-    # prepare-resume command
-    resume_parser = subparsers.add_parser(
-        'prepare-resume',
-        help='Repair stale chunk/runtime state before resuming a run'
-    )
-    resume_parser.add_argument('work_dir', help='Working directory with manifest.json')
-    resume_parser.add_argument('--prompt', default='',
-                               help='Optional prompt override; defaults to manifest plan prompt')
-    resume_parser.add_argument('--config-path', default=None,
-                               help='Optional path to config file')
-    resume_parser.add_argument('--input-key', default='raw_path',
-                               help='Reserved for future resume checks; currently informational only')
-
-    # runtime-status command
-    runtime_status_parser = subparsers.add_parser(
-        'runtime-status',
-        help='Inspect manifest runtime, ownership, and local runtime-control state'
-    )
-    runtime_status_parser.add_argument('work_dir', help='Working directory to inspect')
-
-    # cancel-run command
-    cancel_parser = subparsers.add_parser(
-        'cancel-run',
-        help='Request local cancellation for an active chunk-processing run'
-    )
-    cancel_parser.add_argument('work_dir', help='Working directory to cancel')
-    cancel_parser.add_argument('--reason', default='', help='Optional cancellation reason')
-
-    # pause-run command
-    pause_parser = subparsers.add_parser(
-        'pause-run',
-        help='Request a safe-boundary pause for an active chunk-processing run'
-    )
-    pause_parser.add_argument('work_dir', help='Working directory to pause')
-    pause_parser.add_argument('--reason', default='', help='Optional pause reason')
-
-    # resume-run command
-    resume_run_parser = subparsers.add_parser(
-        'resume-run',
-        help='Clear a local pause request and restore resumable runtime state'
-    )
-    resume_run_parser.add_argument('work_dir', help='Working directory to resume')
-    resume_run_parser.add_argument('--reason', default='', help='Optional resume reason')
-
-    # telemetry-summary command
-    telemetry_summary_parser = subparsers.add_parser(
-        'telemetry-summary',
-        help='Summarize local telemetry journal from a work_dir or telemetry.jsonl path'
-    )
-    telemetry_summary_parser.add_argument('telemetry_ref', help='Work directory or telemetry.jsonl path')
-    telemetry_summary_parser.add_argument('--command-filter', dest='command_filter', default='', help='Optional command filter')
-    telemetry_summary_parser.add_argument('--document-id', default='', help='Optional document_id filter')
-    telemetry_summary_parser.add_argument('--success', choices=['all', 'true', 'false'], default='all', help='Filter by success state')
-    telemetry_summary_parser.add_argument('--recent-limit', type=int, default=5, help='Number of recent events to include')
-
-    # telemetry-events command
-    telemetry_events_parser = subparsers.add_parser(
-        'telemetry-events',
-        help='Query local telemetry journal events from a work_dir or telemetry.jsonl path'
-    )
-    telemetry_events_parser.add_argument('telemetry_ref', help='Work directory or telemetry.jsonl path')
-    telemetry_events_parser.add_argument('--limit', type=int, default=20, help='Maximum number of matching recent events to return (0 = all)')
-    telemetry_events_parser.add_argument('--command-filter', dest='command_filter', default='', help='Optional command filter')
-    telemetry_events_parser.add_argument('--trace-id', default='', help='Optional trace_id filter')
-    telemetry_events_parser.add_argument('--document-id', default='', help='Optional document_id filter')
-    telemetry_events_parser.add_argument('--success', choices=['all', 'true', 'false'], default='all', help='Filter by success state')
-
-    # build-glossary command
-    glossary_parser = subparsers.add_parser(
-        'build-glossary',
-        help='Build a local glossary artifact for terminology consistency'
-    )
-    glossary_parser.add_argument('work_dir', help='Working directory with manifest.json and raw chunks')
-    glossary_parser.add_argument('--max-terms', type=int, default=50, help='Maximum number of glossary terms to keep')
-    glossary_parser.add_argument('--min-occurrences', type=int, default=1, help='Minimum source occurrences required for a term')
-    glossary_parser.add_argument('--mode', choices=['auto', 'manifest', 'transcript'], default='auto',
-                                 help='Glossary source mode; transcript adds normalized-doc/chapter/metadata context when available')
-    glossary_parser.add_argument('--normalized-document', dest='normalized_document_path', default='',
-                                 help='Optional normalized_document.json path')
-    glossary_parser.add_argument('--chapters-path', default='',
-                                 help='Optional chapters or chapter_plan JSON path')
-    glossary_parser.add_argument('--metadata-json', dest='metadata_json_path', default='',
-                                 help='Optional metadata JSON path with title/channel/description/chapter fields')
-    glossary_parser.add_argument('--description-text', default='',
-                                 help='Optional description text to mine for glossary terms')
-    glossary_parser.add_argument('--description-path', default='',
-                                 help='Optional text file path containing description text')
-
-    # assemble-final command
-    af_parser = subparsers.add_parser(
-        'assemble-final',
-        help='Assemble final markdown file from optimized text and metadata'
-    )
-    af_parser.add_argument('optimized_text_path', help='Path to optimized text file')
-    af_parser.add_argument('output_file', help='Path to write final markdown file')
-    af_parser.add_argument('--title', default='', help='Video title')
-    af_parser.add_argument('--source', default='', help='Video URL')
-    af_parser.add_argument('--channel', default='', help='Channel name')
-    af_parser.add_argument('--date', default='', help='Video upload date')
-    af_parser.add_argument('--created', default='', help='File creation date')
-    af_parser.add_argument('--duration', type=int, default=0, help='Video duration in seconds')
-    af_parser.add_argument('--transcript-source', default='', help='youtube or deepgram')
-    af_parser.add_argument('--bilingual', action='store_true', help='Whether content is bilingual')
-
-    # verify-quality command
-    vq_parser = subparsers.add_parser(
-        'verify-quality',
-        help='Verify quality of optimized text file (structural checks)'
-    )
-    vq_parser.add_argument('optimized_text_path', help='Path to optimized text file')
-    vq_parser.add_argument('--raw-text', default=None, help='Path to raw text file for size comparison')
-    vq_parser.add_argument('--bilingual', action='store_true', help='Whether content should be bilingual')
-    vq_parser.add_argument('--work-dir', default='', help='Optional work_dir used to load glossary.json for drift checks')
-    vq_parser.add_argument('--glossary-path', default='', help='Optional glossary.json path for final drift checks')
-    vq_parser.add_argument('--glossary-max-terms', type=int, default=12,
-                           help='Maximum glossary terms to verify in final output')
-
-    # load-config command
-    config_parser = subparsers.add_parser(
-        'load-config',
-        help='Load and return configuration from config.yaml'
-    )
-    config_parser.add_argument('--config-path', default=None,
-                               help='Optional path to config file')
-
-    # sync-state command
-    sync_state_parser = subparsers.add_parser(
-        'sync-state',
-        help='Sync legacy state.md with authoritative machine_state.json'
-    )
-    sync_state_parser.add_argument('state_ref', help='Path to legacy state.md or machine_state.json')
-    sync_state_parser.add_argument('--write-legacy', action='store_true',
-                                   help='When given a machine_state.json, write the legacy state.md projection')
-
-    # normalize-document command
-    normalize_parser = subparsers.add_parser(
-        'normalize-document',
-        help='Materialize normalized_document.json from raw text or segments artifacts'
-    )
-    normalize_parser.add_argument('state_ref', help='Path to legacy state.md or machine_state.json')
-    normalize_parser.add_argument('--output', default='', help='Optional output path for normalized_document.json')
-    normalize_parser.add_argument('--prefer', default='auto', choices=['auto', 'segments', 'raw_text'],
-                                  help='Preferred source artifact for normalization')
-    normalize_parser.add_argument('--allow-missing', action='store_true',
-                                  help='Return success when no raw text or segments artifact is available')
-
-    # validate-state command
-    state_parser = subparsers.add_parser(
-        'validate-state',
-        help='Validate workflow state fields for a given stage'
-    )
-    state_parser.add_argument('state_path', help='Path to state markdown file')
-    state_parser.add_argument(
-        '--stage',
-        default='',
-        choices=sorted(STATE_STAGE_FIELDS.keys()),
-        help='Named validation stage to enforce',
-    )
-    state_parser.add_argument(
-        '--require',
-        action='append',
-        default=[],
-        help='Additional required field name (can be repeated)',
-    )
-
-    # find-unfinished command
-    unfinished_parser = subparsers.add_parser(
-        'find-unfinished',
-        help='List interrupted runs whose state and work files are kept for resume'
-    )
-    unfinished_parser.add_argument('--video-id', default='', help='Only check this video id')
-    unfinished_parser.add_argument('--tmp-dir', default='/tmp', help='Directory holding <VIDEO_ID>_state.md files')
-
-    # subtitle-info command
-    subtitle_info_parser = subparsers.add_parser(
-        'subtitle-info',
-        help='Detect the spoken language and pick subtitle candidates from yt-dlp metadata on stdin'
-    )
-    subtitle_info_parser.add_argument('--video-id', default='', help='Video id to report when metadata lacks one')
-    subtitle_info_parser.add_argument('--from-list-subs', action='store_true',
-                                      help='Read `yt-dlp --list-subs` output instead of `yt-dlp -J` JSON')
-    subtitle_info_parser.add_argument('--yt-dlp-runtime-json', default='',
-                                      help='yt-dlp runtime JSON to echo back in the result')
-
-    # plan-optimization command
-    plan_parser = subparsers.add_parser(
-        'plan-optimization',
-        help='Generate a structured optimization plan from workflow state'
-    )
-    plan_parser.add_argument('state_path', help='Path to state markdown file')
-
-    # run command
-    from kernel import pipeline as kernel_pipeline
     run_parser = subparsers.add_parser(
         'run',
         help='Run or continue the whole pipeline for one video (one JSON result, fixed exit codes)'
@@ -7659,14 +7140,12 @@ def main():
     run_parser.add_argument('--restart', action='store_true', help="Discard this video's work directory first")
     run_parser.add_argument('--config-path', default=None, help='Path to config.yaml')
 
-    # status command
     status_parser = subparsers.add_parser(
         'status',
         help='Show the runs under the work root, or one video\'s state.json'
     )
     status_parser.add_argument('video_id', nargs='?', default='', help='Video id (omit to list every run)')
 
-    # cleanup command
     cleanup_parser = subparsers.add_parser(
         'cleanup',
         help="Remove a video's work directory (an unfinished run needs --force)"
@@ -7674,452 +7153,33 @@ def main():
     cleanup_parser.add_argument('video_id', help='Video id')
     cleanup_parser.add_argument('--force', action='store_true', help='Also remove an unfinished run')
 
+    # Debug command; download.sh also pipes yt-dlp metadata through it.
+    subtitle_info_parser = subparsers.add_parser(
+        'subtitle-info',
+        help='Detect the spoken language and pick subtitle candidates from yt-dlp metadata on stdin'
+    )
+    subtitle_info_parser.add_argument('--video-id', default='', help='Video id to report when metadata lacks one')
+    subtitle_info_parser.add_argument('--from-list-subs', action='store_true',
+                                      help='Read `yt-dlp --list-subs` output instead of `yt-dlp -J` JSON')
+    subtitle_info_parser.add_argument('--yt-dlp-runtime-json', default='',
+                                      help='yt-dlp runtime JSON to echo back in the result')
+
+    # Debug command: the quality check `run` applies in its verify stage.
+    vq_parser = subparsers.add_parser(
+        'verify-quality',
+        help='Verify quality of optimized text file (structural checks)'
+    )
+    vq_parser.add_argument('optimized_text_path', help='Path to optimized text file')
+    vq_parser.add_argument('--raw-text', default=None, help='Path to raw text file for size comparison')
+    vq_parser.add_argument('--bilingual', action='store_true', help='Whether content should be bilingual')
+    vq_parser.add_argument('--work-dir', default='', help='Optional work_dir used to load glossary.json for drift checks')
+    vq_parser.add_argument('--glossary-path', default='', help='Optional glossary.json path for final drift checks')
+    vq_parser.add_argument('--glossary-max-terms', type=int, default=12,
+                           help='Maximum glossary terms to verify in final output')
+
     args = parser.parse_args()
 
-    if args.command == 'parse-vtt':
-        result = parse_vtt(args.vtt_path)
-        print(result)
-
-    elif args.command == 'parse-vtt-segments':
-        result = parse_vtt_segments(args.vtt_path, language=args.language)
-        print(json.dumps(result, ensure_ascii=False))
-
-    elif args.command == 'process-deepgram':
-        result = process_deepgram(
-            args.json_path,
-            prefer_structured_output=args.prefer_structured_output,
-        )
-        print(json.dumps(result, ensure_ascii=False))
-
-    elif args.command == 'sanitize-filename':
-        result = sanitize_filename(args.title)
-        print(result)
-
-    elif args.command == 'transcribe-deepgram':
-        result = transcribe_deepgram(
-            args.audio_path,
-            language=args.language,
-            config_path=args.config_path,
-            api_key=args.api_key,
-            max_size_mb=args.max_size,
-            max_deviation_sec=args.max_deviation,
-            timeout=args.timeout,
-            output_json=args.output_json,
-            output_text=args.output_text,
-            output_segments=args.output_segments,
-            deepgram_model=args.model,
-            enable_utterances=args.enable_utterances_override,
-            prefer_structured_output=args.prefer_structured_output_override,
-            resume_existing_chunks=args.resume_existing_chunks,
-        )
-        print(json.dumps(result, ensure_ascii=False))
-
-    elif args.command == 'test-deepgram-api':
-        result = test_deepgram_api(args.api_key)
-        print(json.dumps(result, ensure_ascii=False))
-        if not result['valid']:
-            sys.exit(1)
-
-    elif args.command == 'test-llm-api':
-        result = test_llm_api(
-            config_path=args.config_path,
-            api_key=args.api_key,
-            base_url=args.base_url,
-            model=args.model,
-            api_format=args.api_format,
-            timeout_sec=args.timeout,
-            stream_mode=args.stream,
-        )
-        print(json.dumps(result, ensure_ascii=False))
-        if not result['valid']:
-            sys.exit(1)
-
-    elif args.command == 'resolve-llm-backend':
-        result = kernel_agent_cli.resolve_llm_backend(
-            load_config(args.config_path, allow_missing=True),
-            override=args.agent_cli,
-            probe=not args.no_probe,
-        )
-        print(json.dumps(result, ensure_ascii=False))
-        if result['backend'] == 'none':
-            sys.exit(1)
-
-    elif args.command == 'test-token-count':
-        result = test_token_count(
-            config_path=args.config_path,
-            api_key=args.api_key,
-            base_url=args.base_url,
-            model=args.model,
-            api_format=args.api_format,
-            timeout_sec=args.timeout,
-            sample_text=args.sample_text,
-        )
-        print(json.dumps(result, ensure_ascii=False))
-
-    elif args.command == 'split-audio':
-        result = split_audio(args.audio_path, args.max_size, args.max_deviation)
-        print(json.dumps(result, ensure_ascii=False))
-
-    elif args.command == 'chunk-text':
-        envelope = run_kernel_command(
-            'chunk-text',
-            input_path=args.input_path,
-            output_dir=args.output_dir,
-            chunk_size=args.chunk_size,
-            prompt_name=args.prompt,
-            config_path=args.config_path,
-        )
-        print(json.dumps(envelope if args.api_envelope else envelope['result'], ensure_ascii=False))
-
-    elif args.command == 'chunk-segments':
-        envelope = run_kernel_command(
-            'chunk-segments',
-            segments_path=args.segments_path,
-            output_dir=args.output_dir,
-            chunk_size=args.chunk_size,
-            prompt_name=args.prompt,
-            config_path=args.config_path,
-            chapters_path=args.chapters,
-        )
-        print(json.dumps(envelope if args.api_envelope else envelope['result'], ensure_ascii=False))
-
-    elif args.command == 'chunk-document':
-        envelope = run_kernel_command(
-            'chunk-document',
-            normalized_document_path=args.normalized_document_path,
-            output_dir=args.output_dir,
-            chunk_size=args.chunk_size,
-            prompt_name=args.prompt,
-            config_path=args.config_path,
-            chapters_path=args.chapters,
-            prefer=args.prefer,
-        )
-        print(json.dumps(envelope if args.api_envelope else envelope['result'], ensure_ascii=False))
-
-    elif args.command == 'get-chapters':
-        result = get_chapters(args.video_url)
-        print(json.dumps(result, ensure_ascii=False))
-
-    elif args.command == 'build-chapter-plan':
-        result = build_chapter_plan(args.chapters_path, args.manifest_ref, args.output_path)
-        print(json.dumps(result, ensure_ascii=False))
-
-    elif args.command == 'merge-content':
-        envelope = run_kernel_command(
-            'merge-content',
-            work_dir=args.work_dir,
-            output_file=args.output_file,
-            header=args.header,
-        )
-        print(json.dumps(envelope if args.api_envelope else envelope['result'], ensure_ascii=False))
-
-    elif args.command == 'create-run':
-        try:
-            task_spec = _load_optional_json_object(
-                inline_json=args.task_spec_json,
-                file_path=args.task_spec_file,
-            )
-        except (OSError, ValueError, json.JSONDecodeError) as error:
-            print(json.dumps({
-                'success': False,
-                'error': 'invalid_task_spec',
-                'message': str(error),
-            }, ensure_ascii=False))
-            sys.exit(1)
-        envelope = run_kernel_command(
-            'create-run',
-            work_dir=args.work_dir,
-            task_spec=task_spec,
-            task_id=args.task_id,
-            source_ref=args.source_ref,
-            output_mode=args.output_mode,
-            bilingual=args.bilingual,
-            quality_profile=args.quality_profile,
-            speed_priority=args.speed_priority,
-            cost_budget=args.cost_budget,
-            latency_budget=args.latency_budget,
-            allowed_fallbacks=args.allowed_fallbacks,
-            human_escalation_policy=args.human_escalation_policy,
-            policy_profile=args.policy_profile,
-            migration_mode=args.migration_mode,
-        )
-        result = envelope['result']
-        print(json.dumps(envelope if args.api_envelope else result, ensure_ascii=False))
-        if not result.get('success', False):
-            sys.exit(1)
-
-    elif args.command == 'inspect-run':
-        envelope = run_kernel_command(
-            'inspect-run',
-            work_dir=args.work_dir,
-            run_id=args.run_id,
-            policy_profile=args.policy_profile,
-        )
-        result = envelope['result']
-        print(json.dumps(envelope if args.api_envelope else result, ensure_ascii=False))
-        if not result.get('success', False):
-            sys.exit(1)
-
-    elif args.command == 'advance-run':
-        envelope = run_kernel_command(
-            'advance-run',
-            work_dir=args.work_dir,
-            prompt_name=args.prompt,
-            run_id=args.run_id,
-            action=args.action,
-            extra_instruction=args.extra_instruction,
-            config_path=args.config_path,
-            dry_run=args.dry_run,
-            input_key=args.input_key,
-            force=args.force,
-            policy_profile=args.policy_profile,
-        )
-        result = envelope['result']
-        print(json.dumps(envelope if args.api_envelope else result, ensure_ascii=False))
-        if not result.get('success', False) and not result.get('dry_run', False):
-            sys.exit(1)
-
-    elif args.command == 'apply-control':
-        envelope = run_kernel_command(
-            'apply-control',
-            work_dir=args.work_dir,
-            run_id=args.run_id,
-            signal=args.signal,
-            reason=args.reason,
-            policy_profile=args.policy_profile,
-        )
-        result = envelope['result']
-        print(json.dumps(envelope if args.api_envelope else result, ensure_ascii=False))
-        if not result.get('success', False):
-            sys.exit(1)
-
-    elif args.command == 'finalize-run':
-        envelope = run_kernel_command(
-            'finalize-run',
-            work_dir=args.work_dir,
-            run_id=args.run_id,
-            output_file=args.output_file,
-            header=args.header,
-            inspect_only=args.inspect_only,
-            policy_profile=args.policy_profile,
-        )
-        result = envelope['result']
-        print(json.dumps(envelope if args.api_envelope else result, ensure_ascii=False))
-        if not result.get('success', False):
-            sys.exit(1)
-
-    elif args.command == 'process-chunks':
-        if args.agent_cli:
-            os.environ[kernel_agent_cli.AGENT_CLI_ENV_VAR] = args.agent_cli
-        envelope = run_kernel_command(
-            'process-chunks',
-            work_dir=args.work_dir,
-            prompt_name=args.prompt,
-            extra_instruction=args.extra_instruction,
-            config_path=args.config_path,
-            dry_run=args.dry_run,
-            input_key=args.input_key,
-            force=args.force,
-        )
-        result = envelope['result']
-        print(json.dumps(envelope if args.api_envelope else result, ensure_ascii=False))
-        if not result.get('success', False) and not result.get('dry_run', False):
-            sys.exit(1)
-
-    elif args.command == 'prepare-resume':
-        envelope = run_kernel_command(
-            'prepare-resume',
-            work_dir=args.work_dir,
-            prompt_name=args.prompt,
-            config_path=args.config_path,
-            input_key=args.input_key,
-        )
-        print(json.dumps(envelope if args.api_envelope else envelope['result'], ensure_ascii=False))
-
-
-    elif args.command == 'runtime-status':
-        envelope = run_kernel_command(
-            'runtime-status',
-            work_dir=args.work_dir,
-        )
-        print(json.dumps(envelope if args.api_envelope else envelope['result'], ensure_ascii=False))
-
-    elif args.command == 'cancel-run':
-        envelope = run_kernel_command(
-            'cancel-run',
-            work_dir=args.work_dir,
-            reason=args.reason,
-        )
-        result = envelope['result']
-        print(json.dumps(envelope if args.api_envelope else result, ensure_ascii=False))
-        if not result.get('success', False):
-            sys.exit(1)
-
-    elif args.command == 'pause-run':
-        envelope = run_kernel_command(
-            'pause-run',
-            work_dir=args.work_dir,
-            reason=args.reason,
-        )
-        result = envelope['result']
-        print(json.dumps(envelope if args.api_envelope else result, ensure_ascii=False))
-        if not result.get('success', False):
-            sys.exit(1)
-
-    elif args.command == 'resume-run':
-        envelope = run_kernel_command(
-            'resume-run',
-            work_dir=args.work_dir,
-            reason=args.reason,
-        )
-        result = envelope['result']
-        print(json.dumps(envelope if args.api_envelope else result, ensure_ascii=False))
-        if not result.get('success', False):
-            sys.exit(1)
-
-    elif args.command == 'telemetry-summary':
-        envelope = run_kernel_command(
-            'telemetry-summary',
-            telemetry_ref=args.telemetry_ref,
-            command_filter=args.command_filter,
-            document_id=args.document_id,
-            success=args.success,
-            recent_limit=args.recent_limit,
-        )
-        result = envelope['result']
-        print(json.dumps(envelope if args.api_envelope else result, ensure_ascii=False))
-        if not result.get('success', False):
-            sys.exit(1)
-
-    elif args.command == 'telemetry-events':
-        envelope = run_kernel_command(
-            'telemetry-events',
-            telemetry_ref=args.telemetry_ref,
-            limit=args.limit,
-            command_filter=args.command_filter,
-            trace_id=args.trace_id,
-            document_id=args.document_id,
-            success=args.success,
-        )
-        result = envelope['result']
-        print(json.dumps(envelope if args.api_envelope else result, ensure_ascii=False))
-        if not result.get('success', False):
-            sys.exit(1)
-
-    elif args.command == 'build-glossary':
-        envelope = run_kernel_command(
-            'build-glossary',
-            work_dir=args.work_dir,
-            max_terms=args.max_terms,
-            min_occurrences=args.min_occurrences,
-            mode=args.mode,
-            normalized_document_path=args.normalized_document_path,
-            chapters_path=args.chapters_path,
-            metadata_json_path=args.metadata_json_path,
-            description_text=args.description_text,
-            description_path=args.description_path,
-        )
-        result = envelope['result']
-        print(json.dumps(envelope if args.api_envelope else result, ensure_ascii=False))
-        if not result.get('success', False):
-            sys.exit(1)
-
-    elif args.command == 'assemble-final':
-        envelope = run_kernel_command(
-            'assemble-final',
-            optimized_text_path=args.optimized_text_path,
-            output_file=args.output_file,
-            title=args.title,
-            source=args.source,
-            channel=args.channel,
-            date=args.date,
-            created=args.created,
-            duration=args.duration,
-            transcript_source=args.transcript_source,
-            bilingual=args.bilingual,
-        )
-        print(json.dumps(envelope if args.api_envelope else envelope['result'], ensure_ascii=False))
-
-    elif args.command == 'verify-quality':
-        envelope = run_kernel_command(
-            'verify-quality',
-            optimized_text_path=args.optimized_text_path,
-            raw_text_path=args.raw_text,
-            bilingual=args.bilingual,
-            work_dir=args.work_dir,
-            glossary_path=args.glossary_path,
-            glossary_max_terms=args.glossary_max_terms,
-        )
-        result = envelope['result']
-        print(json.dumps(envelope if args.api_envelope else result, ensure_ascii=False))
-        if not result['passed']:
-            sys.exit(1)
-
-    elif args.command == 'load-config':
-        result = load_config(args.config_path)
-        print(json.dumps(result, ensure_ascii=False))
-
-    elif args.command == 'sync-state':
-        result = sync_machine_state(args.state_ref, write_legacy=args.write_legacy)
-        print(json.dumps(result, ensure_ascii=False))
-
-    elif args.command == 'normalize-document':
-        envelope = run_kernel_command(
-            'normalize-document',
-            state_ref=args.state_ref,
-            output_path=args.output,
-            prefer=args.prefer,
-            allow_missing=args.allow_missing,
-        )
-        result = envelope['result']
-        print(json.dumps(envelope if args.api_envelope else result, ensure_ascii=False))
-        if not result['passed']:
-            sys.exit(1)
-
-    elif args.command == 'find-unfinished':
-        result = find_unfinished_runs(args.tmp_dir, video_id=args.video_id)
-        print(json.dumps(result, ensure_ascii=False))
-
-    elif args.command == 'subtitle-info':
-        raw = sys.stdin.read()
-        if args.from_list_subs:
-            payload = kernel_subtitle_language.metadata_from_list_subs(raw, video_id=args.video_id)
-        else:
-            try:
-                payload = json.loads(raw)
-            except json.JSONDecodeError as error:
-                print(f"Error: subtitle-info expects yt-dlp -J metadata on stdin: {error}", file=sys.stderr)
-                sys.exit(1)
-        try:
-            runtime = json.loads(args.yt_dlp_runtime_json) if args.yt_dlp_runtime_json else {}
-        except json.JSONDecodeError:
-            runtime = {}
-        result = kernel_subtitle_language.build_subtitle_info(payload, video_id=args.video_id, yt_dlp_runtime=runtime)
-        print(json.dumps(result, ensure_ascii=False))
-
-    elif args.command == 'validate-state':
-        envelope = run_kernel_command(
-            'validate-state',
-            state_path=args.state_path,
-            stage=args.stage,
-            require=args.require,
-        )
-        result = envelope['result']
-        print(json.dumps(envelope if args.api_envelope else result, ensure_ascii=False))
-        if not result['passed']:
-            sys.exit(1)
-
-    elif args.command == 'plan-optimization':
-        envelope = run_kernel_command(
-            'plan-optimization',
-            state_path=args.state_path,
-        )
-        result = envelope['result']
-        print(json.dumps(envelope if args.api_envelope else result, ensure_ascii=False))
-        if not result['passed']:
-            sys.exit(1)
-
-    elif args.command == 'run':
+    if args.command == 'run':
         # Progress goes to stderr; stdout carries exactly one JSON result.
         stderr_tail = kernel_pipeline._StderrTail(sys.stderr)
         with contextlib.redirect_stderr(stderr_tail), contextlib.redirect_stdout(stderr_tail):
@@ -8146,6 +7206,36 @@ def main():
         result, code = kernel_pipeline.cleanup(args.video_id, force=args.force)
         print(json.dumps(result, ensure_ascii=False))
         sys.exit(code)
+
+    elif args.command == 'subtitle-info':
+        raw = sys.stdin.read()
+        if args.from_list_subs:
+            payload = kernel_subtitle_language.metadata_from_list_subs(raw, video_id=args.video_id)
+        else:
+            try:
+                payload = json.loads(raw)
+            except json.JSONDecodeError as error:
+                print(f"Error: subtitle-info expects yt-dlp -J metadata on stdin: {error}", file=sys.stderr)
+                sys.exit(1)
+        try:
+            runtime = json.loads(args.yt_dlp_runtime_json) if args.yt_dlp_runtime_json else {}
+        except json.JSONDecodeError:
+            runtime = {}
+        result = kernel_subtitle_language.build_subtitle_info(payload, video_id=args.video_id, yt_dlp_runtime=runtime)
+        print(json.dumps(result, ensure_ascii=False))
+
+    elif args.command == 'verify-quality':
+        result = verify_quality(
+            args.optimized_text_path,
+            raw_text_path=args.raw_text,
+            bilingual=args.bilingual,
+            work_dir=args.work_dir,
+            glossary_path=args.glossary_path,
+            glossary_max_terms=args.glossary_max_terms,
+        )
+        print(json.dumps(result, ensure_ascii=False))
+        if not result['passed']:
+            sys.exit(1)
 
     else:
         parser.print_help()

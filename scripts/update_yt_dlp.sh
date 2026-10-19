@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # update_yt_dlp.sh - Update yt-dlp when a newer release exists (best effort).
 # YouTube keeps breaking older yt-dlp releases, so `run` calls this before it
-# fetches a video's metadata, and preflight.sh calls it too. The GitHub check
+# fetches a video's metadata. The GitHub check
 # runs at most once an hour; a failed check or update never fails the caller.
 # Set YT_TRANSCRIPT_YT_DLP_UPDATE=0 to skip it (the offline tests do).
 

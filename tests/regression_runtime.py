@@ -412,42 +412,6 @@ class RuntimeRegressionTests(FixedChunkExecutorTestCase):
             self.assertEqual(result["returned_count"], 1)
             self.assertEqual(result["events"][0]["command"], "pause-run")
 
-    def test_cli_api_envelope_wraps_telemetry_summary(self):
-        """Test cli api envelope wraps telemetry summary."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            source = Path(tmpdir) / "raw.txt"
-            work_dir = Path(tmpdir) / "chunks"
-            source.write_text("第一句。第二句。第三句。第四句。", encoding="utf-8")
-            utils.run_kernel_command(
-                "chunk-text",
-                input_path=str(source),
-                output_dir=str(work_dir),
-                chunk_size=4,
-                prompt_name="structure_only",
-                config_path=None,
-            )
-
-            result = subprocess.run(
-                [
-                    "python3",
-                    str(PROJECT_ROOT / "yt_transcript_utils.py"),
-                    "--api-envelope",
-                    "telemetry-summary",
-                    str(work_dir),
-                ],
-                cwd=PROJECT_ROOT,
-                check=True,
-                capture_output=True,
-                text=True,
-            )
-
-            payload = json.loads(result.stdout)
-            self.assertEqual(payload["format"], utils.COMMAND_RESULT_FORMAT)
-            self.assertEqual(payload["command"], "telemetry-summary")
-            self.assertTrue(payload["ok"])
-            self.assertTrue(payload["result"]["success"])
-            self.assertGreaterEqual(payload["result"]["summary"]["matching_event_count"], 1)
-
     def test_build_glossary_extracts_terms_from_work_dir(self):
         """Test build glossary extracts terms from work dir."""
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1325,69 +1289,6 @@ class RuntimeRegressionTests(FixedChunkExecutorTestCase):
             self.assertEqual(resume_envelope["command"], "resume-run")
             self.assertTrue(resume_envelope["result"]["success"])
             self.assertTrue(resume_envelope["result"]["resumed"])
-
-    def test_cli_api_envelope_wraps_cancel_run(self):
-        """Test cli api envelope wraps cancel run."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            source = Path(tmpdir) / "raw.txt"
-            work_dir = Path(tmpdir) / "chunks"
-            source.write_text("第一句。第二句。第三句。第四句。", encoding="utf-8")
-            utils.chunk_text(str(source), str(work_dir), 4, "structure_only")
-
-            result = subprocess.run(
-                [
-                    "python3",
-                    str(PROJECT_ROOT / "yt_transcript_utils.py"),
-                    "--api-envelope",
-                    "cancel-run",
-                    str(work_dir),
-                    "--reason",
-                    "cli stop",
-                ],
-                cwd=PROJECT_ROOT,
-                check=True,
-                capture_output=True,
-                text=True,
-            )
-
-            payload = json.loads(result.stdout)
-            telemetry_path = Path(payload["telemetry"]["telemetry_path"])
-            self.assertEqual(payload["format"], utils.COMMAND_RESULT_FORMAT)
-            self.assertEqual(payload["command"], "cancel-run")
-            self.assertTrue(payload["ok"])
-            self.assertTrue(payload["result"]["requested"])
-            self.assertEqual(payload["result"]["reason"], "cli stop")
-            self.assertTrue(telemetry_path.exists())
-
-    def test_cli_api_envelope_wraps_runtime_status(self):
-        """Test cli api envelope wraps runtime status."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            source = Path(tmpdir) / "raw.txt"
-            work_dir = Path(tmpdir) / "chunks"
-            source.write_text("第一句。第二句。第三句。第四句。", encoding="utf-8")
-            utils.chunk_text(str(source), str(work_dir), 4, "structure_only")
-
-            result = subprocess.run(
-                [
-                    "python3",
-                    str(PROJECT_ROOT / "yt_transcript_utils.py"),
-                    "--api-envelope",
-                    "runtime-status",
-                    str(work_dir),
-                ],
-                cwd=PROJECT_ROOT,
-                check=True,
-                capture_output=True,
-                text=True,
-            )
-
-            payload = json.loads(result.stdout)
-            telemetry_path = Path(payload["telemetry"]["telemetry_path"])
-            self.assertEqual(payload["format"], utils.COMMAND_RESULT_FORMAT)
-            self.assertEqual(payload["command"], "runtime-status")
-            self.assertTrue(payload["ok"])
-            self.assertTrue(payload["result"]["manifest_present"])
-            self.assertTrue(telemetry_path.exists())
 
     def test_process_chunks_skips_done_chunks_by_default(self):
         """Test process chunks skips done chunks by default."""
@@ -2355,38 +2256,6 @@ class RuntimeRegressionTests(FixedChunkExecutorTestCase):
             self.assertTrue(output_file.exists())
             self.assertGreaterEqual(result["artifact_graph"]["node_count"], 2)
             self.assertEqual(result["task_spec"]["source_ref"], "youtube:finalize")
-
-    def test_cli_api_envelope_wraps_inspect_run(self):
-        """Test CLI api envelope wraps inspect-run with stable runtime contracts."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            source = Path(tmpdir) / "raw.txt"
-            work_dir = Path(tmpdir) / "chunks"
-            source.write_text("第一句。第二句。第三句。第四句。", encoding="utf-8")
-            utils.chunk_text(str(source), str(work_dir), 4, "structure_only")
-            created = utils.create_run(str(work_dir), source_ref="youtube:cli-inspect")
-
-            result = subprocess.run(
-                [
-                    "python3",
-                    str(PROJECT_ROOT / "yt_transcript_utils.py"),
-                    "--api-envelope",
-                    "inspect-run",
-                    str(work_dir),
-                ],
-                cwd=PROJECT_ROOT,
-                check=True,
-                capture_output=True,
-                text=True,
-            )
-
-            payload = json.loads(result.stdout)
-            self.assertEqual(payload["format"], utils.COMMAND_RESULT_FORMAT)
-            self.assertEqual(payload["command"], "inspect-run")
-            self.assertTrue(payload["ok"])
-            self.assertEqual(payload["result"]["run_id"], created["run_id"])
-            self.assertEqual(payload["contracts"]["run_state"]["run_id"], created["run_id"])
-            self.assertEqual(payload["contracts"]["task_spec"]["source_ref"], "youtube:cli-inspect")
-
 
     def test_verify_quality_does_not_flag_complete_chinese_tail_without_punctuation(self):
         """Test verify quality does not flag complete chinese tail without punctuation."""

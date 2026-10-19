@@ -949,47 +949,6 @@ class CoreRegressionTests(unittest.TestCase):
             self.assertEqual(result["diagnostics"]["overlap_trim_count"], 1)
             self.assertEqual(result["diagnostics"]["overlap_trimmed_chars"], 3)
 
-    def test_cli_parse_vtt_segments_command_is_registered(self):
-        """Test cli parse vtt segments command is registered."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            vtt_path = Path(tmpdir) / "sub.vtt"
-            vtt_path.write_text(
-                "WEBVTT\n"
-                "Language: en\n"
-                "\n"
-                "00:00:00.000 --> 00:00:02.000\n"
-                "Hello world.\n"
-                "\n"
-                "00:00:02.000 --> 00:00:04.000\n"
-                "Hello world.\n",
-                encoding="utf-8",
-            )
-
-            result = subprocess.run(
-                [
-                    sys.executable,
-                    str(PROJECT_ROOT / "yt_transcript_utils.py"),
-                    "parse-vtt-segments",
-                    str(vtt_path),
-                    "--language",
-                    "en",
-                ],
-                cwd=PROJECT_ROOT,
-                check=True,
-                capture_output=True,
-                text=True,
-            )
-
-            payload = json.loads(result.stdout)
-            self.assertEqual(payload["source"], "vtt")
-            self.assertEqual(payload["language"], "en")
-            self.assertEqual(payload["segment_count"], 1)
-            self.assertIn("diagnostics", payload)
-            self.assertEqual(payload["diagnostics"]["exact_duplicate_cue_count"], 1)
-            self.assertEqual(payload["segments"][0]["text"], "Hello world.")
-            self.assertEqual(payload["segments"][0]["start_time"], 0.0)
-            self.assertEqual(payload["segments"][0]["end_time"], 4.0)
-
     def test_chunk_segments_can_force_chapter_boundaries(self):
         """Test chunk segments can force chapter boundaries."""
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1961,53 +1920,6 @@ work_dir: /tmp/vid001_chunks
         self.assertIn("duplicate_ngram_ratio", warning_ids)
         self.assertIn("punctuation_density", warning_ids)
         self.assertIn("glossary_drift", warning_ids)
-
-    def test_cli_api_envelope_wraps_plan_optimization(self):
-        """Test cli api envelope wraps plan optimization."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            state = Path(tmpdir) / "state.md"
-            work_dir = Path(tmpdir) / "vid001_chunks"
-            state.write_text(
-                "# State\n"
-                "vid: vid001\n"
-                "url: https://example.com/watch?v=1\n"
-                "title: Sample\n"
-                "channel: Channel\n"
-                "upload_date: 20260308\n"
-                "duration: 3600\n"
-                "output_dir: /tmp/out\n"
-                "mode: bilingual\n"
-                "src: youtube\n"
-                "source_language: en\n"
-                "subtitle_source: YouTube Subtitles\n"
-                f"work_dir: {work_dir}\n",
-                encoding="utf-8",
-            )
-
-            result = subprocess.run(
-                [
-                    "python3",
-                    str(PROJECT_ROOT / "yt_transcript_utils.py"),
-                    "--api-envelope",
-                    "plan-optimization",
-                    str(state),
-                ],
-                cwd=PROJECT_ROOT,
-                check=True,
-                capture_output=True,
-                text=True,
-            )
-
-            payload = json.loads(result.stdout)
-            telemetry_path = Path(payload["telemetry"]["telemetry_path"])
-            self.assertEqual(payload["format"], utils.COMMAND_RESULT_FORMAT)
-            self.assertEqual(payload["command"], "plan-optimization")
-            self.assertTrue(payload["ok"])
-            self.assertTrue(payload["result"]["passed"])
-            self.assertTrue(telemetry_path.exists())
-            event = json.loads(telemetry_path.read_text(encoding="utf-8").splitlines()[-1])
-            self.assertEqual(event["command"], "plan-optimization")
-            self.assertEqual(event["trace_id"], payload["trace_id"])
 
     def test_load_config_parses_llm_tuning_fields(self):
         """Test load config parses llm tuning fields."""

@@ -88,6 +88,14 @@ DOWNLOAD_TIMEOUT_SEC = 1800
 # scripts/update_yt_dlp.sh skips itself when this is "0" (the offline tests set it).
 YT_DLP_UPDATE_ENV = "YT_TRANSCRIPT_YT_DLP_UPDATE"
 YT_DLP_UPDATE_TIMEOUT_SEC = 300
+# download.sh reads the yt-dlp settings from these variables.
+YT_DLP_CONFIG_ENV = {
+    "YT_DLP_SOCKET_TIMEOUT_SEC": "yt_dlp_socket_timeout_sec",
+    "YT_DLP_RETRIES": "yt_dlp_retries",
+    "YT_DLP_EXTRACTOR_RETRIES": "yt_dlp_extractor_retries",
+    "YT_DLP_COOKIES_FROM_BROWSER": "yt_dlp_cookies_from_browser",
+    "YT_DLP_COOKIES_FILE": "yt_dlp_cookies_file",
+}
 DEEPGRAM_KEY_PLACEHOLDERS = {"", "your_api_key_here", "your_deepgram_api_key_here"}
 # yt-dlp messages that only the user can resolve, checked in this order.
 NEEDS_USER_PATTERNS = (
@@ -482,6 +490,11 @@ class _Run:
             "YT_TRANSCRIPT_DOWNLOAD_DIR": str(self.path(SOURCE_DIR)),
             "YT_TRANSCRIPT_SUBTITLE_MODE": subtitle_mode,
         })
+        # yt-dlp settings from config; a variable already in the environment wins.
+        for env_name, key in YT_DLP_CONFIG_ENV.items():
+            value = self.config.get(key)
+            if value not in (None, "") and not env.get(env_name):
+                env[env_name] = str(value)
         self.path(SOURCE_DIR).mkdir(parents=True, exist_ok=True)
         script = _utils()._skill_root() / "scripts" / "download.sh"
         try:
