@@ -29,7 +29,7 @@ import http.client
 import json
 import math
 import os
-import random
+import random  # noqa: F401  (kernel/long_text/llm.py reads it through these module globals)
 import re
 import socket
 import subprocess
@@ -1615,32 +1615,6 @@ def _is_valid_compact_date_fragment(value: str) -> bool:
     return True
 
 
-def _find_compact_dates_in_filename(output_file: str) -> list[str]:
-    """Find compact YYYYMMDD date fragments in a file basename."""
-    filename = Path(str(output_file or "")).name
-    compact_dates = []
-    for match in re.finditer(r"(?<![A-Za-z0-9])(\d{8})(?![A-Za-z0-9])", filename):
-        date_text = match.group(1)
-        if _is_valid_compact_date_fragment(date_text):
-            compact_dates.append(date_text)
-    return compact_dates
-
-
-def _validate_output_filename_date_format(output_file: str) -> list[str]:
-    """Return validation failures for date fragments in final output filenames."""
-    compact_dates = _find_compact_dates_in_filename(output_file)
-    if not compact_dates:
-        return []
-    normalized_examples = [
-        f"{date_text[:4]}-{date_text[4:6]}-{date_text[6:]}"
-        for date_text in compact_dates
-    ]
-    return [
-        "Output filename date must use yyyy-mm-dd, not yyyymmdd "
-        f"({', '.join(compact_dates)} -> {', '.join(normalized_examples)})."
-    ]
-
-
 def _normalize_frontmatter_date(value: str) -> str:
     """Normalize compact YYYYMMDD dates for article frontmatter."""
     text = str(value or "").strip()
@@ -3033,232 +3007,8 @@ def verify_quality(optimized_text_path: str, raw_text_path: str = None,
     }
 
 
-STATE_STAGE_FIELDS = {
-    "metadata": ["vid", "url", "title", "channel", "upload_date", "duration", "output_dir"],
-    "post-source": ["vid", "url", "title", "channel", "upload_date", "duration", "output_dir",
-                    "mode", "src", "source_language", "subtitle_source"],
-    "pre-assemble": ["vid", "url", "title", "channel", "upload_date", "duration", "output_dir",
-                     "mode", "src", "source_language", "subtitle_source"],
-    "final": ["vid", "url", "title", "channel", "upload_date", "duration", "output_dir",
-              "mode", "src", "source_language", "subtitle_source", "output_file"],
-}
-
-MACHINE_STATE_SCHEMA_VERSION = 1
-MACHINE_STATE_FORMAT = "yt_transcript.machine_state/v1"
 NORMALIZED_DOCUMENT_SCHEMA_VERSION = 1
 NORMALIZED_DOCUMENT_FORMAT = "yt_transcript.normalized_document/v1"
-LEGACY_STATE_MACHINE_SUFFIX = "_machine_state.json"
-
-
-def _derive_machine_state_path(state_path: str | Path) -> Path:
-    """Derive machine state path."""
-    path = Path(state_path)
-    if path.suffix.lower() == ".json":
-        return path
-    if path.name.endswith("_state.md"):
-        return path.with_name(path.name[:-len("_state.md")] + LEGACY_STATE_MACHINE_SUFFIX)
-    stem = path.stem
-    if stem.endswith("_state"):
-        stem = stem[:-len("_state")]
-    return path.with_name(f"{stem}{LEGACY_STATE_MACHINE_SUFFIX}")
-
-
-def _derive_legacy_state_path(machine_state_path: str | Path) -> Path:
-    """Derive legacy state path."""
-    path = Path(machine_state_path)
-    if path.suffix.lower() == ".md":
-        return path
-    if path.name.endswith(LEGACY_STATE_MACHINE_SUFFIX):
-        return path.with_name(path.name[:-len(LEGACY_STATE_MACHINE_SUFFIX)] + "_state.md")
-    return path.with_suffix(".md")
-
-
-def _default_normalized_document_path(document_id: str) -> str:
-    """Return the default normalized document path."""
-    token = str(document_id or "").strip() or "unknown"
-    return f"/tmp/{token}_normalized_document.json"
-
-
-def _parse_legacy_state_content(content: str) -> dict:
-    """Parse legacy state content."""
-    state = {}
-    for raw_line in content.splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#") or line.startswith("-"):
-            continue
-        if ":" not in line:
-            continue
-        key, _, value = line.partition(":")
-        state[key.strip()] = value.strip()
-    return state
-
-
-def _read_legacy_state_file(state_path: str | Path) -> tuple[dict, str]:
-    """Read legacy state file."""
-    path = Path(state_path)
-    try:
-        content = path.read_text(encoding="utf-8")
-    except Exception as e:
-        print(f"Error: Cannot read state file: {e}", file=sys.stderr)
-        sys.exit(2)
-    return _parse_legacy_state_content(content), content
-
-
-def _compat_fields_to_machine_state(compat_fields: dict, legacy_state_path: Path,
-                                 machine_state_path: Path, existing_payload: dict | None = None) -> dict:
-    """Compat fields to machine state."""
-    compat = {str(key).strip(): str(value).strip() for key, value in (compat_fields or {}).items() if str(key).strip()}
-    content = "\n".join(f"{key}: {value}" for key, value in sorted(compat.items()))
-    content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
-    existing_payload = existing_payload if isinstance(existing_payload, dict) else {}
-    existing_artifacts = existing_payload.get("artifacts", {}) if isinstance(existing_payload.get("artifacts", {}), dict) else {}
-    existing_normalization = existing_payload.get("normalization", {}) if isinstance(existing_payload.get("normalization", {}), dict) else {}
-
-    source = {
-        "type": compat.get("src", ""),
-        "url": compat.get("url", ""),
-        "title": compat.get("title", ""),
-        "channel": compat.get("channel", ""),
-        "upload_date": compat.get("upload_date", ""),
-        "duration": compat.get("duration", ""),
-        "source_language": compat.get("source_language", ""),
-        "subtitle_source": compat.get("subtitle_source", ""),
-    }
-    artifacts = {
-        "output_dir": compat.get("output_dir", existing_artifacts.get("output_dir", "")),
-        "work_dir": compat.get("work_dir", existing_artifacts.get("work_dir", "")),
-        "output_file": compat.get("output_file", existing_artifacts.get("output_file", "")),
-        "raw_text": compat.get("raw_text", existing_artifacts.get("raw_text", "")),
-        "structured_text": compat.get("structured_text", existing_artifacts.get("structured_text", "")),
-        "optimized_text": compat.get("optimized_text", existing_artifacts.get("optimized_text", "")),
-        "segments_path": compat.get("segments_path", existing_artifacts.get("segments_path", "")),
-        "normalized_document": compat.get("normalized_document", existing_artifacts.get("normalized_document", "")),
-    }
-    workflow = {
-        "mode": compat.get("mode", ""),
-        "step": compat.get("step", ""),
-        "last_action": compat.get("last_action", ""),
-        "chunk": compat.get("chunk", ""),
-        "total": compat.get("total", ""),
-    }
-    return {
-        "schema_version": MACHINE_STATE_SCHEMA_VERSION,
-        "format": MACHINE_STATE_FORMAT,
-        "updated_at": _now_iso(),
-        "document_id": compat.get("vid", ""),
-        "legacy_state_path": str(legacy_state_path),
-        "machine_state_path": str(machine_state_path),
-        "compat_projection": {
-            "fields": compat,
-            "source_hash": content_hash,
-        },
-        "source": source,
-        "artifacts": artifacts,
-        "workflow": workflow,
-        "normalization": existing_normalization,
-    }
-
-
-def _read_machine_state(machine_state_path: str | Path) -> dict:
-    """Read machine state."""
-    path = Path(machine_state_path)
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except Exception as e:
-        print(f"Error: Cannot read machine state: {e}", file=sys.stderr)
-        sys.exit(2)
-    if not isinstance(payload, dict):
-        print("Error: Machine state must be a JSON object", file=sys.stderr)
-        sys.exit(2)
-    return payload
-
-
-def _write_machine_state(machine_state_path: str | Path, payload: dict) -> None:
-    """Write machine state."""
-    path = Path(machine_state_path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    _atomic_write_text(path, json.dumps(payload, ensure_ascii=False, indent=2))
-
-
-def _machine_state_to_compat_fields(payload: dict) -> dict:
-    """Machine state to compat fields."""
-    compat = payload.get("compat_projection", {}).get("fields", {}) if isinstance(payload, dict) else {}
-    if not isinstance(compat, dict):
-        return {}
-    return {str(key).strip(): str(value).strip() for key, value in compat.items() if str(key).strip()}
-
-
-def sync_machine_state(state_ref: str, write_legacy: bool = False) -> dict:
-    """Synchronize machine state."""
-    path = Path(state_ref)
-    if path.suffix.lower() == ".json":
-        if not path.exists():
-            print(f"Error: Machine state file not found: {state_ref}", file=sys.stderr)
-            sys.exit(1)
-        machine_state = _read_machine_state(path)
-        legacy_state_path = _derive_legacy_state_path(path)
-        compat_fields = _machine_state_to_compat_fields(machine_state)
-        if write_legacy:
-            lines = ["# State"]
-            for key, value in compat_fields.items():
-                lines.append(f"{key}: {value}")
-            _atomic_write_text(legacy_state_path, "\n".join(lines) + "\n")
-        return {
-            "machine_state_path": str(path),
-            "legacy_state_path": str(legacy_state_path),
-            "compat_fields": compat_fields,
-            "updated_machine_state": False,
-            "updated_legacy_state": write_legacy,
-        }
-
-    if not path.exists():
-        machine_state_path = _derive_machine_state_path(path)
-        if machine_state_path.exists():
-            machine_state = _read_machine_state(machine_state_path)
-            return {
-                "machine_state_path": str(machine_state_path),
-                "legacy_state_path": str(path),
-                "compat_fields": _machine_state_to_compat_fields(machine_state),
-                "updated_machine_state": False,
-                "updated_legacy_state": False,
-            }
-        print(f"Error: State file not found: {state_ref}", file=sys.stderr)
-        sys.exit(1)
-
-    compat_fields, content = _read_legacy_state_file(path)
-    machine_state_path = _derive_machine_state_path(path)
-    content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
-    existing = _read_machine_state(machine_state_path) if machine_state_path.exists() else None
-    existing_hash = ""
-    if isinstance(existing, dict):
-        existing_hash = str(existing.get("compat_projection", {}).get("source_hash", "")).strip()
-    updated_machine_state = not existing or existing_hash != content_hash
-    if updated_machine_state:
-        machine_state = _compat_fields_to_machine_state(compat_fields, path, machine_state_path, existing_payload=existing)
-        _write_machine_state(machine_state_path, machine_state)
-    else:
-        machine_state = existing
-    return {
-        "machine_state_path": str(machine_state_path),
-        "legacy_state_path": str(path),
-        "compat_fields": _machine_state_to_compat_fields(machine_state),
-        "updated_machine_state": updated_machine_state,
-        "updated_legacy_state": False,
-    }
-
-
-def load_state(state_path: str) -> dict:
-    """
-    Load workflow state through the authoritative machine-state bridge.
-
-    Compatibility behavior:
-    - legacy markdown state files remain accepted inputs
-    - if a legacy state file is provided, a sibling machine_state.json is
-      created or refreshed automatically
-    - direct machine_state.json inputs are also supported
-    """
-    sync_result = sync_machine_state(state_path)
-    return sync_result["compat_fields"]
 
 
 def _normalize_text_body(text: str) -> str:
@@ -3293,7 +3043,7 @@ def _normalize_segment_text_for_source(text: str, source_payload: dict) -> str:
 
 
 def _prefer_text_chunking_for_source(source_payload: dict, workflow_payload: dict) -> bool:
-    """Return whether chunk-document should prefer text despite timed segments."""
+    """Return whether chunking should prefer text despite timed segments."""
     if not _is_youtube_subtitle_source(source_payload):
         return False
     mode = str((workflow_payload or {}).get("mode", "")).strip().lower()
@@ -3529,110 +3279,17 @@ def _build_source_routing_signal(source: str, mode: str, subtitle_quality: dict 
     }
 
 
-def _update_machine_state_normalization(machine_state_path: str | Path, *, normalized_document_path: str,
-                                        source_adapter: str, preferred_chunk_source: str,
-                                        segment_count: int, char_count: int,
-                                        raw_text_path: str = "", segments_path: str = "") -> None:
-    """Update machine state normalization."""
-    payload = _read_machine_state(machine_state_path)
-    artifacts = payload.get("artifacts", {}) if isinstance(payload.get("artifacts", {}), dict) else {}
-    if raw_text_path:
-        artifacts["raw_text"] = raw_text_path
-    if segments_path:
-        artifacts["segments_path"] = segments_path
-    artifacts["normalized_document"] = normalized_document_path
-    payload["artifacts"] = artifacts
-    payload["normalization"] = {
-        "materialized_at": _now_iso(),
-        "source_adapter": source_adapter,
-        "preferred_chunk_source": preferred_chunk_source,
-        "segment_count": segment_count,
-        "char_count": char_count,
-        "normalized_document_path": normalized_document_path,
-    }
-    payload["updated_at"] = _now_iso()
-    _write_machine_state(machine_state_path, payload)
-
-
-def normalize_document(state_ref: str, output_path: str = "", prefer: str = "auto",
-                       allow_missing: bool = False) -> dict:
-    """Materialize `normalized_document.json` from synced workflow state artifacts."""
-    sync_result = sync_machine_state(state_ref)
-    compat = sync_result["compat_fields"]
-    machine_state_path = sync_result["machine_state_path"]
-    machine_state = _read_machine_state(machine_state_path)
-    state_paths = {
-        "machine_state_path": machine_state_path,
-        "legacy_state_path": sync_result["legacy_state_path"],
-    }
-    document_id = str(compat.get("vid", machine_state.get("document_id", ""))).strip()
-    normalized_document_path = str(output_path or _default_normalized_document_path(document_id)).strip()
-    if not document_id:
-        return {
-            "passed": False,
-            "warnings": [],
-            "hard_failures": ["Missing document id for normalization"],
-            **state_paths,
-            "normalized_document_path": normalized_document_path,
-            "materialized": False,
-        }
-
-    preference = str(prefer or "auto").strip().lower()
-    if preference not in {"auto", "segments", "raw_text"}:
-        return {
-            "passed": False,
-            "warnings": [],
-            "hard_failures": [f"Unsupported normalization preference: {prefer}"],
-            **state_paths,
-            "normalized_document_path": normalized_document_path,
-            "materialized": False,
-        }
-
-    machine_artifacts = machine_state.get("artifacts", {}) if isinstance(machine_state.get("artifacts", {}), dict) else {}
-    raw_text_path = str(compat.get("raw_text") or machine_artifacts.get("raw_text") or f"/tmp/{document_id}_raw_text.txt").strip()
-    segments_path = str(compat.get("segments_path") or machine_artifacts.get("segments_path") or f"/tmp/{document_id}_segments.json").strip()
-    normalized_document_path = str(output_path or machine_artifacts.get("normalized_document") or normalized_document_path).strip()
-
-    result = build_normalized_document(
-        document_id=document_id,
-        raw_text_path=raw_text_path,
-        segments_path=segments_path,
-        normalized_document_path=normalized_document_path,
-        source_payload=machine_state.get("source", {}),
-        workflow_payload=machine_state.get("workflow", {}),
-        prefer=preference,
-        allow_missing=allow_missing,
-        recorded_mode=compat.get("mode", ""),
-    )
-    if result.get("materialized"):
-        _update_machine_state_normalization(
-            machine_state_path,
-            normalized_document_path=normalized_document_path,
-            source_adapter=result["source_adapter"],
-            preferred_chunk_source=result["preferred_chunk_source"],
-            segment_count=result["segment_count"],
-            char_count=result["char_count"],
-            raw_text_path=result["raw_text_path"],
-            segments_path=result["segments_path"],
-        )
-    result.pop("raw_text_path", None)
-    result.pop("segments_path", None)
-    return {**result, **state_paths}
-
-
 def build_normalized_document(*, document_id: str, raw_text_path: str, segments_path: str,
                               normalized_document_path: str, source_payload: dict | None = None,
-                              workflow_payload: dict | None = None, prefer: str = "auto",
-                              allow_missing: bool = False, recorded_mode: str = "") -> dict:
+                              workflow_payload: dict | None = None) -> dict:
     """Write the normalized document from a raw text file and/or a segments file.
 
     `source_payload` says where the text came from (`type` youtube or deepgram,
     `subtitle_source`, title, channel, ...) and `workflow_payload` carries the
     output `mode`; together they decide how the text is cleaned, whether
     chunking prefers text over timed segments, and whether the subtitle
-    quality score applies. `recorded_mode` is the document's `workflow.mode`
-    when `workflow_payload` has none (state.md's mode in the legacy path).
-    The result also names the raw text and segments files that were actually
+    quality score applies. Timed segments are used when the segments file
+    exists, else the raw text. The result also names the raw text and segments files that were actually
     used (`raw_text_path`, `segments_path`).
     """
     source_payload = source_payload if isinstance(source_payload, dict) else {}
@@ -3649,30 +3306,11 @@ def build_normalized_document(*, document_id: str, raw_text_path: str, segments_
 
     if not document_id:
         return failure("Missing document id for normalization")
-    preference = str(prefer or "auto").strip().lower()
-    if preference not in {"auto", "segments", "raw_text"}:
-        return failure(f"Unsupported normalization preference: {prefer}")
 
     raw_text_file = Path(raw_text_path) if raw_text_path else None
     segments_file = Path(segments_path) if segments_path else None
-    use_segments = False
-    if preference in {"auto", "segments"} and segments_file and segments_file.exists():
-        use_segments = True
-    elif preference == "segments":
-        return failure(f"Segments artifact not found: {segments_path}")
-
+    use_segments = bool(segments_file and segments_file.exists())
     if not use_segments and not (raw_text_file and raw_text_file.exists()):
-        if allow_missing:
-            return {
-                "passed": True,
-                "warnings": ["Normalization skipped: no raw text or segments artifact found"],
-                "hard_failures": [],
-                "normalized_document_path": normalized_document_path,
-                "materialized": False,
-                "source_adapter": "",
-                "preferred_chunk_source": "",
-                "segment_count": 0,
-            }
         return failure(f"Raw text artifact not found: {raw_text_path}")
 
     prefer_text_chunking = _prefer_text_chunking_for_source(source_payload, workflow_payload)
@@ -3751,7 +3389,7 @@ def build_normalized_document(*, document_id: str, raw_text_path: str, segments_
             "subtitle_source": source_payload.get("subtitle_source", ""),
         },
         "workflow": {
-            "mode": workflow_payload.get("mode", recorded_mode),
+            "mode": workflow_payload.get("mode", ""),
         },
         "artifacts": {
             "raw_text": used_raw_text,
@@ -3800,191 +3438,6 @@ def build_normalized_document(*, document_id: str, raw_text_path: str, segments_
     }
 
 
-def validate_state(state_path: str, stage: str = "", require: list[str] | None = None) -> dict:
-    """
-    Validate workflow state fields for a stage or explicit required fields.
-
-    Compatibility behavior:
-    - legacy state.md inputs are accepted
-    - machine_state.json is materialized and refreshed automatically when the
-      legacy projection changes
-    """
-    sync_result = sync_machine_state(state_path)
-    state = sync_result["compat_fields"]
-    warnings = []
-    hard_failures = []
-
-    required_fields = []
-    if stage:
-        if stage not in STATE_STAGE_FIELDS:
-            print(f"Error: Unknown state validation stage: {stage}", file=sys.stderr)
-            sys.exit(2)
-        required_fields.extend(STATE_STAGE_FIELDS[stage])
-    if require:
-        for field in require:
-            if field not in required_fields:
-                required_fields.append(field)
-
-    missing_fields = []
-    placeholder_fields = []
-    present_fields = []
-
-    for field in required_fields:
-        value = state.get(field, "")
-        if not value:
-            missing_fields.append(field)
-        elif value.lower() == "unknown":
-            placeholder_fields.append(field)
-        else:
-            present_fields.append(field)
-
-    if missing_fields:
-        hard_failures.append("Missing required state fields: " + ", ".join(missing_fields))
-    if placeholder_fields:
-        hard_failures.append("Unresolved placeholder state fields: " + ", ".join(placeholder_fields))
-    output_filename_date_failures = []
-    if stage == "final" and state.get("output_file"):
-        output_filename_date_failures = _validate_output_filename_date_format(state.get("output_file", ""))
-        hard_failures.extend(output_filename_date_failures)
-
-    checks = {
-        "stage": stage or "custom",
-        "required_fields": required_fields,
-        "present_fields": present_fields,
-        "missing_fields": missing_fields,
-        "placeholder_fields": placeholder_fields,
-        "output_filename_date_failures": output_filename_date_failures,
-    }
-
-    return {
-        "passed": len(hard_failures) == 0,
-        "checks": checks,
-        "warnings": warnings,
-        "hard_failures": hard_failures,
-        "machine_state_path": sync_result["machine_state_path"],
-        "legacy_state_path": sync_result["legacy_state_path"],
-        "updated_machine_state": sync_result["updated_machine_state"],
-    }
-
-
-def _state_output_file_exists(state: dict) -> bool:
-    """Return whether the state records an assembled final output that exists on disk."""
-    output_file = str(state.get("output_file", "") or "").strip()
-    if not output_file or output_file.lower() == "unknown":
-        return False
-    return Path(output_file).expanduser().is_file()
-
-
-def _summarize_chunk_manifest(work_dir: str) -> dict:
-    """Summarize chunk progress from a work_dir manifest without mutating it."""
-    manifest_path = Path(str(work_dir or "").strip()) / "manifest.json" if str(work_dir or "").strip() else None
-    summary = {"manifest_path": str(manifest_path) if manifest_path else "", "has_manifest": False,
-               "total_chunks": 0, "done_chunks": 0, "status_counts": {}}
-    if not manifest_path or not manifest_path.is_file():
-        return summary
-    summary["has_manifest"] = True
-    try:
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    except Exception as e:
-        summary["error"] = f"Cannot read manifest: {e}"
-        return summary
-    chunks = manifest.get("chunks", []) if isinstance(manifest, dict) else []
-    active_chunks = [chunk for chunk in chunks if isinstance(chunk, dict)
-                     and chunk.get("status") != SUPERSEDED_CHUNK_STATUS]
-    status_counts = {}
-    for chunk in active_chunks:
-        status = str(chunk.get("status", "pending")).strip() or "pending"
-        status_counts[status] = status_counts.get(status, 0) + 1
-    summary["total_chunks"] = len(active_chunks)
-    summary["done_chunks"] = status_counts.get("done", 0)
-    summary["status_counts"] = status_counts
-    if isinstance(manifest, dict) and manifest.get(kernel_window.EXECUTOR_MANIFEST_KEY) == "window":
-        window_state = kernel_window.load_window_state(work_dir)
-        summary["long_text_mode"] = "window"
-        summary["window"] = {
-            "status": window_state.get("status", ""),
-            "cursor": window_state.get("cursor", 0),
-            "sentence_count": window_state.get("sentence_count", 0),
-        }
-    return summary
-
-
-def find_unfinished_runs(tmp_dir: str = "/tmp", video_id: str = "") -> dict:
-    """
-    Scan workflow state files and report runs that never produced their final output.
-
-    A run is complete only when its state records `output_file` and that file
-    exists. Everything else is unfinished and keeps its temp artifacts so it can
-    be inspected and resumed. Read-only: no state or manifest is rewritten.
-    """
-    if video_id and not re.fullmatch(r"[A-Za-z0-9_-]+", video_id):
-        print(f"Error: VIDEO_ID contains unsafe characters: {video_id}", file=sys.stderr)
-        sys.exit(2)
-    base = Path(tmp_dir).expanduser()
-    pattern = f"{video_id}_state.md" if video_id else "*_state.md"
-    skill_root = _skill_root()
-    unfinished = []
-    completed = []
-    for state_path in sorted(base.glob(pattern)):
-        if not state_path.is_file():
-            continue
-        try:
-            state = _parse_legacy_state_content(state_path.read_text(encoding="utf-8"))
-        except Exception as e:
-            unfinished.append({"state_path": str(state_path), "error": f"Cannot read state file: {e}"})
-            continue
-        vid = state.get("vid", "")
-        if not vid:
-            # Other tools also leave *_state.md files in /tmp; only workflow states record a vid.
-            continue
-        work_dir = state.get("work_dir", "") or f"{base}/{vid}_chunks"
-        chunks = _summarize_chunk_manifest(work_dir)
-        entry = {
-            "vid": vid,
-            "url": state.get("url", ""),
-            "title": state.get("title", ""),
-            "state_path": str(state_path),
-            "step": state.get("step", ""),
-            "last_action": state.get("last_action", ""),
-            "output_file": state.get("output_file", ""),
-            "work_dir": work_dir,
-            "chunks": chunks,
-        }
-        if _state_output_file_exists(state):
-            entry["next_action"] = f"bash {skill_root}/scripts/cleanup.sh {vid}"
-            completed.append(entry)
-            continue
-        window = chunks.get("window")
-        if window is not None:
-            entry["resume_from_step"] = 4
-            if window["status"] == "done":
-                entry["next_action"] = "The window run is done; merge it, then continue with verify-quality and Step 5"
-            else:
-                entry["next_action"] = (f"Re-run process-chunks on {work_dir} (long_text_mode: window) to resume "
-                                        f"at S{window['cursor'] + 1} of {window['sentence_count']}")
-        elif chunks["has_manifest"] and chunks["total_chunks"] and chunks["done_chunks"] < chunks["total_chunks"]:
-            entry["resume_from_step"] = 4
-            entry["next_action"] = (f"python3 {skill_root}/yt_transcript_utils.py prepare-resume {work_dir}, "
-                                    "then continue Step 4")
-        elif chunks["has_manifest"] and chunks["total_chunks"]:
-            entry["resume_from_step"] = 4
-            entry["next_action"] = "All chunks are done; merge them, then continue with verify-quality and Step 5"
-        else:
-            try:
-                step = int(str(state.get("step", "") or "1").strip())
-            except ValueError:
-                step = 1
-            entry["resume_from_step"] = max(step, 1)
-            entry["next_action"] = f"Re-run Step {max(step, 1)} using the values recorded in {state_path}"
-        unfinished.append(entry)
-    return {
-        "tmp_dir": str(base),
-        "has_unfinished": bool(unfinished),
-        "unfinished": unfinished,
-        "completed": completed,
-    }
-
-
 def _estimate_single_pass_input_tokens(normalized_document_path: str, raw_text_path: str,
                                        config: dict | None = None) -> tuple[int, int]:
     """Estimate normalized input size for short-video single-pass routing."""
@@ -4025,71 +3478,13 @@ def _single_pass_token_limit(mode: str, source: str, config: dict | None = None)
     return max(3200, limit)
 
 
-def plan_optimization(state_path: str) -> dict:
-    """
-    Build a structured optimization plan from validated workflow state.
-
-    This is the canonical routing source for text optimization. Workflow docs
-    should consume this JSON instead of re-deriving short/long or bilingual
-    branches in prose.
-    """
-    validation = validate_state(state_path, stage="post-source")
-    if not validation["passed"]:
-        return {
-            "passed": False,
-            "checks": validation["checks"],
-            "warnings": validation["warnings"],
-            "hard_failures": validation["hard_failures"],
-            "machine_state_path": validation.get("machine_state_path", ""),
-            "legacy_state_path": validation.get("legacy_state_path", ""),
-        }
-
-    normalization = normalize_document(state_path, allow_missing=True)
-    if not normalization["passed"]:
-        return {
-            "passed": False,
-            "checks": validation["checks"],
-            "warnings": normalization.get("warnings", []),
-            "hard_failures": normalization.get("hard_failures", []),
-            "machine_state_path": validation.get("machine_state_path", ""),
-            "legacy_state_path": validation.get("legacy_state_path", ""),
-        }
-
-    state = load_state(state_path)
-    try:
-        duration = int(state.get("duration", "0") or 0)
-    except ValueError:
-        duration = 0
-    video_id = state.get("vid", "")
-    plan = plan_text_operations(
-        video_id=video_id,
-        duration=duration,
-        mode=state.get("mode", ""),
-        source=state.get("src", ""),
-        normalization=normalization,
-        raw_text_path=str(state.get("raw_text", "") or f"/tmp/{video_id}_raw_text.txt"),
-        segments_path=str(state.get("segments_path", "") or f"/tmp/{video_id}_segments.json"),
-        work_dir=state.get("work_dir", "/tmp/unknown_chunks"),
-        structured_text=str(state.get("structured_text", "") or f"/tmp/{video_id}_structured.txt"),
-        optimized_text=str(state.get("optimized_text", "") or f"/tmp/{video_id}_optimized.txt"),
-        config=load_config(None, allow_missing=True),
-    )
-    return {
-        "passed": True,
-        "machine_state_path": validation.get("machine_state_path", ""),
-        "legacy_state_path": validation.get("legacy_state_path", ""),
-        **plan,
-    }
-
-
 def plan_text_operations(*, video_id: str, duration: int, mode: str, source: str, normalization: dict,
                          raw_text_path: str, segments_path: str, work_dir: str, structured_text: str,
                          optimized_text: str, config: dict | None = None) -> dict:
     """Choose the text operations for a source and estimate their size.
 
-    `normalization` is the result of `build_normalized_document` (or
-    `normalize_document`) for that source; `source` is youtube or deepgram and
-    `mode` chinese or bilingual. Returns the plan fields of `plan-optimization`.
+    `normalization` is the result of `build_normalized_document` for that
+    source; `source` is youtube or deepgram and `mode` chinese or bilingual.
     """
     planner_config = config or {}
     duration_bucket = "long" if duration >= 1800 else "short"

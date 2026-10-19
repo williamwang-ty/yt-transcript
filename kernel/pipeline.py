@@ -621,7 +621,7 @@ class _Run:
         return self.download("subtitle-info")
 
     def source_payload(self, source: str, language: str) -> dict:
-        """What the normalizer needs to know about the source (the old state.md fields)."""
+        """What the normalizer needs to know about the source."""
         meta = self.state["metadata"]
         return {
             "type": "youtube" if source == "subtitles" else "deepgram",

@@ -5,6 +5,7 @@ from tests.regression_chunking import ChunkingTests, PostMergeCleanupTests
 from tests.regression_core import CoreRegressionTests
 from tests.regression_e2e import EndToEndFixtureTests
 from tests.regression_language import LanguageRegressionTests
+from tests.regression_plan import NormalizedDocumentTests, TextPlanTests
 from tests.regression_run import RunCommandTests
 from tests.regression_quality import AtomicWriteTests, GlossaryTests, VerifyQualityTests
 from tests.regression_window import (
@@ -25,8 +26,10 @@ __all__ = [
     "EndToEndFixtureTests",
     "GlossaryTests",
     "LanguageRegressionTests",
+    "NormalizedDocumentTests",
     "PostMergeCleanupTests",
     "RunCommandTests",
+    "TextPlanTests",
     "VerifyQualityTests",
     "WindowBilingualTests",
     "WindowCueSplitTests",
