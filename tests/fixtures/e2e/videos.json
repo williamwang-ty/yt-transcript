@@ -1,0 +1,33 @@
+{
+  "description": "End-to-end fixture set, recorded with tests/e2e/record_fixtures.py (yt-dlp 2026.08.19, 2026-10-18). Replayed offline by scripts/run_regression.py --fixtures and tests/regression_e2e.py.",
+  "videos": [
+    {
+      "id": "Fhx_qNS2P8g",
+      "label": "Long Chinese podcast, manual zh-Hans (硅谷101 E255); window runs several rounds with an outline",
+      "expected_case": "zh_manual",
+      "case": "zh_manual_long",
+      "fixture_cut_minutes": 30
+    },
+    {
+      "id": "CIatbV3_Rjg",
+      "label": "English, manual en, no Chinese track (Lex Clips); bilingual mode",
+      "expected_case": "en_manual",
+      "case": "en_manual_bilingual",
+      "fixture_cut_minutes": 0
+    },
+    {
+      "id": "tGVSOK3PNUI",
+      "label": "Japanese, auto ja-orig only; unsupported",
+      "expected_case": "unsupported",
+      "case": "unsupported_ja",
+      "fixture_cut_minutes": 0
+    },
+    {
+      "id": "E2Edeepgram",
+      "label": "Chinese speech, no subtitles; offline stand-in built from Fhx_qNS2P8g's subtitles (info.json without tracks, Deepgram response synthesized from the cues)",
+      "expected_case": "deepgram",
+      "case": "deepgram_zh",
+      "fixture_cut_minutes": 8
+    }
+  ]
+}
