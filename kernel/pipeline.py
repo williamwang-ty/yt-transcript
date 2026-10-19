@@ -85,6 +85,9 @@ SOURCE_LABELS = {"subtitles": "YouTube Subtitles", "deepgram": "Deepgram Transcr
 LANGUAGE_NAMES = {"zh": "Chinese", "en": "English"}
 VIDEO_ID_PATTERN = re.compile(r"[A-Za-z0-9_-]+")
 DOWNLOAD_TIMEOUT_SEC = 1800
+# scripts/update_yt_dlp.sh skips itself when this is "0" (the offline tests set it).
+YT_DLP_UPDATE_ENV = "YT_TRANSCRIPT_YT_DLP_UPDATE"
+YT_DLP_UPDATE_TIMEOUT_SEC = 300
 DEEPGRAM_KEY_PLACEHOLDERS = {"", "your_api_key_here", "your_deepgram_api_key_here"}
 # yt-dlp messages that only the user can resolve, checked in this order.
 NEEDS_USER_PATTERNS = (
@@ -360,6 +363,7 @@ class _Run:
 
         changed = [key for key, value in self.requested_overrides.items()
                    if value is not None and value != self.overrides.get(key)]
+        previous_overrides = dict(self.overrides)
         for key in changed:
             self.overrides[key] = self.requested_overrides[key]
         from_stage = self.from_stage
@@ -395,6 +399,9 @@ class _Run:
             except Stop as stop:
                 if stop.status == "plan_stop":
                     return self.plan_result()
+                if stop.reason == "override_not_applicable":
+                    # Remember only overrides that apply, or a plain rerun would keep failing.
+                    self.state["overrides"] = previous_overrides
                 return self.finish(stop.status, stage=name, reason=stop.reason, message=stop.message,
                                    **stop.fields)
             upstream_ran = True
@@ -498,6 +505,25 @@ class _Run:
         except ValueError:
             raise Stop("failed", "download_error", f"download.sh {mode} printed no JSON", retryable=True)
 
+    def update_yt_dlp(self) -> None:
+        """Update yt-dlp when a newer release exists; YouTube keeps breaking old ones.
+
+        Best effort (the script checks GitHub at most hourly and never fails),
+        run once per video before its metadata is fetched.
+        """
+        if os.environ.get(YT_DLP_UPDATE_ENV) == "0" or not shutil.which("yt-dlp"):
+            return
+        script = _utils()._skill_root() / "scripts" / "update_yt_dlp.sh"
+        try:
+            proc = subprocess.run(["bash", str(script)], capture_output=True, text=True,
+                                  timeout=YT_DLP_UPDATE_TIMEOUT_SEC)
+        except (OSError, subprocess.TimeoutExpired):
+            _log("⚠️ The yt-dlp update check did not finish; continuing with the installed version.")
+            return
+        for line in (proc.stdout + proc.stderr).splitlines():
+            if line.strip():
+                _log(line)
+
     def load_info(self) -> dict:
         try:
             payload = json.loads(self.path(METADATA_FILE).read_text(encoding="utf-8"))
@@ -509,6 +535,7 @@ class _Run:
 
     def stage_metadata(self, record: dict) -> None:
         _remove(self.path(METADATA_FILE))
+        self.update_yt_dlp()
         summary = self.download("metadata")
         if summary.get("video_id") and summary["video_id"] != self.video_id:
             raise Stop("failed", "download_error",

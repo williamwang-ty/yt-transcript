@@ -252,7 +252,8 @@ def merge_content(work_dir: str, output_file: str, header_content: str = "") -> 
     output_path = Path(output_file)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     body_content = "".join(body_lines)
-    cleaned_body, cleanup_diagnostics = kernel_post_merge_cleanup.post_merge_cleanup(body_content)
+    cleaned_body, cleanup_diagnostics = kernel_post_merge_cleanup.post_merge_cleanup(
+        body_content, join_fragments=window_summary is None)
     cleanup_applied = cleaned_body != body_content
 
     sections = []

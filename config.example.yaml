@@ -44,12 +44,13 @@ yt_dlp_extractor_retries: 1
 yt_dlp_cookies_from_browser: ""
 yt_dlp_cookies_file: ""
 
-# Chunk LLM backend for long videos: auto | api
-# auto: send chunks to the calling agent's own CLI (Claude Code `claude -p`,
+# LLM backend for the text of every video: auto | api
+# auto: send the requests to the calling agent's own CLI (Claude Code `claude -p`,
 #       Codex `codex exec`, OpenCode, pi, Gemini CLI, Cursor), detected from the
-#       environment or passed with `process-chunks --agent-cli`. The CLI must
-#       answer a short probe first; if it can't, or fails mid-run, the API
-#       below is used instead.
+#       environment or named in llm_agent_cli below. The CLI must answer a
+#       short probe first; if it can't, or fails mid-run, the API below is
+#       used instead. With neither, `run` hands each request to the calling
+#       agent (`needs_agent_text`).
 # api:  always use the API below.
 llm_backend: "auto"
 # Optional fixed agent for auto mode: a name above or a full non-interactive

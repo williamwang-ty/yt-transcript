@@ -994,6 +994,7 @@ exit 0
             try:
                 env = os.environ.copy()
                 env["PATH"] = f"{tmpdir}:{env['PATH']}"
+                env.pop("YT_TRANSCRIPT_YT_DLP_UPDATE", None)
                 result = subprocess.run(
                     ["bash", str(PROJECT_ROOT / "scripts/preflight.sh")],
                     cwd=PROJECT_ROOT,
@@ -1064,6 +1065,7 @@ exit 1
             try:
                 env = os.environ.copy()
                 env["PATH"] = f"{tmpdir}:{env['PATH']}"
+                env.pop("YT_TRANSCRIPT_YT_DLP_UPDATE", None)
                 result = subprocess.run(
                     ["bash", str(PROJECT_ROOT / "scripts/preflight.sh")],
                     cwd=PROJECT_ROOT,

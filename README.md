@@ -10,7 +10,7 @@ Transcribe YouTube videos into formatted Markdown articles. Supports subtitle do
 
 Start here:
 - If you want the canonical terminology, see `Canonical Terms` below.
-- If you want the reusable execution order, see `Validation Matrix` and `Minimum Commands`.
+- If you want to see how a video is processed, see `The run Command` and `Minimum Commands`.
 
 ### ✨ Features
 
@@ -119,20 +119,20 @@ pip install yt-dlp
    > - Deepgram transcription defaults to `nova-3`. Legacy `nova-2` / `nova-2-*` settings are automatically upgraded to `nova-3` before any request is sent.
    > - `deepgram_enable_utterances` and `deepgram_prefer_structured_output` now default to `true`; set either to `false` only when you need to compare against the legacy flat-transcript path.
    > - Deepgram requests now use bounded automatic retries for transient timeout/network failures before surfacing an error.
-   > - LLM API config is only needed for long video chunk processing, or when bilingual translation is required.
+   > - The text of every video goes through an LLM backend. By default (`llm_backend: auto`) that is the calling agent's own CLI, so the LLM API settings are a fallback; when neither works, `run` hands each text request to the calling agent (`needs_agent_text`).
    > - `llm_base_url` can be either a provider root URL or a `/v1` URL. The tool normalizes both.
    > - `llm_stream: "auto"` prefers SSE streaming when the provider supports it.
    > - With `llm_reasoning_probe_enabled: true`, unknown OpenAI-compatible models get one non-streaming `OK` probe; if the response exposes reasoning metadata, chunk calls switch to non-streaming for recovery telemetry.
    > - `bash scripts/preflight.sh --require-llm` now performs a real low-cost LLM probe and reports latency.
-   > - `llm_backend: "auto"` (default) sends long-video chunks to the calling agent's own CLI (Claude Code, Codex, OpenCode, pi, Gemini CLI, Cursor), detected from the environment or passed with `process-chunks --agent-cli`. The CLI must answer a short probe; if it can't, or fails mid-run, the LLM API above is used. `llm_backend: "api"` always uses the API. `python3 yt_transcript_utils.py resolve-llm-backend` shows which one a run would use.
+   > - `llm_backend: "auto"` (default) sends the text requests to the calling agent's own CLI (Claude Code, Codex, OpenCode, pi, Gemini CLI, Cursor), detected from the environment or named with `llm_agent_cli`. The CLI must answer a short probe; if it can't, or fails mid-run, the LLM API above is used. `llm_backend: "api"` always uses the API. `python3 yt_transcript_utils.py resolve-llm-backend` shows which one a run would use.
 
 ### 🚀 Usage
 
 #### As a Claude Skill
 
-1. Place this directory in any Claude skills directory
-2. Provide a YouTube link in your Claude conversation
-3. Claude will automatically execute the transcription workflow
+1. Place this directory in any Claude skills directory (or another agent's skills directory)
+2. Provide a YouTube link in your conversation
+3. The agent runs `python3 yt_transcript_utils.py run <url>`, which does the whole job for the video, and reports the result (see `The run Command` below)
 
 The scripts resolve `config.yaml` relative to the skill directory, so the skill is no longer tied to `~/.claude/skills/yt-transcript`.
 
@@ -144,7 +144,7 @@ Please transcribe this video: https://www.youtube.com/watch?v=xxxxx
 
 #### Multiple Videos (Batch Processing)
 
-You can provide multiple links at once. They will be processed **serially** (one at a time) to ensure quality and context isolation:
+You can provide multiple links at once. They will be processed **serially** (one `run` per link):
 
 ```
 Please transcribe these videos:
@@ -158,22 +158,22 @@ After completion, a summary table will be provided with status and output paths 
 
 ### Routing Notes
 
-- `plan-optimization` still records the raw `duration_bucket` (`short` vs `long`).
-- If a short-duration transcript is too large for reliable single-pass prompting, the planner now escalates it to chunked processing and returns `video_path=long` with `routing_reason=oversized_short_input`.
-- Workflow callers should follow `video_path`, `operations`, and `routing_reason` from the planner rather than duration alone.
-- Final output filenames must format date fragments as `yyyy-mm-dd`; do not use raw metadata `upload_date` (`yyyymmdd`) in filenames.
+- `run` makes every routing decision itself and records it in the video's `state.json` (`route`: subtitles or Deepgram, the track, the mode, and the reason).
+- Short and long videos go through the same stages; there is no separate Quick Mode. A short text takes one window round and skips the outline; YouTube chapters become outline hints when the plan says `long`.
+- `run <url> --stage plan` shows the route and the text plan without spending anything (no LLM, no Deepgram).
+- `run` builds the output filename (`yyyy-mm-dd. <title>.md`) and the frontmatter from the metadata.
 
 ### 📁 Project Structure
 
 ```
 yt-transcript/
-├── SKILL.md                 # Claude Skill workflow guide (main entry point)
+├── SKILL.md                 # What the host agent reads: run `run`, act on its result (main entry point)
 ├── SYSTEM_DESIGN.md         # Single authoritative system design document
-├── workflows/               # Modular workflow files
 ├── prompts/                 # Single-task prompt templates
 ├── scripts/                 # Helper shell scripts
-├── yt_transcript_utils.py   # Main Python entry; imports the two kernel layers directly
-├── kernel/                 # Two-layer kernel package
+├── yt_transcript_utils.py   # Main Python entry (CLI, including `run`, `status`, `cleanup`)
+├── kernel/                 # Kernel package
+│   ├── pipeline.py         # The `run` command: stages, state.json, results and exit codes
 │   ├── task_runtime/       # Generic task runtime layer
 │   │   ├── runtime.py      # Ownership, command envelopes, telemetry append
 │   │   ├── api.py          # Stable runtime-facing API for create/inspect/advance/control/finalize
@@ -210,15 +210,16 @@ yt-transcript/
 
 `README.md` is the operator-facing quickstart and command guide. `SYSTEM_DESIGN.md` is the single authoritative design document for the system architecture.
 
-At a high level, `yt-transcript` is a local-first, script-first system that turns a YouTube URL into a Markdown article through:
+At a high level, `yt-transcript` is a local-first system in which one deterministic command, `run <url>`, turns a YouTube URL into a Markdown article through a fixed list of stages:
 
-- preflight and configuration checks
-- metadata and subtitle availability detection
-- subtitle download or Deepgram fallback transcription
-- state synchronization and normalized document creation
-- optimization planning
-- short-path direct transformation or the long-text transformation subsystem
-- final assembly and quality gates
+- `metadata`: one yt-dlp fetch of the video's info
+- `source`: spoken-language detection, the trusted subtitle track or Deepgram transcription, and the subtitle-quality reroute
+- `normalize`: the normalized document (sentences with their timed cues)
+- `plan`: the text tasks for the mode and their size
+- `text`: the long-text transformation subsystem (sliding window, outline and glossary) for every task
+- `merge`, `verify` (quality gate), `assemble` (filename, frontmatter, bilingual layout) and `cleanup`
+
+The host agent only starts `run`, acts on the result it returns, and reports to the user; `SKILL.md` tells it how.
 
 The codebase mirrors that design through a two-layer kernel split: `kernel/task_runtime/*` owns generic long-running job control, while `kernel/long_text/*` owns long-text transformation behavior. `yt_transcript_utils.py` remains the main CLI and workflow façade, but it now delegates into those two layers directly.
 
@@ -229,39 +230,47 @@ Phase 4 adds `kernel/task_runtime/recovery.py` and `artifacts.py` so long-text r
 Phase 5 adds `kernel/task_runtime/evaluator.py` plus constrained llm-assisted ranking hooks so quality-gated recommendations and optional model-assisted action selection can coexist without bypassing the allowed-action contract.
 Phase 6 adds `kernel/task_runtime/api.py`, making `create-run`, `inspect-run`, `advance-run`, `apply-control`, `resume-run`, and `finalize-run` the preferred outer runtime contract while preserving the older control commands as compatibility helpers.
 
-The hardest internal subsystem is long-text transformation. It activates only when the planning layer determines that the input is long enough to require windowed or chunked processing, consistency protection (outline + glossary), verification, repair, and deterministic merge.
+Nothing in the `run` flow uses that outer runtime contract; stage 4 of [#23](https://github.com/williamwang-ty/yt-transcript/issues/23) removes it.
+
+The hardest internal subsystem is long-text transformation. Every video's text goes through it (a short text in one window round): windowed processing, consistency protection (outline + glossary), verification, repair, and deterministic merge.
 
 [Read separate System Design Document](SYSTEM_DESIGN.md)
 
-### 🔁 Preferred Runtime API
+### 🔁 The run Command
 
-For new outer-agent integrations, prefer the stable runtime-facing commands over the older path-oriented helpers:
+`python3 yt_transcript_utils.py run <url>` is the entry point for one video. Each video has one work directory, `/tmp/yt-transcript/<video_id>/` (or `$YT_TRANSCRIPT_WORK_ROOT/<video_id>/`), with one `state.json`. Rerunning the same command continues at the first unfinished stage; a finished video returns `done` with the existing article at once.
 
-- `create-run <work_dir>` initializes or refreshes the persisted runtime task record
-- `inspect-run <work_dir>` returns stable task/run state, recovery summary, and allowed actions
-- `advance-run <work_dir>` selects the bounded next runtime action and dispatches it
-- `apply-control <work_dir> --signal pause|cancel` applies operator control signals
-- `resume-run <work_dir>` resumes a paused run
-- `finalize-run <work_dir>` returns a final summary and can optionally call `merge-content`
+Every call prints progress on stderr and exactly one JSON result on stdout, with a fixed exit code:
 
-The default migration mode is `runtime_api`. Set `YT_TRANSCRIPT_RUNTIME_API_MODE=legacy_cli` only when you need to force the older compatibility framing.
+| `status` | Exit | Meaning |
+|---|---|---|
+| `done` | 0 | Article written (`output_file`, `route`, `warnings`, `llm`), or `--stage plan` finished |
+| `failed` | 1 | A stage failed: `stage`, `reason`, `message`, `retryable`, `next_command` |
+| `needs_user` | 3 | Only the user can fix it: `cookies_required`, `login_required`, `rate_limited`, `deepgram_key_missing`, `tool_missing`, `output_dir_missing` |
+| `unsupported` | 4 | The spoken language is not supported |
+| `needs_agent_text` | 5 | No LLM backend is reachable; one text request is handed to the agent (`task.prompt_file`, `task.output_file`) |
+| `in_progress` | 6 | The `--max-seconds` budget ran out at a safe point; rerun to continue |
+
+Exit code 2 is a command-line usage error. Flags: `--source subtitles|deepgram` and `--mode chinese|bilingual` (remembered for the video until `--restart`), `--from <stage>`, `--stage plan`, `--max-seconds <n>`, `--restart`, `--config-path`. `status [<video_id>]` lists unfinished runs or shows one video's state; `cleanup <video_id> [--force]` removes a work directory. `$YT_TRANSCRIPT_OUTPUT_DIR` replaces the configured `output_dir`.
 
 ### 🔧 Preflight Modes
 
+`run` checks what each stage needs right before it (yt-dlp, the Deepgram key only when Deepgram is chosen, an LLM backend at the text stage), so preflight is no longer a required step. The checks remain available for diagnosis:
+
 ```bash
-# Base checks only: subtitles / metadata workflows
+# Base checks: yt-dlp, python3, config
 bash scripts/preflight.sh
 
-# Require Deepgram before audio transcription
+# Also check the Deepgram key
 bash scripts/preflight.sh --require-deepgram
 
-# Require LLM config before long-video chunk processing
+# Also probe the LLM API
 bash scripts/preflight.sh --require-llm
 ```
 
 ### 🧩 Structured Script Outputs
 
-This project is script-first: helper commands emit machine-readable JSON on stdout so routing, validation, and execution decisions stay in code instead of drifting inside prompt prose:
+These are the steps `run` calls internally; the agent no longer runs them one by one. They stay available for debugging until stage 4 of [#23](https://github.com/williamwang-ty/yt-transcript/issues/23) turns most of them into internal functions. They emit machine-readable JSON on stdout so routing, validation, and execution decisions stay in code:
 
 - `scripts/download.sh "$URL" metadata`
 - `scripts/download.sh "$URL" subtitle-info`
@@ -300,9 +309,9 @@ For long-video chunking, `plan-optimization` now also emits a canonical `chunkin
 
 The current design also has explicit resume semantics: `prepare-resume` repairs stale manifest state manually, while `process-chunks` runs the same repair step automatically before execution continues.
 
-Unfinished runs keep their files: `scripts/cleanup.sh` only cleans once the state file records an `output_file` that exists, and otherwise exits with code `3` without deleting anything (`--force` discards the run on purpose). `python3 yt_transcript_utils.py find-unfinished [--video-id ID]` lists interrupted runs with their step, chunk progress and the next action to resume them.
+Unfinished runs keep their work directory: `run`'s own cleanup stage only runs once the article exists, and `python3 yt_transcript_utils.py cleanup <video_id>` refuses an unfinished run unless `--force` is given (to discard it on purpose). `python3 yt_transcript_utils.py status` lists interrupted runs with their next stage, last result and the command that continues them.
 
-Known limitation: all state and work files live under `/tmp`, which macOS empties on restart (many Linux systems do too). Resume therefore only works within the same boot; after a reboot an interrupted run starts over. Interrupted runs also keep their downloaded audio in `/tmp` until they finish or are discarded with `cleanup.sh <VIDEO_ID> --force`, which can take hundreds of MB. Moving the work directory to a persistent location (for example `~/.cache/yt-transcript`) is deferred for now.
+Known limitation: all state and work files live under `/tmp`, which macOS empties on restart (many Linux systems do too). Resume therefore only works within the same boot; after a reboot an interrupted run starts over. Interrupted runs also keep their downloaded audio in `/tmp` until they finish or are discarded with `cleanup <video_id> --force`, which can take hundreds of MB. Moving the work directory to a persistent location (for example `~/.cache/yt-transcript`) is deferred for now.
 
 Current policy is intentional and explicit:
 
@@ -348,7 +357,7 @@ Current policy is intentional and explicit:
 - `download.sh subtitles` now distinguishes detection vs downloadability more explicitly: `listed_candidates` shows tracks exposed by YouTube/yt-dlp, while `attempted_candidates`, `blocked_candidates`, and `fallback_used` show what the current runtime could actually fetch
 - when a preferred subtitle candidate fails with an auth-like error such as `HTTP 429`, `download.sh subtitles` now retries the same candidate with Chrome cookies before it gives up and falls back to the next candidate
 - subtitle-driven workflows still support Chinese-source monolingual mode and English-source bilingual mode; Chinese-source runs now prefer `cleanup_zh`, while English-source runs still use `structure_only -> translate_only`; when neither usable Chinese nor English subtitles can be downloaded, the workflow should stop and fall back to audio transcription
-- `plan-optimization` is the canonical short/long router with `< 1800s = short` and `>= 1800s = long`; the Quick Mode shortcut from `SKILL.md` is a narrower `< 900s` subset for subtitle-friendly videos
+- `plan-optimization` is the canonical short/long router with `< 1800s = short` and `>= 1800s = long`; both go through the same `run` stages (there is no Quick Mode any more), and a short text takes one window round
 - `manifest.json` now separates immutable `plan` metadata from `runtime` state, and `process-chunks` records attempt-level telemetry (`attempt_logs`) in addition to chunk-level fields
 - fixed chunks are sized by each task's chunk target (`chunk_tokens_*`) with a hard cap of `chunk_hard_cap_multiplier` × target; the old continuity context, autotune and `replan-remaining` patches were removed with the switch to window mode, and a fixed-chunk run stops after repeated consecutive timeouts instead
 - `build-glossary --mode transcript` now mines glossary terms from raw chunks plus any available normalized-document title/channel, chapter titles, and optional metadata/description context; `cleanup_zh` auto-builds that glossary when the work_dir does not have one yet
@@ -366,9 +375,7 @@ Current policy is intentional and explicit:
 ### 📘 Canonical Terms
 
 - `bilingual`: English source text plus Chinese translation. It is not subtitle-file merging.
-- `preflight base`: `bash scripts/preflight.sh` for metadata, subtitle inspection, and subtitle-driven paths.
-- `preflight deepgram`: `bash scripts/preflight.sh --require-deepgram` immediately before audio transcription.
-- `preflight llm`: `bash scripts/preflight.sh --require-llm` only when `plan-optimization` says long-video chunk processing requires it.
+- `run`: `python3 yt_transcript_utils.py run <url>`, the one entry point for a video; it returns one JSON result whose `status` (`done`, `failed`, `needs_user`, `unsupported`, `needs_agent_text`, `in_progress`) has a fixed exit code.
 - `Deepgram unified entry`: `python3 yt_transcript_utils.py transcribe-deepgram ...`
 - `Deepgram result observability`: `/tmp/${VIDEO_ID}_deepgram_result.json` now exposes per-chunk `chunk_reports`, aggregate structure counts, and `warnings` when segment extraction falls back from richer structures
 - `quality gate`: `verify-quality` JSON where `hard_failures` means STOP, `warnings` means review before proceeding, and `checks` carries the readability metrics behind those warnings. Pass `--work-dir` or `--glossary-path` when available to enable glossary drift checks.
@@ -377,50 +384,41 @@ Current policy is intentional and explicit:
 
 ### 🧪 Validation Matrix
 
-| Scenario | Minimum command sequence | Stop/go rule |
-|----------|--------------------------|--------------|
-| Short video with subtitles | `preflight.sh` → `download.sh metadata` → create state → `validate-state --stage metadata` → `download.sh subtitle-info` → `download.sh subtitles` → `validate-state --stage post-source` → optimize → `verify-quality` | Stop only if `validate-state` or `verify-quality` returns non-empty `hard_failures` |
-| Video without usable subtitles | `preflight.sh` → `download.sh metadata` → `download.sh subtitle-info` → `preflight.sh --require-deepgram` → `transcribe-deepgram` → `validate-state --stage post-source` → optimize → `verify-quality` | Stop on any command failure or non-empty `hard_failures` |
-| Long video | `validate-state --stage post-source` → `plan-optimization` → if `requires_llm_preflight=true`, run `preflight.sh --require-llm` → chunk → raw-path `process-chunks` → optional processed-path translation → merge → `verify-quality` → `validate-state --stage pre-assemble` | `warnings` alone do not block; `hard_failures` block |
+| Scenario | What `run` does | Result |
+|----------|-----------------|--------|
+| Video with trusted subtitles, short or long | `metadata` → `source` (subtitle track) → `normalize` → `plan` → `text` → `merge` → `verify` → `assemble` → `cleanup` | `done` with `output_file`; `warnings` are advisory |
+| No trusted subtitles, or very poor Chinese subtitles | `source` transcribes the audio with Deepgram | `done`; `needs_user` (`deepgram_key_missing`) without a key |
+| Video in another spoken language | stops in `source` | `unsupported` |
+| Long video on a host with a shell time limit | stops at the first stage or window-round boundary after `--max-seconds` | `in_progress`; rerunning continues |
+| No LLM backend reachable | hands one text request at a time to the agent | `needs_agent_text`; rerun after writing the answer |
+| Hard quality failure | `verify` stops before any article is written | `failed` (`quality_hard_failure`); `--from text` redoes the text |
+
+Offline end-to-end: `python3 scripts/run_regression.py --fixtures tests/fixtures/e2e` replays recorded videos with a fake yt-dlp and a fake LLM (also run by the test suite).
 
 Live regression: `python3 scripts/run_regression.py` runs the pipeline on a fixed set of real videos and reports `verify-quality` results; see [tests/live_regression/README.md](tests/live_regression/README.md).
 
 ### 🛠️ Minimum Commands
 
 ```bash
-# 1. Base checks
-bash scripts/preflight.sh
+# Transcribe one video; rerun the same command to resume
+python3 yt_transcript_utils.py run "$URL" --max-seconds 300
 
-# 2. Metadata + subtitle availability
-bash scripts/download.sh "$URL" metadata
-bash scripts/download.sh "$URL" subtitle-info
+# Free routing check: source, mode and text plan, no LLM or Deepgram
+python3 yt_transcript_utils.py run "$URL" --stage plan
 
-# 3. State validation
-python3 yt_transcript_utils.py validate-state /tmp/${VIDEO_ID}_state.md --stage metadata
-python3 yt_transcript_utils.py validate-state /tmp/${VIDEO_ID}_state.md --stage post-source
+# Overrides (--source and --mode are remembered for the video until --restart)
+python3 yt_transcript_utils.py run "$URL" --source deepgram   # or subtitles
+python3 yt_transcript_utils.py run "$URL" --mode chinese      # or bilingual
+python3 yt_transcript_utils.py run "$URL" --from text         # redo this stage and every later one
+python3 yt_transcript_utils.py run "$URL" --restart           # start over
 
-# 4. Optimization planning
-python3 yt_transcript_utils.py plan-optimization /tmp/${VIDEO_ID}_state.md
+# Unfinished runs
+python3 yt_transcript_utils.py status                         # every run under /tmp/yt-transcript/
+python3 yt_transcript_utils.py status "$VIDEO_ID"
+python3 yt_transcript_utils.py cleanup "$VIDEO_ID" --force    # discard an unfinished run
 
-# 4b. Long-video stages run process-chunks for each plan operation
-#     (sliding window by default; long_text_mode: chunks for fixed chunks)
-
-# 5. Audio fallback when needed
-bash scripts/preflight.sh --require-deepgram
-python3 yt_transcript_utils.py transcribe-deepgram "$AUDIO_FILE" --language "$LANGUAGE" --output-text "/tmp/${VIDEO_ID}_raw_text.txt"
-# optional parity check against the legacy flat path:
-# python3 yt_transcript_utils.py transcribe-deepgram "$AUDIO_FILE" --language "$LANGUAGE" --disable-utterances --legacy-flat-output
-
-# 6. Optional explicit transcript glossary build for chunked cleanup paths
-python3 yt_transcript_utils.py build-glossary /tmp/${VIDEO_ID}_chunks --mode transcript
-
-# 7. Final quality gate
-python3 yt_transcript_utils.py verify-quality /tmp/${VIDEO_ID}_optimized.txt --raw-text /tmp/${VIDEO_ID}_raw_text.txt
-# add --work-dir /tmp/${VIDEO_ID}_chunks when a glossary/work_dir exists and you want glossary drift checks
-
-# `checks` now includes advisory readability signals such as chunk seam duplication,
-# Chinese spacing anomalies, repeated phrase density, short paragraph ratio,
-# header density, punctuation density, and glossary drift metrics.
+# Debug: rerun the quality check on any file
+python3 yt_transcript_utils.py verify-quality "$FILE" --raw-text "$RAW_TEXT"
 ```
 
 ### 📄 License
@@ -440,7 +438,7 @@ MIT License
 
 建议先看：
 - 想确认统一术语口径，直接看下方 `术语口径`
-- 想复用执行顺序，直接看 `验证矩阵` 和 `最小命令集`
+- 想了解一个视频是怎么处理的，直接看 `run 命令` 和 `最小命令集`
 
 ### ✨ 功能特点
 
@@ -503,20 +501,20 @@ pip install yt-dlp
    > - `deepgram_api_key` 仅在没有可用字幕、需要音频转录时才必需。
    > - Deepgram 转录默认使用 `nova-3`。旧版 `nova-2` / `nova-2-*` 配置会在发起请求前自动提升为 `nova-3`。
    > - `deepgram_enable_utterances` 和 `deepgram_prefer_structured_output` 现在默认都是 `true`；只有在需要和旧的 flat transcript 路径做对照排查时，才建议改成 `false`。
-   > - LLM API 配置仅用于长视频 chunk 处理，或需要双语翻译时。
+   > - 每个视频的文字都经过 LLM 后端处理。默认（`llm_backend: auto`）用正在调用 skill 的 agent 自己的 CLI，所以 LLM API 配置只是备用；两者都不可用时，`run` 把每个文字请求交给调用它的 agent 处理（`needs_agent_text`）。
    > - `llm_base_url` 可以填写服务根地址或带 `/v1` 的地址，工具会自动归一化。
    > - `llm_stream: "auto"` 会在 provider 支持时优先走流式响应。
    > - `llm_reasoning_probe_enabled: true` 时，未知 OpenAI-compatible 模型会先走一次非流式 `OK` 探测；如果响应里有 reasoning 元数据，后续 chunk 调用会切到非流式以保留恢复所需的 usage 信息。
    > - `bash scripts/preflight.sh --require-llm` 现在会执行一次低成本真实探活并输出延迟。
-   > - `llm_backend: "auto"`（默认）会把长视频的分块交给正在调用 skill 的 agent 自己的 CLI（Claude Code、Codex、OpenCode、pi、Gemini CLI、Cursor）处理，宿主从环境变量自动识别，也可以用 `process-chunks --agent-cli` 指定。CLI 要先通过一次简短试调；试调失败或中途失败时改用上面的 LLM API。`llm_backend: "api"` 始终走 API。`python3 yt_transcript_utils.py resolve-llm-backend` 可以查看本次会用哪一个。
+   > - `llm_backend: "auto"`（默认）会把文字请求交给正在调用 skill 的 agent 自己的 CLI（Claude Code、Codex、OpenCode、pi、Gemini CLI、Cursor）处理，宿主从环境变量自动识别，也可以用 `llm_agent_cli` 指定。CLI 要先通过一次简短试调；试调失败或中途失败时改用上面的 LLM API。`llm_backend: "api"` 始终走 API。`python3 yt_transcript_utils.py resolve-llm-backend` 可以查看本次会用哪一个。
 
 ### 🚀 使用方法
 
 #### 作为 Claude Skill 使用
 
-1. 将此目录放入任意 Claude skills 目录
-2. 在 Claude 对话中提供 YouTube 链接
-3. Claude 将自动执行转录流程
+1. 将此目录放入任意 Claude skills 目录（或其他 agent 的 skills 目录）
+2. 在对话中提供 YouTube 链接
+3. agent 执行 `python3 yt_transcript_utils.py run <url>`，由它完成这个视频的全部处理，再汇报结果（见下方 `run 命令`）
 
 脚本会相对于 skill 目录查找 `config.yaml`，不再强绑定 `~/.claude/skills/yt-transcript`。
 
@@ -528,7 +526,7 @@ pip install yt-dlp
 
 #### 多个视频（批量处理）
 
-可以一次提供多个链接，将**串行处理**（逐个处理）以确保质量和上下文隔离：
+可以一次提供多个链接，将**串行处理**（每个链接执行一次 `run`）：
 
 ```
 请帮我转录这些视频：
@@ -539,17 +537,24 @@ pip install yt-dlp
 
 处理完成后会提供汇总表格，显示每个视频的状态和输出路径。
 
+### 路由说明
+
+- 所有路由决定都由 `run` 自己做出，并记录在该视频的 `state.json`（`route`：字幕还是 Deepgram、哪条字幕轨、哪种模式，以及原因）。
+- 短视频和长视频走同样的阶段，不再有单独的 Quick Mode。短文本只跑一轮窗口，也不生成大纲；计划判定为 `long` 时，YouTube 章节作为大纲的提示。
+- `run <url> --stage plan` 只查看路由和文字处理计划，不花钱（不调用 LLM，也不调用 Deepgram）。
+- 输出文件名（`yyyy-mm-dd. <标题>.md`）和 frontmatter 由 `run` 根据 metadata 生成。
+
 ### 📁 项目结构
 
 ```
 yt-transcript/
-├── SKILL.md                 # Claude Skill 工作流程指南（主入口）
+├── SKILL.md                 # 宿主 agent 读的说明：执行 `run`，按结果处理（主入口）
 ├── SYSTEM_DESIGN.md         # 系统设计唯一权威文档
-├── workflows/               # 模块化工作流文件
 ├── prompts/                 # 单任务 Prompt 模板
 ├── scripts/                 # Shell 辅助脚本
-├── yt_transcript_utils.py   # 主 Python 入口；现直接依赖两层 kernel 子包
-├── kernel/                 # 两层 kernel 包
+├── yt_transcript_utils.py   # 主 Python 入口（命令行，包括 `run`、`status`、`cleanup`）
+├── kernel/                 # kernel 包
+│   ├── pipeline.py         # `run` 命令：阶段、state.json、结果和退出码
 │   ├── task_runtime/       # 通用任务运行时层
 │   │   ├── runtime.py      # ownership、command envelope、telemetry append
 │   │   ├── api.py          # 对外稳定 runtime API：create/inspect/advance/control/finalize
@@ -586,53 +591,62 @@ yt-transcript/
 
 `README.md` 是面向操作者的快速上手与命令指南，`SYSTEM_DESIGN.md` 是系统架构唯一的权威设计文档。
 
-从整体上看，`yt-transcript` 是一个 local-first、script-first 的系统：它把 YouTube URL 通过以下阶段转换成 Markdown 文章：
+从整体上看，`yt-transcript` 是一个 local-first 的系统：一条确定性的命令 `run <url>` 按固定的阶段列表把 YouTube URL 转换成 Markdown 文章：
 
-- preflight 与配置检查
-- metadata 与字幕可用性探测
-- 字幕下载或 Deepgram 兜底转录
-- 状态同步与标准化文档生成
-- 优化计划制定
-- 短路径直接变换或进入长文本变换子系统
-- 最终装配与质量门禁
+- `metadata`：用 yt-dlp 取一次视频信息
+- `source`：判断说话语言，选可信的字幕轨或用 Deepgram 转写，字幕质量太差时改道
+- `normalize`：生成标准化文档（句子和对应的带时间字幕条）
+- `plan`：按模式确定文字处理任务并估算规模
+- `text`：每个任务都经过长文本变换子系统（滑动窗口、大纲和术语表）
+- `merge`、`verify`（质量门禁）、`assemble`（文件名、frontmatter、双语排版）和 `cleanup`
+
+宿主 agent 只负责启动 `run`、按它返回的结果处理、向用户汇报；`SKILL.md` 告诉它怎么做。
 
 代码结构也按照这套设计拆成两层 kernel：`kernel/task_runtime/*` 负责通用长程任务控制，`kernel/long_text/*` 负责长文本变换行为。`yt_transcript_utils.py` 仍然是主 CLI 和 workflow façade，但现在会直接把职责委托给这两层。
 
 Phase 6 进一步加入了 `kernel/task_runtime/api.py`，把 `create-run`、`inspect-run`、`advance-run`、`apply-control`、`resume-run`、`finalize-run` 收敛为首选外部运行时接口；原来的 `runtime-status`、`process-chunks`、`pause-run`、`cancel-run` 等命令仍然保留，但定位为兼容辅助入口。
 
-其中最难的内部子系统是长文本变换。它只会在 planning 层判断输入足够长、必须进入 chunk 处理时激活，并负责窗口或分块处理、一致性保护（大纲 + 术语表）、verification、repair 与确定性 merge。
+`run` 的流程不使用这套外部运行时接口；[#23](https://github.com/williamwang-ty/yt-transcript/issues/23) 的第 4 阶段会删除它。
+
+其中最难的内部子系统是长文本变换。每个视频的文字都经过它（短文本只跑一轮窗口），负责窗口处理、一致性保护（大纲 + 术语表）、verification、repair 与确定性 merge。
 
 [阅读详细系统设计文档](SYSTEM_DESIGN.md)
 
-### 🔁 首选 Runtime API
+### 🔁 run 命令
 
-对于新的外层 agent 集成，建议优先使用稳定的 runtime-facing 命令，而不是旧的 path-oriented helper：
+`python3 yt_transcript_utils.py run <url>` 是处理一个视频的入口。每个视频有一个工作目录 `/tmp/yt-transcript/<video_id>/`（或 `$YT_TRANSCRIPT_WORK_ROOT/<video_id>/`），里面只有一个 `state.json`。重跑同一条命令就从第一个未完成的阶段继续；已经完成的视频会立即返回 `done` 和已有的文章。
 
-- `create-run <work_dir>`：初始化或刷新持久化 runtime task record
-- `inspect-run <work_dir>`：返回稳定的 task/run state、recovery summary 与 allowed actions
-- `advance-run <work_dir>`：选择受限的下一步 runtime action 并执行
-- `apply-control <work_dir> --signal pause|cancel`：施加操作级控制信号
-- `resume-run <work_dir>`：恢复暂停中的 run
-- `finalize-run <work_dir>`：返回最终摘要，并可选调用 `merge-content`
+每次调用在 stderr 输出进度，在 stdout 输出且只输出一个 JSON 结果，退出码固定：
 
-默认迁移模式是 `runtime_api`。只有在必须强制走旧兼容包装时，才设置 `YT_TRANSCRIPT_RUNTIME_API_MODE=legacy_cli`。
+| `status` | 退出码 | 含义 |
+|---|---|---|
+| `done` | 0 | 文章已写好（`output_file`、`route`、`warnings`、`llm`），或 `--stage plan` 已完成 |
+| `failed` | 1 | 某个阶段失败：`stage`、`reason`、`message`、`retryable`、`next_command` |
+| `needs_user` | 3 | 只有用户能解决：`cookies_required`、`login_required`、`rate_limited`、`deepgram_key_missing`、`tool_missing`、`output_dir_missing` |
+| `unsupported` | 4 | 不支持这个说话语言 |
+| `needs_agent_text` | 5 | 没有可用的 LLM 后端，把一个文字请求交给 agent（`task.prompt_file`、`task.output_file`） |
+| `in_progress` | 6 | `--max-seconds` 的时间用完，停在安全点；重跑即继续 |
+
+退出码 2 表示命令行用法错误。参数：`--source subtitles|deepgram` 和 `--mode chinese|bilingual`（对这个视频一直有效，直到 `--restart`）、`--from <阶段>`、`--stage plan`、`--max-seconds <n>`、`--restart`、`--config-path`。`status [<video_id>]` 列出未完成的运行或显示一个视频的状态；`cleanup <video_id> [--force]` 删除工作目录。`$YT_TRANSCRIPT_OUTPUT_DIR` 可以替换配置里的 `output_dir`。
 
 ### 🔧 预检模式
 
+`run` 在每个阶段开始前检查它需要的东西（yt-dlp；只在选中 Deepgram 时检查 Deepgram key；到文字处理阶段才检查 LLM 后端），所以预检不再是必需的步骤。这些检查仍可用于排查问题：
+
 ```bash
-# 仅检查基础依赖：字幕 / metadata 工作流
+# 基础检查：yt-dlp、python3、配置
 bash scripts/preflight.sh
 
-# 在音频转录前要求 Deepgram 可用
+# 同时检查 Deepgram key
 bash scripts/preflight.sh --require-deepgram
 
-# 在长视频 chunk 处理前要求 LLM 配置完整
+# 同时探测 LLM API
 bash scripts/preflight.sh --require-llm
 ```
 
 ### 🧩 结构化脚本输出
 
-这个项目是 script-first 的：辅助命令会在 stdout 输出可解析 JSON，让路由、校验与执行决策尽量留在代码里，而不是漂移到 prompt 文案中：
+下面这些是 `run` 在内部调用的步骤，agent 不再逐条执行它们。在 [#23](https://github.com/williamwang-ty/yt-transcript/issues/23) 的第 4 阶段把其中大部分改为内部函数之前，它们仍可用于调试。它们会在 stdout 输出可解析 JSON，让路由、校验与执行决策留在代码里：
 
 - `scripts/download.sh "$URL" metadata`
 - `scripts/download.sh "$URL" subtitle-info`
@@ -654,7 +668,7 @@ bash scripts/preflight.sh --require-llm
 - 中文单语输出使用 `cleanup_zh`
 - 英文源双语输出使用 `structure_only`
 
-这样 workflow 文档只保留调用顺序，具体判断逻辑下沉到脚本中。
+这样具体判断逻辑都留在脚本里，而不是写在 prompt 说明中。
 
 `plan-optimization` 现在还会输出标准化的 chunk 执行契约。
 
@@ -671,9 +685,9 @@ bash scripts/preflight.sh --require-llm
 
 当前设计还包含显式的 resume 语义：`prepare-resume` 用于手动修复 stale manifest，而 `process-chunks` 在继续执行前会自动做同样的修复。
 
-未完成的任务会保留文件：只有当 state 记录的 `output_file` 确实存在时，`scripts/cleanup.sh` 才会清理，否则以退出码 `3` 结束且不删除任何东西（`--force` 用于明确放弃该任务）。`python3 yt_transcript_utils.py find-unfinished [--video-id ID]` 会列出中断的任务、所在步骤、分块进度以及续跑的下一步。
+未完成的运行会保留工作目录：`run` 自己的 cleanup 阶段只在文章写好后才执行；`python3 yt_transcript_utils.py cleanup <video_id>` 遇到未完成的运行会拒绝，除非加 `--force`（明确放弃）。`python3 yt_transcript_utils.py status` 会列出中断的运行、下一个阶段、上次的结果，以及继续它的命令。
 
-已知限制：所有 state 和中间文件都放在 `/tmp` 下，macOS 重启时会清空 `/tmp`（不少 Linux 系统也是如此）。因此续跑只在同一次开机内有效，重启后中断的任务需要从头开始。中断的任务还会把已下载的音频一直留在 `/tmp`，直到任务完成或用 `cleanup.sh <VIDEO_ID> --force` 放弃，可能占用几百 MB。把工作目录迁到持久位置（例如 `~/.cache/yt-transcript`）暂时搁置。
+已知限制：所有 state 和中间文件都放在 `/tmp` 下，macOS 重启时会清空 `/tmp`（不少 Linux 系统也是如此）。因此续跑只在同一次开机内有效，重启后中断的任务需要从头开始。中断的任务还会把已下载的音频一直留在 `/tmp`，直到任务完成或用 `cleanup <video_id> --force` 放弃，可能占用几百 MB。把工作目录迁到持久位置（例如 `~/.cache/yt-transcript`）暂时搁置。
 
 当前约定是明确固定的：
 
@@ -719,7 +733,7 @@ bash scripts/preflight.sh --require-llm
 - chunk 执行现在也有显式 resume 语义：在继续执行前，stale 的 `running` / 缺失输出 checkpoint 会被确定性修复为 `done` 或 `interrupted`
 - `process-chunks` 现在会把 `Remote end closed connection without response` 这类瞬时网关断连视为可重试传输错误，并可在产出异常短/结构异常的 chunk 时自动重跑一轮，再决定是否保留 warning
 - `process-chunks --dry-run` 只校验 prompt、manifest 和分块预算，不需要真实的 LLM 凭据，也不探测后端；真正执行时需要一个可用的后端：调用方 agent 的 CLI（`llm_backend: auto`），或者 `llm_api_key`、`llm_base_url` 和 `llm_model`
-- `plan-optimization` 是规范的长短路由：`< 1800s = short`，`>= 1800s = long`；`SKILL.md` 里的 Quick Mode 是其中更窄的 `< 900s` 子集，只用于字幕条件好的视频
+- `plan-optimization` 是规范的长短路由：`< 1800s = short`，`>= 1800s = long`；两者走同样的 `run` 阶段（已经没有 Quick Mode），短文本只跑一轮窗口
 - `manifest.json` 现在会把不可变 `plan` 和可变 `runtime` 状态分开，同时为每个 chunk 记录 `attempt_logs` 级别的请求观测数据
 - 固定分块按每个任务的分块目标（`chunk_tokens_*`）切，硬上限是目标的 `chunk_hard_cap_multiplier` 倍；原来为小固定分块加的 continuity 上下文、autotune 和 `replan-remaining` 补丁已随窗口模式转正删除，固定分块连续超时多次后直接停止
 - `build-glossary --mode transcript` 现在会从 raw chunk、可用的 normalized document 标题/频道、chapter 标题，以及可选 metadata/description 上下文中抽取术语；当 `cleanup_zh` 的 work_dir 里还没有 glossary 时，`process-chunks` 会自动生成这一份 glossary
@@ -737,9 +751,7 @@ bash scripts/preflight.sh --require-llm
 ### 📘 术语口径
 
 - `bilingual`：英文源文本 + 中文翻译，不是双字幕文件合并。
-- `基础 preflight`：`bash scripts/preflight.sh`，用于 metadata、字幕探测和字幕路径。
-- `Deepgram preflight`：`bash scripts/preflight.sh --require-deepgram`，仅在音频转录前执行。
-- `LLM preflight`：只有当 `plan-optimization` 返回 long-video chunk 处理需要时，才执行 `bash scripts/preflight.sh --require-llm`。
+- `run`：`python3 yt_transcript_utils.py run <url>`，处理一个视频的唯一入口；它返回一个 JSON 结果，`status`（`done`、`failed`、`needs_user`、`unsupported`、`needs_agent_text`、`in_progress`）对应固定的退出码。
 - `Deepgram 统一入口`：`python3 yt_transcript_utils.py transcribe-deepgram ...`
 - `Deepgram 结果可观测性`：`/tmp/${VIDEO_ID}_deepgram_result.json` 现在会暴露逐 chunk 的 `chunk_reports`、聚合结构计数，以及 structured-output 回退时的 `warnings`
 - `质量门禁`：读取 `verify-quality` 的 JSON；`hard_failures` 表示必须 STOP，`warnings` 表示需要人工复核，`checks` 则给出这些告警背后的可读性指标。有 work_dir 或现成 glossary 时，建议额外传 `--work-dir` 或 `--glossary-path` 打开 glossary drift 检查。
@@ -749,49 +761,41 @@ bash scripts/preflight.sh --require-llm
 
 ### 🧪 验证矩阵
 
-| 场景 | 最小命令序列 | Stop/go 规则 |
-|------|--------------|--------------|
-| 有字幕短视频 | `preflight.sh` → `download.sh metadata` → 创建 state → `validate-state --stage metadata` → `download.sh subtitle-info` → `download.sh subtitles` → `validate-state --stage post-source` → 优化 → `verify-quality` | 只有 `validate-state` 或 `verify-quality` 返回非空 `hard_failures` 才停止 |
-| 无可用字幕视频 | `preflight.sh` → `download.sh metadata` → `download.sh subtitle-info` → `preflight.sh --require-deepgram` → `transcribe-deepgram` → `validate-state --stage post-source` → 优化 → `verify-quality` | 任一命令失败或 `hard_failures` 非空都必须停止 |
-| 长视频 | `validate-state --stage post-source` → `plan-optimization` → 若 `requires_llm_preflight=true` 则执行 `preflight.sh --require-llm` → 分块 → `raw_path` 阶段运行 `process-chunks` → 需要时执行 `processed_path` 翻译阶段 → 合并 → `verify-quality` → `validate-state --stage pre-assemble` | `warnings` 不自动阻断，`hard_failures` 阻断 |
+| 场景 | `run` 做什么 | 结果 |
+|------|-------------|------|
+| 有可信字幕的视频，长短都一样 | `metadata` → `source`（字幕轨）→ `normalize` → `plan` → `text` → `merge` → `verify` → `assemble` → `cleanup` | `done` 和 `output_file`；`warnings` 只作提示 |
+| 没有可信字幕，或中文字幕质量极差 | `source` 用 Deepgram 转写音频 | `done`；没有 key 时 `needs_user`（`deepgram_key_missing`） |
+| 说其他语言的视频 | 在 `source` 停下 | `unsupported` |
+| 长视频，宿主的 shell 有时间上限 | 超过 `--max-seconds` 后在第一个阶段或窗口轮次边界停下 | `in_progress`；重跑即继续 |
+| 没有可用的 LLM 后端 | 每次把一个文字请求交给 agent | `needs_agent_text`；写好答案后重跑 |
+| 质量检查硬失败 | `verify` 停下，不写文章 | `failed`（`quality_hard_failure`）；`--from text` 重做文字处理 |
+
+离线端到端测试：`python3 scripts/run_regression.py --fixtures tests/fixtures/e2e` 用假的 yt-dlp 和假的 LLM 回放录好的视频（测试集也会跑）。
 
 真实视频回归：`python3 scripts/run_regression.py` 会在一组固定的真实视频上跑完整流程并汇总 `verify-quality` 结果，详见 [tests/live_regression/README.md](tests/live_regression/README.md)。
 
 ### 🛠️ 最小命令集
 
 ```bash
-# 1. 基础检查
-bash scripts/preflight.sh
+# 转录一个视频；重跑同一条命令就是续跑
+python3 yt_transcript_utils.py run "$URL" --max-seconds 300
 
-# 2. Metadata 与字幕可用性
-bash scripts/download.sh "$URL" metadata
-bash scripts/download.sh "$URL" subtitle-info
+# 免费的路由检查：来源、模式和文字处理计划，不调用 LLM 和 Deepgram
+python3 yt_transcript_utils.py run "$URL" --stage plan
 
-# 3. State 校验
-python3 yt_transcript_utils.py validate-state /tmp/${VIDEO_ID}_state.md --stage metadata
-python3 yt_transcript_utils.py validate-state /tmp/${VIDEO_ID}_state.md --stage post-source
+# 覆盖参数（--source 和 --mode 会记住，对这个视频一直有效，直到 --restart）
+python3 yt_transcript_utils.py run "$URL" --source deepgram   # 或 subtitles
+python3 yt_transcript_utils.py run "$URL" --mode chinese      # 或 bilingual
+python3 yt_transcript_utils.py run "$URL" --from text         # 重做这个阶段及之后的所有阶段
+python3 yt_transcript_utils.py run "$URL" --restart           # 从头开始
 
-# 4. 优化计划
-python3 yt_transcript_utils.py plan-optimization /tmp/${VIDEO_ID}_state.md
+# 未完成的运行
+python3 yt_transcript_utils.py status                         # /tmp/yt-transcript/ 下的所有运行
+python3 yt_transcript_utils.py status "$VIDEO_ID"
+python3 yt_transcript_utils.py cleanup "$VIDEO_ID" --force    # 放弃一个未完成的运行
 
-# 4b. 长视频按 plan 的每个 operation 运行 process-chunks
-#     （默认滑动窗口；long_text_mode: chunks 用固定分块）
-
-# 5. 需要时走音频兜底
-bash scripts/preflight.sh --require-deepgram
-python3 yt_transcript_utils.py transcribe-deepgram "$AUDIO_FILE" --language "$LANGUAGE" --output-text "/tmp/${VIDEO_ID}_raw_text.txt"
-# 需要与 legacy flat path 做对照时：
-# python3 yt_transcript_utils.py transcribe-deepgram "$AUDIO_FILE" --language "$LANGUAGE" --disable-utterances --legacy-flat-output
-
-# 6. 仅在 chunk cleanup 路径下可选的 transcript glossary 构建
-python3 yt_transcript_utils.py build-glossary /tmp/${VIDEO_ID}_chunks --mode transcript
-
-# 7. 最终质量门禁
-python3 yt_transcript_utils.py verify-quality /tmp/${VIDEO_ID}_optimized.txt --raw-text /tmp/${VIDEO_ID}_raw_text.txt
-# 如果存在 glossary/work_dir，且希望检查 glossary drift，可额外传 --work-dir /tmp/${VIDEO_ID}_chunks
-
-# `checks` 现在还会包含 chunk seam 重复、中文空格异常、
-# 重复短语密度、短碎段比例、标题密度、标点密度，以及 glossary drift 等 advisory 指标。
+# 调试：对任意文件重跑质量检查
+python3 yt_transcript_utils.py verify-quality "$FILE" --raw-text "$RAW_TEXT"
 ```
 
 ### 📄 许可证

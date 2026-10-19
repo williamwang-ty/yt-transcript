@@ -50,6 +50,7 @@ class RunCommandTests(unittest.TestCase):
             fake_deepgram.FIXTURES_ENV: str(FIXTURES),
             pipeline.WORK_ROOT_ENV: str(self.root / "work"),
             pipeline.OUTPUT_DIR_ENV: str(self.root / "out"),
+            pipeline.YT_DLP_UPDATE_ENV: "0",
             "FAKE_LLM_LOG": str(self.llm_log),
         })
         patcher.start()
@@ -285,6 +286,34 @@ class RunCommandTests(unittest.TestCase):
         self.assertEqual(("needs_user", "metadata", "tool_missing"),
                          (result["status"], result["stage"], result["reason"]))
 
+    def test_yt_dlp_update_check_runs_once_before_the_metadata_fetch(self):
+        real_run = subprocess.run
+        calls = []
+
+        def fake_run(args, *rest, **kwargs):
+            command = " ".join(str(arg) for arg in args)
+            calls.append("update" if command.endswith("update_yt_dlp.sh") else
+                         "download" if "download.sh" in command else "other")
+            if calls[-1] == "update":
+                return subprocess.CompletedProcess(args, 0, stdout="✅ yt-dlp is up to date\n", stderr="")
+            return real_run(args, *rest, **kwargs)
+
+        os.environ[pipeline.YT_DLP_UPDATE_ENV] = "1"
+        with mock.patch("kernel.pipeline.subprocess.run", side_effect=fake_run):
+            self.assert_finished(ENGLISH, self.run_video(ENGLISH))
+            self.assertEqual(["update", "download"], calls[:2])
+            self.assertEqual(1, calls.count("update"))
+            self.assertEqual("done", self.run_video(ENGLISH)["status"])
+            self.assertEqual(1, calls.count("update"))
+            os.environ[pipeline.YT_DLP_UPDATE_ENV] = "0"
+            self.run_video(ENGLISH, restart=True)
+        self.assertEqual(1, calls.count("update"))
+
+    def test_update_script_does_nothing_when_disabled(self):
+        proc = subprocess.run(["bash", str(PROJECT_ROOT / "scripts" / "update_yt_dlp.sh")], capture_output=True,
+                              text=True, env={**os.environ, pipeline.YT_DLP_UPDATE_ENV: "0"})
+        self.assertEqual((0, "", ""), (proc.returncode, proc.stdout, proc.stderr))
+
     def test_no_llm_backend_hands_each_request_to_the_agent(self):
         expected = self.reference_article(LONG)
         config = self.write_config("handoff.yaml", llm_agent_cli=None)
@@ -326,6 +355,18 @@ class RunCommandTests(unittest.TestCase):
                 self.assertEqual(("failed", "source", "override_not_applicable"),
                                  (result["status"], result["stage"], result["reason"]))
                 self.assertFalse(result["retryable"])
+                # The rejected override is not remembered: a plain rerun takes the normal route.
+                self.assertEqual({"source": None, "mode": None}, self.state(video)["overrides"])
+                self.assert_finished(video, self.run_video(video))
+
+    def test_rejected_override_keeps_the_earlier_one(self):
+        self.assert_finished(ENGLISH, self.run_video(ENGLISH, source="subtitles"))
+        result = self.run_video(ENGLISH, mode="chinese")
+        self.assertEqual("override_not_applicable", result["reason"])
+        self.assertEqual({"source": "subtitles", "mode": None}, self.state(ENGLISH)["overrides"])
+        rerun = self.run_video(ENGLISH)
+        self.assert_finished(ENGLISH, rerun)
+        self.assertEqual("bilingual", rerun["route"]["mode"])
 
     def test_quality_failure_stops_in_verify_and_from_text_redoes_the_text(self):
         failing = {"passed": False, "hard_failures": ["size ratio too low"], "warnings": [], "checks": {}}

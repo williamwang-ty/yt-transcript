@@ -144,6 +144,7 @@ class WindowProtocolTests(unittest.TestCase):
         structure = window.build_window_prompt("{RAW_TEXT}", prompt_name="structure_only", **kwargs)
         cleanup = window.build_window_prompt("{RAW_TEXT}", prompt_name="cleanup_zh", **kwargs)
         self.assertIn("whenever the speaker changes", structure)
+        self.assertIn("Drop the `-` or `>>` marker", structure)
         self.assertNotIn("whenever the speaker changes", cleanup)
 
     def test_long_unpunctuated_sentences_are_split_into_numbered_units(self):
@@ -583,6 +584,36 @@ class WindowBilingualTests(unittest.TestCase):
             self.assertEqual(merged.count(f"This is sentence number {i}."), 2, i)  # English + translated copy
         self.assertIn("【译】", merged)
         self.assertNotIn("<!--", merged)
+
+    def test_short_speaker_turns_and_their_translations_stay_separate_paragraphs(self):
+        # Chunk merging joins a short block that looks unfinished to the next one;
+        # window paragraphs have no seams, so that must not glue a pair together.
+        def llm(**kwargs):
+            prompt = kwargs["messages"][0]["content"]
+            if "Translation-Only" not in prompt:
+                lines = _window_lines(prompt)[:4]
+                return _api_result("\n\n".join([f"[S{number}] {text}" for number, text in lines] + ["<!--END-->"]))
+            paragraphs = re.findall(r"^\[S(\d+)\] (.*)$", prompt, re.MULTILINE)
+            return _api_result("\n\n".join([f"[S{number}] {text}\n\n译文{number}" for number, text in paragraphs[:4]]
+                                             + ["<!--END-->"]))
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source = Path(tmpdir) / "raw.txt"
+            source.write_text(" ".join(f"Yes, that is turn {i}." for i in range(1, 9)), encoding="utf-8")
+            work_dir = Path(tmpdir) / "chunks"
+            utils.chunk_text(str(source), str(work_dir), 0, "structure_only")
+            config = WindowExecutorTests._config(self)
+            WindowExecutorTests._run(self, work_dir, config, llm, prompt_name="structure_only")
+            translate, _ = WindowExecutorTests._run(self, work_dir, config, llm, prompt_name="translate_only",
+                                                    input_key="processed_path")
+            output = Path(tmpdir) / "optimized.md"
+            utils.merge_content(str(work_dir), str(output))
+            merged = output.read_text(encoding="utf-8")
+
+        self.assertTrue(translate["success"], translate)
+        blocks = merged.split("\n\n")
+        self.assertEqual(16, len(blocks), merged)
+        self.assertEqual(["Yes, that is turn 1.", "译文1"], blocks[:2])
 
     def test_translation_stays_on_chunks_when_the_raw_stage_used_chunks(self):
         with tempfile.TemporaryDirectory() as tmpdir:

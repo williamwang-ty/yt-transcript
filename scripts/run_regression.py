@@ -97,6 +97,8 @@ def fixture_env(fixtures_dir: Path) -> dict:
     env["PATH"] = f"{E2E_DIR / 'bin'}{os.pathsep}{env.get('PATH', '')}"
     env["YT_TRANSCRIPT_E2E_FIXTURES"] = str(fixtures_dir.resolve())
     env["YT_TRANSCRIPT_AGENT_CLI"] = shlex.join([sys.executable, str(FAKE_LLM)])
+    # The fake yt-dlp must not be "updated" from GitHub.
+    env["YT_TRANSCRIPT_YT_DLP_UPDATE"] = "0"
     return env
 
 

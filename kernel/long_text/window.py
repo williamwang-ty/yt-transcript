@@ -139,7 +139,8 @@ TASK_PROTOCOL_NOTES = {
     # exchange into one paragraph; keep dialogue readable.
     "structure_only": (
         "\n- Start a new paragraph whenever the speaker changes (for example where the source has `-` or `>>`): "
-        "each speaker's turn is its own paragraph, separated by a blank line."
+        "each speaker's turn is its own paragraph, separated by a blank line. Drop the `-` or `>>` marker "
+        "itself, since Markdown would show a paragraph starting with `-` as a list item."
     ),
     "translate_only": (
         "\n- For each source paragraph, write its tag and the English paragraph unchanged, then a blank line "

@@ -208,7 +208,7 @@ def _strip_duplicate_heading_lines(previous_heading_block: str, current_block: s
     return "\n".join(trimmed_lines).strip(), removed
 
 
-def _cleanup_body_blocks(text: str, diagnostics: dict) -> str:
+def _cleanup_body_blocks(text: str, diagnostics: dict, *, join_fragments: bool = True) -> str:
     """Run markdown-safe cleanup on the merge body."""
     blocks = _split_blocks(text)
     if not blocks:
@@ -247,7 +247,7 @@ def _cleanup_body_blocks(text: str, diagnostics: dict) -> str:
                     if not current_block:
                         diagnostics["duplicate_body_blocks_removed"] += 1
                         continue
-                if _should_merge_short_body_blocks(previous_block, current_block):
+                if join_fragments and _should_merge_short_body_blocks(previous_block, current_block):
                     cleaned_blocks[-1] = _merge_body_blocks(previous_block, current_block)
                     diagnostics["short_paragraph_merge_count"] += 1
                     continue
@@ -257,11 +257,13 @@ def _cleanup_body_blocks(text: str, diagnostics: dict) -> str:
     return "\n\n".join(block.strip() for block in cleaned_blocks if block.strip()).strip()
 
 
-def post_merge_cleanup(text: str, *, has_header: bool = False) -> tuple[str, dict]:
+def post_merge_cleanup(text: str, *, has_header: bool = False, join_fragments: bool = True) -> tuple[str, dict]:
     """Clean merge-body seams while preserving markdown structure.
 
     Callers should pass the merge body only. ``has_header`` is retained for
-    backward compatibility and is otherwise ignored.
+    backward compatibility and is otherwise ignored. ``join_fragments=False``
+    keeps short paragraphs apart: window output has no chunk seams, and its
+    short paragraphs are speaker turns or the halves of a bilingual pair.
     """
     del has_header
     diagnostics = build_empty_post_merge_diagnostics()
@@ -269,7 +271,7 @@ def post_merge_cleanup(text: str, *, has_header: bool = False) -> tuple[str, dic
     if not normalized:
         return "", diagnostics
 
-    cleaned_text = _cleanup_body_blocks(normalized, diagnostics)
+    cleaned_text = _cleanup_body_blocks(normalized, diagnostics, join_fragments=join_fragments)
     cleaned_text, collapsed_count = re.subn(r"\n{3,}", "\n\n", cleaned_text)
     diagnostics["blank_line_groups_collapsed"] = collapsed_count
     return cleaned_text.strip(), diagnostics
