@@ -1,7 +1,8 @@
-"""Regression tests for the llm_backend=auto agent-CLI chunk backend."""
+"""Regression tests for the llm_backend=auto agent-CLI backend."""
 
 from tests._support import *
 from kernel.long_text import agent_cli
+from kernel.long_text import window
 
 
 def _which_all(name):
@@ -14,7 +15,7 @@ def _completed(stdout="", returncode=0, stderr=""):
     return subprocess.CompletedProcess(args=[], returncode=returncode, stdout=stdout, stderr=stderr)
 
 
-class AgentCliRegressionTests(FixedChunkExecutorTestCase):
+class AgentCliRegressionTests(unittest.TestCase):
     """Agent detection, backend selection, and the CLI call wrapper."""
 
     def test_detects_known_agents_from_marker_variables(self):
@@ -69,7 +70,7 @@ class AgentCliRegressionTests(FixedChunkExecutorTestCase):
         """No detected agent and no API configured resolves to none."""
         decision = agent_cli.resolve_llm_backend({"llm_backend": "auto"}, env={}, which=_which_all)
         self.assertEqual(decision["backend"], "none")
-        self.assertIn("--agent-cli", decision["fallback_reason"])
+        self.assertIn("llm_agent_cli", decision["fallback_reason"])
 
     def test_missing_cli_binary_falls_back(self):
         """A detected agent whose CLI is not installed is skipped."""
@@ -80,7 +81,7 @@ class AgentCliRegressionTests(FixedChunkExecutorTestCase):
         self.assertIn("cursor-agent", decision["fallback_reason"])
 
     def test_explicit_command_beats_detection_and_previous_run_is_reused(self):
-        """--agent-cli (via env) wins over detection; a resumed run keeps its CLI."""
+        """An explicit command (via env) wins over detection; a resumed run keeps its CLI."""
         runner = mock.Mock(return_value=_completed("OK"))
         decision = agent_cli.resolve_llm_backend(
             {"llm_backend": "auto"},
@@ -125,12 +126,8 @@ class AgentCliRegressionTests(FixedChunkExecutorTestCase):
         self.assertEqual(len(caught.exception.attempt_history), 2)
 
     def _make_work_dir(self, tmpdir):
-        """Chunk a small transcript into a work dir."""
-        source = Path(tmpdir) / "raw.txt"
-        work_dir = Path(tmpdir) / "chunks"
-        source.write_text("第一句话讲人工智能。" * 30, encoding="utf-8")
-        utils.chunk_text(str(source), str(work_dir), 1000, "cleanup_zh")
-        return work_dir
+        """Chunk a small transcript into a work dir (one window round covers it)."""
+        return chunk_plain_text("第一句话讲人工智能。" * 30, Path(tmpdir) / "text")
 
     def _config(self, **overrides):
         """Default config with the API configured."""
@@ -139,69 +136,70 @@ class AgentCliRegressionTests(FixedChunkExecutorTestCase):
             "llm_api_key": "key",
             "llm_base_url": "https://api.deepseek.com",
             "llm_model": "deepseek-v4-pro",
-            "llm_chunk_recovery_attempts": 0,
-            "llm_reasoning_probe_enabled": False,
         })
         config.update(overrides)
         return config
 
-    def test_process_chunks_sends_chunks_to_agent_cli(self):
-        """With a CLI backend, chunks never reach the API and the choice is recorded."""
+    def _cli_result(self, prompt, **kwargs):
+        return {"text": tag_echo(prompt), "latency_ms": 5, "request_url": "cli:claude-code",
+                "streaming_used": False, "finish_reason": "", "usage": {}, "attempts": 1}
+
+    def test_window_rounds_go_to_the_agent_cli(self):
+        """With a CLI backend, requests never reach the API and the choice is recorded."""
         cli_decision = {
             "mode": "auto", "backend": "cli", "agent": "claude-code", "agent_source": "detected",
             "command": ["claude", "-p"], "strip_env": [], "api_configured": True,
             "probe": {"attempted": True, "ok": True}, "fallback_reason": "",
         }
-        cli_result = {
-            "text": "## 人工智能\n\n" + "第一句话讲人工智能。" * 30,
-            "latency_ms": 5, "request_url": "cli:claude-code", "streaming_used": False,
-            "finish_reason": "", "usage": {}, "attempts": 1,
-        }
         with tempfile.TemporaryDirectory() as tmpdir:
             work_dir = self._make_work_dir(tmpdir)
             with mock.patch.object(utils, "load_config", return_value=self._config()), \
                 mock.patch.object(agent_cli, "resolve_llm_backend", return_value=cli_decision), \
-                mock.patch.object(agent_cli, "call_cli_llm", return_value=cli_result) as cli_call, \
-                mock.patch.object(utils, "_call_llm_api") as api_call:
-                result = utils.process_chunks(str(work_dir), "cleanup_zh")
-            manifest = json.loads((work_dir / "manifest.json").read_text(encoding="utf-8"))
+                mock.patch.object(agent_cli, "call_cli_llm", side_effect=lambda command, prompt, **kw:
+                                  self._cli_result(prompt)) as cli_call, \
+                mock.patch.object(utils, "_call_llm_api") as api_call, \
+                mock.patch("sys.stderr", new_callable=io.StringIO):
+                result = window.process_window(str(work_dir), "cleanup_zh")
+            state = window.load_window_state(str(work_dir))
 
         self.assertTrue(result["success"], result)
         self.assertEqual(cli_call.call_count, 1)
         api_call.assert_not_called()
         self.assertEqual(result["request_url"], "cli:claude-code")
-        self.assertEqual(manifest["runtime"]["llm_backend"]["backend"], "cli")
+        self.assertEqual(state["llm_backend"]["backend"], "cli")
 
-    def test_process_chunks_switches_to_api_when_cli_fails_mid_run(self):
-        """A CLI failure after its retries moves the chunk and the rest to the API."""
+    def test_window_switches_to_api_when_cli_fails_mid_run(self):
+        """A CLI failure after its retries moves the round and the rest to the API."""
         cli_decision = {
             "mode": "auto", "backend": "cli", "agent": "codex", "agent_source": "detected",
             "command": ["codex", "exec", "-"], "strip_env": [], "api_configured": True,
             "probe": {"attempted": True, "ok": True}, "fallback_reason": "",
         }
-        api_result = {
-            "text": "## 人工智能\n\n" + "第一句话讲人工智能。" * 30,
-            "latency_ms": 5, "request_url": "https://api.deepseek.com/v1/chat/completions",
-            "streaming_used": False, "finish_reason": "stop", "usage": {}, "attempts": 1,
-        }
         cli_error = utils.LLMRequestError("codex exited", error_type="cli_exit_error", retryable=True)
+
+        def api(**kwargs):
+            return {"text": tag_echo(kwargs["messages"][0]["content"]), "latency_ms": 5,
+                    "request_url": "https://api.deepseek.com/v1/chat/completions", "streaming_used": False,
+                    "finish_reason": "stop", "usage": {}, "attempts": 1}
+
         with tempfile.TemporaryDirectory() as tmpdir:
             work_dir = self._make_work_dir(tmpdir)
             with mock.patch.object(utils, "load_config", return_value=self._config()), \
                 mock.patch.object(agent_cli, "resolve_llm_backend", return_value=cli_decision), \
                 mock.patch.object(agent_cli, "call_cli_llm", side_effect=cli_error), \
-                mock.patch.object(utils, "_call_llm_api", return_value=api_result) as api_call:
-                result = utils.process_chunks(str(work_dir), "cleanup_zh")
-            manifest = json.loads((work_dir / "manifest.json").read_text(encoding="utf-8"))
+                mock.patch.object(utils, "_call_llm_api", side_effect=api) as api_call, \
+                mock.patch("sys.stderr", new_callable=io.StringIO):
+                result = window.process_window(str(work_dir), "cleanup_zh")
+            state = window.load_window_state(str(work_dir))
 
         self.assertTrue(result["success"], result)
         self.assertEqual(api_call.call_count, 1)
-        self.assertEqual(manifest["runtime"]["llm_backend"]["backend"], "api")
-        self.assertIn("Agent CLI failed mid-run", manifest["runtime"]["llm_backend"]["fallback_reason"])
-        self.assertTrue(any("switching the remaining chunks" in w for w in result["warnings"]))
+        self.assertEqual(state["llm_backend"]["backend"], "api")
+        self.assertIn("Agent CLI failed mid-run", state["llm_backend"]["fallback_reason"])
+        self.assertTrue(any("switching the remaining window rounds" in w for w in result["warnings"]))
 
-    def test_process_chunks_without_any_backend_exits(self):
-        """No CLI and no API configured stops before touching chunks."""
+    def test_window_without_any_backend_exits(self):
+        """No CLI, no API and no agent handoff stops before the first round."""
         none_decision = {
             "mode": "auto", "backend": "none", "agent": "", "agent_source": "", "command": [],
             "strip_env": [], "api_configured": False, "probe": {"attempted": False},
@@ -213,7 +211,7 @@ class AgentCliRegressionTests(FixedChunkExecutorTestCase):
                 mock.patch.object(agent_cli, "resolve_llm_backend", return_value=none_decision), \
                 mock.patch("sys.stderr", new_callable=io.StringIO) as stderr:
                 with self.assertRaises(SystemExit):
-                    utils.process_chunks(str(work_dir), "cleanup_zh")
+                    window.process_window(str(work_dir), "cleanup_zh")
         self.assertIn("no LLM backend available", stderr.getvalue())
 
     def test_load_config_reads_backend_settings(self):

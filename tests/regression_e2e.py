@@ -92,8 +92,8 @@ def observe(item: dict, vdir: Path, llm_calls: list[dict]) -> dict:
         "plan": {k: plan.get(k) for k in ("video_path", "routing_reason", "subtitle_quality_band",
                                            "reroute_recommended", "prompts") if k in plan},
         "raw_chars": item.get("raw_chars"),
-        "llm_runs": [{k: run.get(k) for k in ("prompt", "long_text_mode", "total_chunks", "processed_count",
-                                              "failed_count")} for run in item.get("llm_runs", [])],
+        "llm_runs": [{k: run.get(k) for k in ("prompt", "round_count", "invalid_rounds", "fallback_rounds")}
+                     for run in item.get("llm_runs", [])],
         "llm_calls": [call["kind"] for call in llm_calls if call["kind"] != "probe"],
     }
     if verify:

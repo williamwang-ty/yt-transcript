@@ -25,17 +25,15 @@
     "llm_runs": [
       {
         "prompt": "structure_only",
-        "long_text_mode": "window",
-        "total_chunks": 1,
-        "processed_count": 1,
-        "failed_count": 0
+        "round_count": 1,
+        "invalid_rounds": 0,
+        "fallback_rounds": 0
       },
       {
         "prompt": "translate_only",
-        "long_text_mode": "window",
-        "total_chunks": 1,
-        "processed_count": 1,
-        "failed_count": 0
+        "round_count": 1,
+        "invalid_rounds": 0,
+        "fallback_rounds": 0
       }
     ],
     "llm_calls": [
@@ -103,10 +101,9 @@
     "llm_runs": [
       {
         "prompt": "cleanup_zh",
-        "long_text_mode": "window",
-        "total_chunks": 1,
-        "processed_count": 1,
-        "failed_count": 0
+        "round_count": 1,
+        "invalid_rounds": 0,
+        "fallback_rounds": 0
       }
     ],
     "llm_calls": [
@@ -173,10 +170,9 @@
     "llm_runs": [
       {
         "prompt": "cleanup_zh",
-        "long_text_mode": "window",
-        "total_chunks": 3,
-        "processed_count": 3,
-        "failed_count": 0
+        "round_count": 3,
+        "invalid_rounds": 0,
+        "fallback_rounds": 0
       }
     ],
     "llm_calls": [

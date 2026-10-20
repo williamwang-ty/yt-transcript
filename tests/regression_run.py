@@ -22,7 +22,6 @@ from unittest import mock
 import yt_transcript_utils as utils
 from kernel import pipeline
 from kernel.long_text import agent_cli as _agent_cli
-from kernel.task_runtime import runtime as kernel_runtime
 from tests.e2e import fake_deepgram
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -314,6 +313,31 @@ class RunCommandTests(unittest.TestCase):
                               text=True, env={**os.environ, pipeline.YT_DLP_UPDATE_ENV: "0"})
         self.assertEqual((0, "", ""), (proc.returncode, proc.stdout, proc.stderr))
 
+    def test_yt_dlp_settings_from_config_reach_download_sh(self):
+        cookies = self.root / "cookies.txt"
+        cookies.write_text("# Netscape HTTP Cookie File\n", encoding="utf-8")
+        config = self.write_config("cookies.yaml", yt_dlp_cookies_file=json.dumps(str(cookies)),
+                                   yt_dlp_socket_timeout_sec="7")
+        envs = []
+        real_run = subprocess.run
+
+        def spy(command, *args, **kwargs):
+            if str(command[1]).endswith("download.sh"):
+                envs.append(kwargs.get("env") or {})
+            return real_run(command, *args, **kwargs)
+
+        with mock.patch.dict(os.environ), mock.patch.object(pipeline.subprocess, "run", side_effect=spy):
+            for var in pipeline.YT_DLP_CONFIG_ENV:
+                os.environ.pop(var, None)
+            result = self.run_video(ENGLISH, config=config, stage="plan")
+
+        self.assertEqual("done", result["status"], result)
+        self.assertTrue(envs)
+        for env in envs:
+            self.assertEqual(str(cookies), env.get("YT_DLP_COOKIES_FILE"))
+            self.assertEqual("7", env.get("YT_DLP_SOCKET_TIMEOUT_SEC"))
+            self.assertEqual(str(utils.DEFAULT_YT_DLP_RETRIES), env.get("YT_DLP_RETRIES"))
+
     def test_no_llm_backend_hands_each_request_to_the_agent(self):
         expected = self.reference_article(LONG)
         config = self.write_config("handoff.yaml", llm_agent_cli=None)
@@ -338,12 +362,11 @@ class RunCommandTests(unittest.TestCase):
     def test_active_lock_fails_with_locked(self):
         work_dir = self.work_dir(ENGLISH)
         work_dir.mkdir(parents=True)
-        owner = kernel_runtime.acquire_runtime_ownership(str(work_dir), "run")
-        self.assertTrue(owner["success"])
+        self.assertTrue(pipeline.acquire_lock(work_dir))
         try:
             result = self.run_video(ENGLISH)
         finally:
-            kernel_runtime.release_runtime_ownership(str(work_dir), owner["owner_id"])
+            pipeline.release_lock(work_dir)
         self.assertEqual(("failed", "locked"), (result["status"], result["reason"]))
         self.assertTrue(result["retryable"])
         self.assertEqual("done", self.run_video(ENGLISH)["status"])

@@ -29,10 +29,10 @@ from datetime import datetime
 from pathlib import Path
 
 from kernel import subtitle_language as kernel_subtitle_language
-from kernel.long_text import execution as kernel_execution
+from kernel.files import atomic_write_text
+from kernel.long_text import chunking as kernel_chunking
+from kernel.long_text import merge as kernel_merge
 from kernel.long_text import window as kernel_window
-from kernel.task_runtime import runtime as kernel_runtime
-from kernel.task_runtime import state as kernel_state
 
 STAGES = ("metadata", "source", "normalize", "plan", "text", "merge", "verify", "assemble", "cleanup")
 PLAN_STAGE = "plan"
@@ -53,6 +53,8 @@ EXIT_CODES = {
 USAGE_EXIT_CODE = 2
 
 STATE_FILE = "state.json"
+# Held while a run of the video is active; records the owning process.
+LOCK_FILE = ".runtime_owner.json"
 METADATA_FILE = "metadata.json"
 CHAPTERS_FILE = "chapters.json"
 SOURCE_DIR = "source"
@@ -88,6 +90,14 @@ DOWNLOAD_TIMEOUT_SEC = 1800
 # scripts/update_yt_dlp.sh skips itself when this is "0" (the offline tests set it).
 YT_DLP_UPDATE_ENV = "YT_TRANSCRIPT_YT_DLP_UPDATE"
 YT_DLP_UPDATE_TIMEOUT_SEC = 300
+# download.sh reads the yt-dlp settings from these variables.
+YT_DLP_CONFIG_ENV = {
+    "YT_DLP_SOCKET_TIMEOUT_SEC": "yt_dlp_socket_timeout_sec",
+    "YT_DLP_RETRIES": "yt_dlp_retries",
+    "YT_DLP_EXTRACTOR_RETRIES": "yt_dlp_extractor_retries",
+    "YT_DLP_COOKIES_FROM_BROWSER": "yt_dlp_cookies_from_browser",
+    "YT_DLP_COOKIES_FILE": "yt_dlp_cookies_file",
+}
 DEEPGRAM_KEY_PLACEHOLDERS = {"", "your_api_key_here", "your_deepgram_api_key_here"}
 # yt-dlp messages that only the user can resolve, checked in this order.
 NEEDS_USER_PATTERNS = (
@@ -229,6 +239,49 @@ def _remove(path: Path) -> None:
         path.unlink()
 
 
+def _process_alive(pid: int) -> bool:
+    if pid == os.getpid():
+        return True
+    try:
+        os.kill(pid, 0)
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def lock_holder(work_dir: Path) -> dict:
+    """The lock record of the live process running this video, or {} when nobody holds the lock."""
+    try:
+        record = json.loads((work_dir / LOCK_FILE).read_text(encoding="utf-8"))
+        pid = int(record.get("pid") or 0)
+    except (OSError, ValueError, TypeError, AttributeError):
+        return {}
+    return record if pid > 0 and _process_alive(pid) else {}
+
+
+def acquire_lock(work_dir: Path) -> bool:
+    """Take the video's lock; a lock left by a dead process (or unreadable) is replaced."""
+    path = work_dir / LOCK_FILE
+    for _ in range(3):
+        try:
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+        except FileExistsError:
+            if lock_holder(work_dir):
+                return False
+            _remove(path)
+            continue
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump({"pid": os.getpid(), "acquired_at": _now()}, handle)
+        return True
+    return False
+
+
+def release_lock(work_dir: Path) -> None:
+    _remove(work_dir / LOCK_FILE)
+
+
 def read_state(work_dir: Path) -> dict:
     try:
         payload = json.loads((work_dir / STATE_FILE).read_text(encoding="utf-8"))
@@ -303,8 +356,7 @@ class _Run:
 
     def save(self) -> None:
         self.state["updated_at"] = _now()
-        kernel_state.atomic_write_text(self.path(STATE_FILE),
-                                       json.dumps(self.state, ensure_ascii=False, indent=2) + "\n")
+        atomic_write_text(self.path(STATE_FILE), json.dumps(self.state, ensure_ascii=False, indent=2) + "\n")
 
     def next_command(self) -> str:
         parts = [_skill_command(), "run", shlex.quote(self.url)]
@@ -350,7 +402,7 @@ class _Run:
     def execute(self) -> dict:
         if self.restart:
             for child in self.work_dir.iterdir():
-                if child.name != kernel_runtime.RUNTIME_OWNER_FILENAME:
+                if child.name != LOCK_FILE:
                     _remove(child)
         self.state = read_state(self.work_dir) or _new_state(self.video_id, self.url)
         self.state["url"] = self.url
@@ -482,6 +534,11 @@ class _Run:
             "YT_TRANSCRIPT_DOWNLOAD_DIR": str(self.path(SOURCE_DIR)),
             "YT_TRANSCRIPT_SUBTITLE_MODE": subtitle_mode,
         })
+        # yt-dlp settings from config; a variable already in the environment wins.
+        for env_name, key in YT_DLP_CONFIG_ENV.items():
+            value = self.config.get(key)
+            if value not in (None, "") and not env.get(env_name):
+                env[env_name] = str(value)
         self.path(SOURCE_DIR).mkdir(parents=True, exist_ok=True)
         script = _utils()._skill_root() / "scripts" / "download.sh"
         try:
@@ -564,7 +621,7 @@ class _Run:
         return self.download("subtitle-info")
 
     def source_payload(self, source: str, language: str) -> dict:
-        """What the normalizer needs to know about the source (the old state.md fields)."""
+        """What the normalizer needs to know about the source."""
         meta = self.state["metadata"]
         return {
             "type": "youtube" if source == "subtitles" else "deepgram",
@@ -814,8 +871,7 @@ class _Run:
     def stage_text(self, record: dict) -> None:
         text_dir = self.path(TEXT_DIR)
         tasks = self.state["stages"]["plan"]["summary"]["tasks"]
-        utils = _utils()
-        if not (text_dir / "manifest.json").is_file():
+        if not (text_dir / kernel_chunking.MANIFEST_FILE).is_file():
             # YouTube chapters become outline hints on the long path, as in the
             # agent-driven long path. A short text has no outline, and chapter
             # cuts would only split its sentences at the chapter times.
@@ -826,9 +882,8 @@ class _Run:
                     has_chapters = bool(json.loads(chapters.read_text(encoding="utf-8")).get("has_chapters"))
                 except (OSError, json.JSONDecodeError, AttributeError):
                     has_chapters = False
-            utils.chunk_document(str(self.path(NORMALIZED_FILE)), str(text_dir), prompt_name=tasks[0]["prompt"],
-                                 config_path=self.config_path,
-                                 chapters_path=str(chapters) if has_chapters else "")
+            kernel_chunking.chunk_document(str(self.path(NORMALIZED_FILE)), str(text_dir), tasks[0]["prompt"],
+                                           self.config, chapters_path=str(chapters) if has_chapters else "")
         handoff = AgentHandoff(self.path(AGENT_TASK_DIR))
         handoff.collect()
         task_records = record.setdefault("tasks", {})
@@ -855,7 +910,7 @@ class _Run:
                 return "paused" if self.deadline_passed() else ""
 
             try:
-                result = kernel_execution.process_chunks(
+                result = kernel_window.process_window(
                     str(text_dir),
                     prompt,
                     extra_instruction=task.get("extra_instruction", ""),
@@ -876,8 +931,8 @@ class _Run:
                     task={**needed.task, "name": prompt},
                 ) from None
             task_record.update({key: result.get(key) for key in (
-                "long_text_mode", "total_chunks", "processed_count", "failed_count", "round_count",
-                "fallback_rounds", "invalid_rounds", "outline") if key in result})
+                "round_count", "fallback_rounds", "invalid_rounds", "outline", "coverage", "efficiency")
+                if key in result})
             self.update_task_progress(task_record, task["input_key"])
             self.update_llm_usage()
             self.add_warnings(result.get("warnings", []))
@@ -892,9 +947,8 @@ class _Run:
                 raise Stop("in_progress", "", "", progress=self.progress())
             task_record["status"] = "failed"
             error_type = str(result.get("error") or "")
-            message = str(result.get("message") or result.get("aborted_reason") or "text processing failed")
-            reason = "locked" if "ownership" in message.lower() else \
-                ("llm_timeout" if "timeout" in error_type.lower() else "llm_error")
+            message = str(result.get("message") or "text processing failed")
+            reason = "llm_timeout" if "timeout" in error_type.lower() else "llm_error"
             raise Stop("failed", reason, message, retryable=True)
         handoff.clear()
         record["outputs"] = [TEXT_DIR]
@@ -910,10 +964,10 @@ class _Run:
         self.state["llm"] = llm_usage(self.path(TEXT_DIR))
 
     def stage_merge(self, record: dict) -> None:
-        result = _utils().merge_content(str(self.path(TEXT_DIR)), str(self.path(OPTIMIZED_FILE)))
+        result = kernel_merge.merge_content(str(self.path(TEXT_DIR)), str(self.path(OPTIMIZED_FILE)))
         if not result.get("success", False):
-            raise Stop("failed", "merge_error", str(result.get("message") or result.get("error") or
-                                                    "merge-content did not succeed"), retryable=False)
+            raise Stop("failed", "merge_error", str(result.get("message") or "the merge did not succeed"),
+                       retryable=False)
         record["outputs"] = [OPTIMIZED_FILE]
 
     def stage_verify(self, record: dict) -> None:
@@ -1051,9 +1105,8 @@ def run(url: str, *, source: str | None = None, mode: str | None = None, from_st
         return {"status": "usage_error", "message": "--max-seconds must be positive"}, USAGE_EXIT_CODE
     work_dir = work_root() / video_id
     work_dir.mkdir(parents=True, exist_ok=True)
-    ownership = kernel_runtime.acquire_runtime_ownership(str(work_dir), "run")
-    if not ownership.get("success"):
-        active = ownership.get("active_owner") or {}
+    if not acquire_lock(work_dir):
+        active = lock_holder(work_dir)
         result = {
             "status": "failed",
             "video_id": video_id,
@@ -1070,7 +1123,7 @@ def run(url: str, *, source: str | None = None, mode: str | None = None, from_st
                    config_path=config_path, stderr_tail=stderr_tail)
         result = job.execute()
     finally:
-        kernel_runtime.release_runtime_ownership(str(work_dir), ownership.get("owner_id", ""))
+        release_lock(work_dir)
     return result, EXIT_CODES.get(result["status"], EXIT_CODES["failed"])
 
 
@@ -1088,7 +1141,7 @@ def _status_entry(work_dir: Path, state: dict) -> dict:
         "output_file": state.get("output_file"),
         "updated_at": state.get("updated_at", ""),
         "work_dir": str(work_dir),
-        "active": kernel_runtime.read_runtime_ownership(str(work_dir)).get("held", False),
+        "active": bool(lock_holder(work_dir)),
     }
 
 
@@ -1130,7 +1183,7 @@ def cleanup(video_id: str, force: bool = False) -> tuple[dict, int]:
     work_dir = work_root() / video_id
     if not work_dir.exists():
         return {"success": True, "removed": False, "video_id": video_id, "message": "no work directory"}, 0
-    if kernel_runtime.read_runtime_ownership(str(work_dir)).get("held"):
+    if lock_holder(work_dir):
         return {"success": False, "removed": False, "video_id": video_id, "reason": "locked",
                 "message": "A run of this video is active; stop it first."}, 1
     if not run_finished(read_state(work_dir)) and not force:

@@ -1,60 +1,22 @@
 #!/usr/bin/env python3
 """
-Provides VTT parsing, Deepgram result processing, audio splitting, filename sanitization, etc.
+yt-transcript: one YouTube video to one Markdown article.
 
-This module also owns the script-first workflow checkpoints:
-- `validate-state` for stage-based state validation
-- `plan-optimization` for canonical short/long routing
-- `verify-quality` for final stop/go gating
+`run` drives the whole flow (kernel/pipeline.py); the rest of this module holds
+the functions its stages call: VTT parsing, Deepgram transcription, the text
+plan, normalization, merge, the quality check and article assembly.
 
 Usage:
-    python3 yt_transcript_utils.py [--api-envelope] <command> [args]
+    python3 yt_transcript_utils.py <command> [args]
 
 Commands:
-    parse-vtt <vtt_path>           Parse VTT subtitle file, output plain text
-    parse-vtt-segments <vtt_path>  Parse VTT subtitle file, output aligned segments JSON
-    process-deepgram <json_path>   Process Deepgram JSON, output cleaned text
-    transcribe-deepgram <audio_path>  Call Deepgram API and auto-merge split chunks
-    sanitize-filename "<title>"    Clean illegal filename characters
-    test-deepgram-api <api_key>    Test Deepgram API key validity
-    test-llm-api                   Probe configured LLM API reachability
-    test-token-count               Probe provider token counting support with local fallback
-    split-audio <audio_path>       Split large audio at silence points (--max-size, --max-deviation)
-    chunk-text <input> <output_dir> Split text file into chunks by sentence boundary
-    chunk-segments <segments_json> <output_dir> Split aligned source segments into timed chunks (--chapters for chapter-aware boundaries)
-    chunk-document <normalized_document> <output_dir> Chunk a normalized document using its preferred source shape
-    get-chapters <video_url>       Fetch YouTube video chapter metadata
-    build-chapter-plan <chapters_json> <work_dir> <output_json>  Map YouTube chapters onto timed chunks
-    merge-content <work_dir> <output_file>  Merge processed chunks with chapter headers
-    create-run <work_dir>          Persist a stable runtime task record for outer-agent orchestration
-    inspect-run <work_dir>         Inspect run/task state through the stable runtime-facing API
-    advance-run <work_dir>         Advance the runtime through the preferred bounded control path
-    apply-control <work_dir>       Apply pause or cancel through the stable runtime-facing API
-    finalize-run <work_dir>        Finalize a run summary and optionally materialize merged output
-    process-chunks <work_dir> --prompt <name>  Run one long-text stage: sliding window by default, fixed chunks with long_text_mode: chunks (--input-key for chained processing)
-    resolve-llm-backend            Show whether chunks go to the calling agent's CLI or the configured API
-    prepare-resume <work_dir>      Repair stale chunk/runtime state before resuming a run
-    runtime-status <work_dir>      Inspect manifest runtime, ownership, and local runtime-control status
-    cancel-run <work_dir>          Request local cancellation for an active chunk-processing run
-    pause-run <work_dir>           Request a safe-boundary pause for an active chunk-processing run
-    resume-run <work_dir>          Clear a local pause request and restore resumable runtime state
-    telemetry-summary <ref>        Summarize local telemetry journal from a work_dir or telemetry.jsonl path
-    telemetry-events <ref>         Query local telemetry journal events from a work_dir or telemetry.jsonl path
-    build-glossary <work_dir>      Build a local glossary artifact for terminology consistency
-    assemble-final <optimized_text> <output_file>  Assemble final markdown from optimized text + metadata
-    verify-quality <optimized_text>  Verify quality of optimized text (structural checks)
-    sync-state <state_ref>         Sync legacy state.md and authoritative machine_state.json
-    normalize-document <state_ref> Materialize normalized_document.json from raw text or segments
-    validate-state <state_path>    Validate workflow state fields for a given stage
-    find-unfinished                List interrupted runs whose state and work files are kept for resume
-    subtitle-info                  Detect the spoken language and pick subtitle candidates from yt-dlp metadata on stdin
-    plan-optimization <state_path> Generate a structured optimization plan from workflow state
     run <url>                      Run or continue the whole pipeline for one video (state.json per video)
     status [video_id]              Show the runs under the work root, or one video's state.json
     cleanup <video_id>             Remove a video's work directory (--force for an unfinished run)
 
-Global flags:
-    --api-envelope               Emit stable `yt_transcript.command_result/v1` envelopes for kernel commands
+Debug commands:
+    subtitle-info                  Detect the spoken language and pick subtitle candidates from yt-dlp metadata on stdin
+    verify-quality <optimized_text>  Rerun the quality check on any file
 """
 
 from __future__ import annotations
@@ -67,7 +29,7 @@ import http.client
 import json
 import math
 import os
-import random
+import random  # noqa: F401  (kernel/long_text/llm.py reads it through these module globals)
 import re
 import socket
 import subprocess
@@ -77,24 +39,14 @@ import urllib.parse
 from collections import Counter
 from pathlib import Path
 
-from kernel.task_runtime import runtime as kernel_runtime
-from kernel.task_runtime import state as kernel_state
-from kernel.task_runtime import controller as kernel_controller
-from kernel.task_runtime import telemetry as kernel_telemetry
-from kernel.task_runtime import api as kernel_runtime_api
+from kernel.files import atomic_write_text as _atomic_write_text
 from kernel.text_cleanup import overlap as kernel_overlap
 from kernel.text_cleanup import subtitle as kernel_subtitle_cleanup
 from kernel.long_text import glossary as kernel_glossary
 from kernel.long_text import semantic as kernel_semantic
-from kernel.long_text import chunking as kernel_chunking
-from kernel.long_text import merge as kernel_merge
-from kernel.long_text import execution as kernel_execution
-from kernel.long_text import contracts as kernel_contracts
-from kernel.long_text import lifecycle as kernel_lifecycle
 from kernel.long_text import prompting as kernel_prompting
 from kernel.long_text import llm as kernel_llm
 from kernel.long_text import agent_cli as kernel_agent_cli
-from kernel.long_text import processing as kernel_processing
 from kernel.long_text import window as kernel_window
 from kernel.long_text import outline as kernel_outline
 from kernel import subtitle_language as kernel_subtitle_language
@@ -190,21 +142,6 @@ def _build_api_url(base_url: str, api_format: str = "openai") -> str:
     return f"{base}/v1/chat/completions"
 
 
-def _build_token_count_url(base_url: str, api_format: str = "openai") -> str:
-    """Build token count url."""
-    base = base_url.rstrip("/")
-
-    if api_format != "anthropic":
-        return ""
-    if base.endswith("/messages/count_tokens"):
-        return base
-    if base.endswith("/messages"):
-        return f"{base}/count_tokens"
-    if base.endswith("/v1"):
-        return f"{base}/messages/count_tokens"
-    return f"{base}/v1/messages/count_tokens"
-
-
 class LLMRequestError(Exception):
     """Structured exception for LLM transport and provider-level request failures."""
     def __init__(self, message: str, *, error_type: str = "unknown",
@@ -257,14 +194,6 @@ def _parse_int_min(value, default: int, minimum: int) -> int:
     return parsed
 
 
-def _parse_float_min(value, default: float, minimum: float) -> float:
-    """Parse float min."""
-    parsed = _parse_float(value, default)
-    if parsed < minimum:
-        return default
-    return parsed
-
-
 def _parse_float_range(value, default: float, minimum: float, maximum: float) -> float:
     """Parse float range."""
     parsed = _parse_float(value, default)
@@ -283,43 +212,21 @@ def _normalize_stream_mode(value) -> str:
     return "auto"
 
 
-def _llm_reasoning_probe_enabled(config: dict | None = None) -> bool:
-    """Return whether chunk processing may probe unknown models for reasoning metadata."""
-    config = config or {}
-    return _parse_bool(
-        config.get("llm_reasoning_probe_enabled", True),
-        True,
-    )
-
-
 def _now_iso() -> str:
     """Return the current local timestamp in ISO-like wall-clock format."""
     return time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime())
 
 
-LEGACY_CHAR_CHUNK_DEFAULTS = {
-    "translate_only": 3000,
-    "structure_only": 4000,
-    "quick_cleanup": 4000,
-    "summarize": 8000,
-}
-
-PROMPT_BUDGET_ALIASES = {}
-
 TASK_CHUNK_TOKEN_DEFAULTS = {
     "structure_only": 1200,
-    "quick_cleanup": 1000,
     "cleanup_zh": 1000,
     "translate_only": 900,
-    "summarize": 2500,
 }
 
 TASK_OUTPUT_RATIO_DEFAULTS = {
     "structure_only": 1.15,
-    "quick_cleanup": 1.05,
     "cleanup_zh": 1.05,
     "translate_only": 1.10,
-    "summarize": 0.15,
 }
 
 # max_tokens is a stop line, not a cost: an unused ceiling is free, while a
@@ -328,10 +235,8 @@ TASK_OUTPUT_RATIO_DEFAULTS = {
 DEFAULT_MAX_OUTPUT_TOKENS = 8192
 TASK_MAX_OUTPUT_TOKEN_DEFAULTS = {
     "structure_only": DEFAULT_MAX_OUTPUT_TOKENS,
-    "quick_cleanup": DEFAULT_MAX_OUTPUT_TOKENS,
     "cleanup_zh": DEFAULT_MAX_OUTPUT_TOKENS,
     "translate_only": DEFAULT_MAX_OUTPUT_TOKENS,
-    "summarize": DEFAULT_MAX_OUTPUT_TOKENS,
 }
 
 # Largest input (tokens) sent as one non-chunked prompt; longer text is chunked.
@@ -341,21 +246,11 @@ SINGLE_PASS_TOKEN_LIMITS = {
     "translate_only": 4100,
 }
 
-DEFAULT_OUTPUT_RETRY_ATTEMPTS = 2
-DEFAULT_OUTPUT_RETRY_MULTIPLIER = 2.0
-DEFAULT_OUTPUT_RETRY_MAX_TOKENS = 16384
-# finish_reason values that mean "stopped at max_tokens" across providers
-# (OpenAI-compatible, Anthropic, Gemini).
-TRUNCATED_FINISH_REASONS = {"length", "max_tokens", "max_output_tokens"}
 DEFAULT_LLM_MODEL = "deepseek-v4-pro"
 DEFAULT_LLM_BASE_URL = "https://api.deepseek.com"
 
-DEFAULT_CHUNK_MODE = "tokens"
 DEFAULT_CHUNK_HARD_CAP_MULTIPLIER = 1.33
 MAX_CHUNK_HARD_CAP_MULTIPLIER = 2.0
-DEFAULT_ENABLE_TOKEN_COUNT_PROBE = True
-DEFAULT_LLM_CHUNK_RECOVERY_ATTEMPTS = 1
-DEFAULT_LLM_CHUNK_RECOVERY_BACKOFF_SEC = 1.0
 DEFAULT_YT_DLP_SOCKET_TIMEOUT_SEC = 15
 DEFAULT_YT_DLP_RETRIES = 1
 DEFAULT_YT_DLP_EXTRACTOR_RETRIES = 1
@@ -365,57 +260,13 @@ DEFAULT_DEEPGRAM_ENABLE_UTTERANCES = True
 DEFAULT_DEEPGRAM_PREFER_STRUCTURED_OUTPUT = True
 DEFAULT_DEEPGRAM_REQUEST_RETRIES = 2
 DEFAULT_DEEPGRAM_RETRY_BACKOFF_SEC = 1.0
-DEFAULT_CHAPTER_BOUNDARY_TOLERANCE_SEC = 0.35
 
 
-def _budget_prompt_name(prompt_name: str = "") -> str:
-    """Return the prompt family used for chunk-budget and sizing config lookups."""
-    prompt = (prompt_name or "").strip().lower()
-    return PROMPT_BUDGET_ALIASES.get(prompt, prompt)
-
-
-def _legacy_budget_prompt_names(prompt_name: str = "") -> list[str]:
-    """Return older prompt families that can still provide fallback config."""
-    prompt = (prompt_name or "").strip().lower()
-    if prompt == "cleanup_zh":
-        return ["structure_only", "quick_cleanup"]
-    return []
-
-
-MANIFEST_SCHEMA_VERSION = 5
-CHUNK_CONTRACT_SCHEMA_VERSION = 1
-CONTROL_CONTRACT_SCHEMA_VERSION = 1
 DEEPGRAM_CHUNK_CACHE_SCHEMA_VERSION = 1
 DEEPGRAM_CHUNK_CACHE_FORMAT = "yt_transcript.deepgram_chunk_cache/v1"
-COMMAND_RESULT_SCHEMA_VERSION = kernel_runtime.COMMAND_RESULT_SCHEMA_VERSION
-COMMAND_RESULT_FORMAT = kernel_runtime.COMMAND_RESULT_FORMAT
-TELEMETRY_EVENT_SCHEMA_VERSION = kernel_runtime.TELEMETRY_EVENT_SCHEMA_VERSION
-TELEMETRY_EVENT_FORMAT = kernel_runtime.TELEMETRY_EVENT_FORMAT
-RUNTIME_OWNERSHIP_SCHEMA_VERSION = kernel_runtime.RUNTIME_OWNERSHIP_SCHEMA_VERSION
-RUNTIME_OWNERSHIP_FORMAT = kernel_runtime.RUNTIME_OWNERSHIP_FORMAT
-RUNTIME_OWNER_FILENAME = kernel_runtime.RUNTIME_OWNER_FILENAME
 DEFAULT_UNKNOWN_CHUNK_TOKENS = 900
-CHUNK_SEPARATOR = "\n\n"
 DEFAULT_UNKNOWN_OUTPUT_RATIO = 1.0
 DEFAULT_UNKNOWN_MAX_OUTPUT_TOKENS = DEFAULT_MAX_OUTPUT_TOKENS
-DEFAULT_UNKNOWN_LEGACY_CHARS = 8000
-SUPERSEDED_CHUNK_STATUS = "superseded"
-INTERRUPTED_CHUNK_STATUS = "interrupted"
-PAUSED_RUNTIME_STATUS = "paused"
-RESUMABLE_RUNTIME_STATUS = "resumable"
-SHORT_OUTPUT_WARNING_RATIO = 0.5
-TRANSLATION_WARNING_CN_RATIO = 0.1
-STRUCTURE_HEADER_WARNING_MIN_CHARS = 2000
-
-
-def _normalize_chunk_mode(value) -> str:
-    """Normalize chunk mode."""
-    if value is None:
-        return DEFAULT_CHUNK_MODE
-    text = str(value).strip().lower()
-    if text in {"tokens", "chars"}:
-        return text
-    return DEFAULT_CHUNK_MODE
 
 
 def _is_disabled_deepgram_model(model: str = "") -> bool:
@@ -461,23 +312,11 @@ def _default_config_values(config_path: str = "") -> dict:
         "llm_max_retries": 3,
         "llm_backoff_sec": 1.5,
         "llm_stream": "auto",
-        "llm_probe_timeout_sec": 20,
-        "llm_probe_max_tokens": 16,
-        # Real config parsing defaults this to true; the raw fallback dict stays
-        # side-effect-free for dry runs and direct in-memory test configs.
-        "llm_reasoning_probe_enabled": False,
-        "llm_stop_after_consecutive_timeouts": 2,
-        "llm_chunk_recovery_attempts": DEFAULT_LLM_CHUNK_RECOVERY_ATTEMPTS,
-        "llm_chunk_recovery_backoff_sec": DEFAULT_LLM_CHUNK_RECOVERY_BACKOFF_SEC,
-        "llm_output_retry_attempts": DEFAULT_OUTPUT_RETRY_ATTEMPTS,
-        "llm_output_retry_multiplier": DEFAULT_OUTPUT_RETRY_MULTIPLIER,
-        "llm_output_retry_max_tokens": DEFAULT_OUTPUT_RETRY_MAX_TOKENS,
         "llm_backend": kernel_agent_cli.DEFAULT_LLM_BACKEND,
         "llm_agent_cli": "",
         "llm_cli_timeout_sec": kernel_agent_cli.DEFAULT_CLI_TIMEOUT_SEC,
         "llm_cli_max_retries": kernel_agent_cli.DEFAULT_CLI_MAX_RETRIES,
         "llm_cli_probe_timeout_sec": kernel_agent_cli.DEFAULT_CLI_PROBE_TIMEOUT_SEC,
-        "long_text_mode": kernel_window.DEFAULT_LONG_TEXT_MODE,
         "window_read_tokens": kernel_window.DEFAULT_WINDOW_READ_TOKENS,
         "window_write_tokens": kernel_window.DEFAULT_WINDOW_WRITE_TOKENS,
         "window_tail_tokens": kernel_window.DEFAULT_WINDOW_TAIL_TOKENS,
@@ -485,40 +324,21 @@ def _default_config_values(config_path: str = "") -> dict:
         "window_outline": True,
         "window_outline_read_tokens": kernel_outline.DEFAULT_OUTLINE_READ_TOKENS,
         "window_outline_max_terms": kernel_outline.DEFAULT_OUTLINE_MAX_TERMS,
-        "chunk_mode": DEFAULT_CHUNK_MODE,
         "chunk_size_override": 0,
         "chunk_tokens_structure_only": TASK_CHUNK_TOKEN_DEFAULTS["structure_only"],
-        "chunk_tokens_quick_cleanup": TASK_CHUNK_TOKEN_DEFAULTS["quick_cleanup"],
         "chunk_tokens_cleanup_zh": TASK_CHUNK_TOKEN_DEFAULTS["cleanup_zh"],
         "chunk_tokens_translate_only": TASK_CHUNK_TOKEN_DEFAULTS["translate_only"],
-        "chunk_tokens_summarize": TASK_CHUNK_TOKEN_DEFAULTS["summarize"],
         "chunk_hard_cap_multiplier": DEFAULT_CHUNK_HARD_CAP_MULTIPLIER,
         "chunk_glossary_max_prompt_terms": 8,
         "output_ratio_structure_only": TASK_OUTPUT_RATIO_DEFAULTS["structure_only"],
-        "output_ratio_quick_cleanup": TASK_OUTPUT_RATIO_DEFAULTS["quick_cleanup"],
         "output_ratio_cleanup_zh": TASK_OUTPUT_RATIO_DEFAULTS["cleanup_zh"],
         "output_ratio_translate_only": TASK_OUTPUT_RATIO_DEFAULTS["translate_only"],
-        "output_ratio_summarize": TASK_OUTPUT_RATIO_DEFAULTS["summarize"],
         "max_output_tokens_structure_only": TASK_MAX_OUTPUT_TOKEN_DEFAULTS["structure_only"],
-        "max_output_tokens_quick_cleanup": TASK_MAX_OUTPUT_TOKEN_DEFAULTS["quick_cleanup"],
         "max_output_tokens_cleanup_zh": TASK_MAX_OUTPUT_TOKEN_DEFAULTS["cleanup_zh"],
         "max_output_tokens_translate_only": TASK_MAX_OUTPUT_TOKEN_DEFAULTS["translate_only"],
-        "max_output_tokens_summarize": TASK_MAX_OUTPUT_TOKEN_DEFAULTS["summarize"],
-        "enable_token_count_probe": DEFAULT_ENABLE_TOKEN_COUNT_PROBE,
         "config_path": config_path,
         "config_warnings": [],
     }
-
-
-def _legacy_chunk_target_chars(prompt_name: str = "", config: dict | None = None) -> int:
-    """Legacy chunk target chars."""
-    config = config or {}
-    override = max(0, _parse_int(config.get("chunk_size_override"), 0))
-    if override > 0:
-        return override
-
-    prompt = _budget_prompt_name(prompt_name)
-    return LEGACY_CHAR_CHUNK_DEFAULTS.get(prompt, DEFAULT_UNKNOWN_LEGACY_CHARS)
 
 
 def _get_task_chunk_target(prompt_name: str, config: dict | None = None) -> int:
@@ -528,43 +348,25 @@ def _get_task_chunk_target(prompt_name: str, config: dict | None = None) -> int:
     if override > 0:
         return override
 
-    prompt = _budget_prompt_name(prompt_name)
-    key = f"chunk_tokens_{prompt}"
+    prompt = (prompt_name or "").strip().lower()
     default = TASK_CHUNK_TOKEN_DEFAULTS.get(prompt, DEFAULT_UNKNOWN_CHUNK_TOKENS)
-    if key not in config:
-        for legacy_prompt in _legacy_budget_prompt_names(prompt_name):
-            legacy_key = f"chunk_tokens_{legacy_prompt}"
-            if legacy_key in config:
-                return max(1, _parse_int(config.get(legacy_key), default))
-    return max(1, _parse_int(config.get(key), default))
+    return max(1, _parse_int(config.get(f"chunk_tokens_{prompt}"), default))
 
 
 def _get_task_output_ratio(prompt_name: str, config: dict | None = None) -> float:
     """Return task output ratio."""
     config = config or {}
-    prompt = _budget_prompt_name(prompt_name)
-    key = f"output_ratio_{prompt}"
+    prompt = (prompt_name or "").strip().lower()
     default = TASK_OUTPUT_RATIO_DEFAULTS.get(prompt, DEFAULT_UNKNOWN_OUTPUT_RATIO)
-    if key not in config:
-        for legacy_prompt in _legacy_budget_prompt_names(prompt_name):
-            legacy_key = f"output_ratio_{legacy_prompt}"
-            if legacy_key in config:
-                return max(0.01, _parse_float(config.get(legacy_key), default))
-    return max(0.01, _parse_float(config.get(key), default))
+    return max(0.01, _parse_float(config.get(f"output_ratio_{prompt}"), default))
 
 
 def _get_task_max_output_tokens(prompt_name: str, config: dict | None = None) -> int:
     """Return task max output tokens."""
     config = config or {}
-    prompt = _budget_prompt_name(prompt_name)
-    key = f"max_output_tokens_{prompt}"
+    prompt = (prompt_name or "").strip().lower()
     default = TASK_MAX_OUTPUT_TOKEN_DEFAULTS.get(prompt, DEFAULT_UNKNOWN_MAX_OUTPUT_TOKENS)
-    if key not in config:
-        for legacy_prompt in _legacy_budget_prompt_names(prompt_name):
-            legacy_key = f"max_output_tokens_{legacy_prompt}"
-            if legacy_key in config:
-                return max(1, _parse_int(config.get(legacy_key), default))
-    return max(1, _parse_int(config.get(key), default))
+    return max(1, _parse_int(config.get(f"max_output_tokens_{prompt}"), default))
 
 
 def _is_cjk_char(char: str) -> bool:
@@ -623,16 +425,14 @@ def _advance_token_estimate_state(state: dict, char: str, next_char: str = "") -
     state["punct_count"] = punct_count + 1
 
 
+def _estimate_tokens(text: str) -> int:
+    """Estimate tokens with a local heuristic.
 
-def _estimate_tokens_local(text: str, mode: str = "tokens", config: dict | None = None) -> int:
-    # Heuristic estimation only. This intentionally over-approximates common
-    # transcript shapes and is not a substitute for provider-side token counting.
-    """Estimate tokens local."""
-    del config
+    It over-approximates common transcript shapes on purpose and is not a
+    substitute for provider-side token counting.
+    """
     if not text:
         return 0
-    if _normalize_chunk_mode(mode) == "chars":
-        return len(text)
 
     state = _new_token_estimate_state()
     for index, char in enumerate(text):
@@ -641,20 +441,12 @@ def _estimate_tokens_local(text: str, mode: str = "tokens", config: dict | None 
     return max(1, state["tokens"])
 
 
-# Runtime chunk planning still uses the local estimator to avoid one remote
-# token-count round trip per sentence or segment. Provider probing is wired via
-# _count_tokens_via_provider()/test_token_count() and can be promoted later.
-def _estimate_tokens(text: str, mode: str = "tokens", config: dict | None = None) -> int:
-    """Estimate tokens."""
-    return _estimate_tokens_local(text, mode, config)
-
-
 def _truncate_tail_text_to_tokens(text: str, max_tokens: int,
                                   config: dict | None = None) -> str:
     """Keep the tail-most portion of text within a soft token cap."""
     if not text:
         return ""
-    if max_tokens <= 0 or _estimate_tokens(text, "tokens", config) <= max_tokens:
+    if max_tokens <= 0 or _estimate_tokens(text) <= max_tokens:
         return text.strip()
     segments = _force_split_text_by_tokens(text.strip(), max_tokens, config)
     return segments[-1].strip() if segments else text.strip()
@@ -679,371 +471,6 @@ def _build_chunk_prompt(prompt_template: str, chunk_body: str,
         context_text=context_text,
         glossary_text=glossary_text,
     )
-
-
-def _calculate_chunk_budget(prompt_name: str, prompt_template: str,
-                            config: dict | None = None) -> dict:
-    """Size fixed chunks for a prompt: the task's chunk target and a hard cap above it.
-
-    The output ceiling is a stop line (see TASK_MAX_OUTPUT_TOKEN_DEFAULTS), so
-    it is not carved out of an input budget.
-    """
-    config = config or {}
-    prompt_template_tokens = _estimate_tokens(prompt_template or "", "tokens", config)
-    target_tokens = _get_task_chunk_target(prompt_name, config)
-    hard_cap_multiplier = _parse_float_range(
-        config.get("chunk_hard_cap_multiplier"),
-        DEFAULT_CHUNK_HARD_CAP_MULTIPLIER,
-        1.0,
-        MAX_CHUNK_HARD_CAP_MULTIPLIER,
-    )
-    return {
-        "prompt_name": prompt_name,
-        "prompt_template_tokens": prompt_template_tokens,
-        "prompt_tokens": prompt_template_tokens,
-        "target_tokens": target_tokens,
-        "hard_cap_tokens": max(target_tokens, int(math.ceil(target_tokens * hard_cap_multiplier))),
-        "output_ratio": _get_task_output_ratio(prompt_name, config),
-        "planned_max_output_tokens": _get_task_max_output_tokens(prompt_name, config),
-        "chunk_mode": _normalize_chunk_mode(config.get("chunk_mode", DEFAULT_CHUNK_MODE)),
-        "token_count_source": "local_estimate",
-    }
-
-
-def _recommended_chunk_size(prompt_name: str = "", config: dict | None = None) -> int:
-    """Recommended chunk size."""
-    config = config or {}
-    if _normalize_chunk_mode(config.get("chunk_mode", DEFAULT_CHUNK_MODE)) == "chars":
-        return _legacy_chunk_target_chars(prompt_name, config)
-    return _get_task_chunk_target(prompt_name, config)
-
-
-def _new_plan_id() -> str:
-    """Create plan id."""
-    return kernel_contracts.new_plan_id()
-
-
-def _build_manifest_chunk_contract(source_kind: str = "text", *, driver: str = "",
-                                   normalized_document_path: str = "", source_adapter: str = "",
-                                   has_timing: bool = False, chapters_enabled: bool = False) -> dict:
-    """Build manifest chunk contract."""
-    return kernel_contracts.build_manifest_chunk_contract(
-        source_kind,
-        driver=driver,
-        normalized_document_path=normalized_document_path,
-        source_adapter=source_adapter,
-        has_timing=has_timing,
-        chapters_enabled=chapters_enabled,
-    )
-
-
-def _build_manifest_plan(prompt_name: str, chunk_mode: str, recommended_chunk_size: int,
-                         effective_chunk_size: int, budget: dict, *, source_file: str = "",
-                         plan_id: str = "", prior_plan_id: str = "",
-                         chunk_contract: dict | None = None) -> dict:
-    """Build manifest plan."""
-    return kernel_contracts.build_manifest_plan(
-        prompt_name,
-        chunk_mode,
-        recommended_chunk_size,
-        effective_chunk_size,
-        budget,
-        source_file=source_file,
-        plan_id=plan_id,
-        prior_plan_id=prior_plan_id,
-        chunk_contract=chunk_contract,
-    )
-
-
-def _normalize_operation_input_key(input_key: str = "") -> str:
-    """Normalize operation input key."""
-    return kernel_contracts.normalize_operation_input_key(input_key)
-
-
-def _chunk_output_matches_operation(chunk_info: dict | None, output_path: str | Path, *,
-                                    prompt_name: str = "", input_key: str = "raw_path") -> bool:
-    """Return whether a durable output file belongs to the current operation.
-
-    Backward compatibility:
-    - legacy `raw_path` runs without output-operation metadata still count as reusable
-    - legacy `processed_path` runs are ambiguous, so they must be regenerated
-    """
-    output_file = Path(output_path)
-    if not output_file.exists():
-        return False
-
-    chunk_info = chunk_info if isinstance(chunk_info, dict) else {}
-    normalized_prompt = str(prompt_name or "").strip()
-    normalized_input_key = _normalize_operation_input_key(input_key)
-    recorded_prompt = str(chunk_info.get("output_prompt_name", "")).strip()
-    recorded_input_key = _normalize_operation_input_key(chunk_info.get("output_input_key", ""))
-
-    if recorded_prompt:
-        if normalized_prompt and recorded_prompt != normalized_prompt:
-            return False
-        if recorded_input_key and recorded_input_key != normalized_input_key:
-            return False
-        return True
-
-    return normalized_input_key != "processed_path"
-
-
-def _stamp_chunk_output_operation(chunk_info: dict | None, *, prompt_name: str = "",
-                                  input_key: str = "raw_path") -> None:
-    """Persist the operation identity for the chunk's current durable output."""
-    if not isinstance(chunk_info, dict):
-        return
-    chunk_info["output_prompt_name"] = str(prompt_name or "").strip()
-    chunk_info["output_input_key"] = _normalize_operation_input_key(input_key)
-
-
-def _build_quality_gate_contract(*, bilingual: bool = False) -> dict:
-    """Build quality gate contract."""
-    return kernel_contracts.build_quality_gate_contract(bilingual=bilingual)
-
-
-def _build_operation_control_contract(kind: str, prompt_name: str, *,
-                                      input_key: str = "raw_path",
-                                      config: dict | None = None,
-                                      bilingual: bool = False) -> dict:
-    """Build operation control contract."""
-    return kernel_contracts.build_operation_control_contract(
-        kind,
-        prompt_name,
-        input_key=input_key,
-        config=config,
-        bilingual=bilingual,
-    )
-
-
-def _ensure_runtime_control_state(runtime: dict) -> dict:
-    """Ensure runtime control state."""
-    return kernel_contracts.ensure_runtime_control_state(runtime)
-
-
-def _build_chunk_control_state() -> dict:
-    """Build chunk control state."""
-    return kernel_contracts.build_chunk_control_state()
-
-
-def _ensure_chunk_control_state(chunk_info: dict) -> dict:
-    """Ensure chunk control state."""
-    return kernel_contracts.ensure_chunk_control_state(chunk_info)
-
-
-def _record_chunk_verification(chunk_info: dict, *, status: str, warnings: list[str],
-                               retry_reasons: list[str], repair_exhausted: bool = False) -> None:
-    """Record chunk verification."""
-    kernel_contracts.record_chunk_verification(
-        chunk_info,
-        status=status,
-        warnings=warnings,
-        retry_reasons=retry_reasons,
-        repair_exhausted=repair_exhausted,
-    )
-
-
-def _build_process_control_summary(runtime: dict, operation_control: dict) -> dict:
-    """Build process control summary."""
-    return kernel_contracts.build_process_control_summary(runtime, operation_control)
-
-
-def _build_manifest_runtime(plan_id: str, request_url: str = "") -> dict:
-    """Build manifest runtime."""
-    return kernel_contracts.build_manifest_runtime(plan_id, request_url=request_url)
-
-
-def _new_chunk_manifest_entry(chunk_id: int, chunk_content: str, budget: dict,
-                              config: dict | None = None, *, raw_path: str = "",
-                              processed_path: str = "", plan_id: str = "",
-                              chunk_contract: dict | None = None) -> dict:
-    """Create chunk manifest entry."""
-    return kernel_lifecycle._new_chunk_manifest_entry(
-        chunk_id,
-        chunk_content,
-        budget,
-        config,
-        raw_path=raw_path,
-        processed_path=processed_path,
-        plan_id=plan_id,
-        chunk_contract=chunk_contract,
-    )
-
-
-def _resolve_chunk_output_filename(chunk_info: dict, prompt_name: str = "") -> str:
-    """Resolve chunk output filename."""
-    return kernel_lifecycle._resolve_chunk_output_filename(chunk_info, prompt_name)
-
-
-def _resolve_chunk_output_path(work_path: Path, chunk_info: dict, prompt_name: str = "") -> Path:
-    """Resolve chunk output path."""
-    return kernel_lifecycle._resolve_chunk_output_path(work_path, chunk_info, prompt_name)
-
-
-def _ensure_chunk_runtime_defaults(manifest: dict, runtime: dict, plan: dict,
-                                   prompt_budget: dict, request_url: str,
-                                   planned_max_output_tokens: int) -> None:
-    """Ensure chunk runtime defaults."""
-    kernel_lifecycle._ensure_chunk_runtime_defaults(
-        manifest,
-        runtime,
-        plan,
-        prompt_budget,
-        request_url,
-        planned_max_output_tokens,
-    )
-
-
-def _infer_resume_runtime_status(runtime: dict, chunks: list[dict]) -> str:
-    """Infer resume runtime status."""
-    return kernel_lifecycle._infer_resume_runtime_status(runtime, chunks)
-
-
-def _prepare_manifest_for_resume(manifest: dict, work_path: Path, prompt_name: str = "",
-                                 input_key: str = "raw_path") -> dict:
-    """Prepare manifest for resume."""
-    return kernel_lifecycle._prepare_manifest_for_resume(
-        manifest,
-        work_path,
-        prompt_name,
-        input_key=input_key,
-    )
-
-
-def _format_resume_report(report: dict) -> str:
-    """Format resume report."""
-    return kernel_lifecycle._format_resume_report(report)
-
-
-def _prepare_resume_impl(work_dir: str, prompt_name: str = "", config_path: str = None,
-                         input_key: str = "raw_path") -> dict:
-    """Prepare resume impl."""
-    return kernel_lifecycle._prepare_resume_impl(
-        work_dir,
-        prompt_name=prompt_name,
-        config_path=config_path,
-        input_key=input_key,
-    )
-
-
-def _sync_manifest_legacy_fields(manifest: dict) -> dict:
-    """Synchronize manifest legacy fields."""
-    plan = manifest.get("plan", {}) if isinstance(manifest, dict) else {}
-    runtime = manifest.get("runtime", {}) if isinstance(manifest, dict) else {}
-    chunk_contract = plan.get("chunk_contract", {}) if isinstance(plan.get("chunk_contract", {}), dict) else {}
-
-    manifest["schema_version"] = MANIFEST_SCHEMA_VERSION
-    manifest["last_prompt"] = plan.get("prompt_name", manifest.get("last_prompt", ""))
-    manifest["last_request_url"] = runtime.get("last_request_url", manifest.get("last_request_url", ""))
-    manifest["recommended_chunk_size"] = plan.get("recommended_chunk_size", manifest.get("recommended_chunk_size", 0))
-    manifest["chunk_size"] = plan.get("chunk_size", manifest.get("chunk_size", 0))
-    manifest["chunk_mode"] = plan.get("chunk_mode", manifest.get("chunk_mode", DEFAULT_CHUNK_MODE))
-    manifest["prompt_name"] = plan.get("prompt_name", manifest.get("prompt_name", ""))
-    manifest["target_tokens"] = plan.get("target_input_tokens", manifest.get("target_tokens", 0))
-    manifest["hard_cap_tokens"] = plan.get("hard_cap_tokens", manifest.get("hard_cap_tokens", 0))
-    manifest["prompt_tokens"] = plan.get("prompt_tokens", manifest.get("prompt_tokens", 0))
-    manifest["planned_max_output_tokens"] = plan.get("planned_max_output_tokens", manifest.get("planned_max_output_tokens", 0))
-    manifest["output_ratio"] = plan.get("output_ratio", manifest.get("output_ratio", DEFAULT_UNKNOWN_OUTPUT_RATIO))
-    manifest["token_count_source"] = str(manifest.get("token_count_source", "")).strip() or plan.get("token_count_source", "")
-    manifest["normalized_document_path"] = str(
-        chunk_contract.get("normalized_document_path", manifest.get("normalized_document_path", ""))
-    ).strip()
-    manifest["chunk_driver"] = str(chunk_contract.get("driver", manifest.get("chunk_driver", ""))).strip()
-    manifest["source_adapter"] = str(chunk_contract.get("source_adapter", manifest.get("source_adapter", ""))).strip()
-    manifest["chunk_source_kind"] = str(chunk_contract.get("source_kind", manifest.get("chunk_source_kind", ""))).strip()
-    manifest["boundary_mode"] = str(chunk_contract.get("boundary_mode", manifest.get("boundary_mode", "strict"))).strip() or "strict"
-    manifest["interrupted_count"] = runtime.get("interrupted_count", manifest.get("interrupted_count", 0))
-    return manifest
-
-
-def _ensure_manifest_structure(manifest: dict, *, prompt_name: str = "", prompt_budget: dict | None = None,
-                               recommended_chunk_size: int = 0, request_url: str = "",
-                               source_file: str = "", config: dict | None = None) -> dict:
-    """Ensure manifest structure."""
-    manifest = manifest if isinstance(manifest, dict) else {}
-    prompt_budget = prompt_budget or {}
-    config = config or {}
-    chunk_mode = _normalize_chunk_mode(
-        manifest.get("chunk_mode", prompt_budget.get("chunk_mode", DEFAULT_CHUNK_MODE))
-    )
-    effective_chunk_size = max(0, _parse_int(manifest.get("chunk_size"), 0))
-    existing_plan = manifest.get("plan", {}) if isinstance(manifest.get("plan", {}), dict) else {}
-    source_kind = str(
-        manifest.get("chunk_source_kind")
-        or existing_plan.get("chunk_contract", {}).get("source_kind", "")
-        or ("segments" if str(manifest.get("source_segments_file", "")).strip() else "text")
-    ).strip()
-    has_timing = any(
-        chunk.get("start_time") is not None or chunk.get("end_time") is not None
-        for chunk in manifest.get("chunks", [])
-        if isinstance(chunk, dict)
-    )
-    normalized_document_path = str(
-        manifest.get("normalized_document_path")
-        or existing_plan.get("chunk_contract", {}).get("normalized_document_path", "")
-    ).strip()
-    chunk_contract = existing_plan.get("chunk_contract") if isinstance(existing_plan.get("chunk_contract", {}), dict) else None
-    if not chunk_contract:
-        chunk_contract = _build_manifest_chunk_contract(
-            source_kind,
-            driver=str(manifest.get("chunk_driver", "")).strip() or ("chunk-segments" if source_kind == "segments" else "chunk-text"),
-            normalized_document_path=normalized_document_path,
-            source_adapter=str(manifest.get("source_adapter", "")).strip(),
-            has_timing=has_timing,
-            chapters_enabled=False,
-        )
-    if not isinstance(manifest.get("plan"), dict):
-        manifest["plan"] = _build_manifest_plan(
-            prompt_name or str(manifest.get("last_prompt", manifest.get("prompt_name", ""))).strip(),
-            chunk_mode,
-            recommended_chunk_size or max(0, _parse_int(manifest.get("recommended_chunk_size"), effective_chunk_size)),
-            effective_chunk_size,
-            {
-                "target_tokens": max(0, _parse_int(manifest.get("target_tokens"), prompt_budget.get("target_tokens", 0))),
-                "hard_cap_tokens": max(0, _parse_int(manifest.get("hard_cap_tokens"), prompt_budget.get("hard_cap_tokens", 0))),
-                "planned_max_output_tokens": max(0, _parse_int(manifest.get("planned_max_output_tokens"), prompt_budget.get("planned_max_output_tokens", 0))),
-                "prompt_tokens": max(0, _parse_int(manifest.get("prompt_tokens"), prompt_budget.get("prompt_tokens", 0))),
-                "prompt_template_tokens": max(0, _parse_int(manifest.get("prompt_template_tokens"), prompt_budget.get("prompt_template_tokens", 0))),
-                "output_ratio": _parse_float(manifest.get("output_ratio"), prompt_budget.get("output_ratio", DEFAULT_UNKNOWN_OUTPUT_RATIO)),
-                "token_count_source": str(manifest.get("token_count_source", prompt_budget.get("token_count_source", ""))).strip(),
-            },
-            source_file=source_file or str(manifest.get("source_file", "")).strip(),
-            plan_id=str(manifest.get("plan_id", "")).strip(),
-            chunk_contract=chunk_contract,
-        )
-    else:
-        manifest["plan"].setdefault("chunk_contract", chunk_contract)
-    if not isinstance(manifest.get("runtime"), dict):
-        manifest["runtime"] = _build_manifest_runtime(
-            manifest["plan"].get("plan_id", _new_plan_id()),
-            request_url=request_url or str(manifest.get("last_request_url", "")).strip(),
-        )
-    runtime = manifest["runtime"]
-    runtime.setdefault("status", "pending")
-    runtime.setdefault("active_plan_id", manifest["plan"].get("plan_id", _new_plan_id()))
-    runtime.setdefault("last_request_url", request_url or str(manifest.get("last_request_url", "")).strip())
-    runtime.setdefault("processed_count", 0)
-    runtime.setdefault("failed_count", 0)
-    runtime.setdefault("skipped_count", 0)
-    runtime.setdefault("superseded_count", 0)
-    runtime.setdefault("interrupted_count", 0)
-    runtime.setdefault("current_chunk_index", 0)
-    runtime.setdefault("last_resume_check_at", "")
-    runtime.setdefault("last_resume_repair_at", "")
-    runtime.setdefault("resume_repair_count", 0)
-    runtime.setdefault("last_paused_at", "")
-    runtime.setdefault("last_pause_reason", "")
-    runtime.setdefault("pause_count", 0)
-    runtime.setdefault("last_resumed_at", "")
-    runtime.setdefault("last_resume_reason", "")
-    runtime.setdefault("run_id", "")
-    runtime.setdefault("operation_prompt_name", "")
-    runtime.setdefault("operation_input_key", "raw_path")
-    runtime.setdefault("operation_control", {})
-    runtime.setdefault("updated_at", _now_iso())
-    _ensure_runtime_control_state(runtime)
-    _sync_manifest_legacy_fields(manifest)
-    return manifest
 
 
 def _build_attempt_log_from_result(result: dict, attempt_index: int | None = None) -> dict:
@@ -1077,235 +504,6 @@ def _build_attempt_log_from_error(error: Exception, attempt_index: int | None = 
         "streaming_used": False,
         "retryable": bool(getattr(error, "retryable", False)),
     }
-
-
-def _collect_attempt_logs(result_or_error) -> list[dict]:
-    """Collect attempt logs."""
-    attempt_logs = getattr(result_or_error, "attempt_history", None)
-    if attempt_logs is None and isinstance(result_or_error, dict):
-        attempt_logs = result_or_error.get("attempt_history")
-    if isinstance(attempt_logs, list) and attempt_logs:
-        return [dict(log) for log in attempt_logs if isinstance(log, dict)]
-    if isinstance(result_or_error, dict):
-        return [_build_attempt_log_from_result(result_or_error)]
-    return [_build_attempt_log_from_error(result_or_error)]
-
-
-def _reasoning_usage_stats(llm_result: dict | None) -> dict:
-    """Return normalized reasoning/content token stats for one LLM result."""
-    result = llm_result if isinstance(llm_result, dict) else {}
-    usage = result.get("usage") if isinstance(result.get("usage"), dict) else {}
-    reasoning_tokens = max(0, _parse_int(usage.get("reasoning_tokens"), 0))
-    completion_tokens = max(0, _parse_int(usage.get("completion_tokens"), 0))
-    content_tokens = max(0, _parse_int(usage.get("content_tokens"), completion_tokens - reasoning_tokens))
-    ratio = reasoning_tokens / completion_tokens if completion_tokens > 0 else 0.0
-    return {
-        "reasoning_tokens": reasoning_tokens,
-        "completion_tokens": completion_tokens,
-        "content_tokens": content_tokens,
-        "reasoning_ratio": ratio,
-    }
-
-
-def _is_output_budget_exhausted(llm_result: dict | None, result_text: str,
-                                requested_max_tokens: int) -> bool:
-    """Return whether the response stopped at max_tokens instead of finishing.
-
-    The primary signal is the provider's finish_reason, which every API
-    reports, streaming included. Usage-based detection only covers gateways
-    that return empty content with a normal finish_reason after spending the
-    whole budget on reasoning.
-    """
-    result = llm_result if isinstance(llm_result, dict) else {}
-    finish_reason = str(result.get("finish_reason", "") or "").strip().lower()
-    if finish_reason in TRUNCATED_FINISH_REASONS:
-        return True
-    if result_text.strip() or finish_reason not in {"stop", "end_turn"}:
-        return False
-    stats = _reasoning_usage_stats(result)
-    if stats["reasoning_tokens"] <= 0:
-        return False
-    requested = max(1, _parse_int(requested_max_tokens, 1))
-    if stats["completion_tokens"] >= max(1, int(math.floor(requested * 0.95))):
-        return True
-    return stats["reasoning_ratio"] >= 0.95 and stats["content_tokens"] == 0
-
-
-def _output_retry_setting(config: dict | None, name: str, default):
-    """Read one llm_output_retry_* setting."""
-    value = (config or {}).get(f"llm_output_retry_{name}")
-    if value is None or str(value).strip() == "":
-        return default
-    return value
-
-
-def _next_output_retry_max_tokens(current_max_tokens: int, config: dict | None = None,
-                                  observed_reasoning_tokens: int = 0) -> int:
-    """Raise max_tokens for a retry after the response was cut off.
-
-    The new ceiling is at least the old one plus any reasoning tokens the
-    provider reported, so the retry keeps the original room for the answer.
-    """
-    current = max(1, _parse_int(current_max_tokens, 1))
-    multiplier = _parse_float_range(
-        _output_retry_setting(config, "multiplier", DEFAULT_OUTPUT_RETRY_MULTIPLIER),
-        DEFAULT_OUTPUT_RETRY_MULTIPLIER,
-        1.01,
-        4.0,
-    )
-    cap = max(
-        current,
-        _parse_int_min(
-            _output_retry_setting(config, "max_tokens", DEFAULT_OUTPUT_RETRY_MAX_TOKENS),
-            DEFAULT_OUTPUT_RETRY_MAX_TOKENS,
-            current,
-        ),
-    )
-    observed = max(0, _parse_int(observed_reasoning_tokens, 0))
-    return min(cap, max(current + 1, int(math.ceil(current * multiplier)), current + observed))
-
-
-def _build_output_budget_warning(chunk_id: int, stats: dict, finish_reason: str,
-                                 requested_max_tokens: int) -> str:
-    """Build a concise warning for a chunk response cut off at max_tokens."""
-    reasoning_note = ""
-    if stats.get("reasoning_tokens", 0) > 0:
-        reasoning_note = (
-            f", {stats['reasoning_tokens']}/{max(1, stats['completion_tokens'])} "
-            "completion tokens spent on reasoning"
-        )
-    return (
-        f"⚠️ Chunk {chunk_id}: output stopped at max_tokens={requested_max_tokens} "
-        f"(finish_reason={finish_reason or 'n/a'}{reasoning_note}). Retrying with a larger ceiling."
-    )
-
-
-def _structured_reasoning_metadata_reason(value) -> str:
-    """Detect provider-specific reasoning fields inside a structured payload."""
-    if isinstance(value, dict):
-        for raw_key, item in value.items():
-            key = str(raw_key or "").strip().lower()
-            if key == "reasoning_tokens" and _parse_int(item, 0) > 0:
-                return "reasoning_tokens"
-            if key in {"reasoning_content", "reasoning", "thinking"}:
-                if isinstance(item, (dict, list)):
-                    nested_reason = _structured_reasoning_metadata_reason(item)
-                    if nested_reason:
-                        return nested_reason
-                elif str(item or "").strip():
-                    return key
-            nested_reason = _structured_reasoning_metadata_reason(item)
-            if nested_reason:
-                return nested_reason
-    if isinstance(value, list):
-        for item in value:
-            nested_reason = _structured_reasoning_metadata_reason(item)
-            if nested_reason:
-                return nested_reason
-    return ""
-
-
-def _reasoning_metadata_reason(llm_result: dict | None) -> str:
-    """Return the structured signal that indicates a reasoning-capable response."""
-    result = llm_result if isinstance(llm_result, dict) else {}
-    stats = _reasoning_usage_stats(result)
-    if stats["reasoning_tokens"] > 0:
-        return "reasoning_tokens"
-    if str(result.get("reasoning_text", "") or "").strip():
-        return "reasoning_text"
-    usage = result.get("usage") if isinstance(result.get("usage"), dict) else {}
-    raw_usage = usage.get("raw") if isinstance(usage, dict) else {}
-    return _structured_reasoning_metadata_reason(raw_usage)
-
-
-def _has_reasoning_metadata(llm_result: dict | None) -> bool:
-    """Return whether an LLM response exposes structured reasoning metadata."""
-    return bool(_reasoning_metadata_reason(llm_result))
-
-
-def _build_reasoning_probe_record(model: str = "", api_format: str = "openai",
-                                  reason: str = "not_attempted") -> dict:
-    """Build a manifest-safe reasoning probe record."""
-    return {
-        "enabled": True,
-        "attempted": False,
-        "detected": False,
-        "reason": reason,
-        "model": str(model or ""),
-        "api_format": str(api_format or "openai"),
-        "stream_mode": "false",
-        "max_tokens": None,
-        "request_url": "",
-        "latency_ms": None,
-        "finish_reason": "",
-        "reasoning_tokens": 0,
-        "completion_tokens": 0,
-        "content_tokens": 0,
-        "reasoning_text_present": False,
-        "streaming_used": False,
-        "error_type": "",
-        "error": "",
-    }
-
-
-def _probe_llm_reasoning_metadata(api_key: str, base_url: str, model: str,
-                                  api_format: str = "openai",
-                                  config: dict | None = None) -> dict:
-    """Probe an unknown OpenAI-compatible model for structured reasoning metadata."""
-    config = config or {}
-    api_format = str(api_format or "openai").strip().lower() or "openai"
-    record = _build_reasoning_probe_record(model, api_format)
-    record["enabled"] = _llm_reasoning_probe_enabled(config)
-    record["max_tokens"] = max(1, _parse_int(config.get("llm_probe_max_tokens"), 16))
-    record["request_url"] = _build_api_url(base_url, api_format) if base_url else ""
-
-    if not record["enabled"]:
-        record["reason"] = "disabled_by_config"
-        return record
-    if api_format != "openai":
-        record["reason"] = "unsupported_api_format"
-        return record
-    if not api_key or not base_url or not model:
-        record["reason"] = "missing_llm_config"
-        return record
-
-    record["attempted"] = True
-    try:
-        result = _call_llm_api(
-            api_key=api_key,
-            base_url=base_url,
-            model=model,
-            messages=[{"role": "user", "content": "Reply with OK only."}],
-            api_format=api_format,
-            max_tokens=record["max_tokens"],
-            temperature=0.0,
-            timeout_sec=max(1, _parse_int(config.get("llm_probe_timeout_sec"), 20)),
-            max_retries=1,
-            backoff_sec=min(_parse_float(config.get("llm_backoff_sec"), 1.5), 1.0),
-            stream_mode="false",
-        )
-    except LLMRequestError as error:
-        record["reason"] = "probe_failed"
-        record["request_url"] = error.request_url or record["request_url"]
-        record["error_type"] = str(error.error_type or "unknown")
-        record["error"] = str(error)
-        return record
-
-    stats = _reasoning_usage_stats(result)
-    reason = _reasoning_metadata_reason(result)
-    record.update({
-        "detected": bool(reason),
-        "reason": reason or "no_reasoning_metadata",
-        "request_url": result.get("request_url", record["request_url"]),
-        "latency_ms": result.get("latency_ms"),
-        "finish_reason": str(result.get("finish_reason", "") or ""),
-        "reasoning_tokens": stats["reasoning_tokens"],
-        "completion_tokens": stats["completion_tokens"],
-        "content_tokens": stats["content_tokens"],
-        "reasoning_text_present": bool(str(result.get("reasoning_text", "") or "").strip()),
-        "streaming_used": bool(result.get("streaming_used", False)),
-    })
-    return record
 
 
 def _classify_llm_transport_issue(error_or_reason) -> tuple[str, bool]:
@@ -1349,106 +547,6 @@ def _classify_llm_transport_issue(error_or_reason) -> tuple[str, bool]:
     return "network", False
 
 
-def _evaluate_chunk_output_health(prompt_name: str, chunk_id: int, chunk_char_count: int,
-                                  result_text: str, *, source_text: str = "",
-                                  glossary_payload: dict | None = None,
-                                  glossary_max_terms: int = 8) -> dict:
-    """Evaluate chunk output health."""
-    result_char_count = len(result_text)
-    ratio = result_char_count / chunk_char_count if chunk_char_count > 0 else 0
-    warnings = []
-    retry_reasons = []
-
-    if prompt_name != "summarize" and result_char_count == 0 and chunk_char_count > 0:
-        warnings.append(
-            f"⚠️ Chunk {chunk_id}: LLM returned an empty output for a non-empty input "
-            f"({chunk_char_count} chars)."
-        )
-        retry_reasons.append("empty_output")
-
-    if prompt_name != "summarize" and ratio < SHORT_OUTPUT_WARNING_RATIO:
-        warnings.append(
-            f"⚠️ Chunk {chunk_id}: output is only {ratio:.0%} of input size "
-            f"({result_char_count} vs {chunk_char_count} chars). Possible summarization instead of structuring."
-        )
-        retry_reasons.append("short_output")
-
-    if (
-        prompt_name in ("structure_only", "quick_cleanup", "cleanup_zh")
-        and "##" not in result_text
-        and chunk_char_count > STRUCTURE_HEADER_WARNING_MIN_CHARS
-    ):
-        warnings.append(
-            f"⚠️ Chunk {chunk_id}: no section headers (##) found in output "
-            f"({chunk_char_count} chars input). Structuring may have failed."
-        )
-        retry_reasons.append("missing_headers")
-
-    if prompt_name == "translate_only":
-        cn_chars = sum(1 for char in result_text if '一' <= char <= '鿿')
-        cn_ratio = cn_chars / result_char_count if result_char_count > 0 else 0
-        if cn_ratio < TRANSLATION_WARNING_CN_RATIO:
-            warnings.append(
-                f"⚠️ Chunk {chunk_id}: Chinese character ratio is only {cn_ratio:.0%}. "
-                f"Translation may have been skipped."
-            )
-            retry_reasons.append("translation_skipped")
-
-    glossary_evaluation = kernel_glossary.evaluate_glossary_terms(
-        glossary_payload or {},
-        source_text,
-        result_text,
-        max_terms=glossary_max_terms,
-    )
-    warnings.extend(glossary_evaluation["warnings"])
-    retry_reasons.extend(glossary_evaluation["retry_reasons"])
-
-    return {
-        "warnings": warnings,
-        "retry_reasons": list(dict.fromkeys(retry_reasons)),
-        "ratio": ratio,
-        "result_chars": result_char_count,
-        "glossary_terms": glossary_evaluation["matched_terms"],
-        "missing_glossary_terms": glossary_evaluation["missing_terms"],
-    }
-
-
-def _append_chunk_recovery_log(chunk_info: dict, *, action: str, reasons: list[str],
-                               details: list[str], request_attempts: int,
-                               request_url: str = "", latency_ms: int | None = None,
-                               sleep_sec: float = 0.0,
-                               from_max_tokens: int = 0,
-                               to_max_tokens: int = 0) -> None:
-    """Append chunk recovery log."""
-    recovery_logs = list(chunk_info.get("recovery_logs", []))
-    recovery_logs.append({
-        "attempt_index": len(recovery_logs) + 1,
-        "action": action,
-        "reasons": [str(reason) for reason in reasons if str(reason).strip()],
-        "details": [str(detail) for detail in details if str(detail).strip()],
-        "request_attempts": max(1, _parse_int(request_attempts, 1)),
-        "request_url": str(request_url or ""),
-        "latency_ms": latency_ms,
-        "sleep_sec": round(max(0.0, _parse_float(sleep_sec, 0.0)), 2),
-        "from_max_tokens": max(0, _parse_int(from_max_tokens, 0)),
-        "to_max_tokens": max(0, _parse_int(to_max_tokens, 0)),
-        "updated_at": _now_iso(),
-    })
-    chunk_info["recovery_logs"] = recovery_logs
-    if action == "retry":
-        chunk_info["recovery_attempts"] = max(0, _parse_int(chunk_info.get("recovery_attempts"), 0)) + 1
-    elif action == "expand_max_tokens":
-        chunk_info["budget_recovery_attempts"] = max(
-            0,
-            _parse_int(chunk_info.get("budget_recovery_attempts"), 0),
-        ) + 1
-
-
-def _available_prompt_names() -> list[str]:
-    """Available prompt names."""
-    return sorted(p.stem for p in (_skill_root() / "prompts").glob("*.md"))
-
-
 def _resolve_prompt_template_path(prompt_name: str) -> Path:
     """Resolve prompt template path."""
     prompt = (prompt_name or "").strip()
@@ -1466,13 +564,6 @@ def _resolve_prompt_template_path(prompt_name: str) -> Path:
     if not prompt_path.exists():
         raise ValueError(f"Prompt template not found: {prompt_path}")
     return prompt_path
-
-
-def _load_optional_config(config_path: str = None) -> dict:
-    """Load optional config."""
-    if config_path is None or not str(config_path).strip():
-        return load_config(None, allow_missing=True)
-    return load_config(config_path, allow_missing=False)
 
 
 def _force_split_text_by_tokens(text: str, max_tokens: int, config: dict | None = None) -> list[str]:
@@ -1503,108 +594,9 @@ def _force_split_text_by_tokens(text: str, max_tokens: int, config: dict | None 
     return segments
 
 
-def _force_split_text(text: str, max_size: int, chunk_mode: str,
-                      config: dict | None = None) -> list[str]:
-    """Force split text."""
-    if _normalize_chunk_mode(chunk_mode) == "chars":
-        return _hard_split_text(text, max_size)
-    return _force_split_text_by_tokens(text, max_size, config)
-
-
-def _build_chunk_plan(prompt_name: str, chunk_size: int, config: dict,
-                      prompt_template: str) -> dict:
-    """Build chunk plan."""
-    requested_chunk_mode = _normalize_chunk_mode(config.get("chunk_mode", DEFAULT_CHUNK_MODE))
-    use_legacy_char_override = requested_chunk_mode == "tokens" and chunk_size and chunk_size > 0 and not prompt_name
-    chunk_mode = "chars" if use_legacy_char_override else requested_chunk_mode
-    budget = _calculate_chunk_budget(prompt_name, prompt_template, config)
-    recommended_chunk_size = (
-        _legacy_chunk_target_chars(prompt_name, config)
-        if chunk_mode == "chars"
-        else _get_task_chunk_target(prompt_name, config)
-    )
-    hard_cap_multiplier = _parse_float_range(
-        config.get("chunk_hard_cap_multiplier"),
-        DEFAULT_CHUNK_HARD_CAP_MULTIPLIER,
-        1.0,
-        MAX_CHUNK_HARD_CAP_MULTIPLIER,
-    )
-
-    if chunk_mode == "chars":
-        effective_chunk_size = chunk_size if chunk_size and chunk_size > 0 else recommended_chunk_size
-        hard_cap_size = effective_chunk_size
-        target_tokens = budget["target_tokens"]
-        hard_cap_tokens = budget["hard_cap_tokens"]
-    else:
-        effective_chunk_size = max(1, chunk_size if chunk_size and chunk_size > 0 else budget["target_tokens"])
-        hard_cap_size = max(effective_chunk_size, int(math.ceil(effective_chunk_size * hard_cap_multiplier)))
-        target_tokens = effective_chunk_size
-        hard_cap_tokens = hard_cap_size
-
-    return {
-        "budget": budget,
-        "chunk_mode": chunk_mode,
-        "use_legacy_char_override": use_legacy_char_override,
-        "recommended_chunk_size": recommended_chunk_size,
-        "effective_chunk_size": effective_chunk_size,
-        "hard_cap_size": hard_cap_size,
-        "target_tokens": target_tokens,
-        "hard_cap_tokens": hard_cap_tokens,
-    }
-
-
-def _split_text_into_chunks(sentences: list[str], chunk_mode: str,
-                            effective_chunk_size: int, hard_cap_size: int,
-                            config: dict) -> tuple[list[str], list[str]]:
-    """Split text into chunks."""
-    chunks = []
-    current_chunk = []
-    current_size = 0
-    warnings = []
-    separator_size = len(CHUNK_SEPARATOR) if chunk_mode == "chars" else _estimate_tokens(CHUNK_SEPARATOR, "tokens", config)
-
-    for i, sentence in enumerate(sentences):
-        sentence_segments = [sentence]
-        sentence_len = _estimate_tokens(sentence, chunk_mode, config)
-
-        if sentence_len > hard_cap_size:
-            sentence_segments = _force_split_text(sentence, hard_cap_size, chunk_mode, config)
-            warnings.append(
-                f"Sentence {i} exceeds chunk_size ({sentence_len} > {hard_cap_size}), split into {len(sentence_segments)} fixed-width segment(s)"
-            )
-
-        for segment in sentence_segments:
-            segment_len = _estimate_tokens(segment, chunk_mode, config)
-            candidate_size = current_size + segment_len + (separator_size if current_chunk else 0)
-            if current_chunk and (candidate_size > effective_chunk_size or candidate_size > hard_cap_size):
-                chunks.append(CHUNK_SEPARATOR.join(current_chunk))
-                current_chunk = [segment]
-                current_size = segment_len
-            else:
-                current_chunk.append(segment)
-                current_size = candidate_size
-
-    if current_chunk:
-        chunks.append(CHUNK_SEPARATOR.join(current_chunk))
-    return chunks, warnings
-
-
-_atomic_write_text = kernel_state.atomic_write_text
-_write_manifest = kernel_state.write_manifest
-
-
 def _is_retryable_status(status_code: int) -> bool:
     """Return whether retryable status."""
     return status_code in {408, 409, 425, 429} or status_code >= 500
-
-
-def _is_timeout_error(error: Exception) -> bool:
-    """Return whether timeout error."""
-    if isinstance(error, LLMRequestError):
-        if error.status_code in {408, 504}:
-            return True
-        return error.error_type in {"timeout", "socket_timeout", "read_timeout"}
-    return False
 
 
 def _extract_openai_content_from_message(message) -> str:
@@ -2014,15 +1006,6 @@ def _split_sentences(text: str) -> list[str]:
     return sentences
 
 
-def _hard_split_text(text: str, max_len: int) -> list[str]:
-    """
-    Force-split overlong text into fixed-width chunks as a last-resort fallback.
-    """
-    if max_len <= 0:
-        return [text]
-    return [text[i:i + max_len].strip() for i in range(0, len(text), max_len) if text[i:i + max_len].strip()]
-
-
 def _normalize_subtitle_text(text: str) -> str:
     """Apply conservative cleanup tailored to subtitle-derived text."""
     return kernel_subtitle_cleanup.normalize_subtitle_text(text)
@@ -2066,7 +1049,7 @@ def parse_vtt(vtt_path: str) -> str:
 def parse_vtt_segments(vtt_path: str, *, language: str = "") -> dict:
     """Parse a VTT file and return aligned segments with timing metadata.
 
-    Output schema matches `chunk-segments` expectations:
+    Output schema (the segments file the normalizer reads):
 
     {
       "source": "vtt",
@@ -2085,47 +1068,6 @@ def parse_vtt_segments(vtt_path: str, *, language: str = "") -> dict:
         print(f"Error: Cannot read file {e}", file=sys.stderr)
         sys.exit(2)
     return _parse_vtt_payload(content, language=language, vtt_path=str(path))
-
-
-def process_deepgram(json_path: str, *, prefer_structured_output: bool = DEFAULT_DEEPGRAM_PREFER_STRUCTURED_OUTPUT) -> dict:
-    """
-    Process Deepgram API JSON result
-
-    Processing:
-    - Extract complete transcript text
-    - Remove spaces between Chinese characters (multiple passes for thoroughness)
-    - Fix spaces around punctuation
-    - Remove consecutive repeated phrases
-    - Count number of speakers
-    - Surface basic observability fields about which Deepgram structures were present
-
-    Returns:
-        {"transcript": "cleaned text", "speaker_count": N, ...}
-    """
-    path = Path(json_path)
-    if not path.exists():
-        print(f"Error: File does not exist {json_path}", file=sys.stderr)
-        sys.exit(1)
-
-    try:
-        data = json.loads(path.read_text(encoding='utf-8'))
-    except json.JSONDecodeError as e:
-        print(f"Error: JSON parsing failed {e}", file=sys.stderr)
-        sys.exit(2)
-    except Exception as e:
-        print(f"Error: Cannot read file {e}", file=sys.stderr)
-        sys.exit(2)
-
-    try:
-        if isinstance(data, dict) and str(data.get("format", "")).strip() == DEEPGRAM_CHUNK_CACHE_FORMAT:
-            envelope_payload = data.get("payload")
-            if not isinstance(envelope_payload, dict):
-                raise KeyError("payload")
-            data = envelope_payload
-        return process_deepgram_payload(data, prefer_structured_output=prefer_structured_output)
-    except (KeyError, IndexError) as e:
-        print(f"Error: Deepgram JSON structure unexpected {e}", file=sys.stderr)
-        sys.exit(2)
 
 
 def _coerce_float_or_none(value) -> float | None:
@@ -2578,20 +1520,6 @@ def _extract_deepgram_segments_with_report(data: dict, *, time_offset: float = 0
     }
 
 
-def extract_deepgram_segments(data: dict, *, time_offset: float = 0.0,
-                              source_chunk_index: int = 0, starting_segment_id: int = 0,
-                              prefer_structured_output: bool = DEFAULT_DEEPGRAM_PREFER_STRUCTURED_OUTPUT) -> list[dict]:
-    """Extract deepgram segments."""
-    segments, _ = _extract_deepgram_segments_with_report(
-        data,
-        time_offset=time_offset,
-        source_chunk_index=source_chunk_index,
-        starting_segment_id=starting_segment_id,
-        prefer_structured_output=prefer_structured_output,
-    )
-    return segments
-
-
 def process_deepgram_payload(data: dict, *, prefer_structured_output: bool = DEFAULT_DEEPGRAM_PREFER_STRUCTURED_OUTPUT) -> dict:
     """Process deepgram payload."""
     inspection = _inspect_deepgram_payload(data)
@@ -2644,32 +1572,6 @@ def _is_valid_compact_date_fragment(value: str) -> bool:
     except ValueError:
         return False
     return True
-
-
-def _find_compact_dates_in_filename(output_file: str) -> list[str]:
-    """Find compact YYYYMMDD date fragments in a file basename."""
-    filename = Path(str(output_file or "")).name
-    compact_dates = []
-    for match in re.finditer(r"(?<![A-Za-z0-9])(\d{8})(?![A-Za-z0-9])", filename):
-        date_text = match.group(1)
-        if _is_valid_compact_date_fragment(date_text):
-            compact_dates.append(date_text)
-    return compact_dates
-
-
-def _validate_output_filename_date_format(output_file: str) -> list[str]:
-    """Return validation failures for date fragments in final output filenames."""
-    compact_dates = _find_compact_dates_in_filename(output_file)
-    if not compact_dates:
-        return []
-    normalized_examples = [
-        f"{date_text[:4]}-{date_text[4:6]}-{date_text[6:]}"
-        for date_text in compact_dates
-    ]
-    return [
-        "Output filename date must use yyyy-mm-dd, not yyyymmdd "
-        f"({', '.join(compact_dates)} -> {', '.join(normalized_examples)})."
-    ]
 
 
 def _normalize_frontmatter_date(value: str) -> str:
@@ -2846,745 +1748,6 @@ def _find_best_split_point(rough_time: float, silence_midpoints: list, max_devia
         return rough_time
 
 
-def test_deepgram_api(api_key: str) -> dict:
-    """
-    Quick test of Deepgram API key validity
-    
-    Makes a minimal request to verify:
-    - API key is valid
-    - Network connectivity works
-    - Account has credits
-    
-    Returns:
-        {"valid": bool, "error": str or None, "balance_warning": bool}
-    """
-    import urllib.request
-    import urllib.error
-    
-    url = f"https://api.deepgram.com/v1/listen?model={urllib.parse.quote(DEFAULT_DEEPGRAM_MODEL)}&language=en"
-    headers = {
-        "Authorization": f"Token {api_key}",
-        "Content-Type": "audio/wav"
-    }
-    
-    # Send empty audio to trigger auth check (will fail with audio error if auth works)
-    req = urllib.request.Request(url, data=b'', headers=headers, method='POST')
-    
-    try:
-        with urllib.request.urlopen(req, timeout=10):
-            # Unexpected success with empty audio
-            return {"valid": True, "error": None, "balance_warning": False}
-    except urllib.error.HTTPError as e:
-        if e.code == 401:
-            return {"valid": False, "error": "Invalid API key (401 Unauthorized)", "balance_warning": False}
-        elif e.code == 402:
-            return {"valid": False, "error": "Insufficient credits (402 Payment Required)", "balance_warning": True}
-        elif e.code == 400:
-            # Bad request usually means auth worked but audio was invalid
-            return {"valid": True, "error": None, "balance_warning": False}
-        else:
-            return {"valid": False, "error": f"HTTP Error {e.code}: {e.reason}", "balance_warning": False}
-    except urllib.error.URLError as e:
-        return {"valid": False, "error": f"Network error: {e.reason}", "balance_warning": False}
-    except Exception as e:
-        return {"valid": False, "error": f"Unexpected error: {e}", "balance_warning": False}
-
-
-build_command_result_envelope = kernel_runtime.build_command_result_envelope
-
-
-_resolve_runtime_mutation_ownership = kernel_controller.resolve_runtime_mutation_ownership
-_finalize_mutation_result = kernel_controller.finalize_mutation_result
-_runtime_ownership_error_parts = kernel_controller.runtime_ownership_error_parts
-
-
-def _build_prepare_resume_ownership_conflict_result(manifest_path: Path, prompt_name: str,
-                                                    ownership: dict) -> dict:
-    """Build prepare resume ownership conflict result."""
-    error, message = _runtime_ownership_error_parts(ownership)
-    return _finalize_mutation_result({
-        "success": False,
-        "manifest_path": str(manifest_path),
-        "prompt_name": str(prompt_name or "").strip(),
-        "resume": {"repaired": False, "warnings": []},
-        "runtime": {},
-        "error": error,
-        "message": message,
-    }, ownership)
-
-
-def _build_process_ownership_conflict_result(ownership: dict) -> dict:
-    """Build process ownership conflict result."""
-    error, message = _runtime_ownership_error_parts(ownership)
-    return _finalize_mutation_result({
-        "success": False,
-        "processed_count": 0,
-        "failed_count": 0,
-        "skipped_count": 0,
-        "superseded_count": 0,
-        "total_chunks": 0,
-        "warnings": [],
-        "warning_count": 0,
-        "output_files": [],
-        "aborted": True,
-        "aborted_reason": message,
-        "resume": {"repaired": False, "warnings": []},
-        "plan": {},
-        "control": {},
-        "request_url": "",
-        "error": error,
-        "message": message,
-    }, ownership)
-
-
-def prepare_resume(work_dir: str, prompt_name: str = "", config_path: str = None,
-                   input_key: str = "raw_path", runtime_ownership: dict | None = None) -> dict:
-    """Delegate resume preparation to `kernel.long_text.execution`."""
-    return kernel_execution.prepare_resume(
-        work_dir,
-        prompt_name=prompt_name,
-        config_path=config_path,
-        input_key=input_key,
-        runtime_ownership=runtime_ownership,
-    )
-
-
-def create_run(work_dir: str, task_spec: dict | None = None, *, task_id: str = "",
-               source_ref: str = "", output_mode: str = "markdown",
-               bilingual: bool = False, quality_profile: str = "balanced",
-               speed_priority: str = "balanced", cost_budget: float = 0.0,
-               latency_budget: float = 0.0, allowed_fallbacks=None,
-               human_escalation_policy: str = "on_blocking_failure",
-               policy_profile: str = "default", migration_mode: str = "") -> dict:
-    """Persist a stable runtime-task record for outer-agent orchestration."""
-    return kernel_runtime_api.create_run(
-        task_spec,
-        work_dir=work_dir,
-        task_id=task_id,
-        source_ref=source_ref,
-        output_mode=output_mode,
-        bilingual=bilingual,
-        quality_profile=quality_profile,
-        speed_priority=speed_priority,
-        cost_budget=cost_budget,
-        latency_budget=latency_budget,
-        allowed_fallbacks=allowed_fallbacks,
-        human_escalation_policy=human_escalation_policy,
-        policy_profile=policy_profile,
-        migration_mode=migration_mode,
-    )
-
-
-def inspect_run(work_dir: str, *, run_id: str = "", policy_profile: str = "default") -> dict:
-    """Inspect run/task state through the stable runtime-facing API."""
-    return kernel_runtime_api.inspect_run(
-        work_dir,
-        run_id=run_id,
-        policy_profile=policy_profile,
-    )
-
-
-def advance_run(work_dir: str, prompt_name: str = "", *, run_id: str = "",
-                action: str = "auto", extra_instruction: str = "",
-                config_path: str = None, dry_run: bool = False,
-                input_key: str = "raw_path", force: bool = False,
-                policy_profile: str = "default") -> dict:
-    """Advance the runtime through the preferred bounded control path."""
-    return kernel_runtime_api.advance_run(
-        work_dir,
-        prompt_name,
-        run_id=run_id,
-        action=action,
-        extra_instruction=extra_instruction,
-        config_path=config_path,
-        dry_run=dry_run,
-        input_key=input_key,
-        force=force,
-        policy_profile=policy_profile,
-    )
-
-
-def apply_control(work_dir: str, signal: str, *, run_id: str = "",
-                  reason: str = "", policy_profile: str = "default") -> dict:
-    """Apply pause or cancel through the stable runtime-facing API."""
-    return kernel_runtime_api.apply_control(
-        work_dir,
-        signal,
-        run_id=run_id,
-        reason=reason,
-        policy_profile=policy_profile,
-    )
-
-
-def runtime_status(work_dir: str) -> dict:
-    """Compatibility helper for runtime inspection; prefer `inspect_run` for new integrations."""
-    return kernel_execution.runtime_status(work_dir)
-
-
-def cancel_run(work_dir: str, reason: str = "") -> dict:
-    """Delegate cancellation requests to `kernel.long_text.execution`."""
-    return kernel_execution.cancel_run(work_dir, reason=reason)
-
-
-def pause_run(work_dir: str, reason: str = "") -> dict:
-    """Delegate pause requests to `kernel.long_text.execution`."""
-    return kernel_execution.pause_run(work_dir, reason=reason)
-
-
-def _build_resume_run_ownership_conflict_result(ownership: dict) -> dict:
-    """Build resume run ownership conflict result."""
-    error, message = _runtime_ownership_error_parts(ownership)
-    return _finalize_mutation_result({
-        "success": False,
-        "resumed": False,
-        "pause": {},
-        "runtime": {},
-        "error": error,
-        "message": message,
-    }, ownership)
-
-
-def resume_run(work_dir: str, reason: str = "", runtime_ownership: dict | None = None) -> dict:
-    """Resume a paused runtime; stable API entrypoint retained for compatibility."""
-    return kernel_execution.resume_run(work_dir, reason=reason, runtime_ownership=runtime_ownership)
-
-
-def finalize_run(work_dir: str, *, run_id: str = "", output_file: str = "",
-                 header: str = "", inspect_only: bool = False,
-                 policy_profile: str = "default") -> dict:
-    """Finalize a run summary and optionally materialize merged output."""
-    return kernel_runtime_api.finalize_run(
-        work_dir,
-        run_id=run_id,
-        output_file=output_file,
-        header=header,
-        inspect_only=inspect_only,
-        policy_profile=policy_profile,
-    )
-
-
-def _resume_run_impl(work_dir: str, reason: str = "") -> dict:
-    """Resume run impl."""
-    return kernel_lifecycle._resume_run_impl(work_dir, reason=reason)
-
-
-def _resolve_telemetry_ref_kwargs(telemetry_ref: str = "", *, telemetry_path: str = "", work_dir: str = "") -> dict:
-    """Resolve telemetry ref kwargs."""
-    explicit_telemetry_path = str(telemetry_path or "").strip()
-    explicit_work_dir = str(work_dir or "").strip()
-    if explicit_telemetry_path or explicit_work_dir:
-        return {
-            "telemetry_path": explicit_telemetry_path,
-            "work_dir": explicit_work_dir,
-        }
-
-    ref = str(telemetry_ref or "").strip()
-    if not ref:
-        return {
-            "telemetry_path": "",
-            "work_dir": "",
-        }
-
-    ref_path = Path(ref).expanduser()
-    if ref_path.name == kernel_telemetry.TELEMETRY_FILENAME or ref_path.suffix == ".jsonl":
-        return {
-            "telemetry_path": str(ref_path),
-            "work_dir": "",
-        }
-    return {
-        "telemetry_path": "",
-        "work_dir": str(ref_path),
-    }
-
-
-def _parse_optional_success_filter(value) -> bool | None:
-    """Parse optional success filter."""
-    if value is None:
-        return None
-    text = str(value).strip().lower()
-    if not text or text == "all":
-        return None
-    if text in {"1", "true", "yes", "success", "ok"}:
-        return True
-    if text in {"0", "false", "no", "failure", "fail"}:
-        return False
-    raise ValueError(f"Unsupported success filter: {value}")
-
-
-def _load_optional_json_object(*, inline_json: str = "", file_path: str = "") -> dict:
-    """Load an optional JSON object from inline text or a file path."""
-    inline_payload = str(inline_json or "").strip()
-    file_ref = str(file_path or "").strip()
-    if inline_payload and file_ref:
-        raise ValueError("Provide either --task-spec-json or --task-spec-file, not both")
-    if file_ref:
-        inline_payload = Path(file_ref).expanduser().read_text(encoding="utf-8")
-    if not inline_payload:
-        return {}
-    payload = json.loads(inline_payload)
-    if not isinstance(payload, dict):
-        raise ValueError("task spec input must decode to a JSON object")
-    return payload
-
-
-def telemetry_summary(telemetry_ref: str = "", *, telemetry_path: str = "", work_dir: str = "",
-                      command_filter: str = "", document_id: str = "", success=None,
-                      recent_limit: int = 5) -> dict:
-    """Delegate telemetry summarization to `kernel.task_runtime.telemetry`."""
-    resolved = _resolve_telemetry_ref_kwargs(telemetry_ref, telemetry_path=telemetry_path, work_dir=work_dir)
-    return kernel_telemetry.summarize_telemetry(
-        work_dir=resolved["work_dir"],
-        telemetry_path=resolved["telemetry_path"],
-        command=command_filter,
-        document_id=document_id,
-        success=_parse_optional_success_filter(success),
-        recent_limit=recent_limit,
-    )
-
-
-def telemetry_events(telemetry_ref: str = "", *, telemetry_path: str = "", work_dir: str = "",
-                     limit: int = 20, command_filter: str = "", trace_id: str = "",
-                     document_id: str = "", success=None) -> dict:
-    """Delegate telemetry event queries to `kernel.task_runtime.telemetry`."""
-    resolved = _resolve_telemetry_ref_kwargs(telemetry_ref, telemetry_path=telemetry_path, work_dir=work_dir)
-    return kernel_telemetry.read_telemetry_events(
-        work_dir=resolved["work_dir"],
-        telemetry_path=resolved["telemetry_path"],
-        limit=limit,
-        command=command_filter,
-        trace_id=trace_id,
-        document_id=document_id,
-        success=_parse_optional_success_filter(success),
-    )
-
-
-def build_glossary(work_dir: str, max_terms: int = 50,
-                  min_occurrences: int = 1, mode: str = "auto",
-                  normalized_document_path: str = "", chapters_path: str = "",
-                  metadata_json_path: str = "", description_text: str = "",
-                  description_path: str = "") -> dict:
-    """Delegate glossary construction to `kernel.long_text.glossary`."""
-    return kernel_glossary.build_glossary(
-        work_dir,
-        max_terms=max_terms,
-        min_occurrences=min_occurrences,
-        mode=mode,
-        normalized_document_path=normalized_document_path,
-        chapters_path=chapters_path,
-        metadata_json_path=metadata_json_path,
-        description_text=description_text,
-        description_path=description_path,
-    )
-
-
-def _kernel_command_registry() -> dict[str, object]:
-    """Return the command registry exposed through the top-level CLI façade."""
-    return {
-        "validate-state": validate_state,
-        "normalize-document": normalize_document,
-        "plan-optimization": plan_optimization,
-        "chunk-text": chunk_text,
-        "chunk-segments": chunk_segments,
-        "chunk-document": chunk_document,
-        "create-run": create_run,
-        "inspect-run": inspect_run,
-        "advance-run": advance_run,
-        "apply-control": apply_control,
-        "finalize-run": finalize_run,
-        "prepare-resume": prepare_resume,
-        "runtime-status": runtime_status,
-        "cancel-run": cancel_run,
-        "pause-run": pause_run,
-        "resume-run": resume_run,
-        "telemetry-summary": telemetry_summary,
-        "telemetry-events": telemetry_events,
-        "build-glossary": build_glossary,
-        "merge-content": lambda *, work_dir, output_file, header="": merge_content(work_dir, output_file, header_content=header),
-        "assemble-final": assemble_final,
-        "verify-quality": verify_quality,
-    }
-
-
-def _dispatch_process_chunks_command(*, work_dir: str, prompt_name: str, extra_instruction: str = "",
-                                     config_path: str = None, dry_run: bool = False,
-                                     input_key: str = "raw_path", force: bool = False) -> dict:
-    """Dispatch process chunks command."""
-    return process_chunks(
-        work_dir,
-        prompt_name,
-        extra_instruction=extra_instruction,
-        config_path=config_path,
-        dry_run=dry_run,
-        input_key=input_key,
-        force=force,
-    )
-
-
-def run_kernel_command(command: str, **kwargs) -> dict:
-    """Dispatch a kernel command through the top-level CLI façade."""
-    return kernel_runtime.run_registered_kernel_command(
-        command,
-        kwargs=kwargs,
-        registry=_kernel_command_registry(),
-        process_chunks_handler=_dispatch_process_chunks_command,
-    )
-
-def _prepare_chunking_context(prompt_name: str = "", chunk_size: int = 0,
-                              config_path: str = None) -> dict:
-    """Prepare chunking context."""
-    return kernel_prompting._prepare_chunking_context(
-        prompt_name=prompt_name,
-        chunk_size=chunk_size,
-        config_path=config_path,
-    )
-
-
-def _chunk_text_payload(text: str, source_file: str, output_dir: str, chunk_size: int = 0,
-                        prompt_name: str = "", config_path: str = None, *, driver: str = "chunk-text",
-                        source_kind: str = "text", normalized_document_path: str = "",
-                        source_adapter: str = "") -> dict:
-    """Chunk text payload."""
-    chunking = _prepare_chunking_context(prompt_name, chunk_size, config_path)
-    config = chunking["config"]
-    budget = chunking["budget"]
-    chunk_mode = chunking["chunk_mode"]
-    use_legacy_char_override = chunking["use_legacy_char_override"]
-    recommended_chunk_size = chunking["recommended_chunk_size"]
-    effective_chunk_size = chunking["effective_chunk_size"]
-    hard_cap_size = chunking["hard_cap_size"]
-    target_tokens = chunking["target_tokens"]
-    hard_cap_tokens = chunking["hard_cap_tokens"]
-
-    out_dir = Path(output_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    sentences = _split_sentences(text)
-    chunks, warnings = _split_text_into_chunks(
-        sentences,
-        chunk_mode,
-        effective_chunk_size,
-        hard_cap_size,
-        config,
-    )
-
-    plan_id = _new_plan_id()
-    chunk_contract = _build_manifest_chunk_contract(
-        source_kind,
-        driver=driver,
-        normalized_document_path=normalized_document_path,
-        source_adapter=source_adapter,
-        has_timing=False,
-        chapters_enabled=False,
-    )
-    manifest = {
-        "schema_version": MANIFEST_SCHEMA_VERSION,
-        "total_chunks": len(chunks),
-        "source_file": str(Path(source_file).absolute()) if source_file else "",
-        "source_adapter": str(source_adapter).strip(),
-        "work_dir": str(out_dir.absolute()),
-        "normalized_document_path": str(normalized_document_path).strip(),
-        "plan": _build_manifest_plan(
-            prompt_name,
-            chunk_mode,
-            recommended_chunk_size,
-            effective_chunk_size,
-            {
-                **budget,
-                "target_tokens": target_tokens,
-                "hard_cap_tokens": hard_cap_tokens,
-            },
-            source_file=str(Path(source_file).absolute()) if source_file else "",
-            plan_id=plan_id,
-            chunk_contract=chunk_contract,
-        ),
-        "runtime": _build_manifest_runtime(plan_id),
-        "chunks": [],
-    }
-
-    for index, chunk_content in enumerate(chunks):
-        chunk_filename = f"chunk_{index:03d}.txt"
-        chunk_path = out_dir / chunk_filename
-        _atomic_write_text(chunk_path, chunk_content)
-
-        chunk_entry = _new_chunk_manifest_entry(
-            index,
-            chunk_content,
-            budget,
-            config,
-            raw_path=chunk_filename,
-            processed_path=f"processed_{index:03d}.md",
-            plan_id=plan_id,
-            chunk_contract=chunk_contract,
-        )
-        manifest["chunks"].append(chunk_entry)
-
-    manifest_path = out_dir / "manifest.json"
-    _sync_manifest_legacy_fields(manifest)
-    _write_manifest(manifest_path, manifest)
-
-    for warning in warnings:
-        print(f"⚠️ {warning}", file=sys.stderr)
-
-    if use_legacy_char_override:
-        print(
-            "ℹ️ Interpreting explicit chunk_size as characters for backward compatibility; add --prompt to use token-aware auto sizing.",
-            file=sys.stderr,
-        )
-
-    if prompt_name and chunk_size <= 0:
-        print(
-            f"ℹ️ Auto-selected chunk_size={effective_chunk_size} ({chunk_mode}) for prompt '{prompt_name}'",
-            file=sys.stderr,
-        )
-
-    return {
-        "total_chunks": len(chunks),
-        "manifest_path": str(manifest_path),
-        "plan_id": plan_id,
-        "chunks": [chunk["raw_path"] for chunk in manifest["chunks"]],
-        "warnings": warnings,
-        "chunk_size": effective_chunk_size,
-        "recommended_chunk_size": manifest["recommended_chunk_size"],
-        "chunk_mode": chunk_mode,
-        "target_tokens": manifest["target_tokens"],
-        "hard_cap_tokens": manifest["hard_cap_tokens"],
-        "source_kind": chunk_contract["source_kind"],
-        "driver": chunk_contract["driver"],
-        "normalized_document_path": str(normalized_document_path).strip(),
-    }
-
-
-def chunk_text(input_path: str, output_dir: str, chunk_size: int = 0,
-               prompt_name: str = "", config_path: str = None) -> dict:
-    """Delegate text chunking to `kernel.long_text.chunking`."""
-    return kernel_chunking.chunk_text(
-        input_path,
-        output_dir,
-        chunk_size=chunk_size,
-        prompt_name=prompt_name,
-        config_path=config_path,
-    )
-
-
-def _load_segment_document(segments_path: str) -> tuple[dict, list[dict]]:
-    """Load segment document."""
-    path = Path(segments_path)
-    if not path.exists():
-        print(f"Error: File does not exist {segments_path}", file=sys.stderr)
-        sys.exit(1)
-
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as e:
-        print(f"Error: JSON parsing failed {e}", file=sys.stderr)
-        sys.exit(2)
-    except Exception as e:
-        print(f"Error: Cannot read file {e}", file=sys.stderr)
-        sys.exit(2)
-
-    if isinstance(data, dict):
-        metadata = {key: value for key, value in data.items() if key != "segments"}
-        raw_segments = data.get("segments", [])
-    elif isinstance(data, list):
-        metadata = {}
-        raw_segments = data
-    else:
-        print("Error: Segment document must be a JSON object or array", file=sys.stderr)
-        sys.exit(2)
-
-    normalized_segments = []
-    for index, raw_segment in enumerate(raw_segments):
-        if not isinstance(raw_segment, dict):
-            continue
-        segment_text = str(raw_segment.get("text", "")).strip()
-        if not segment_text:
-            continue
-        normalized_segments.append({
-            "id": _parse_int(raw_segment.get("id"), index),
-            "text": segment_text,
-            "start_time": _coerce_float_or_none(raw_segment.get("start_time")),
-            "end_time": _coerce_float_or_none(raw_segment.get("end_time")),
-            "speaker": raw_segment.get("speaker"),
-        })
-
-    if not normalized_segments:
-        print("Error: No usable segments found", file=sys.stderr)
-        sys.exit(2)
-
-    return metadata, normalized_segments
-
-
-def _load_chapters_document(chapters_path: str) -> list[dict]:
-    """Load chapters document."""
-    path = Path(chapters_path)
-    if not path.exists():
-        print(f"Error: File does not exist {chapters_path}", file=sys.stderr)
-        sys.exit(1)
-
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as e:
-        print(f"Error: JSON parsing failed {e}", file=sys.stderr)
-        sys.exit(2)
-    except Exception as e:
-        print(f"Error: Cannot read file {e}", file=sys.stderr)
-        sys.exit(2)
-
-    if isinstance(data, dict):
-        chapters = data.get("chapters", [])
-    elif isinstance(data, list):
-        chapters = data
-    else:
-        print("Error: Chapters JSON must be an array or an object with 'chapters'", file=sys.stderr)
-        sys.exit(2)
-
-    return [chapter for chapter in chapters if isinstance(chapter, dict)]
-
-
-def _chapter_boundary_tolerance_sec(timed_items: list[dict]) -> float:
-    """Return a small boundary tolerance for chapter-to-timing alignment."""
-    durations = []
-    for item in timed_items:
-        start_time = _coerce_float_or_none(item.get("start_time"))
-        end_time = _coerce_float_or_none(item.get("end_time"))
-        if start_time is None or end_time is None or end_time <= start_time:
-            continue
-        durations.append(end_time - start_time)
-    shortest_duration = min(durations, default=DEFAULT_CHAPTER_BOUNDARY_TOLERANCE_SEC)
-    return max(0.05, min(DEFAULT_CHAPTER_BOUNDARY_TOLERANCE_SEC, shortest_duration * 0.2))
-
-
-def _map_timestamp_to_timed_item(timestamp: float | None, timed_items: list[dict], *,
-                                 next_strategy: str = "next_segment",
-                                 after_last_strategy: str = "after_last_segment") -> tuple[dict, str, str, dict]:
-    """Map a timestamp onto the best matching timed segment/chunk with boundary tolerance."""
-    if not timed_items:
-        return {}, after_last_strategy, "low", {"boundary_tolerance_sec": 0.0}
-
-    tolerance = _chapter_boundary_tolerance_sec(timed_items)
-    if timestamp is None:
-        first_item = timed_items[0]
-        return first_item, "missing_time", "low", {
-            "boundary_tolerance_sec": round(tolerance, 3),
-            "matched_id": first_item.get("id"),
-        }
-
-    for index, item in enumerate(timed_items):
-        start_time = float(item["start_time"])
-        end_time = float(item["end_time"])
-        next_item = timed_items[index + 1] if index + 1 < len(timed_items) else None
-        if next_item is not None:
-            next_start = float(next_item["start_time"])
-            delta_to_next_start = next_start - timestamp
-            if 0.0 <= delta_to_next_start <= tolerance:
-                return next_item, "near_next_start", "high", {
-                    "boundary_tolerance_sec": round(tolerance, 3),
-                    "matched_id": next_item.get("id"),
-                    "delta_to_next_start_sec": round(delta_to_next_start, 3),
-                }
-        if start_time <= timestamp < end_time or math.isclose(timestamp, start_time, abs_tol=tolerance / 4):
-            return item, "time_contains", "high", {
-                "boundary_tolerance_sec": round(tolerance, 3),
-                "matched_id": item.get("id"),
-                "delta_to_start_sec": round(timestamp - start_time, 3),
-                "delta_to_end_sec": round(end_time - timestamp, 3),
-            }
-        if timestamp < start_time:
-            return item, next_strategy, "medium", {
-                "boundary_tolerance_sec": round(tolerance, 3),
-                "matched_id": item.get("id"),
-                "delta_to_start_sec": round(start_time - timestamp, 3),
-            }
-
-    last_item = timed_items[-1]
-    last_end = float(last_item["end_time"])
-    delta_after_last_end = timestamp - last_end
-    if 0.0 <= delta_after_last_end <= tolerance:
-        return last_item, "near_last_end", "medium", {
-            "boundary_tolerance_sec": round(tolerance, 3),
-            "matched_id": last_item.get("id"),
-            "delta_after_last_end_sec": round(delta_after_last_end, 3),
-        }
-    return last_item, after_last_strategy, "low", {
-        "boundary_tolerance_sec": round(tolerance, 3),
-        "matched_id": last_item.get("id"),
-        "delta_after_last_end_sec": round(delta_after_last_end, 3),
-    }
-
-
-def _map_chapter_starts_to_segment_break_ids(chapters: list[dict], segments: list[dict]) -> tuple[set[int], list[str]]:
-    """Map chapter starts to segment break ids."""
-    timed_segments = [
-        seg for seg in segments
-        if seg.get("start_time") is not None and seg.get("end_time") is not None
-    ]
-    if not timed_segments:
-        return set(), ["No timed segments found; cannot apply chapter-aware chunking"]
-
-    warnings = []
-    tolerated_strategies = {"time_contains", "near_next_start"}
-    break_ids = set()
-    for index, chapter in enumerate(chapters):
-        start_time = _coerce_float_or_none(chapter.get("start_time"))
-        if start_time is None:
-            continue
-
-        segment, match_strategy, _, _ = _map_timestamp_to_timed_item(
-            start_time,
-            timed_segments,
-            next_strategy="next_segment",
-            after_last_strategy="after_last_segment",
-        )
-        segment_id = int(segment.get("id", 0))
-        break_ids.add(segment_id)
-        if match_strategy not in tolerated_strategies:
-            warnings.append(f"Chapter {index} used fallback strategy '{match_strategy}'")
-
-    return break_ids, warnings
-
-
-def _split_timed_segment(segment: dict, max_size: int, chunk_mode: str,
-                         config: dict, warning_index: int) -> tuple[list[dict], list[str]]:
-    """Split timed segment."""
-    text = segment["text"]
-    segment_len = _estimate_tokens(text, chunk_mode, config)
-    if segment_len <= max_size:
-        return [segment], []
-
-    parts = _force_split_text(text, max_size, chunk_mode, config)
-    warnings = [
-        f"Segment {warning_index} exceeds chunk_size ({segment_len} > {max_size}), split into {len(parts)} fixed-width segment(s)"
-    ]
-
-    start_time = segment.get("start_time")
-    end_time = segment.get("end_time")
-    duration = None
-    if start_time is not None and end_time is not None:
-        duration = max(0.0, end_time - start_time)
-
-    total_chars = sum(len(part) for part in parts) or 1
-    offset_chars = 0
-    split_segments = []
-
-    for part_index, part in enumerate(parts):
-        part_start = start_time
-        part_end = end_time
-        if duration is not None and start_time is not None:
-            part_start = start_time + (offset_chars / total_chars) * duration
-            offset_chars += len(part)
-            part_end = start_time + (offset_chars / total_chars) * duration
-
-        split_segments.append({
-            **segment,
-            "text": part,
-            "start_time": None if part_start is None else round(part_start, 3),
-            "end_time": None if part_end is None else round(part_end, 3),
-            "segment_part_index": part_index,
-        })
-
-    return split_segments, warnings
-
-
 def _load_normalized_document(normalized_document_path: str) -> dict:
     """Load normalized document."""
     path = Path(normalized_document_path)
@@ -3634,414 +1797,6 @@ def _load_normalized_document(normalized_document_path: str) -> dict:
     return payload
 
 
-def _minimum_viable_chunk_size(target_size: int, chunk_mode: str) -> int:
-    """Return the smallest chunk size worth keeping as a standalone unit."""
-    if target_size <= 0:
-        return 0
-    baseline = max(1, target_size // 6)
-    if chunk_mode == "tokens":
-        return max(60, min(120, baseline))
-    return max(40, min(80, baseline))
-
-
-def _merge_chunk_specs(left: dict, right: dict) -> dict:
-    """Merge two adjacent chunk specs while preserving timing and boundary metadata."""
-    content_parts = [part for part in (left.get("content", ""), right.get("content", "")) if part]
-    content = CHUNK_SEPARATOR.join(content_parts)
-    segment_ids = [seg_id for seg_id in left.get("segment_ids", []) + right.get("segment_ids", []) if seg_id is not None]
-    start_time = left.get("start_time") if left.get("start_time") is not None else right.get("start_time")
-    end_time = right.get("end_time") if right.get("end_time") is not None else left.get("end_time")
-    return {
-        "content": content,
-        "start_time": start_time,
-        "end_time": end_time,
-        "duration_sec": None if start_time is None or end_time is None else round(max(0.0, end_time - start_time), 3),
-        "segment_ids": segment_ids,
-        "source_segment_start": segment_ids[0] if segment_ids else None,
-        "source_segment_end": segment_ids[-1] if segment_ids else None,
-        "source_segments_count": len({seg_id for seg_id in segment_ids}),
-        "starts_with_chapter_break": bool(left.get("starts_with_chapter_break")),
-    }
-
-
-def _coalesce_undersized_chunk_specs(chunk_specs: list[dict], chunk_mode: str, config: dict,
-                                     effective_chunk_size: int, hard_cap_size: int) -> tuple[list[dict], list[str]]:
-    """Merge tiny boundary fragments into neighbors when doing so is still budget-safe."""
-    if len(chunk_specs) < 3:
-        return chunk_specs, []
-
-    minimum_size = _minimum_viable_chunk_size(effective_chunk_size, chunk_mode)
-    if minimum_size <= 0:
-        return chunk_specs, []
-
-    merged_specs = list(chunk_specs)
-    warnings: list[str] = []
-    merged_count = 0
-    merge_slack = max(10, minimum_size // 2)
-    index = 0
-    while index < len(merged_specs):
-        if len(merged_specs) < 2:
-            break
-        current = merged_specs[index]
-        current_size = _estimate_tokens(current.get("content", ""), chunk_mode, config)
-        if current_size >= minimum_size:
-            index += 1
-            continue
-
-        source_segments_count = max(0, _parse_int(current.get("source_segments_count"), 0))
-        if source_segments_count > 1 and current_size > max(20, minimum_size // 2):
-            index += 1
-            continue
-
-        starts_with_chapter_break = bool(current.get("starts_with_chapter_break"))
-        candidates = []
-        if index + 1 < len(merged_specs):
-            next_total = _estimate_tokens(
-                CHUNK_SEPARATOR.join(part for part in (current.get("content", ""), merged_specs[index + 1].get("content", "")) if part),
-                chunk_mode,
-                config,
-            )
-            candidates.append(("next", next_total, next_total <= hard_cap_size, 0 if starts_with_chapter_break else 1))
-        if index > 0 and not starts_with_chapter_break:
-            prev_total = _estimate_tokens(
-                CHUNK_SEPARATOR.join(part for part in (merged_specs[index - 1].get("content", ""), current.get("content", "")) if part),
-                chunk_mode,
-                config,
-            )
-            candidates.append(("prev", prev_total, prev_total <= hard_cap_size, 0))
-
-        if not candidates:
-            index += 1
-            continue
-
-        candidates.sort(key=lambda item: (0 if item[2] else 1, item[3], item[1]))
-        direction, combined_size, within_cap, _ = candidates[0]
-        if not within_cap and combined_size > hard_cap_size + merge_slack:
-            warnings.append(
-                f"Chunk {index} remains below the preferred floor ({current_size} {chunk_mode}); neighbor merge would exceed hard cap"
-            )
-            index += 1
-            continue
-
-        if direction == "prev":
-            merged_specs[index - 1] = _merge_chunk_specs(merged_specs[index - 1], current)
-            del merged_specs[index]
-            index = max(0, index - 1)
-        else:
-            merged_specs[index] = _merge_chunk_specs(current, merged_specs[index + 1])
-            del merged_specs[index + 1]
-        merged_count += 1
-
-    if merged_count:
-        warnings.append(
-            f"Merged {merged_count} undersized chunk fragment(s) below the preferred floor of {minimum_size} {chunk_mode}"
-        )
-    remaining_small = sum(
-        1 for spec in merged_specs
-        if _estimate_tokens(spec.get("content", ""), chunk_mode, config) < minimum_size
-    )
-    if remaining_small:
-        warnings.append(
-            f"{remaining_small} chunk(s) remain below the preferred floor of {minimum_size} {chunk_mode}"
-        )
-    return merged_specs, warnings
-
-
-def _chunk_segments_payload(metadata: dict, segments: list[dict], source_file: str, output_dir: str,
-                            chunk_size: int = 0, prompt_name: str = "", config_path: str = None,
-                            *, chapters_path: str = "", driver: str = "chunk-segments",
-                            source_kind: str = "segments", normalized_document_path: str = "",
-                            source_adapter: str = "", source_segments_file: str = "") -> dict:
-    """Chunk segments payload."""
-    if not segments:
-        print("Error: No usable segments found", file=sys.stderr)
-        sys.exit(2)
-
-    chunking = _prepare_chunking_context(prompt_name, chunk_size, config_path)
-    config = chunking["config"]
-    budget = chunking["budget"]
-    chunk_mode = chunking["chunk_mode"]
-    use_legacy_char_override = chunking["use_legacy_char_override"]
-    recommended_chunk_size = chunking["recommended_chunk_size"]
-    effective_chunk_size = chunking["effective_chunk_size"]
-    hard_cap_size = chunking["hard_cap_size"]
-    target_tokens = chunking["target_tokens"]
-    hard_cap_tokens = chunking["hard_cap_tokens"]
-
-    prepared_segments = []
-    warnings = []
-    for index, segment in enumerate(segments):
-        split_segments, split_warnings = _split_timed_segment(segment, hard_cap_size, chunk_mode, config, index)
-        prepared_segments.extend(split_segments)
-        warnings.extend(split_warnings)
-
-    chapter_break_ids: set[int] = set()
-    if chapters_path:
-        chapters = _load_chapters_document(chapters_path)
-        chapter_break_ids, chapter_warnings = _map_chapter_starts_to_segment_break_ids(chapters, segments)
-        warnings.extend(chapter_warnings)
-
-    chunk_specs = []
-    current_parts = []
-    current_size = 0
-    separator_size = len(CHUNK_SEPARATOR) if chunk_mode == "chars" else _estimate_tokens(CHUNK_SEPARATOR, "tokens", config)
-
-    def finalize_chunk(parts: list[dict]):
-        """Finalize chunk."""
-        if not parts:
-            return
-        content = CHUNK_SEPARATOR.join(part["text"] for part in parts if part.get("text"))
-        start_time = next((part.get("start_time") for part in parts if part.get("start_time") is not None), None)
-        end_time = next((part.get("end_time") for part in reversed(parts) if part.get("end_time") is not None), None)
-        segment_ids = [part.get("id") for part in parts if part.get("id") is not None]
-        first_part = parts[0]
-        first_part_id = first_part.get("id")
-        first_part_index = first_part.get("segment_part_index")
-        starts_with_chapter_break = (
-            first_part_id is not None
-            and (first_part_index is None or int(first_part_index) == 0)
-            and int(first_part_id) in chapter_break_ids
-        )
-        chunk_specs.append({
-            "content": content,
-            "start_time": start_time,
-            "end_time": end_time,
-            "duration_sec": None if start_time is None or end_time is None else round(max(0.0, end_time - start_time), 3),
-            "segment_ids": segment_ids,
-            "source_segment_start": segment_ids[0] if segment_ids else None,
-            "source_segment_end": segment_ids[-1] if segment_ids else None,
-            "source_segments_count": len({seg_id for seg_id in segment_ids}),
-            "starts_with_chapter_break": starts_with_chapter_break,
-        })
-
-    for part in prepared_segments:
-        part_len = _estimate_tokens(part["text"], chunk_mode, config)
-
-        part_id = part.get("id")
-        part_index = part.get("segment_part_index")
-        is_first_part = part_index is None or int(part_index) == 0
-        if current_parts and is_first_part and part_id is not None and int(part_id) in chapter_break_ids:
-            finalize_chunk(current_parts)
-            current_parts = [part]
-            current_size = part_len
-            continue
-
-        candidate_size = current_size + part_len + (separator_size if current_parts else 0)
-        if current_parts and (candidate_size > effective_chunk_size or candidate_size > hard_cap_size):
-            finalize_chunk(current_parts)
-            current_parts = [part]
-            current_size = part_len
-        else:
-            current_parts.append(part)
-            current_size = candidate_size
-
-    if current_parts:
-        finalize_chunk(current_parts)
-
-    chunk_specs, merge_warnings = _coalesce_undersized_chunk_specs(
-        chunk_specs,
-        chunk_mode,
-        config,
-        effective_chunk_size,
-        hard_cap_size,
-    )
-    warnings.extend(merge_warnings)
-
-    out_dir = Path(output_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    plan_id = _new_plan_id()
-    has_timing = any(segment.get("start_time") is not None or segment.get("end_time") is not None for segment in segments)
-    chunk_contract = _build_manifest_chunk_contract(
-        source_kind,
-        driver=driver,
-        normalized_document_path=normalized_document_path,
-        source_adapter=source_adapter,
-        has_timing=has_timing,
-        chapters_enabled=bool(chapters_path),
-    )
-    manifest = {
-        "schema_version": MANIFEST_SCHEMA_VERSION,
-        "total_chunks": len(chunk_specs),
-        "source_file": str(Path(source_file).absolute()) if source_file else "",
-        "source_segments_file": str(Path(source_segments_file or source_file).absolute()) if (source_segments_file or source_file) else "",
-        "source_segments_count": len(segments),
-        "source_kind": str(metadata.get("source", "")).strip(),
-        "source_adapter": str(source_adapter or metadata.get("source", "")).strip(),
-        "work_dir": str(out_dir.absolute()),
-        "normalized_document_path": str(normalized_document_path).strip(),
-        "plan": _build_manifest_plan(
-            prompt_name,
-            chunk_mode,
-            recommended_chunk_size,
-            effective_chunk_size,
-            {
-                **budget,
-                "target_tokens": target_tokens,
-                "hard_cap_tokens": hard_cap_tokens,
-            },
-            source_file=str(Path(source_file).absolute()) if source_file else "",
-            plan_id=plan_id,
-            chunk_contract=chunk_contract,
-        ),
-        "runtime": _build_manifest_runtime(plan_id),
-        "chunks": [],
-    }
-
-    for index, chunk_spec in enumerate(chunk_specs):
-        chunk_filename = f"chunk_{index:03d}.txt"
-        chunk_path = out_dir / chunk_filename
-        _atomic_write_text(chunk_path, chunk_spec["content"])
-
-        chunk_entry = _new_chunk_manifest_entry(
-            index,
-            chunk_spec["content"],
-            budget,
-            config,
-            raw_path=chunk_filename,
-            processed_path=f"processed_{index:03d}.md",
-            plan_id=plan_id,
-            chunk_contract=chunk_contract,
-        )
-        chunk_entry["start_time"] = chunk_spec["start_time"]
-        chunk_entry["end_time"] = chunk_spec["end_time"]
-        chunk_entry["duration_sec"] = chunk_spec["duration_sec"]
-        chunk_entry["source_segment_start"] = chunk_spec["source_segment_start"]
-        chunk_entry["source_segment_end"] = chunk_spec["source_segment_end"]
-        chunk_entry["source_segments_count"] = chunk_spec["source_segments_count"]
-        manifest["chunks"].append(chunk_entry)
-
-    manifest_path = out_dir / "manifest.json"
-    _sync_manifest_legacy_fields(manifest)
-    _write_manifest(manifest_path, manifest)
-
-    for warning in warnings:
-        print(f"⚠️ {warning}", file=sys.stderr)
-
-    if use_legacy_char_override:
-        print(
-            "ℹ️ Interpreting explicit chunk_size as characters for backward compatibility; add --prompt to use token-aware auto sizing.",
-            file=sys.stderr,
-        )
-
-    if prompt_name and chunk_size <= 0:
-        print(
-            f"ℹ️ Auto-selected chunk_size={effective_chunk_size} ({chunk_mode}) for prompt '{prompt_name}'",
-            file=sys.stderr,
-        )
-
-    return {
-        "total_chunks": len(chunk_specs),
-        "manifest_path": str(manifest_path),
-        "plan_id": plan_id,
-        "chunks": [chunk["raw_path"] for chunk in manifest["chunks"]],
-        "warnings": warnings,
-        "chunk_size": effective_chunk_size,
-        "recommended_chunk_size": manifest["recommended_chunk_size"],
-        "chunk_mode": chunk_mode,
-        "target_tokens": manifest["target_tokens"],
-        "hard_cap_tokens": manifest["hard_cap_tokens"],
-        "source_segments_count": len(segments),
-        "source_kind": chunk_contract["source_kind"],
-        "driver": chunk_contract["driver"],
-        "normalized_document_path": str(normalized_document_path).strip(),
-    }
-
-
-def chunk_segments(segments_path: str, output_dir: str, chunk_size: int = 0,
-                   prompt_name: str = "", config_path: str = None,
-                   chapters_path: str = "") -> dict:
-    """Delegate segment chunking to `kernel.long_text.chunking`."""
-    return kernel_chunking.chunk_segments(
-        segments_path,
-        output_dir,
-        chunk_size=chunk_size,
-        prompt_name=prompt_name,
-        config_path=config_path,
-        chapters_path=chapters_path,
-    )
-
-
-def chunk_document(normalized_document_path: str, output_dir: str, chunk_size: int = 0,
-                   prompt_name: str = "", config_path: str = None,
-                   chapters_path: str = "", prefer: str = "auto") -> dict:
-    """Delegate normalized-document chunking to `kernel.long_text.chunking`."""
-    return kernel_chunking.chunk_document(
-        normalized_document_path,
-        output_dir,
-        chunk_size=chunk_size,
-        prompt_name=prompt_name,
-        config_path=config_path,
-        chapters_path=chapters_path,
-        prefer=prefer,
-    )
-
-
-def get_chapters(video_url: str, timeout: int = 30) -> dict:
-    """
-    Fetch YouTube video chapter metadata using yt-dlp
-    
-    Args:
-        video_url: YouTube video URL
-        timeout: Timeout in seconds for yt-dlp command (default 30)
-    
-    Returns:
-        {"has_chapters": bool, "chapters": [{"title": ..., "start_time": ..., "end_time": ...}, ...]}
-    """
-    try:
-        cmd = [
-            "yt-dlp", "--print", "%(chapters)j", video_url
-        ]
-        # Don't use check=True - some warnings may cause non-zero exit but still output data
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-        output = result.stdout.strip()
-        
-        # Handle various empty/null cases
-        if not output or output == 'null' or output == 'NA' or output == 'None':
-            return {"has_chapters": False, "chapters": []}
-        
-        try:
-            chapters = json.loads(output)
-        except json.JSONDecodeError:
-            # Sometimes yt-dlp outputs non-JSON error messages
-            return {"has_chapters": False, "chapters": []}
-        
-        if not chapters or not isinstance(chapters, list):
-            return {"has_chapters": False, "chapters": []}
-        
-        return {
-            "has_chapters": True,
-            "chapters": chapters
-        }
-    except subprocess.TimeoutExpired:
-        print(f"Error: yt-dlp timed out after {timeout}s", file=sys.stderr)
-        return {"has_chapters": False, "chapters": [], "error": f"Timeout after {timeout}s"}
-    except FileNotFoundError:
-        print("Error: yt-dlp not found. Please install it: pip install yt-dlp", file=sys.stderr)
-        return {"has_chapters": False, "chapters": [], "error": "yt-dlp not found"}
-    except Exception as e:
-        print(f"Error: {e}", file=sys.stderr)
-        return {"has_chapters": False, "chapters": [], "error": str(e)}
-
-
-def _resolve_manifest_path(manifest_ref: str) -> Path:
-    """Resolve manifest path."""
-    path = Path(manifest_ref)
-    if path.is_dir():
-        return path / "manifest.json"
-    return path
-
-
-def build_chapter_plan(chapters_path: str, manifest_ref: str, output_path: str = "") -> dict:
-    """Build chapter plan."""
-    return kernel_merge.build_chapter_plan(chapters_path, manifest_ref, output_path=output_path)
-
-
-def merge_content(work_dir: str, output_file: str, header_content: str = "") -> dict:
-    """Merge content."""
-    return kernel_merge.merge_content(work_dir, output_file, header_content=header_content)
-
-
 def _call_llm_api(api_key: str, base_url: str, model: str, messages: list,
                   api_format: str = "openai", max_tokens: int = 8192,
                   temperature: float = 0.3, timeout_sec: int = 120,
@@ -4060,318 +1815,6 @@ def _call_llm_api(api_key: str, base_url: str, model: str, messages: list,
         max_retries=max_retries,
         backoff_sec=backoff_sec,
         stream_mode=stream_mode,
-    )
-
-
-def test_llm_api(config_path: str = None, api_key: str = "", base_url: str = "",
-                 model: str = "", api_format: str = "", timeout_sec: int = 0,
-                 stream_mode: str = "") -> dict:
-    """Probe configured LLM reachability and return a normalized diagnostics payload."""
-    config = _load_optional_config(config_path)
-    api_key = api_key or config.get("llm_api_key", "")
-    base_url = base_url or config.get("llm_base_url", "")
-    model = model or config.get("llm_model", "")
-    api_format = api_format or config.get("llm_api_format", "openai")
-    timeout_sec = timeout_sec or config.get("llm_probe_timeout_sec", 20)
-    stream_mode = stream_mode or config.get("llm_stream", "auto")
-    max_tokens = config.get("llm_probe_max_tokens", 16)
-
-    if not api_key or not base_url or not model:
-        return {
-            "valid": False,
-            "error": "LLM API is not fully configured",
-            "error_type": "config",
-            "request_url": _build_api_url(base_url, api_format) if base_url else "",
-        }
-
-    try:
-        result = _call_llm_api(
-            api_key=api_key,
-            base_url=base_url,
-            model=model,
-            messages=[{"role": "user", "content": "Reply with OK only."}],
-            api_format=api_format,
-            max_tokens=max_tokens,
-            temperature=0.0,
-            timeout_sec=timeout_sec,
-            max_retries=1,
-            backoff_sec=min(config.get("llm_backoff_sec", 1.5), 1.0),
-            stream_mode=stream_mode,
-        )
-        return {
-            "valid": True,
-            "model": model,
-            "api_format": api_format,
-            "request_url": result["request_url"],
-            "latency_ms": result["latency_ms"],
-            "attempts": result["attempts"],
-            "streaming_used": result["streaming_used"],
-            "preview": result["text"][:80],
-        }
-    except LLMRequestError as error:
-        return {
-            "valid": False,
-            "model": model,
-            "api_format": api_format,
-            "request_url": error.request_url,
-            "status_code": error.status_code,
-            "error_type": error.error_type,
-            "error": str(error),
-            "attempts": getattr(error, "attempts", 1),
-        }
-
-
-def _count_tokens_via_provider(text: str, config: dict | None = None,
-                               api_key: str = "", base_url: str = "",
-                               model: str = "", api_format: str = "",
-                               timeout_sec: int = 0) -> dict:
-    """Count tokens via provider."""
-    import urllib.error
-    import urllib.request
-
-    config = config or {}
-    local_estimate = _estimate_tokens_local(text, "tokens", config)
-    api_format = (api_format or config.get("llm_api_format", "openai") or "openai").strip().lower()
-    api_key = api_key or config.get("llm_api_key", "")
-    base_url = base_url or config.get("llm_base_url", "")
-    model = model or config.get("llm_model", "")
-    timeout_sec = timeout_sec or config.get("llm_probe_timeout_sec", 20)
-
-    if not _parse_bool(config.get("enable_token_count_probe"), DEFAULT_ENABLE_TOKEN_COUNT_PROBE):
-        return {
-            "valid": False,
-            "provider_supported": False,
-            "token_count": local_estimate,
-            "token_count_source": "local_estimate",
-            "error_type": "disabled",
-            "error": "Token count probe disabled in config",
-            "request_url": "",
-            "latency_ms": None,
-            "api_format": api_format,
-        }
-
-    if api_format != "anthropic":
-        return {
-            "valid": False,
-            "provider_supported": False,
-            "token_count": local_estimate,
-            "token_count_source": "local_estimate",
-            "error_type": "unsupported_api_format",
-            "error": f"Provider token counting is not implemented for api_format={api_format}",
-            "request_url": "",
-            "latency_ms": None,
-            "api_format": api_format,
-        }
-
-    if not api_key or not base_url or not model:
-        return {
-            "valid": False,
-            "provider_supported": False,
-            "token_count": local_estimate,
-            "token_count_source": "local_estimate",
-            "error_type": "config",
-            "error": "LLM API is not fully configured",
-            "request_url": _build_token_count_url(base_url, api_format) if base_url else "",
-            "latency_ms": None,
-            "api_format": api_format,
-        }
-
-    url = _build_token_count_url(base_url, api_format)
-    headers = {
-        "x-api-key": api_key,
-        "Content-Type": "application/json",
-        "anthropic-version": "2023-06-01",
-        "User-Agent": "yt-transcript/4.0",
-    }
-    body = {
-        "model": model,
-        "messages": [{"role": "user", "content": text or " "}],
-    }
-    req = urllib.request.Request(
-        url,
-        data=json.dumps(body).encode("utf-8"),
-        headers=headers,
-        method="POST",
-    )
-
-    try:
-        started_at = time.monotonic()
-        with urllib.request.urlopen(req, timeout=timeout_sec) as response:
-            result = json.loads(response.read().decode("utf-8"))
-        latency_ms = int((time.monotonic() - started_at) * 1000)
-        input_tokens = max(0, _parse_int(result.get("input_tokens"), 0))
-        return {
-            "valid": True,
-            "provider_supported": True,
-            "token_count": input_tokens,
-            "token_count_source": "provider",
-            "request_url": url,
-            "latency_ms": latency_ms,
-            "api_format": api_format,
-            "model": model,
-        }
-    except urllib.error.HTTPError as error:
-        error_body = error.read().decode("utf-8", errors="replace")
-        return {
-            "valid": False,
-            "provider_supported": False,
-            "token_count": local_estimate,
-            "token_count_source": "local_estimate",
-            "request_url": url,
-            "latency_ms": None,
-            "api_format": api_format,
-            "status_code": error.code,
-            "error_type": f"http_{error.code}",
-            "error": error_body,
-        }
-    except urllib.error.URLError as error:
-        reason = getattr(error, "reason", error)
-        return {
-            "valid": False,
-            "provider_supported": False,
-            "token_count": local_estimate,
-            "token_count_source": "local_estimate",
-            "request_url": url,
-            "latency_ms": None,
-            "api_format": api_format,
-            "error_type": "network",
-            "error": str(reason),
-        }
-    except (socket.timeout, TimeoutError) as error:
-        return {
-            "valid": False,
-            "provider_supported": False,
-            "token_count": local_estimate,
-            "token_count_source": "local_estimate",
-            "request_url": url,
-            "latency_ms": None,
-            "api_format": api_format,
-            "error_type": "timeout",
-            "error": str(error),
-        }
-    except Exception as error:
-        return {
-            "valid": False,
-            "provider_supported": False,
-            "token_count": local_estimate,
-            "token_count_source": "local_estimate",
-            "request_url": url,
-            "latency_ms": None,
-            "api_format": api_format,
-            "error_type": "unknown",
-            "error": str(error),
-        }
-
-
-def test_token_count(config_path: str = None, api_key: str = "", base_url: str = "",
-                     model: str = "", api_format: str = "", timeout_sec: int = 0,
-                     sample_text: str = "Reply with OK only.") -> dict:
-    """Test token count."""
-    config = _load_optional_config(config_path)
-    api_key = api_key or config.get("llm_api_key", "")
-    base_url = base_url or config.get("llm_base_url", "")
-    model = model or config.get("llm_model", "")
-    api_format = api_format or config.get("llm_api_format", "openai")
-    timeout_sec = timeout_sec or config.get("llm_probe_timeout_sec", 20)
-    sample_text = sample_text or "Reply with OK only."
-
-    provider_probe = _count_tokens_via_provider(
-        sample_text,
-        config=config,
-        api_key=api_key,
-        base_url=base_url,
-        model=model,
-        api_format=api_format,
-        timeout_sec=timeout_sec,
-    )
-    provider_probe["sample_text"] = sample_text
-    provider_probe["probe_enabled"] = _parse_bool(
-        config.get("enable_token_count_probe"),
-        DEFAULT_ENABLE_TOKEN_COUNT_PROBE,
-    )
-    provider_probe["fallback_used"] = not provider_probe.get("valid", False)
-
-    if provider_probe.get("valid", False):
-        return provider_probe
-
-    provider_probe["valid"] = True
-    provider_probe.setdefault("provider_supported", False)
-    provider_probe.setdefault("token_count_source", "local_estimate")
-    provider_probe.setdefault(
-        "error",
-        "Provider token count unavailable; using local heuristic fallback",
-    )
-    return provider_probe
-
-
-def _estimate_chunk_input_tokens(chunk_info: dict, input_key: str, text: str,
-                                 config: dict | None = None) -> tuple[int, str]:
-    """Estimate chunk input tokens without adding another network probe.
-
-    For `processed_path` chains we reuse `actual_output_tokens`, because that is
-    the closest measurement of the text now being fed into the next stage.
-    """
-    chunk_info = chunk_info or {}
-    config = config or {}
-
-    if input_key == "processed_path":
-        cached_tokens = max(0, _parse_int(chunk_info.get("actual_output_tokens"), 0))
-        if cached_tokens > 0:
-            return cached_tokens, "manifest_cached_output"
-    else:
-        cached_tokens = max(0, _parse_int(chunk_info.get("estimated_input_tokens"), 0))
-        if cached_tokens > 0:
-            return cached_tokens, "manifest_cached_input"
-
-    return _estimate_tokens(text, "tokens", config), "local_estimate"
-
-
-def _refresh_manifest_token_source_summary(manifest: dict) -> None:
-    """Refresh manifest token source summary."""
-    chunks = manifest.get("chunks", []) if isinstance(manifest, dict) else []
-    sources = sorted({
-        str(chunk.get("token_count_source", "")).strip()
-        for chunk in chunks
-        if str(chunk.get("token_count_source", "")).strip()
-    })
-    manifest["token_count_sources"] = sources
-    if not sources:
-        manifest["token_count_source"] = ""
-    elif len(sources) == 1:
-        manifest["token_count_source"] = sources[0]
-    else:
-        manifest["token_count_source"] = "mixed"
-
-
-def process_chunks(work_dir: str, prompt_name: str, extra_instruction: str = "",
-                   config_path: str = None, dry_run: bool = False,
-                   input_key: str = "raw_path", force: bool = False,
-                   runtime_ownership: dict | None = None) -> dict:
-    """Delegate chunk execution to `kernel.long_text.execution`."""
-    return kernel_execution.process_chunks(
-        work_dir,
-        prompt_name,
-        extra_instruction=extra_instruction,
-        config_path=config_path,
-        dry_run=dry_run,
-        input_key=input_key,
-        force=force,
-        runtime_ownership=runtime_ownership,
-    )
-
-
-def _process_chunks_impl(work_dir: str, prompt_name: str, extra_instruction: str = "",
-                         config_path: str = None, dry_run: bool = False,
-                         input_key: str = "raw_path", force: bool = False) -> dict:
-    """Delegate chunk processing to `kernel.long_text.processing`."""
-    return kernel_processing._process_chunks_impl(
-        work_dir,
-        prompt_name,
-        extra_instruction=extra_instruction,
-        config_path=config_path,
-        dry_run=dry_run,
-        input_key=input_key,
-        force=force,
     )
 
 
@@ -5498,43 +2941,9 @@ def verify_quality(optimized_text_path: str, raw_text_path: str = None,
             except Exception:
                 pass  # Non-critical, skip if raw text unreadable
 
-    empty_processed_files = []
-    if work_dir:
-        work_path = Path(work_dir)
-        if work_path.exists() and work_path.is_dir():
-            try:
-                manifest_path = work_path / "manifest.json"
-                if manifest_path.exists():
-                    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-                    processed_names = []
-                    for chunk in manifest.get("chunks", []):
-                        if not isinstance(chunk, dict):
-                            continue
-                        if chunk.get("status") == SUPERSEDED_CHUNK_STATUS:
-                            continue
-                        processed_name = str(chunk.get("processed_path", "") or "").strip()
-                        if processed_name:
-                            processed_names.append(processed_name)
-                else:
-                    processed_names = [path.name for path in sorted(work_path.glob("processed_*.md"))]
-
-                for processed_name in processed_names:
-                    processed_path = work_path / processed_name
-                    if processed_path.exists() and processed_path.is_file() and processed_path.stat().st_size == 0:
-                        empty_processed_files.append(str(processed_path))
-            except Exception:
-                empty_processed_files = []
-
-    checks["empty_processed_file_count"] = len(empty_processed_files)
-    checks["empty_processed_files"] = empty_processed_files
-    checks["processed_chunks_non_empty"] = len(empty_processed_files) == 0
-    if empty_processed_files:
-        preview = ", ".join(Path(path).name for path in empty_processed_files[:5])
-        suffix = "" if len(empty_processed_files) <= 5 else f", +{len(empty_processed_files) - 5} more"
-        hard_failures.append(f"Empty processed chunk file(s) detected: {preview}{suffix}")
-
-    if work_dir and kernel_window.manifest_uses_window(work_dir):
-        window_coverage = kernel_window.coverage_report(kernel_window.load_window_state(work_dir))
+    window_state = kernel_window.load_window_state(work_dir) if work_dir else {}
+    if window_state:
+        window_coverage = kernel_window.coverage_report(window_state)
         checks["window_coverage_ratio"] = window_coverage["coverage_ratio"]
         checks["window_uncovered_ranges"] = window_coverage["uncovered_ranges"]
         checks["window_low_output_ratio_paragraphs"] = window_coverage["low_output_ratio_paragraphs"]
@@ -5557,232 +2966,8 @@ def verify_quality(optimized_text_path: str, raw_text_path: str = None,
     }
 
 
-STATE_STAGE_FIELDS = {
-    "metadata": ["vid", "url", "title", "channel", "upload_date", "duration", "output_dir"],
-    "post-source": ["vid", "url", "title", "channel", "upload_date", "duration", "output_dir",
-                    "mode", "src", "source_language", "subtitle_source"],
-    "pre-assemble": ["vid", "url", "title", "channel", "upload_date", "duration", "output_dir",
-                     "mode", "src", "source_language", "subtitle_source"],
-    "final": ["vid", "url", "title", "channel", "upload_date", "duration", "output_dir",
-              "mode", "src", "source_language", "subtitle_source", "output_file"],
-}
-
-MACHINE_STATE_SCHEMA_VERSION = 1
-MACHINE_STATE_FORMAT = "yt_transcript.machine_state/v1"
 NORMALIZED_DOCUMENT_SCHEMA_VERSION = 1
 NORMALIZED_DOCUMENT_FORMAT = "yt_transcript.normalized_document/v1"
-LEGACY_STATE_MACHINE_SUFFIX = "_machine_state.json"
-
-
-def _derive_machine_state_path(state_path: str | Path) -> Path:
-    """Derive machine state path."""
-    path = Path(state_path)
-    if path.suffix.lower() == ".json":
-        return path
-    if path.name.endswith("_state.md"):
-        return path.with_name(path.name[:-len("_state.md")] + LEGACY_STATE_MACHINE_SUFFIX)
-    stem = path.stem
-    if stem.endswith("_state"):
-        stem = stem[:-len("_state")]
-    return path.with_name(f"{stem}{LEGACY_STATE_MACHINE_SUFFIX}")
-
-
-def _derive_legacy_state_path(machine_state_path: str | Path) -> Path:
-    """Derive legacy state path."""
-    path = Path(machine_state_path)
-    if path.suffix.lower() == ".md":
-        return path
-    if path.name.endswith(LEGACY_STATE_MACHINE_SUFFIX):
-        return path.with_name(path.name[:-len(LEGACY_STATE_MACHINE_SUFFIX)] + "_state.md")
-    return path.with_suffix(".md")
-
-
-def _default_normalized_document_path(document_id: str) -> str:
-    """Return the default normalized document path."""
-    token = str(document_id or "").strip() or "unknown"
-    return f"/tmp/{token}_normalized_document.json"
-
-
-def _parse_legacy_state_content(content: str) -> dict:
-    """Parse legacy state content."""
-    state = {}
-    for raw_line in content.splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#") or line.startswith("-"):
-            continue
-        if ":" not in line:
-            continue
-        key, _, value = line.partition(":")
-        state[key.strip()] = value.strip()
-    return state
-
-
-def _read_legacy_state_file(state_path: str | Path) -> tuple[dict, str]:
-    """Read legacy state file."""
-    path = Path(state_path)
-    try:
-        content = path.read_text(encoding="utf-8")
-    except Exception as e:
-        print(f"Error: Cannot read state file: {e}", file=sys.stderr)
-        sys.exit(2)
-    return _parse_legacy_state_content(content), content
-
-
-def _compat_fields_to_machine_state(compat_fields: dict, legacy_state_path: Path,
-                                 machine_state_path: Path, existing_payload: dict | None = None) -> dict:
-    """Compat fields to machine state."""
-    compat = {str(key).strip(): str(value).strip() for key, value in (compat_fields or {}).items() if str(key).strip()}
-    content = "\n".join(f"{key}: {value}" for key, value in sorted(compat.items()))
-    content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
-    existing_payload = existing_payload if isinstance(existing_payload, dict) else {}
-    existing_artifacts = existing_payload.get("artifacts", {}) if isinstance(existing_payload.get("artifacts", {}), dict) else {}
-    existing_normalization = existing_payload.get("normalization", {}) if isinstance(existing_payload.get("normalization", {}), dict) else {}
-
-    source = {
-        "type": compat.get("src", ""),
-        "url": compat.get("url", ""),
-        "title": compat.get("title", ""),
-        "channel": compat.get("channel", ""),
-        "upload_date": compat.get("upload_date", ""),
-        "duration": compat.get("duration", ""),
-        "source_language": compat.get("source_language", ""),
-        "subtitle_source": compat.get("subtitle_source", ""),
-    }
-    artifacts = {
-        "output_dir": compat.get("output_dir", existing_artifacts.get("output_dir", "")),
-        "work_dir": compat.get("work_dir", existing_artifacts.get("work_dir", "")),
-        "output_file": compat.get("output_file", existing_artifacts.get("output_file", "")),
-        "raw_text": compat.get("raw_text", existing_artifacts.get("raw_text", "")),
-        "structured_text": compat.get("structured_text", existing_artifacts.get("structured_text", "")),
-        "optimized_text": compat.get("optimized_text", existing_artifacts.get("optimized_text", "")),
-        "segments_path": compat.get("segments_path", existing_artifacts.get("segments_path", "")),
-        "normalized_document": compat.get("normalized_document", existing_artifacts.get("normalized_document", "")),
-    }
-    workflow = {
-        "mode": compat.get("mode", ""),
-        "step": compat.get("step", ""),
-        "last_action": compat.get("last_action", ""),
-        "chunk": compat.get("chunk", ""),
-        "total": compat.get("total", ""),
-    }
-    return {
-        "schema_version": MACHINE_STATE_SCHEMA_VERSION,
-        "format": MACHINE_STATE_FORMAT,
-        "updated_at": _now_iso(),
-        "document_id": compat.get("vid", ""),
-        "legacy_state_path": str(legacy_state_path),
-        "machine_state_path": str(machine_state_path),
-        "compat_projection": {
-            "fields": compat,
-            "source_hash": content_hash,
-        },
-        "source": source,
-        "artifacts": artifacts,
-        "workflow": workflow,
-        "normalization": existing_normalization,
-    }
-
-
-def _read_machine_state(machine_state_path: str | Path) -> dict:
-    """Read machine state."""
-    path = Path(machine_state_path)
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except Exception as e:
-        print(f"Error: Cannot read machine state: {e}", file=sys.stderr)
-        sys.exit(2)
-    if not isinstance(payload, dict):
-        print("Error: Machine state must be a JSON object", file=sys.stderr)
-        sys.exit(2)
-    return payload
-
-
-def _write_machine_state(machine_state_path: str | Path, payload: dict) -> None:
-    """Write machine state."""
-    path = Path(machine_state_path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    _atomic_write_text(path, json.dumps(payload, ensure_ascii=False, indent=2))
-
-
-def _machine_state_to_compat_fields(payload: dict) -> dict:
-    """Machine state to compat fields."""
-    compat = payload.get("compat_projection", {}).get("fields", {}) if isinstance(payload, dict) else {}
-    if not isinstance(compat, dict):
-        return {}
-    return {str(key).strip(): str(value).strip() for key, value in compat.items() if str(key).strip()}
-
-
-def sync_machine_state(state_ref: str, write_legacy: bool = False) -> dict:
-    """Synchronize machine state."""
-    path = Path(state_ref)
-    if path.suffix.lower() == ".json":
-        if not path.exists():
-            print(f"Error: Machine state file not found: {state_ref}", file=sys.stderr)
-            sys.exit(1)
-        machine_state = _read_machine_state(path)
-        legacy_state_path = _derive_legacy_state_path(path)
-        compat_fields = _machine_state_to_compat_fields(machine_state)
-        if write_legacy:
-            lines = ["# State"]
-            for key, value in compat_fields.items():
-                lines.append(f"{key}: {value}")
-            _atomic_write_text(legacy_state_path, "\n".join(lines) + "\n")
-        return {
-            "machine_state_path": str(path),
-            "legacy_state_path": str(legacy_state_path),
-            "compat_fields": compat_fields,
-            "updated_machine_state": False,
-            "updated_legacy_state": write_legacy,
-        }
-
-    if not path.exists():
-        machine_state_path = _derive_machine_state_path(path)
-        if machine_state_path.exists():
-            machine_state = _read_machine_state(machine_state_path)
-            return {
-                "machine_state_path": str(machine_state_path),
-                "legacy_state_path": str(path),
-                "compat_fields": _machine_state_to_compat_fields(machine_state),
-                "updated_machine_state": False,
-                "updated_legacy_state": False,
-            }
-        print(f"Error: State file not found: {state_ref}", file=sys.stderr)
-        sys.exit(1)
-
-    compat_fields, content = _read_legacy_state_file(path)
-    machine_state_path = _derive_machine_state_path(path)
-    content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
-    existing = _read_machine_state(machine_state_path) if machine_state_path.exists() else None
-    existing_hash = ""
-    if isinstance(existing, dict):
-        existing_hash = str(existing.get("compat_projection", {}).get("source_hash", "")).strip()
-    updated_machine_state = not existing or existing_hash != content_hash
-    if updated_machine_state:
-        machine_state = _compat_fields_to_machine_state(compat_fields, path, machine_state_path, existing_payload=existing)
-        _write_machine_state(machine_state_path, machine_state)
-    else:
-        machine_state = existing
-    return {
-        "machine_state_path": str(machine_state_path),
-        "legacy_state_path": str(path),
-        "compat_fields": _machine_state_to_compat_fields(machine_state),
-        "updated_machine_state": updated_machine_state,
-        "updated_legacy_state": False,
-    }
-
-
-def load_state(state_path: str) -> dict:
-    """
-    Load workflow state through the authoritative machine-state bridge.
-
-    Compatibility behavior:
-    - legacy markdown state files remain accepted inputs
-    - if a legacy state file is provided, a sibling machine_state.json is
-      created or refreshed automatically
-    - direct machine_state.json inputs are also supported
-    """
-    sync_result = sync_machine_state(state_path)
-    return sync_result["compat_fields"]
 
 
 def _normalize_text_body(text: str) -> str:
@@ -5817,7 +3002,7 @@ def _normalize_segment_text_for_source(text: str, source_payload: dict) -> str:
 
 
 def _prefer_text_chunking_for_source(source_payload: dict, workflow_payload: dict) -> bool:
-    """Return whether chunk-document should prefer text despite timed segments."""
+    """Return whether chunking should prefer text despite timed segments."""
     if not _is_youtube_subtitle_source(source_payload):
         return False
     mode = str((workflow_payload or {}).get("mode", "")).strip().lower()
@@ -6053,110 +3238,17 @@ def _build_source_routing_signal(source: str, mode: str, subtitle_quality: dict 
     }
 
 
-def _update_machine_state_normalization(machine_state_path: str | Path, *, normalized_document_path: str,
-                                        source_adapter: str, preferred_chunk_source: str,
-                                        segment_count: int, char_count: int,
-                                        raw_text_path: str = "", segments_path: str = "") -> None:
-    """Update machine state normalization."""
-    payload = _read_machine_state(machine_state_path)
-    artifacts = payload.get("artifacts", {}) if isinstance(payload.get("artifacts", {}), dict) else {}
-    if raw_text_path:
-        artifacts["raw_text"] = raw_text_path
-    if segments_path:
-        artifacts["segments_path"] = segments_path
-    artifacts["normalized_document"] = normalized_document_path
-    payload["artifacts"] = artifacts
-    payload["normalization"] = {
-        "materialized_at": _now_iso(),
-        "source_adapter": source_adapter,
-        "preferred_chunk_source": preferred_chunk_source,
-        "segment_count": segment_count,
-        "char_count": char_count,
-        "normalized_document_path": normalized_document_path,
-    }
-    payload["updated_at"] = _now_iso()
-    _write_machine_state(machine_state_path, payload)
-
-
-def normalize_document(state_ref: str, output_path: str = "", prefer: str = "auto",
-                       allow_missing: bool = False) -> dict:
-    """Materialize `normalized_document.json` from synced workflow state artifacts."""
-    sync_result = sync_machine_state(state_ref)
-    compat = sync_result["compat_fields"]
-    machine_state_path = sync_result["machine_state_path"]
-    machine_state = _read_machine_state(machine_state_path)
-    state_paths = {
-        "machine_state_path": machine_state_path,
-        "legacy_state_path": sync_result["legacy_state_path"],
-    }
-    document_id = str(compat.get("vid", machine_state.get("document_id", ""))).strip()
-    normalized_document_path = str(output_path or _default_normalized_document_path(document_id)).strip()
-    if not document_id:
-        return {
-            "passed": False,
-            "warnings": [],
-            "hard_failures": ["Missing document id for normalization"],
-            **state_paths,
-            "normalized_document_path": normalized_document_path,
-            "materialized": False,
-        }
-
-    preference = str(prefer or "auto").strip().lower()
-    if preference not in {"auto", "segments", "raw_text"}:
-        return {
-            "passed": False,
-            "warnings": [],
-            "hard_failures": [f"Unsupported normalization preference: {prefer}"],
-            **state_paths,
-            "normalized_document_path": normalized_document_path,
-            "materialized": False,
-        }
-
-    machine_artifacts = machine_state.get("artifacts", {}) if isinstance(machine_state.get("artifacts", {}), dict) else {}
-    raw_text_path = str(compat.get("raw_text") or machine_artifacts.get("raw_text") or f"/tmp/{document_id}_raw_text.txt").strip()
-    segments_path = str(compat.get("segments_path") or machine_artifacts.get("segments_path") or f"/tmp/{document_id}_segments.json").strip()
-    normalized_document_path = str(output_path or machine_artifacts.get("normalized_document") or normalized_document_path).strip()
-
-    result = build_normalized_document(
-        document_id=document_id,
-        raw_text_path=raw_text_path,
-        segments_path=segments_path,
-        normalized_document_path=normalized_document_path,
-        source_payload=machine_state.get("source", {}),
-        workflow_payload=machine_state.get("workflow", {}),
-        prefer=preference,
-        allow_missing=allow_missing,
-        recorded_mode=compat.get("mode", ""),
-    )
-    if result.get("materialized"):
-        _update_machine_state_normalization(
-            machine_state_path,
-            normalized_document_path=normalized_document_path,
-            source_adapter=result["source_adapter"],
-            preferred_chunk_source=result["preferred_chunk_source"],
-            segment_count=result["segment_count"],
-            char_count=result["char_count"],
-            raw_text_path=result["raw_text_path"],
-            segments_path=result["segments_path"],
-        )
-    result.pop("raw_text_path", None)
-    result.pop("segments_path", None)
-    return {**result, **state_paths}
-
-
 def build_normalized_document(*, document_id: str, raw_text_path: str, segments_path: str,
                               normalized_document_path: str, source_payload: dict | None = None,
-                              workflow_payload: dict | None = None, prefer: str = "auto",
-                              allow_missing: bool = False, recorded_mode: str = "") -> dict:
+                              workflow_payload: dict | None = None) -> dict:
     """Write the normalized document from a raw text file and/or a segments file.
 
     `source_payload` says where the text came from (`type` youtube or deepgram,
     `subtitle_source`, title, channel, ...) and `workflow_payload` carries the
     output `mode`; together they decide how the text is cleaned, whether
     chunking prefers text over timed segments, and whether the subtitle
-    quality score applies. `recorded_mode` is the document's `workflow.mode`
-    when `workflow_payload` has none (state.md's mode in the legacy path).
-    The result also names the raw text and segments files that were actually
+    quality score applies. Timed segments are used when the segments file
+    exists, else the raw text. The result also names the raw text and segments files that were actually
     used (`raw_text_path`, `segments_path`).
     """
     source_payload = source_payload if isinstance(source_payload, dict) else {}
@@ -6173,30 +3265,11 @@ def build_normalized_document(*, document_id: str, raw_text_path: str, segments_
 
     if not document_id:
         return failure("Missing document id for normalization")
-    preference = str(prefer or "auto").strip().lower()
-    if preference not in {"auto", "segments", "raw_text"}:
-        return failure(f"Unsupported normalization preference: {prefer}")
 
     raw_text_file = Path(raw_text_path) if raw_text_path else None
     segments_file = Path(segments_path) if segments_path else None
-    use_segments = False
-    if preference in {"auto", "segments"} and segments_file and segments_file.exists():
-        use_segments = True
-    elif preference == "segments":
-        return failure(f"Segments artifact not found: {segments_path}")
-
+    use_segments = bool(segments_file and segments_file.exists())
     if not use_segments and not (raw_text_file and raw_text_file.exists()):
-        if allow_missing:
-            return {
-                "passed": True,
-                "warnings": ["Normalization skipped: no raw text or segments artifact found"],
-                "hard_failures": [],
-                "normalized_document_path": normalized_document_path,
-                "materialized": False,
-                "source_adapter": "",
-                "preferred_chunk_source": "",
-                "segment_count": 0,
-            }
         return failure(f"Raw text artifact not found: {raw_text_path}")
 
     prefer_text_chunking = _prefer_text_chunking_for_source(source_payload, workflow_payload)
@@ -6275,7 +3348,7 @@ def build_normalized_document(*, document_id: str, raw_text_path: str, segments_
             "subtitle_source": source_payload.get("subtitle_source", ""),
         },
         "workflow": {
-            "mode": workflow_payload.get("mode", recorded_mode),
+            "mode": workflow_payload.get("mode", ""),
         },
         "artifacts": {
             "raw_text": used_raw_text,
@@ -6324,191 +3397,6 @@ def build_normalized_document(*, document_id: str, raw_text_path: str, segments_
     }
 
 
-def validate_state(state_path: str, stage: str = "", require: list[str] | None = None) -> dict:
-    """
-    Validate workflow state fields for a stage or explicit required fields.
-
-    Compatibility behavior:
-    - legacy state.md inputs are accepted
-    - machine_state.json is materialized and refreshed automatically when the
-      legacy projection changes
-    """
-    sync_result = sync_machine_state(state_path)
-    state = sync_result["compat_fields"]
-    warnings = []
-    hard_failures = []
-
-    required_fields = []
-    if stage:
-        if stage not in STATE_STAGE_FIELDS:
-            print(f"Error: Unknown state validation stage: {stage}", file=sys.stderr)
-            sys.exit(2)
-        required_fields.extend(STATE_STAGE_FIELDS[stage])
-    if require:
-        for field in require:
-            if field not in required_fields:
-                required_fields.append(field)
-
-    missing_fields = []
-    placeholder_fields = []
-    present_fields = []
-
-    for field in required_fields:
-        value = state.get(field, "")
-        if not value:
-            missing_fields.append(field)
-        elif value.lower() == "unknown":
-            placeholder_fields.append(field)
-        else:
-            present_fields.append(field)
-
-    if missing_fields:
-        hard_failures.append("Missing required state fields: " + ", ".join(missing_fields))
-    if placeholder_fields:
-        hard_failures.append("Unresolved placeholder state fields: " + ", ".join(placeholder_fields))
-    output_filename_date_failures = []
-    if stage == "final" and state.get("output_file"):
-        output_filename_date_failures = _validate_output_filename_date_format(state.get("output_file", ""))
-        hard_failures.extend(output_filename_date_failures)
-
-    checks = {
-        "stage": stage or "custom",
-        "required_fields": required_fields,
-        "present_fields": present_fields,
-        "missing_fields": missing_fields,
-        "placeholder_fields": placeholder_fields,
-        "output_filename_date_failures": output_filename_date_failures,
-    }
-
-    return {
-        "passed": len(hard_failures) == 0,
-        "checks": checks,
-        "warnings": warnings,
-        "hard_failures": hard_failures,
-        "machine_state_path": sync_result["machine_state_path"],
-        "legacy_state_path": sync_result["legacy_state_path"],
-        "updated_machine_state": sync_result["updated_machine_state"],
-    }
-
-
-def _state_output_file_exists(state: dict) -> bool:
-    """Return whether the state records an assembled final output that exists on disk."""
-    output_file = str(state.get("output_file", "") or "").strip()
-    if not output_file or output_file.lower() == "unknown":
-        return False
-    return Path(output_file).expanduser().is_file()
-
-
-def _summarize_chunk_manifest(work_dir: str) -> dict:
-    """Summarize chunk progress from a work_dir manifest without mutating it."""
-    manifest_path = Path(str(work_dir or "").strip()) / "manifest.json" if str(work_dir or "").strip() else None
-    summary = {"manifest_path": str(manifest_path) if manifest_path else "", "has_manifest": False,
-               "total_chunks": 0, "done_chunks": 0, "status_counts": {}}
-    if not manifest_path or not manifest_path.is_file():
-        return summary
-    summary["has_manifest"] = True
-    try:
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    except Exception as e:
-        summary["error"] = f"Cannot read manifest: {e}"
-        return summary
-    chunks = manifest.get("chunks", []) if isinstance(manifest, dict) else []
-    active_chunks = [chunk for chunk in chunks if isinstance(chunk, dict)
-                     and chunk.get("status") != SUPERSEDED_CHUNK_STATUS]
-    status_counts = {}
-    for chunk in active_chunks:
-        status = str(chunk.get("status", "pending")).strip() or "pending"
-        status_counts[status] = status_counts.get(status, 0) + 1
-    summary["total_chunks"] = len(active_chunks)
-    summary["done_chunks"] = status_counts.get("done", 0)
-    summary["status_counts"] = status_counts
-    if isinstance(manifest, dict) and manifest.get(kernel_window.EXECUTOR_MANIFEST_KEY) == "window":
-        window_state = kernel_window.load_window_state(work_dir)
-        summary["long_text_mode"] = "window"
-        summary["window"] = {
-            "status": window_state.get("status", ""),
-            "cursor": window_state.get("cursor", 0),
-            "sentence_count": window_state.get("sentence_count", 0),
-        }
-    return summary
-
-
-def find_unfinished_runs(tmp_dir: str = "/tmp", video_id: str = "") -> dict:
-    """
-    Scan workflow state files and report runs that never produced their final output.
-
-    A run is complete only when its state records `output_file` and that file
-    exists. Everything else is unfinished and keeps its temp artifacts so it can
-    be inspected and resumed. Read-only: no state or manifest is rewritten.
-    """
-    if video_id and not re.fullmatch(r"[A-Za-z0-9_-]+", video_id):
-        print(f"Error: VIDEO_ID contains unsafe characters: {video_id}", file=sys.stderr)
-        sys.exit(2)
-    base = Path(tmp_dir).expanduser()
-    pattern = f"{video_id}_state.md" if video_id else "*_state.md"
-    skill_root = _skill_root()
-    unfinished = []
-    completed = []
-    for state_path in sorted(base.glob(pattern)):
-        if not state_path.is_file():
-            continue
-        try:
-            state = _parse_legacy_state_content(state_path.read_text(encoding="utf-8"))
-        except Exception as e:
-            unfinished.append({"state_path": str(state_path), "error": f"Cannot read state file: {e}"})
-            continue
-        vid = state.get("vid", "")
-        if not vid:
-            # Other tools also leave *_state.md files in /tmp; only workflow states record a vid.
-            continue
-        work_dir = state.get("work_dir", "") or f"{base}/{vid}_chunks"
-        chunks = _summarize_chunk_manifest(work_dir)
-        entry = {
-            "vid": vid,
-            "url": state.get("url", ""),
-            "title": state.get("title", ""),
-            "state_path": str(state_path),
-            "step": state.get("step", ""),
-            "last_action": state.get("last_action", ""),
-            "output_file": state.get("output_file", ""),
-            "work_dir": work_dir,
-            "chunks": chunks,
-        }
-        if _state_output_file_exists(state):
-            entry["next_action"] = f"bash {skill_root}/scripts/cleanup.sh {vid}"
-            completed.append(entry)
-            continue
-        window = chunks.get("window")
-        if window is not None:
-            entry["resume_from_step"] = 4
-            if window["status"] == "done":
-                entry["next_action"] = "The window run is done; merge it, then continue with verify-quality and Step 5"
-            else:
-                entry["next_action"] = (f"Re-run process-chunks on {work_dir} (long_text_mode: window) to resume "
-                                        f"at S{window['cursor'] + 1} of {window['sentence_count']}")
-        elif chunks["has_manifest"] and chunks["total_chunks"] and chunks["done_chunks"] < chunks["total_chunks"]:
-            entry["resume_from_step"] = 4
-            entry["next_action"] = (f"python3 {skill_root}/yt_transcript_utils.py prepare-resume {work_dir}, "
-                                    "then continue Step 4")
-        elif chunks["has_manifest"] and chunks["total_chunks"]:
-            entry["resume_from_step"] = 4
-            entry["next_action"] = "All chunks are done; merge them, then continue with verify-quality and Step 5"
-        else:
-            try:
-                step = int(str(state.get("step", "") or "1").strip())
-            except ValueError:
-                step = 1
-            entry["resume_from_step"] = max(step, 1)
-            entry["next_action"] = f"Re-run Step {max(step, 1)} using the values recorded in {state_path}"
-        unfinished.append(entry)
-    return {
-        "tmp_dir": str(base),
-        "has_unfinished": bool(unfinished),
-        "unfinished": unfinished,
-        "completed": completed,
-    }
-
-
 def _estimate_single_pass_input_tokens(normalized_document_path: str, raw_text_path: str,
                                        config: dict | None = None) -> tuple[int, int]:
     """Estimate normalized input size for short-video single-pass routing."""
@@ -6532,7 +3420,7 @@ def _estimate_single_pass_input_tokens(normalized_document_path: str, raw_text_p
             continue
         normalized_text = _normalize_text_body(text)
         if normalized_text:
-            return _estimate_tokens(normalized_text, 'tokens', config), len(normalized_text)
+            return _estimate_tokens(normalized_text), len(normalized_text)
     return 0, 0
 
 
@@ -6549,74 +3437,15 @@ def _single_pass_token_limit(mode: str, source: str, config: dict | None = None)
     return max(3200, limit)
 
 
-def plan_optimization(state_path: str) -> dict:
-    """
-    Build a structured optimization plan from validated workflow state.
-
-    This is the canonical routing source for text optimization. Workflow docs
-    should consume this JSON instead of re-deriving short/long or bilingual
-    branches in prose.
-    """
-    validation = validate_state(state_path, stage="post-source")
-    if not validation["passed"]:
-        return {
-            "passed": False,
-            "checks": validation["checks"],
-            "warnings": validation["warnings"],
-            "hard_failures": validation["hard_failures"],
-            "machine_state_path": validation.get("machine_state_path", ""),
-            "legacy_state_path": validation.get("legacy_state_path", ""),
-        }
-
-    normalization = normalize_document(state_path, allow_missing=True)
-    if not normalization["passed"]:
-        return {
-            "passed": False,
-            "checks": validation["checks"],
-            "warnings": normalization.get("warnings", []),
-            "hard_failures": normalization.get("hard_failures", []),
-            "machine_state_path": validation.get("machine_state_path", ""),
-            "legacy_state_path": validation.get("legacy_state_path", ""),
-        }
-
-    state = load_state(state_path)
-    try:
-        duration = int(state.get("duration", "0") or 0)
-    except ValueError:
-        duration = 0
-    video_id = state.get("vid", "")
-    plan = plan_text_operations(
-        video_id=video_id,
-        duration=duration,
-        mode=state.get("mode", ""),
-        source=state.get("src", ""),
-        normalization=normalization,
-        raw_text_path=str(state.get("raw_text", "") or f"/tmp/{video_id}_raw_text.txt"),
-        segments_path=str(state.get("segments_path", "") or f"/tmp/{video_id}_segments.json"),
-        work_dir=state.get("work_dir", "/tmp/unknown_chunks"),
-        structured_text=str(state.get("structured_text", "") or f"/tmp/{video_id}_structured.txt"),
-        optimized_text=str(state.get("optimized_text", "") or f"/tmp/{video_id}_optimized.txt"),
-        config=load_config(None, allow_missing=True),
-    )
-    return {
-        "passed": True,
-        "machine_state_path": validation.get("machine_state_path", ""),
-        "legacy_state_path": validation.get("legacy_state_path", ""),
-        **plan,
-    }
-
-
 def plan_text_operations(*, video_id: str, duration: int, mode: str, source: str, normalization: dict,
                          raw_text_path: str, segments_path: str, work_dir: str, structured_text: str,
                          optimized_text: str, config: dict | None = None) -> dict:
     """Choose the text operations for a source and estimate their size.
 
-    `normalization` is the result of `build_normalized_document` (or
-    `normalize_document`) for that source; `source` is youtube or deepgram and
-    `mode` chinese or bilingual. Returns the plan fields of `plan-optimization`.
+    `normalization` is the result of `build_normalized_document` for that
+    source; `source` is youtube or deepgram and `mode` chinese or bilingual.
     """
     planner_config = config or {}
-    bilingual_quality_gate = mode == "bilingual"
     duration_bucket = "long" if duration >= 1800 else "short"
     raw_text_output = raw_text_path
     estimated_input_tokens, estimated_input_chars = _estimate_single_pass_input_tokens(
@@ -6668,20 +3497,6 @@ def plan_text_operations(*, video_id: str, duration: int, mode: str, source: str
         "work_dir": work_dir,
     }
 
-    def build_execution_contract(kind: str, input_key: str = "") -> dict:
-        """Build execution contract."""
-        return {"mode": "chunked" if kind == "chunk" else "single_pass"}
-
-    def build_control_contract(kind: str, prompt: str, input_key: str = "", *, bilingual_output: bool = False) -> dict:
-        """Build control contract."""
-        return _build_operation_control_contract(
-            kind,
-            prompt,
-            input_key=input_key,
-            config=planner_config,
-            bilingual=bilingual_output,
-        )
-
     chinese_cleanup_prompt = "cleanup_zh"
 
     if video_path == "short":
@@ -6693,8 +3508,6 @@ def plan_text_operations(*, video_id: str, duration: int, mode: str, source: str
                     "input": outputs["raw_text"],
                     "output": outputs["structured_text"],
                     "extra_instruction": "",
-                    "execution": build_execution_contract("prompt"),
-                    "control": build_control_contract("prompt", "structure_only", bilingual_output=False),
                 },
                 {
                     "kind": "prompt",
@@ -6702,8 +3515,6 @@ def plan_text_operations(*, video_id: str, duration: int, mode: str, source: str
                     "input": outputs["structured_text"],
                     "output": outputs["optimized_text"],
                     "extra_instruction": "",
-                    "execution": build_execution_contract("prompt"),
-                    "control": build_control_contract("prompt", "translate_only", bilingual_output=True),
                 },
             ]
         else:
@@ -6720,8 +3531,6 @@ def plan_text_operations(*, video_id: str, duration: int, mode: str, source: str
                     "input": outputs["raw_text"],
                     "output": outputs["optimized_text"],
                     "extra_instruction": extra_instruction,
-                    "execution": build_execution_contract("prompt"),
-                    "control": build_control_contract("prompt", chinese_cleanup_prompt, bilingual_output=False),
                 }
             ]
     else:
@@ -6738,13 +3547,6 @@ def plan_text_operations(*, video_id: str, duration: int, mode: str, source: str
                 "prompt": chinese_cleanup_prompt if mode == "chinese" else "structure_only",
                 "input_key": "raw_path",
                 "extra_instruction": extra_instruction,
-                "execution": build_execution_contract("chunk", "raw_path"),
-                "control": build_control_contract(
-                    "chunk",
-                    chinese_cleanup_prompt if mode == "chinese" else "structure_only",
-                    "raw_path",
-                    bilingual_output=False,
-                ),
             }
         ]
         if mode == "bilingual":
@@ -6754,23 +3556,11 @@ def plan_text_operations(*, video_id: str, duration: int, mode: str, source: str
                     "prompt": "translate_only",
                     "input_key": "processed_path",
                     "extra_instruction": "",
-                    "execution": build_execution_contract("chunk", "processed_path"),
-                    "control": build_control_contract("chunk", "translate_only", "processed_path", bilingual_output=True),
                 }
             )
 
-    chunk_driver = "chunk-document" if normalization.get("materialized") else ("chunk-segments" if Path(str(segments_path or "")).exists() else "chunk-text")
-    chunking = {
-        "driver": chunk_driver,
-        "normalized_document_path": normalization.get("normalized_document_path", ""),
-        "preferred_source_kind": normalization.get("preferred_chunk_source", ""),
-        "boundary_mode": "strict",
-        "merge_strategy": "ordered_concat",
-    }
-
     return {
         "checks": {
-            "state_stage": "post-source",
             "duration": duration,
             "duration_bucket": duration_bucket,
             "mode": mode,
@@ -6807,12 +3597,8 @@ def plan_text_operations(*, video_id: str, duration: int, mode: str, source: str
             "normalized_document_path": normalization.get("normalized_document_path", ""),
             "subtitle_quality": normalization.get("subtitle_quality", {}),
         },
-        "chunking": chunking,
-        "requires_llm_preflight": video_path == "long",
         "estimated_input_tokens": estimated_input_tokens,
         "single_pass_token_limit": single_pass_token_limit,
-        "requires_quality_check": True,
-        "quality_contract": _build_quality_gate_contract(bilingual=bilingual_quality_gate),
         "operations": operations,
         "outputs": outputs,
     }
@@ -6950,121 +3736,14 @@ def load_config(config_path: str = None, allow_missing: bool = False) -> dict:
     llm_timeout_sec = parse_int_field('llm_timeout_sec', 120, minimum=1)
     llm_max_retries = parse_int_field('llm_max_retries', 3, minimum=0)
     llm_backoff_sec = parse_float_field('llm_backoff_sec', 1.5, minimum=0.1)
-    llm_probe_timeout_sec = parse_int_field('llm_probe_timeout_sec', 20, minimum=1)
-    llm_probe_max_tokens = parse_int_field('llm_probe_max_tokens', 16, minimum=1)
-    llm_reasoning_probe_enabled = _parse_bool(
-        config.get('llm_reasoning_probe_enabled', True),
-        True,
-    )
-    llm_stop_after_consecutive_timeouts = parse_int_field('llm_stop_after_consecutive_timeouts', 2, minimum=1)
-    llm_chunk_recovery_attempts = parse_int_field(
-        'llm_chunk_recovery_attempts',
-        DEFAULT_LLM_CHUNK_RECOVERY_ATTEMPTS,
-        minimum=0,
-    )
-    llm_chunk_recovery_backoff_sec = parse_float_field(
-        'llm_chunk_recovery_backoff_sec',
-        DEFAULT_LLM_CHUNK_RECOVERY_BACKOFF_SEC,
-        minimum=0.0,
-    )
-    # llm_reasoning_retry_* was the old name for these settings; a value set
-    # only under the old name still applies, with a rename warning.
-    for suffix in ('attempts', 'multiplier', 'max_tokens'):
-        legacy_key = f'llm_reasoning_retry_{suffix}'
-        new_key = f'llm_output_retry_{suffix}'
-        if not str(config.get(legacy_key, '') or '').strip():
-            continue
-        if not str(config.get(new_key, '') or '').strip():
-            config[new_key] = config[legacy_key]
-        legacy_warning = f"{legacy_key} has been renamed to {new_key}; please update config.yaml"
-        config_warnings.append(legacy_warning)
-        config_issue_warnings.append(legacy_warning)
-    llm_output_retry_attempts = parse_int_field(
-        'llm_output_retry_attempts',
-        DEFAULT_OUTPUT_RETRY_ATTEMPTS,
-        minimum=0,
-    )
-    llm_output_retry_multiplier = parse_float_field(
-        'llm_output_retry_multiplier',
-        DEFAULT_OUTPUT_RETRY_MULTIPLIER,
-        minimum=1.01,
-        maximum=4.0,
-    )
-    llm_output_retry_max_tokens = parse_int_field(
-        'llm_output_retry_max_tokens',
-        DEFAULT_OUTPUT_RETRY_MAX_TOKENS,
-        minimum=1,
-    )
-
-    def has_config_value(key: str) -> bool:
-        """Return whether a config key is explicitly set to a non-empty value."""
-        return key in config and str(config.get(key, "")).strip() != ""
-
-    chunk_tokens_structure_only = parse_int_field(
-        'chunk_tokens_structure_only',
-        TASK_CHUNK_TOKEN_DEFAULTS['structure_only'],
-        minimum=1,
-    )
-    chunk_tokens_quick_cleanup = parse_int_field(
-        'chunk_tokens_quick_cleanup',
-        TASK_CHUNK_TOKEN_DEFAULTS['quick_cleanup'],
-        minimum=1,
-    )
-    chunk_tokens_cleanup_default = TASK_CHUNK_TOKEN_DEFAULTS['cleanup_zh']
-    if not has_config_value('chunk_tokens_cleanup_zh'):
-        if has_config_value('chunk_tokens_structure_only'):
-            chunk_tokens_cleanup_default = chunk_tokens_structure_only
-        elif has_config_value('chunk_tokens_quick_cleanup'):
-            chunk_tokens_cleanup_default = chunk_tokens_quick_cleanup
-    chunk_tokens_cleanup_zh = parse_int_field(
-        'chunk_tokens_cleanup_zh',
-        chunk_tokens_cleanup_default,
-        minimum=1,
-    )
-
-    output_ratio_structure_only = parse_float_field(
-        'output_ratio_structure_only',
-        TASK_OUTPUT_RATIO_DEFAULTS['structure_only'],
-        minimum=0.01,
-    )
-    output_ratio_quick_cleanup = parse_float_field(
-        'output_ratio_quick_cleanup',
-        TASK_OUTPUT_RATIO_DEFAULTS['quick_cleanup'],
-        minimum=0.01,
-    )
-    output_ratio_cleanup_default = TASK_OUTPUT_RATIO_DEFAULTS['cleanup_zh']
-    if not has_config_value('output_ratio_cleanup_zh'):
-        if has_config_value('output_ratio_structure_only'):
-            output_ratio_cleanup_default = output_ratio_structure_only
-        elif has_config_value('output_ratio_quick_cleanup'):
-            output_ratio_cleanup_default = output_ratio_quick_cleanup
-    output_ratio_cleanup_zh = parse_float_field(
-        'output_ratio_cleanup_zh',
-        output_ratio_cleanup_default,
-        minimum=0.01,
-    )
-
-    max_output_tokens_structure_only = parse_int_field(
-        'max_output_tokens_structure_only',
-        TASK_MAX_OUTPUT_TOKEN_DEFAULTS['structure_only'],
-        minimum=1,
-    )
-    max_output_tokens_quick_cleanup = parse_int_field(
-        'max_output_tokens_quick_cleanup',
-        TASK_MAX_OUTPUT_TOKEN_DEFAULTS['quick_cleanup'],
-        minimum=1,
-    )
-    max_output_tokens_cleanup_default = TASK_MAX_OUTPUT_TOKEN_DEFAULTS['cleanup_zh']
-    if not has_config_value('max_output_tokens_cleanup_zh'):
-        if has_config_value('max_output_tokens_structure_only'):
-            max_output_tokens_cleanup_default = max_output_tokens_structure_only
-        elif has_config_value('max_output_tokens_quick_cleanup'):
-            max_output_tokens_cleanup_default = max_output_tokens_quick_cleanup
-    max_output_tokens_cleanup_zh = parse_int_field(
-        'max_output_tokens_cleanup_zh',
-        max_output_tokens_cleanup_default,
-        minimum=1,
-    )
+    task_budgets = {}
+    for prompt in TASK_CHUNK_TOKEN_DEFAULTS:
+        task_budgets[f"chunk_tokens_{prompt}"] = parse_int_field(
+            f"chunk_tokens_{prompt}", TASK_CHUNK_TOKEN_DEFAULTS[prompt], minimum=1)
+        task_budgets[f"output_ratio_{prompt}"] = parse_float_field(
+            f"output_ratio_{prompt}", TASK_OUTPUT_RATIO_DEFAULTS[prompt], minimum=0.01)
+        task_budgets[f"max_output_tokens_{prompt}"] = parse_int_field(
+            f"max_output_tokens_{prompt}", TASK_MAX_OUTPUT_TOKEN_DEFAULTS[prompt], minimum=1)
 
     parsed = dict(defaults)
     parsed.update({
@@ -7086,21 +3765,11 @@ def load_config(config_path: str = None, allow_missing: bool = False) -> dict:
         "llm_max_retries": llm_max_retries,
         "llm_backoff_sec": llm_backoff_sec,
         "llm_stream": _normalize_stream_mode(config.get('llm_stream', 'auto')),
-        "llm_probe_timeout_sec": llm_probe_timeout_sec,
-        "llm_probe_max_tokens": llm_probe_max_tokens,
-        "llm_reasoning_probe_enabled": llm_reasoning_probe_enabled,
-        "llm_stop_after_consecutive_timeouts": llm_stop_after_consecutive_timeouts,
-        "llm_chunk_recovery_attempts": llm_chunk_recovery_attempts,
-        "llm_chunk_recovery_backoff_sec": llm_chunk_recovery_backoff_sec,
-        "llm_output_retry_attempts": llm_output_retry_attempts,
-        "llm_output_retry_multiplier": llm_output_retry_multiplier,
-        "llm_output_retry_max_tokens": llm_output_retry_max_tokens,
         "llm_backend": kernel_agent_cli.normalize_backend_mode(config.get('llm_backend', kernel_agent_cli.DEFAULT_LLM_BACKEND)),
         "llm_agent_cli": str(config.get('llm_agent_cli', '') or '').strip(),
         "llm_cli_timeout_sec": parse_int_field('llm_cli_timeout_sec', kernel_agent_cli.DEFAULT_CLI_TIMEOUT_SEC, minimum=1),
         "llm_cli_max_retries": parse_int_field('llm_cli_max_retries', kernel_agent_cli.DEFAULT_CLI_MAX_RETRIES, minimum=0),
         "llm_cli_probe_timeout_sec": parse_int_field('llm_cli_probe_timeout_sec', kernel_agent_cli.DEFAULT_CLI_PROBE_TIMEOUT_SEC, minimum=1),
-        "long_text_mode": kernel_window.resolve_long_text_mode(config),
         "window_read_tokens": parse_int_field('window_read_tokens', kernel_window.DEFAULT_WINDOW_READ_TOKENS, minimum=200),
         "window_write_tokens": parse_int_field('window_write_tokens', kernel_window.DEFAULT_WINDOW_WRITE_TOKENS, minimum=100),
         "window_tail_tokens": parse_int_field('window_tail_tokens', kernel_window.DEFAULT_WINDOW_TAIL_TOKENS, minimum=0),
@@ -7108,13 +3777,7 @@ def load_config(config_path: str = None, allow_missing: bool = False) -> dict:
         "window_outline": _parse_bool(config.get('window_outline', True), True),
         "window_outline_read_tokens": parse_int_field('window_outline_read_tokens', kernel_outline.DEFAULT_OUTLINE_READ_TOKENS, minimum=1000),
         "window_outline_max_terms": parse_int_field('window_outline_max_terms', kernel_outline.DEFAULT_OUTLINE_MAX_TERMS, minimum=0),
-        "chunk_mode": _normalize_chunk_mode(config.get('chunk_mode', DEFAULT_CHUNK_MODE)),
         "chunk_size_override": parse_int_field('chunk_size_override', 0, minimum=0),
-        "chunk_tokens_structure_only": chunk_tokens_structure_only,
-        "chunk_tokens_quick_cleanup": chunk_tokens_quick_cleanup,
-        "chunk_tokens_cleanup_zh": chunk_tokens_cleanup_zh,
-        "chunk_tokens_translate_only": parse_int_field('chunk_tokens_translate_only', TASK_CHUNK_TOKEN_DEFAULTS['translate_only'], minimum=1),
-        "chunk_tokens_summarize": parse_int_field('chunk_tokens_summarize', TASK_CHUNK_TOKEN_DEFAULTS['summarize'], minimum=1),
         "chunk_hard_cap_multiplier": parse_float_field(
             'chunk_hard_cap_multiplier',
             DEFAULT_CHUNK_HARD_CAP_MULTIPLIER,
@@ -7122,17 +3785,7 @@ def load_config(config_path: str = None, allow_missing: bool = False) -> dict:
             maximum=MAX_CHUNK_HARD_CAP_MULTIPLIER,
         ),
         "chunk_glossary_max_prompt_terms": parse_int_field('chunk_glossary_max_prompt_terms', 8, minimum=0),
-        "output_ratio_structure_only": output_ratio_structure_only,
-        "output_ratio_quick_cleanup": output_ratio_quick_cleanup,
-        "output_ratio_cleanup_zh": output_ratio_cleanup_zh,
-        "output_ratio_translate_only": parse_float_field('output_ratio_translate_only', TASK_OUTPUT_RATIO_DEFAULTS['translate_only'], minimum=0.01),
-        "output_ratio_summarize": parse_float_field('output_ratio_summarize', TASK_OUTPUT_RATIO_DEFAULTS['summarize'], minimum=0.01),
-        "max_output_tokens_structure_only": max_output_tokens_structure_only,
-        "max_output_tokens_quick_cleanup": max_output_tokens_quick_cleanup,
-        "max_output_tokens_cleanup_zh": max_output_tokens_cleanup_zh,
-        "max_output_tokens_translate_only": parse_int_field('max_output_tokens_translate_only', TASK_MAX_OUTPUT_TOKEN_DEFAULTS['translate_only'], minimum=1),
-        "max_output_tokens_summarize": parse_int_field('max_output_tokens_summarize', TASK_MAX_OUTPUT_TOKEN_DEFAULTS['summarize'], minimum=1),
-        "enable_token_count_probe": _parse_bool(config.get('enable_token_count_probe'), DEFAULT_ENABLE_TOKEN_COUNT_PROBE),
+        **task_budgets,
         "config_path": str(path.absolute()),
         "config_warnings": config_warnings,
     })
@@ -7151,496 +3804,15 @@ def load_config(config_path: str = None, allow_missing: bool = False) -> dict:
 
 def main():
     """Main."""
+    from kernel import pipeline as kernel_pipeline
+
     parser = argparse.ArgumentParser(
         description='yt-transcript utility script',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__
     )
-    parser.add_argument(
-        '--api-envelope',
-        action='store_true',
-        help='Emit stable kernel-command result envelopes instead of legacy flat JSON for kernel commands',
-    )
     subparsers = parser.add_subparsers(dest='command', help='Available commands')
 
-    # parse-vtt command
-    vtt_parser = subparsers.add_parser(
-        'parse-vtt',
-        help='Parse VTT subtitle file, output plain text'
-    )
-    vtt_parser.add_argument('vtt_path', help='VTT file path')
-
-    # parse-vtt-segments command
-    vtt_segments_parser = subparsers.add_parser(
-        'parse-vtt-segments',
-        help='Parse VTT subtitle file, output aligned segments JSON'
-    )
-    vtt_segments_parser.add_argument('vtt_path', help='VTT file path')
-    vtt_segments_parser.add_argument('--language', default='',
-                                     help='Optional language override for output metadata')
-
-    # process-deepgram command
-    dg_parser = subparsers.add_parser(
-        'process-deepgram',
-        help='Process Deepgram JSON, output cleaned text and speaker count'
-    )
-    dg_parser.add_argument('json_path', help='Deepgram JSON file path')
-    dg_parser.set_defaults(prefer_structured_output=DEFAULT_DEEPGRAM_PREFER_STRUCTURED_OUTPUT)
-    dg_output_group = dg_parser.add_mutually_exclusive_group()
-    dg_output_group.add_argument('--prefer-structured-output', dest='prefer_structured_output', action='store_true',
-                                 help='Prefer utterances/sentence text when processing Deepgram JSON (default)')
-    dg_output_group.add_argument('--legacy-flat-output', dest='prefer_structured_output', action='store_false',
-                                 help='Force legacy flat transcript assembly when processing Deepgram JSON')
-
-    # sanitize-filename command
-    fn_parser = subparsers.add_parser(
-        'sanitize-filename',
-        help='Clean illegal filename characters'
-    )
-    fn_parser.add_argument('title', help='Original title')
-
-    # transcribe-deepgram command
-    tdg_parser = subparsers.add_parser(
-        'transcribe-deepgram',
-        help='Call Deepgram API and merge split chunks automatically'
-    )
-    tdg_parser.add_argument('audio_path', help='Audio file path')
-    tdg_parser.add_argument('--language', required=True,
-                            help="Transcription language code, or 'auto' to let Deepgram detect it (reported as detected_language)")
-    tdg_parser.add_argument('--config-path', default=None, help='Optional path to config.yaml')
-    tdg_parser.add_argument('--api-key', default='', help='Optional Deepgram API key override')
-    tdg_parser.add_argument('--max-size', type=float, default=10.0,
-                            help='Max chunk size in MB before splitting (default: 10)')
-    tdg_parser.add_argument('--max-deviation', type=float, default=60.0,
-                            help='Max deviation from silence split point in seconds (default: 60)')
-    tdg_parser.add_argument('--timeout', type=int, default=300, help='Request timeout in seconds')
-    tdg_parser.add_argument('--output-json', default='', help='Optional JSON output path; split mode also writes sibling chunk payload files')
-    tdg_parser.add_argument('--output-text', default='', help='Optional path to write merged transcript text')
-    tdg_parser.add_argument('--output-segments', default='', help='Optional path to write aligned source segments JSON')
-    tdg_parser.add_argument('--model', default='',
-                            help='Optional Deepgram model override; nova-2 variants are upgraded to nova-3')
-    tdg_parser.add_argument('--resume-existing-chunks', action='store_true',
-                            help='Reuse existing sibling *_chunk_XXX.json payloads when resuming a split Deepgram run')
-    tdg_parser.set_defaults(enable_utterances_override=None, prefer_structured_output_override=None)
-    tdg_utterance_group = tdg_parser.add_mutually_exclusive_group()
-    tdg_utterance_group.add_argument('--enable-utterances', dest='enable_utterances_override', action='store_true',
-                                     help='Force Deepgram utterances=true speaker-aware output (default)')
-    tdg_utterance_group.add_argument('--disable-utterances', dest='enable_utterances_override', action='store_false',
-                                     help='Disable Deepgram utterances when comparing against the flatter legacy response shape')
-    tdg_output_group = tdg_parser.add_mutually_exclusive_group()
-    tdg_output_group.add_argument('--prefer-structured-output', dest='prefer_structured_output_override', action='store_true',
-                                  help='Prefer utterances/sentence text over the legacy flat transcript when building output text and segments (default)')
-    tdg_output_group.add_argument('--legacy-flat-output', dest='prefer_structured_output_override', action='store_false',
-                                  help='Force legacy flat transcript assembly for compatibility/debugging checks')
-
-    # test-deepgram-api command
-    api_parser = subparsers.add_parser(
-        'test-deepgram-api',
-        help='Test Deepgram API key validity'
-    )
-    api_parser.add_argument('api_key', help='Deepgram API key')
-
-    # test-llm-api command
-    llm_api_parser = subparsers.add_parser(
-        'test-llm-api',
-        help='Test configured LLM API reachability and latency'
-    )
-    llm_api_parser.add_argument('--config-path', default=None, help='Optional path to config.yaml')
-    llm_api_parser.add_argument('--api-key', default='', help='Optional LLM API key override')
-    llm_api_parser.add_argument('--base-url', default='', help='Optional LLM base URL override')
-    llm_api_parser.add_argument('--model', default='', help='Optional model override')
-    llm_api_parser.add_argument('--api-format', default='', help='Optional API format override')
-    llm_api_parser.add_argument('--timeout', type=int, default=0, help='Probe timeout in seconds')
-    llm_api_parser.add_argument('--stream', default='', help='Streaming mode override: auto|true|false')
-
-    backend_parser = subparsers.add_parser(
-        'resolve-llm-backend',
-        help='Show which backend chunk processing will use (agent CLI or API)'
-    )
-    backend_parser.add_argument('--config-path', default=None, help='Optional path to config.yaml')
-    backend_parser.add_argument('--agent-cli', default='',
-                                help='Agent name (claude-code, codex, opencode, pi, gemini, cursor) or a non-interactive command')
-    backend_parser.add_argument('--no-probe', action='store_true', help='Skip the CLI probe call')
-
-    token_probe_parser = subparsers.add_parser(
-        'test-token-count',
-        help='Probe provider token counting support with local fallback'
-    )
-    token_probe_parser.add_argument('--config-path', default=None, help='Optional path to config.yaml')
-    token_probe_parser.add_argument('--api-key', default='', help='Optional LLM API key override')
-    token_probe_parser.add_argument('--base-url', default='', help='Optional LLM base URL override')
-    token_probe_parser.add_argument('--model', default='', help='Optional model override')
-    token_probe_parser.add_argument('--api-format', default='', help='Optional API format override')
-    token_probe_parser.add_argument('--timeout', type=int, default=0, help='Probe timeout in seconds')
-    token_probe_parser.add_argument('--sample-text', default='Reply with OK only.', help='Sample text for token probe')
-
-    # split-audio command
-    split_parser = subparsers.add_parser(
-        'split-audio',
-        help='Split large audio file at silence points'
-    )
-    split_parser.add_argument('audio_path', help='Audio file path')
-    split_parser.add_argument('--max-size', type=float, default=10.0,
-                              help='Max chunk size in MB (default: 10)')
-    split_parser.add_argument('--max-deviation', type=float, default=60.0,
-                              help='Max deviation from split point in seconds (default: 60)')
-
-    # chunk-text command
-    chunk_parser = subparsers.add_parser(
-        'chunk-text',
-        help='Split text file into chunks by sentence boundary'
-    )
-    chunk_parser.add_argument('input_path', help='Input text file path')
-    chunk_parser.add_argument('output_dir', help='Output directory for chunks')
-    chunk_parser.add_argument('--chunk-size', type=int, default=0,
-                              help='Target chunk size in the active chunk_mode; without --prompt it keeps legacy character sizing')
-    chunk_parser.add_argument('--prompt', default='',
-                              help='Optional prompt name for task-aware auto chunk sizing')
-    chunk_parser.add_argument('--config-path', default=None,
-                              help='Optional path to config file for chunk planning')
-
-    # chunk-segments command
-    chunk_segments_parser = subparsers.add_parser(
-        'chunk-segments',
-        help='Split aligned source segments into timed chunks'
-    )
-    chunk_segments_parser.add_argument('segments_path', help='Aligned source segments JSON path')
-    chunk_segments_parser.add_argument('output_dir', help='Output directory for chunks')
-    chunk_segments_parser.add_argument('--chunk-size', type=int, default=0,
-                                       help='Target chunk size in the active chunk_mode; without --prompt it keeps legacy character sizing')
-    chunk_segments_parser.add_argument('--prompt', default='',
-                                       help='Optional prompt name for task-aware auto chunk sizing')
-    chunk_segments_parser.add_argument('--config-path', default=None,
-                                       help='Optional path to config file for chunk planning')
-    chunk_segments_parser.add_argument('--chapters', default='',
-                                       help='Optional YouTube chapters JSON path; forces chunk boundaries at chapter starts')
-
-    # chunk-document command
-    chunk_document_parser = subparsers.add_parser(
-        'chunk-document',
-        help='Chunk a normalized document using its preferred source shape'
-    )
-    chunk_document_parser.add_argument('normalized_document_path', help='normalized_document.json path')
-    chunk_document_parser.add_argument('output_dir', help='Output directory for chunks')
-    chunk_document_parser.add_argument('--chunk-size', type=int, default=0,
-                                       help='Target chunk size in the active chunk_mode; without --prompt it keeps legacy character sizing')
-    chunk_document_parser.add_argument('--prompt', default='',
-                                       help='Optional prompt name for task-aware auto chunk sizing')
-    chunk_document_parser.add_argument('--config-path', default=None,
-                                       help='Optional path to config file for chunk planning')
-    chunk_document_parser.add_argument('--chapters', default='',
-                                       help='Optional YouTube chapters JSON path; forces chunk boundaries at chapter starts when timed segments exist')
-    chunk_document_parser.add_argument('--prefer', default='auto', choices=['auto', 'segments', 'text'],
-                                       help='Preferred normalized source shape for chunking')
-
-    # get-chapters command
-    chapters_parser = subparsers.add_parser(
-        'get-chapters',
-        help='Fetch YouTube video chapter metadata'
-    )
-    chapters_parser.add_argument('video_url', help='YouTube video URL')
-
-    # build-chapter-plan command
-    chapter_plan_parser = subparsers.add_parser(
-        'build-chapter-plan',
-        help='Map YouTube chapters onto timed chunks'
-    )
-    chapter_plan_parser.add_argument('chapters_path', help='Chapters JSON path')
-    chapter_plan_parser.add_argument('manifest_ref', help='Manifest path or work directory containing manifest.json')
-    chapter_plan_parser.add_argument('output_path', help='Output chapter_plan.json path')
-
-    # merge-content command
-    merge_parser = subparsers.add_parser(
-        'merge-content',
-        help='Merge processed chunks with chapter headers'
-    )
-    merge_parser.add_argument('work_dir', help='Working directory with manifest.json')
-    merge_parser.add_argument('output_file', help='Output file path')
-    merge_parser.add_argument('--header', default='', help='Optional header content to prepend')
-
-    # create-run command
-    create_run_parser = subparsers.add_parser(
-        'create-run',
-        help='Persist a stable runtime task record for outer-agent orchestration'
-    )
-    create_run_parser.add_argument('work_dir', help='Working directory to bind to the runtime task')
-    create_run_parser.add_argument('--task-spec-json', default='', help='Optional inline JSON object with task_spec fields')
-    create_run_parser.add_argument('--task-spec-file', default='', help='Optional JSON file with task_spec fields')
-    create_run_parser.add_argument('--task-id', default='', help='Optional stable task identifier override')
-    create_run_parser.add_argument('--source-ref', default='', help='Optional source reference; defaults to work_dir')
-    create_run_parser.add_argument('--output-mode', default='markdown', help='Task output mode (default: markdown)')
-    create_run_parser.add_argument('--bilingual', action='store_true', help='Record bilingual output intent in the task spec')
-    create_run_parser.add_argument('--quality-profile', default='balanced', help='Quality profile recorded in task spec')
-    create_run_parser.add_argument('--speed-priority', default='balanced', help='Speed priority recorded in task spec')
-    create_run_parser.add_argument('--cost-budget', type=float, default=0.0, help='Optional cost budget recorded in task spec')
-    create_run_parser.add_argument('--latency-budget', type=float, default=0.0, help='Optional latency budget recorded in task spec')
-    create_run_parser.add_argument('--allowed-fallback', dest='allowed_fallbacks', action='append', default=[], help='Repeatable allowed fallback entry')
-    create_run_parser.add_argument('--human-escalation-policy', default='on_blocking_failure', help='Human escalation policy recorded in task spec')
-    create_run_parser.add_argument('--policy-profile', default='default', help='Policy profile recorded in run state')
-    create_run_parser.add_argument('--migration-mode', choices=['runtime_api', 'legacy_cli'], default='', help='Optional runtime API migration mode override')
-
-    # inspect-run command
-    inspect_run_parser = subparsers.add_parser(
-        'inspect-run',
-        help='Inspect run/task state through the stable runtime-facing API'
-    )
-    inspect_run_parser.add_argument('work_dir', help='Working directory to inspect')
-    inspect_run_parser.add_argument('--run-id', default='', help='Optional run identifier assertion for the persisted runtime task')
-    inspect_run_parser.add_argument('--policy-profile', default='default', help='Policy profile used for allowed-action derivation')
-
-    # advance-run command
-    advance_run_parser = subparsers.add_parser(
-        'advance-run',
-        help='Advance the runtime through the preferred bounded control path'
-    )
-    advance_run_parser.add_argument('work_dir', help='Working directory with manifest.json')
-    advance_run_parser.add_argument('--run-id', default='', help='Optional run identifier assertion for the persisted runtime task')
-    advance_run_parser.add_argument('--prompt', default='', help='Optional prompt override; defaults to manifest/runtime metadata')
-    advance_run_parser.add_argument('--action', choices=['auto', 'process', 'process-chunks', 'prepare-resume'], default='auto', help='Runtime action to execute (default: auto)')
-    advance_run_parser.add_argument('--extra-instruction', default='', help='Additional instruction to append to prompt')
-    advance_run_parser.add_argument('--config-path', default=None, help='Optional path to config file')
-    advance_run_parser.add_argument('--dry-run', action='store_true', help='Validate setup without calling the model API')
-    advance_run_parser.add_argument('--input-key', default='raw_path', help='Manifest key for input files')
-    advance_run_parser.add_argument('--force', action='store_true', help='Reprocess work even when manifest state is already done')
-    advance_run_parser.add_argument('--policy-profile', default='default', help='Policy profile used for allowed-action derivation')
-
-    # apply-control command
-    apply_control_parser = subparsers.add_parser(
-        'apply-control',
-        help='Apply pause or cancel through the stable runtime-facing API'
-    )
-    apply_control_parser.add_argument('work_dir', help='Working directory to control')
-    apply_control_parser.add_argument('--run-id', default='', help='Optional run identifier assertion for the persisted runtime task')
-    apply_control_parser.add_argument('--signal', choices=['pause', 'cancel'], required=True, help='Control signal to apply')
-    apply_control_parser.add_argument('--reason', default='', help='Optional operator reason for the control signal')
-    apply_control_parser.add_argument('--policy-profile', default='default', help='Policy profile used for allowed-action derivation')
-
-    # finalize-run command
-    finalize_run_parser = subparsers.add_parser(
-        'finalize-run',
-        help='Finalize a run summary and optionally materialize merged output'
-    )
-    finalize_run_parser.add_argument('work_dir', help='Working directory to finalize')
-    finalize_run_parser.add_argument('--run-id', default='', help='Optional run identifier assertion for the persisted runtime task')
-    finalize_run_parser.add_argument('--output-file', default='', help='Optional merged output path; omit for inspection-only finalization')
-    finalize_run_parser.add_argument('--header', default='', help='Optional header content passed to merge-content when output-file is set')
-    finalize_run_parser.add_argument('--inspect-only', action='store_true', help='Return an inspection-only final summary without merging output')
-    finalize_run_parser.add_argument('--policy-profile', default='default', help='Policy profile used for allowed-action derivation')
-
-    # process-chunks command
-    pc_parser = subparsers.add_parser(
-        'process-chunks',
-        help='Process chunks with isolated LLM API calls'
-    )
-    pc_parser.add_argument('work_dir', help='Working directory with manifest.json')
-    pc_parser.add_argument('--prompt', required=True,
-                           help='Prompt template name (e.g., cleanup_zh, structure_only, translate_only, summarize)')
-    pc_parser.add_argument('--extra-instruction', default='',
-                           help='Additional instruction to append to prompt')
-    pc_parser.add_argument('--input-key', default='raw_path',
-                           help='Manifest key for input files (default: raw_path, use processed_path for chained processing)')
-    pc_parser.add_argument('--config-path', default=None,
-                           help='Optional path to config file')
-    pc_parser.add_argument('--dry-run', action='store_true',
-                           help='Validate setup without calling API')
-    pc_parser.add_argument('--force', action='store_true',
-                           help='Reprocess chunks even if manifest status is done and output exists')
-    pc_parser.add_argument('--agent-cli', default='',
-                           help='With llm_backend=auto: the calling agent\'s name or its non-interactive command')
-
-    # prepare-resume command
-    resume_parser = subparsers.add_parser(
-        'prepare-resume',
-        help='Repair stale chunk/runtime state before resuming a run'
-    )
-    resume_parser.add_argument('work_dir', help='Working directory with manifest.json')
-    resume_parser.add_argument('--prompt', default='',
-                               help='Optional prompt override; defaults to manifest plan prompt')
-    resume_parser.add_argument('--config-path', default=None,
-                               help='Optional path to config file')
-    resume_parser.add_argument('--input-key', default='raw_path',
-                               help='Reserved for future resume checks; currently informational only')
-
-    # runtime-status command
-    runtime_status_parser = subparsers.add_parser(
-        'runtime-status',
-        help='Inspect manifest runtime, ownership, and local runtime-control state'
-    )
-    runtime_status_parser.add_argument('work_dir', help='Working directory to inspect')
-
-    # cancel-run command
-    cancel_parser = subparsers.add_parser(
-        'cancel-run',
-        help='Request local cancellation for an active chunk-processing run'
-    )
-    cancel_parser.add_argument('work_dir', help='Working directory to cancel')
-    cancel_parser.add_argument('--reason', default='', help='Optional cancellation reason')
-
-    # pause-run command
-    pause_parser = subparsers.add_parser(
-        'pause-run',
-        help='Request a safe-boundary pause for an active chunk-processing run'
-    )
-    pause_parser.add_argument('work_dir', help='Working directory to pause')
-    pause_parser.add_argument('--reason', default='', help='Optional pause reason')
-
-    # resume-run command
-    resume_run_parser = subparsers.add_parser(
-        'resume-run',
-        help='Clear a local pause request and restore resumable runtime state'
-    )
-    resume_run_parser.add_argument('work_dir', help='Working directory to resume')
-    resume_run_parser.add_argument('--reason', default='', help='Optional resume reason')
-
-    # telemetry-summary command
-    telemetry_summary_parser = subparsers.add_parser(
-        'telemetry-summary',
-        help='Summarize local telemetry journal from a work_dir or telemetry.jsonl path'
-    )
-    telemetry_summary_parser.add_argument('telemetry_ref', help='Work directory or telemetry.jsonl path')
-    telemetry_summary_parser.add_argument('--command-filter', dest='command_filter', default='', help='Optional command filter')
-    telemetry_summary_parser.add_argument('--document-id', default='', help='Optional document_id filter')
-    telemetry_summary_parser.add_argument('--success', choices=['all', 'true', 'false'], default='all', help='Filter by success state')
-    telemetry_summary_parser.add_argument('--recent-limit', type=int, default=5, help='Number of recent events to include')
-
-    # telemetry-events command
-    telemetry_events_parser = subparsers.add_parser(
-        'telemetry-events',
-        help='Query local telemetry journal events from a work_dir or telemetry.jsonl path'
-    )
-    telemetry_events_parser.add_argument('telemetry_ref', help='Work directory or telemetry.jsonl path')
-    telemetry_events_parser.add_argument('--limit', type=int, default=20, help='Maximum number of matching recent events to return (0 = all)')
-    telemetry_events_parser.add_argument('--command-filter', dest='command_filter', default='', help='Optional command filter')
-    telemetry_events_parser.add_argument('--trace-id', default='', help='Optional trace_id filter')
-    telemetry_events_parser.add_argument('--document-id', default='', help='Optional document_id filter')
-    telemetry_events_parser.add_argument('--success', choices=['all', 'true', 'false'], default='all', help='Filter by success state')
-
-    # build-glossary command
-    glossary_parser = subparsers.add_parser(
-        'build-glossary',
-        help='Build a local glossary artifact for terminology consistency'
-    )
-    glossary_parser.add_argument('work_dir', help='Working directory with manifest.json and raw chunks')
-    glossary_parser.add_argument('--max-terms', type=int, default=50, help='Maximum number of glossary terms to keep')
-    glossary_parser.add_argument('--min-occurrences', type=int, default=1, help='Minimum source occurrences required for a term')
-    glossary_parser.add_argument('--mode', choices=['auto', 'manifest', 'transcript'], default='auto',
-                                 help='Glossary source mode; transcript adds normalized-doc/chapter/metadata context when available')
-    glossary_parser.add_argument('--normalized-document', dest='normalized_document_path', default='',
-                                 help='Optional normalized_document.json path')
-    glossary_parser.add_argument('--chapters-path', default='',
-                                 help='Optional chapters or chapter_plan JSON path')
-    glossary_parser.add_argument('--metadata-json', dest='metadata_json_path', default='',
-                                 help='Optional metadata JSON path with title/channel/description/chapter fields')
-    glossary_parser.add_argument('--description-text', default='',
-                                 help='Optional description text to mine for glossary terms')
-    glossary_parser.add_argument('--description-path', default='',
-                                 help='Optional text file path containing description text')
-
-    # assemble-final command
-    af_parser = subparsers.add_parser(
-        'assemble-final',
-        help='Assemble final markdown file from optimized text and metadata'
-    )
-    af_parser.add_argument('optimized_text_path', help='Path to optimized text file')
-    af_parser.add_argument('output_file', help='Path to write final markdown file')
-    af_parser.add_argument('--title', default='', help='Video title')
-    af_parser.add_argument('--source', default='', help='Video URL')
-    af_parser.add_argument('--channel', default='', help='Channel name')
-    af_parser.add_argument('--date', default='', help='Video upload date')
-    af_parser.add_argument('--created', default='', help='File creation date')
-    af_parser.add_argument('--duration', type=int, default=0, help='Video duration in seconds')
-    af_parser.add_argument('--transcript-source', default='', help='youtube or deepgram')
-    af_parser.add_argument('--bilingual', action='store_true', help='Whether content is bilingual')
-
-    # verify-quality command
-    vq_parser = subparsers.add_parser(
-        'verify-quality',
-        help='Verify quality of optimized text file (structural checks)'
-    )
-    vq_parser.add_argument('optimized_text_path', help='Path to optimized text file')
-    vq_parser.add_argument('--raw-text', default=None, help='Path to raw text file for size comparison')
-    vq_parser.add_argument('--bilingual', action='store_true', help='Whether content should be bilingual')
-    vq_parser.add_argument('--work-dir', default='', help='Optional work_dir used to load glossary.json for drift checks')
-    vq_parser.add_argument('--glossary-path', default='', help='Optional glossary.json path for final drift checks')
-    vq_parser.add_argument('--glossary-max-terms', type=int, default=12,
-                           help='Maximum glossary terms to verify in final output')
-
-    # load-config command
-    config_parser = subparsers.add_parser(
-        'load-config',
-        help='Load and return configuration from config.yaml'
-    )
-    config_parser.add_argument('--config-path', default=None,
-                               help='Optional path to config file')
-
-    # sync-state command
-    sync_state_parser = subparsers.add_parser(
-        'sync-state',
-        help='Sync legacy state.md with authoritative machine_state.json'
-    )
-    sync_state_parser.add_argument('state_ref', help='Path to legacy state.md or machine_state.json')
-    sync_state_parser.add_argument('--write-legacy', action='store_true',
-                                   help='When given a machine_state.json, write the legacy state.md projection')
-
-    # normalize-document command
-    normalize_parser = subparsers.add_parser(
-        'normalize-document',
-        help='Materialize normalized_document.json from raw text or segments artifacts'
-    )
-    normalize_parser.add_argument('state_ref', help='Path to legacy state.md or machine_state.json')
-    normalize_parser.add_argument('--output', default='', help='Optional output path for normalized_document.json')
-    normalize_parser.add_argument('--prefer', default='auto', choices=['auto', 'segments', 'raw_text'],
-                                  help='Preferred source artifact for normalization')
-    normalize_parser.add_argument('--allow-missing', action='store_true',
-                                  help='Return success when no raw text or segments artifact is available')
-
-    # validate-state command
-    state_parser = subparsers.add_parser(
-        'validate-state',
-        help='Validate workflow state fields for a given stage'
-    )
-    state_parser.add_argument('state_path', help='Path to state markdown file')
-    state_parser.add_argument(
-        '--stage',
-        default='',
-        choices=sorted(STATE_STAGE_FIELDS.keys()),
-        help='Named validation stage to enforce',
-    )
-    state_parser.add_argument(
-        '--require',
-        action='append',
-        default=[],
-        help='Additional required field name (can be repeated)',
-    )
-
-    # find-unfinished command
-    unfinished_parser = subparsers.add_parser(
-        'find-unfinished',
-        help='List interrupted runs whose state and work files are kept for resume'
-    )
-    unfinished_parser.add_argument('--video-id', default='', help='Only check this video id')
-    unfinished_parser.add_argument('--tmp-dir', default='/tmp', help='Directory holding <VIDEO_ID>_state.md files')
-
-    # subtitle-info command
-    subtitle_info_parser = subparsers.add_parser(
-        'subtitle-info',
-        help='Detect the spoken language and pick subtitle candidates from yt-dlp metadata on stdin'
-    )
-    subtitle_info_parser.add_argument('--video-id', default='', help='Video id to report when metadata lacks one')
-    subtitle_info_parser.add_argument('--from-list-subs', action='store_true',
-                                      help='Read `yt-dlp --list-subs` output instead of `yt-dlp -J` JSON')
-    subtitle_info_parser.add_argument('--yt-dlp-runtime-json', default='',
-                                      help='yt-dlp runtime JSON to echo back in the result')
-
-    # plan-optimization command
-    plan_parser = subparsers.add_parser(
-        'plan-optimization',
-        help='Generate a structured optimization plan from workflow state'
-    )
-    plan_parser.add_argument('state_path', help='Path to state markdown file')
-
-    # run command
-    from kernel import pipeline as kernel_pipeline
     run_parser = subparsers.add_parser(
         'run',
         help='Run or continue the whole pipeline for one video (one JSON result, fixed exit codes)'
@@ -7659,14 +3831,12 @@ def main():
     run_parser.add_argument('--restart', action='store_true', help="Discard this video's work directory first")
     run_parser.add_argument('--config-path', default=None, help='Path to config.yaml')
 
-    # status command
     status_parser = subparsers.add_parser(
         'status',
         help='Show the runs under the work root, or one video\'s state.json'
     )
     status_parser.add_argument('video_id', nargs='?', default='', help='Video id (omit to list every run)')
 
-    # cleanup command
     cleanup_parser = subparsers.add_parser(
         'cleanup',
         help="Remove a video's work directory (an unfinished run needs --force)"
@@ -7674,452 +3844,33 @@ def main():
     cleanup_parser.add_argument('video_id', help='Video id')
     cleanup_parser.add_argument('--force', action='store_true', help='Also remove an unfinished run')
 
+    # Debug command; download.sh also pipes yt-dlp metadata through it.
+    subtitle_info_parser = subparsers.add_parser(
+        'subtitle-info',
+        help='Detect the spoken language and pick subtitle candidates from yt-dlp metadata on stdin'
+    )
+    subtitle_info_parser.add_argument('--video-id', default='', help='Video id to report when metadata lacks one')
+    subtitle_info_parser.add_argument('--from-list-subs', action='store_true',
+                                      help='Read `yt-dlp --list-subs` output instead of `yt-dlp -J` JSON')
+    subtitle_info_parser.add_argument('--yt-dlp-runtime-json', default='',
+                                      help='yt-dlp runtime JSON to echo back in the result')
+
+    # Debug command: the quality check `run` applies in its verify stage.
+    vq_parser = subparsers.add_parser(
+        'verify-quality',
+        help='Verify quality of optimized text file (structural checks)'
+    )
+    vq_parser.add_argument('optimized_text_path', help='Path to optimized text file')
+    vq_parser.add_argument('--raw-text', default=None, help='Path to raw text file for size comparison')
+    vq_parser.add_argument('--bilingual', action='store_true', help='Whether content should be bilingual')
+    vq_parser.add_argument('--work-dir', default='', help='Optional work_dir used to load glossary.json for drift checks')
+    vq_parser.add_argument('--glossary-path', default='', help='Optional glossary.json path for final drift checks')
+    vq_parser.add_argument('--glossary-max-terms', type=int, default=12,
+                           help='Maximum glossary terms to verify in final output')
+
     args = parser.parse_args()
 
-    if args.command == 'parse-vtt':
-        result = parse_vtt(args.vtt_path)
-        print(result)
-
-    elif args.command == 'parse-vtt-segments':
-        result = parse_vtt_segments(args.vtt_path, language=args.language)
-        print(json.dumps(result, ensure_ascii=False))
-
-    elif args.command == 'process-deepgram':
-        result = process_deepgram(
-            args.json_path,
-            prefer_structured_output=args.prefer_structured_output,
-        )
-        print(json.dumps(result, ensure_ascii=False))
-
-    elif args.command == 'sanitize-filename':
-        result = sanitize_filename(args.title)
-        print(result)
-
-    elif args.command == 'transcribe-deepgram':
-        result = transcribe_deepgram(
-            args.audio_path,
-            language=args.language,
-            config_path=args.config_path,
-            api_key=args.api_key,
-            max_size_mb=args.max_size,
-            max_deviation_sec=args.max_deviation,
-            timeout=args.timeout,
-            output_json=args.output_json,
-            output_text=args.output_text,
-            output_segments=args.output_segments,
-            deepgram_model=args.model,
-            enable_utterances=args.enable_utterances_override,
-            prefer_structured_output=args.prefer_structured_output_override,
-            resume_existing_chunks=args.resume_existing_chunks,
-        )
-        print(json.dumps(result, ensure_ascii=False))
-
-    elif args.command == 'test-deepgram-api':
-        result = test_deepgram_api(args.api_key)
-        print(json.dumps(result, ensure_ascii=False))
-        if not result['valid']:
-            sys.exit(1)
-
-    elif args.command == 'test-llm-api':
-        result = test_llm_api(
-            config_path=args.config_path,
-            api_key=args.api_key,
-            base_url=args.base_url,
-            model=args.model,
-            api_format=args.api_format,
-            timeout_sec=args.timeout,
-            stream_mode=args.stream,
-        )
-        print(json.dumps(result, ensure_ascii=False))
-        if not result['valid']:
-            sys.exit(1)
-
-    elif args.command == 'resolve-llm-backend':
-        result = kernel_agent_cli.resolve_llm_backend(
-            load_config(args.config_path, allow_missing=True),
-            override=args.agent_cli,
-            probe=not args.no_probe,
-        )
-        print(json.dumps(result, ensure_ascii=False))
-        if result['backend'] == 'none':
-            sys.exit(1)
-
-    elif args.command == 'test-token-count':
-        result = test_token_count(
-            config_path=args.config_path,
-            api_key=args.api_key,
-            base_url=args.base_url,
-            model=args.model,
-            api_format=args.api_format,
-            timeout_sec=args.timeout,
-            sample_text=args.sample_text,
-        )
-        print(json.dumps(result, ensure_ascii=False))
-
-    elif args.command == 'split-audio':
-        result = split_audio(args.audio_path, args.max_size, args.max_deviation)
-        print(json.dumps(result, ensure_ascii=False))
-
-    elif args.command == 'chunk-text':
-        envelope = run_kernel_command(
-            'chunk-text',
-            input_path=args.input_path,
-            output_dir=args.output_dir,
-            chunk_size=args.chunk_size,
-            prompt_name=args.prompt,
-            config_path=args.config_path,
-        )
-        print(json.dumps(envelope if args.api_envelope else envelope['result'], ensure_ascii=False))
-
-    elif args.command == 'chunk-segments':
-        envelope = run_kernel_command(
-            'chunk-segments',
-            segments_path=args.segments_path,
-            output_dir=args.output_dir,
-            chunk_size=args.chunk_size,
-            prompt_name=args.prompt,
-            config_path=args.config_path,
-            chapters_path=args.chapters,
-        )
-        print(json.dumps(envelope if args.api_envelope else envelope['result'], ensure_ascii=False))
-
-    elif args.command == 'chunk-document':
-        envelope = run_kernel_command(
-            'chunk-document',
-            normalized_document_path=args.normalized_document_path,
-            output_dir=args.output_dir,
-            chunk_size=args.chunk_size,
-            prompt_name=args.prompt,
-            config_path=args.config_path,
-            chapters_path=args.chapters,
-            prefer=args.prefer,
-        )
-        print(json.dumps(envelope if args.api_envelope else envelope['result'], ensure_ascii=False))
-
-    elif args.command == 'get-chapters':
-        result = get_chapters(args.video_url)
-        print(json.dumps(result, ensure_ascii=False))
-
-    elif args.command == 'build-chapter-plan':
-        result = build_chapter_plan(args.chapters_path, args.manifest_ref, args.output_path)
-        print(json.dumps(result, ensure_ascii=False))
-
-    elif args.command == 'merge-content':
-        envelope = run_kernel_command(
-            'merge-content',
-            work_dir=args.work_dir,
-            output_file=args.output_file,
-            header=args.header,
-        )
-        print(json.dumps(envelope if args.api_envelope else envelope['result'], ensure_ascii=False))
-
-    elif args.command == 'create-run':
-        try:
-            task_spec = _load_optional_json_object(
-                inline_json=args.task_spec_json,
-                file_path=args.task_spec_file,
-            )
-        except (OSError, ValueError, json.JSONDecodeError) as error:
-            print(json.dumps({
-                'success': False,
-                'error': 'invalid_task_spec',
-                'message': str(error),
-            }, ensure_ascii=False))
-            sys.exit(1)
-        envelope = run_kernel_command(
-            'create-run',
-            work_dir=args.work_dir,
-            task_spec=task_spec,
-            task_id=args.task_id,
-            source_ref=args.source_ref,
-            output_mode=args.output_mode,
-            bilingual=args.bilingual,
-            quality_profile=args.quality_profile,
-            speed_priority=args.speed_priority,
-            cost_budget=args.cost_budget,
-            latency_budget=args.latency_budget,
-            allowed_fallbacks=args.allowed_fallbacks,
-            human_escalation_policy=args.human_escalation_policy,
-            policy_profile=args.policy_profile,
-            migration_mode=args.migration_mode,
-        )
-        result = envelope['result']
-        print(json.dumps(envelope if args.api_envelope else result, ensure_ascii=False))
-        if not result.get('success', False):
-            sys.exit(1)
-
-    elif args.command == 'inspect-run':
-        envelope = run_kernel_command(
-            'inspect-run',
-            work_dir=args.work_dir,
-            run_id=args.run_id,
-            policy_profile=args.policy_profile,
-        )
-        result = envelope['result']
-        print(json.dumps(envelope if args.api_envelope else result, ensure_ascii=False))
-        if not result.get('success', False):
-            sys.exit(1)
-
-    elif args.command == 'advance-run':
-        envelope = run_kernel_command(
-            'advance-run',
-            work_dir=args.work_dir,
-            prompt_name=args.prompt,
-            run_id=args.run_id,
-            action=args.action,
-            extra_instruction=args.extra_instruction,
-            config_path=args.config_path,
-            dry_run=args.dry_run,
-            input_key=args.input_key,
-            force=args.force,
-            policy_profile=args.policy_profile,
-        )
-        result = envelope['result']
-        print(json.dumps(envelope if args.api_envelope else result, ensure_ascii=False))
-        if not result.get('success', False) and not result.get('dry_run', False):
-            sys.exit(1)
-
-    elif args.command == 'apply-control':
-        envelope = run_kernel_command(
-            'apply-control',
-            work_dir=args.work_dir,
-            run_id=args.run_id,
-            signal=args.signal,
-            reason=args.reason,
-            policy_profile=args.policy_profile,
-        )
-        result = envelope['result']
-        print(json.dumps(envelope if args.api_envelope else result, ensure_ascii=False))
-        if not result.get('success', False):
-            sys.exit(1)
-
-    elif args.command == 'finalize-run':
-        envelope = run_kernel_command(
-            'finalize-run',
-            work_dir=args.work_dir,
-            run_id=args.run_id,
-            output_file=args.output_file,
-            header=args.header,
-            inspect_only=args.inspect_only,
-            policy_profile=args.policy_profile,
-        )
-        result = envelope['result']
-        print(json.dumps(envelope if args.api_envelope else result, ensure_ascii=False))
-        if not result.get('success', False):
-            sys.exit(1)
-
-    elif args.command == 'process-chunks':
-        if args.agent_cli:
-            os.environ[kernel_agent_cli.AGENT_CLI_ENV_VAR] = args.agent_cli
-        envelope = run_kernel_command(
-            'process-chunks',
-            work_dir=args.work_dir,
-            prompt_name=args.prompt,
-            extra_instruction=args.extra_instruction,
-            config_path=args.config_path,
-            dry_run=args.dry_run,
-            input_key=args.input_key,
-            force=args.force,
-        )
-        result = envelope['result']
-        print(json.dumps(envelope if args.api_envelope else result, ensure_ascii=False))
-        if not result.get('success', False) and not result.get('dry_run', False):
-            sys.exit(1)
-
-    elif args.command == 'prepare-resume':
-        envelope = run_kernel_command(
-            'prepare-resume',
-            work_dir=args.work_dir,
-            prompt_name=args.prompt,
-            config_path=args.config_path,
-            input_key=args.input_key,
-        )
-        print(json.dumps(envelope if args.api_envelope else envelope['result'], ensure_ascii=False))
-
-
-    elif args.command == 'runtime-status':
-        envelope = run_kernel_command(
-            'runtime-status',
-            work_dir=args.work_dir,
-        )
-        print(json.dumps(envelope if args.api_envelope else envelope['result'], ensure_ascii=False))
-
-    elif args.command == 'cancel-run':
-        envelope = run_kernel_command(
-            'cancel-run',
-            work_dir=args.work_dir,
-            reason=args.reason,
-        )
-        result = envelope['result']
-        print(json.dumps(envelope if args.api_envelope else result, ensure_ascii=False))
-        if not result.get('success', False):
-            sys.exit(1)
-
-    elif args.command == 'pause-run':
-        envelope = run_kernel_command(
-            'pause-run',
-            work_dir=args.work_dir,
-            reason=args.reason,
-        )
-        result = envelope['result']
-        print(json.dumps(envelope if args.api_envelope else result, ensure_ascii=False))
-        if not result.get('success', False):
-            sys.exit(1)
-
-    elif args.command == 'resume-run':
-        envelope = run_kernel_command(
-            'resume-run',
-            work_dir=args.work_dir,
-            reason=args.reason,
-        )
-        result = envelope['result']
-        print(json.dumps(envelope if args.api_envelope else result, ensure_ascii=False))
-        if not result.get('success', False):
-            sys.exit(1)
-
-    elif args.command == 'telemetry-summary':
-        envelope = run_kernel_command(
-            'telemetry-summary',
-            telemetry_ref=args.telemetry_ref,
-            command_filter=args.command_filter,
-            document_id=args.document_id,
-            success=args.success,
-            recent_limit=args.recent_limit,
-        )
-        result = envelope['result']
-        print(json.dumps(envelope if args.api_envelope else result, ensure_ascii=False))
-        if not result.get('success', False):
-            sys.exit(1)
-
-    elif args.command == 'telemetry-events':
-        envelope = run_kernel_command(
-            'telemetry-events',
-            telemetry_ref=args.telemetry_ref,
-            limit=args.limit,
-            command_filter=args.command_filter,
-            trace_id=args.trace_id,
-            document_id=args.document_id,
-            success=args.success,
-        )
-        result = envelope['result']
-        print(json.dumps(envelope if args.api_envelope else result, ensure_ascii=False))
-        if not result.get('success', False):
-            sys.exit(1)
-
-    elif args.command == 'build-glossary':
-        envelope = run_kernel_command(
-            'build-glossary',
-            work_dir=args.work_dir,
-            max_terms=args.max_terms,
-            min_occurrences=args.min_occurrences,
-            mode=args.mode,
-            normalized_document_path=args.normalized_document_path,
-            chapters_path=args.chapters_path,
-            metadata_json_path=args.metadata_json_path,
-            description_text=args.description_text,
-            description_path=args.description_path,
-        )
-        result = envelope['result']
-        print(json.dumps(envelope if args.api_envelope else result, ensure_ascii=False))
-        if not result.get('success', False):
-            sys.exit(1)
-
-    elif args.command == 'assemble-final':
-        envelope = run_kernel_command(
-            'assemble-final',
-            optimized_text_path=args.optimized_text_path,
-            output_file=args.output_file,
-            title=args.title,
-            source=args.source,
-            channel=args.channel,
-            date=args.date,
-            created=args.created,
-            duration=args.duration,
-            transcript_source=args.transcript_source,
-            bilingual=args.bilingual,
-        )
-        print(json.dumps(envelope if args.api_envelope else envelope['result'], ensure_ascii=False))
-
-    elif args.command == 'verify-quality':
-        envelope = run_kernel_command(
-            'verify-quality',
-            optimized_text_path=args.optimized_text_path,
-            raw_text_path=args.raw_text,
-            bilingual=args.bilingual,
-            work_dir=args.work_dir,
-            glossary_path=args.glossary_path,
-            glossary_max_terms=args.glossary_max_terms,
-        )
-        result = envelope['result']
-        print(json.dumps(envelope if args.api_envelope else result, ensure_ascii=False))
-        if not result['passed']:
-            sys.exit(1)
-
-    elif args.command == 'load-config':
-        result = load_config(args.config_path)
-        print(json.dumps(result, ensure_ascii=False))
-
-    elif args.command == 'sync-state':
-        result = sync_machine_state(args.state_ref, write_legacy=args.write_legacy)
-        print(json.dumps(result, ensure_ascii=False))
-
-    elif args.command == 'normalize-document':
-        envelope = run_kernel_command(
-            'normalize-document',
-            state_ref=args.state_ref,
-            output_path=args.output,
-            prefer=args.prefer,
-            allow_missing=args.allow_missing,
-        )
-        result = envelope['result']
-        print(json.dumps(envelope if args.api_envelope else result, ensure_ascii=False))
-        if not result['passed']:
-            sys.exit(1)
-
-    elif args.command == 'find-unfinished':
-        result = find_unfinished_runs(args.tmp_dir, video_id=args.video_id)
-        print(json.dumps(result, ensure_ascii=False))
-
-    elif args.command == 'subtitle-info':
-        raw = sys.stdin.read()
-        if args.from_list_subs:
-            payload = kernel_subtitle_language.metadata_from_list_subs(raw, video_id=args.video_id)
-        else:
-            try:
-                payload = json.loads(raw)
-            except json.JSONDecodeError as error:
-                print(f"Error: subtitle-info expects yt-dlp -J metadata on stdin: {error}", file=sys.stderr)
-                sys.exit(1)
-        try:
-            runtime = json.loads(args.yt_dlp_runtime_json) if args.yt_dlp_runtime_json else {}
-        except json.JSONDecodeError:
-            runtime = {}
-        result = kernel_subtitle_language.build_subtitle_info(payload, video_id=args.video_id, yt_dlp_runtime=runtime)
-        print(json.dumps(result, ensure_ascii=False))
-
-    elif args.command == 'validate-state':
-        envelope = run_kernel_command(
-            'validate-state',
-            state_path=args.state_path,
-            stage=args.stage,
-            require=args.require,
-        )
-        result = envelope['result']
-        print(json.dumps(envelope if args.api_envelope else result, ensure_ascii=False))
-        if not result['passed']:
-            sys.exit(1)
-
-    elif args.command == 'plan-optimization':
-        envelope = run_kernel_command(
-            'plan-optimization',
-            state_path=args.state_path,
-        )
-        result = envelope['result']
-        print(json.dumps(envelope if args.api_envelope else result, ensure_ascii=False))
-        if not result['passed']:
-            sys.exit(1)
-
-    elif args.command == 'run':
+    if args.command == 'run':
         # Progress goes to stderr; stdout carries exactly one JSON result.
         stderr_tail = kernel_pipeline._StderrTail(sys.stderr)
         with contextlib.redirect_stderr(stderr_tail), contextlib.redirect_stdout(stderr_tail):
@@ -8146,6 +3897,36 @@ def main():
         result, code = kernel_pipeline.cleanup(args.video_id, force=args.force)
         print(json.dumps(result, ensure_ascii=False))
         sys.exit(code)
+
+    elif args.command == 'subtitle-info':
+        raw = sys.stdin.read()
+        if args.from_list_subs:
+            payload = kernel_subtitle_language.metadata_from_list_subs(raw, video_id=args.video_id)
+        else:
+            try:
+                payload = json.loads(raw)
+            except json.JSONDecodeError as error:
+                print(f"Error: subtitle-info expects yt-dlp -J metadata on stdin: {error}", file=sys.stderr)
+                sys.exit(1)
+        try:
+            runtime = json.loads(args.yt_dlp_runtime_json) if args.yt_dlp_runtime_json else {}
+        except json.JSONDecodeError:
+            runtime = {}
+        result = kernel_subtitle_language.build_subtitle_info(payload, video_id=args.video_id, yt_dlp_runtime=runtime)
+        print(json.dumps(result, ensure_ascii=False))
+
+    elif args.command == 'verify-quality':
+        result = verify_quality(
+            args.optimized_text_path,
+            raw_text_path=args.raw_text,
+            bilingual=args.bilingual,
+            work_dir=args.work_dir,
+            glossary_path=args.glossary_path,
+            glossary_max_terms=args.glossary_max_terms,
+        )
+        print(json.dumps(result, ensure_ascii=False))
+        if not result['passed']:
+            sys.exit(1)
 
     else:
         parser.print_help()

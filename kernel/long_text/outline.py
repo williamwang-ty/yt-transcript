@@ -441,19 +441,6 @@ def hints_from_times(chapters: list[dict], cue_starts: list[tuple[int, float]],
     return hints
 
 
-def hints_from_chunk_plan(chapter_plan: list, chunk_starts: dict) -> list[dict]:
-    """Chapter hints from chapter_plan.json, at the first unit of each chapter's start chunk."""
-    hints = []
-    for chapter in chapter_plan if isinstance(chapter_plan, list) else []:
-        if not isinstance(chapter, dict):
-            continue
-        start = (chunk_starts or {}).get(str(chapter.get("start_chunk")))
-        title = clean_title(chapter.get("title_en") or chapter.get("title") or chapter.get("title_zh"))
-        if start and title and (not hints or int(start) > hints[-1]["start"]):
-            hints.append({"start": int(start), "title": title})
-    return hints
-
-
 # ---------------------------------------------------------------------------
 # Use in window rounds
 # ---------------------------------------------------------------------------

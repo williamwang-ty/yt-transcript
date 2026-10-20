@@ -13,15 +13,10 @@ fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-CONFIG_FILE="$ROOT_DIR/config.yaml"
 VIDEO_URL="$1"
 MODE="$2"
 
-CONFIG_JSON=""
-if [ -f "$CONFIG_FILE" ]; then
-    CONFIG_JSON=$(python3 "$ROOT_DIR/yt_transcript_utils.py" load-config --config-path "$CONFIG_FILE" 2>/dev/null || true)
-fi
-
+# yt-dlp settings; `run` sets them from config.yaml (yt_dlp_* keys).
 YT_DLP_SOCKET_TIMEOUT_SEC="${YT_DLP_SOCKET_TIMEOUT_SEC:-}"
 YT_DLP_RETRIES="${YT_DLP_RETRIES:-}"
 YT_DLP_EXTRACTOR_RETRIES="${YT_DLP_EXTRACTOR_RETRIES:-}"
@@ -42,24 +37,6 @@ METADATA_JSON_LOADED=false
 YT_TRANSCRIPT_INFO_JSON="${YT_TRANSCRIPT_INFO_JSON:-}"
 YT_TRANSCRIPT_DOWNLOAD_DIR="${YT_TRANSCRIPT_DOWNLOAD_DIR:-}"
 YT_TRANSCRIPT_SUBTITLE_MODE="${YT_TRANSCRIPT_SUBTITLE_MODE:-}"
-
-if [ -n "$CONFIG_JSON" ]; then
-    if [ -z "$YT_DLP_SOCKET_TIMEOUT_SEC" ]; then
-        YT_DLP_SOCKET_TIMEOUT_SEC=$(printf '%s' "$CONFIG_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin).get('yt_dlp_socket_timeout_sec',''))" 2>/dev/null)
-    fi
-    if [ -z "$YT_DLP_RETRIES" ]; then
-        YT_DLP_RETRIES=$(printf '%s' "$CONFIG_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin).get('yt_dlp_retries',''))" 2>/dev/null)
-    fi
-    if [ -z "$YT_DLP_EXTRACTOR_RETRIES" ]; then
-        YT_DLP_EXTRACTOR_RETRIES=$(printf '%s' "$CONFIG_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin).get('yt_dlp_extractor_retries',''))" 2>/dev/null)
-    fi
-    if [ -z "$YT_DLP_COOKIES_FROM_BROWSER" ]; then
-        YT_DLP_COOKIES_FROM_BROWSER=$(printf '%s' "$CONFIG_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin).get('yt_dlp_cookies_from_browser',''))" 2>/dev/null)
-    fi
-    if [ -z "$YT_DLP_COOKIES_FILE" ]; then
-        YT_DLP_COOKIES_FILE=$(printf '%s' "$CONFIG_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin).get('yt_dlp_cookies_file',''))" 2>/dev/null)
-    fi
-fi
 
 resolve_positive_int() {
     local raw_value="$1"

@@ -1,162 +1,10 @@
-"""Regression tests for workflow-level state and planning behavior."""
+"""Regression tests for the shell scripts: download.sh and the yt-dlp update check."""
 
 from tests._support import *
 
 
-class WorkflowRegressionTests(unittest.TestCase):
-    """Regression coverage for workflow state, normalization, and planning paths."""
-    def test_cleanup_script_removes_state_by_default(self):
-        """Test cleanup script removes state by default once the run is complete."""
-        video_id = "cleanup_state_test"
-        state_file = Path(f"/tmp/{video_id}_state.md")
-        machine_state_file = Path(f"/tmp/{video_id}_machine_state.json")
-        with tempfile.TemporaryDirectory() as tmpdir:
-            output_file = Path(tmpdir) / "2026-01-01. Done.md"
-            output_file.write_text("final", encoding="utf-8")
-            try:
-                state_file.write_text(f"vid: {video_id}\noutput_file: {output_file}\n", encoding="utf-8")
-                machine_state_file.write_text("{}", encoding="utf-8")
-                subprocess.run(
-                    ["bash", str(PROJECT_ROOT / "scripts/cleanup.sh"), video_id],
-                    cwd=PROJECT_ROOT,
-                    check=True,
-                    capture_output=True,
-                    text=True,
-                )
-                self.assertFalse(state_file.exists())
-                self.assertFalse(machine_state_file.exists())
-                self.assertTrue(output_file.exists())
-            finally:
-                state_file.unlink(missing_ok=True)
-                machine_state_file.unlink(missing_ok=True)
-
-    def test_cleanup_script_can_keep_state(self):
-        """Test cleanup script can keep state."""
-        video_id = "cleanup_keep_state_test"
-        state_file = Path(f"/tmp/{video_id}_state.md")
-        machine_state_file = Path(f"/tmp/{video_id}_machine_state.json")
-        with tempfile.TemporaryDirectory() as tmpdir:
-            output_file = Path(tmpdir) / "2026-01-01. Done.md"
-            output_file.write_text("final", encoding="utf-8")
-            try:
-                state_file.write_text(f"vid: {video_id}\noutput_file: {output_file}\n", encoding="utf-8")
-                machine_state_file.write_text("{}", encoding="utf-8")
-                subprocess.run(
-                    ["bash", str(PROJECT_ROOT / "scripts/cleanup.sh"), video_id, "--keep-state"],
-                    cwd=PROJECT_ROOT,
-                    check=True,
-                    capture_output=True,
-                    text=True,
-                )
-                self.assertTrue(state_file.exists())
-                self.assertTrue(machine_state_file.exists())
-            finally:
-                state_file.unlink(missing_ok=True)
-                machine_state_file.unlink(missing_ok=True)
-
-    def test_cleanup_script_keeps_unfinished_run(self):
-        """Test cleanup script refuses to delete state and chunks of an unfinished run."""
-        video_id = "cleanup_unfinished_test"
-        state_file = Path(f"/tmp/{video_id}_state.md")
-        machine_state_file = Path(f"/tmp/{video_id}_machine_state.json")
-        work_dir = Path(f"/tmp/{video_id}_chunks")
-        try:
-            state_file.write_text(f"vid: {video_id}\noutput_file:\nstep: 4\n", encoding="utf-8")
-            machine_state_file.write_text("{}", encoding="utf-8")
-            work_dir.mkdir(exist_ok=True)
-            (work_dir / "manifest.json").write_text('{"chunks": []}', encoding="utf-8")
-            result = subprocess.run(
-                ["bash", str(PROJECT_ROOT / "scripts/cleanup.sh"), video_id],
-                cwd=PROJECT_ROOT,
-                capture_output=True,
-                text=True,
-            )
-            self.assertEqual(result.returncode, 3)
-            self.assertIn("not finished", result.stderr)
-            self.assertTrue(state_file.exists())
-            self.assertTrue(machine_state_file.exists())
-            self.assertTrue((work_dir / "manifest.json").exists())
-
-            subprocess.run(
-                ["bash", str(PROJECT_ROOT / "scripts/cleanup.sh"), video_id, "--force"],
-                cwd=PROJECT_ROOT,
-                check=True,
-                capture_output=True,
-                text=True,
-            )
-            self.assertFalse(state_file.exists())
-            self.assertFalse(machine_state_file.exists())
-            self.assertFalse(work_dir.exists())
-        finally:
-            state_file.unlink(missing_ok=True)
-            machine_state_file.unlink(missing_ok=True)
-            shutil.rmtree(work_dir, ignore_errors=True)
-
-    def test_cleanup_script_cleans_downloads_without_state(self):
-        """Test cleanup script still clears plain temp files when nothing is resumable."""
-        video_id = "cleanup_no_state_test"
-        raw_text = Path(f"/tmp/{video_id}_raw_text.txt")
-        try:
-            raw_text.write_text("raw", encoding="utf-8")
-            subprocess.run(
-                ["bash", str(PROJECT_ROOT / "scripts/cleanup.sh"), video_id],
-                cwd=PROJECT_ROOT,
-                check=True,
-                capture_output=True,
-                text=True,
-            )
-            self.assertFalse(raw_text.exists())
-        finally:
-            raw_text.unlink(missing_ok=True)
-
-    def test_find_unfinished_reports_chunk_progress_and_completed_runs(self):
-        """Test find-unfinished separates interrupted runs from completed ones."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            tmp = Path(tmpdir)
-            output_file = tmp / "2026-01-01. Done.md"
-            output_file.write_text("final", encoding="utf-8")
-            (tmp / "done1_state.md").write_text(f"vid: done1\noutput_file: {output_file}\n", encoding="utf-8")
-
-            work_dir = tmp / "mid1_chunks"
-            work_dir.mkdir()
-            (work_dir / "manifest.json").write_text(json.dumps({"chunks": [
-                {"id": 0, "status": "done"},
-                {"id": 1, "status": "interrupted"},
-                {"id": 2, "status": "pending"},
-                {"id": 3, "status": "superseded"},
-            ]}), encoding="utf-8")
-            (tmp / "mid1_state.md").write_text(
-                f"vid: mid1\nurl: https://youtu.be/mid1\nstep: 4\noutput_file:\nwork_dir: {work_dir}\n",
-                encoding="utf-8",
-            )
-            (tmp / "early1_state.md").write_text("vid: early1\nstep: 2\noutput_file:\n", encoding="utf-8")
-            (tmp / "othertool_state.md").write_text("unrelated: true\n", encoding="utf-8")
-
-            result = utils.find_unfinished_runs(str(tmp))
-            self.assertTrue(result["has_unfinished"])
-            self.assertEqual([entry["vid"] for entry in result["completed"]], ["done1"])
-            unfinished = {entry["vid"]: entry for entry in result["unfinished"]}
-            self.assertEqual(set(unfinished), {"mid1", "early1"})
-            self.assertEqual(unfinished["mid1"]["chunks"]["total_chunks"], 3)
-            self.assertEqual(unfinished["mid1"]["chunks"]["done_chunks"], 1)
-            self.assertEqual(unfinished["mid1"]["resume_from_step"], 4)
-            self.assertIn(f"{PROJECT_ROOT}/yt_transcript_utils.py prepare-resume", unfinished["mid1"]["next_action"])
-            self.assertEqual(unfinished["early1"]["resume_from_step"], 2)
-
-            only = utils.find_unfinished_runs(str(tmp), video_id="early1")
-            self.assertEqual([entry["vid"] for entry in only["unfinished"]], ["early1"])
-
-    def test_cleanup_script_rejects_unsafe_video_id(self):
-        """Test cleanup script rejects unsafe video id."""
-        result = subprocess.run(
-            ["bash", str(PROJECT_ROOT / "scripts/cleanup.sh"), "../bad-id"],
-            cwd=PROJECT_ROOT,
-            capture_output=True,
-            text=True,
-        )
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("unsafe characters", result.stderr)
-
+class DownloadScriptTests(unittest.TestCase):
+    """download.sh metadata, subtitle-info, subtitles and audio modes, and update_yt_dlp.sh."""
     def test_download_metadata_returns_valid_json(self):
         """Test download metadata returns valid json."""
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -960,79 +808,37 @@ exit 1
             self.assertIn("Spoken language 'es' is not supported yet", result.stderr)
             self.assertNotIn("unexpected subtitle download", result.stderr)
 
-    def test_preflight_treats_update_check_as_best_effort(self):
-        """Test preflight treats update check as best effort."""
+    def test_yt_dlp_update_check_is_best_effort(self):
+        """A failed update check is reported and never fails the caller."""
         with tempfile.TemporaryDirectory() as tmpdir:
             fake_yt_dlp = Path(tmpdir) / "yt-dlp"
-            fake_yt_dlp.write_text(
-                """#!/usr/bin/env bash
-if [ "$1" = "--version" ]; then
-  echo '2025.01.01'
-  exit 0
-fi
-exit 0
-""",
-                encoding="utf-8",
-            )
+            fake_yt_dlp.write_text("#!/usr/bin/env bash\necho '2025.01.01'\n", encoding="utf-8")
             fake_yt_dlp.chmod(0o755)
-
-            fake_ffmpeg = Path(tmpdir) / "ffmpeg"
-            fake_ffmpeg.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
-            fake_ffmpeg.chmod(0o755)
-
             fake_curl = Path(tmpdir) / "curl"
             fake_curl.write_text("#!/usr/bin/env bash\nexit 127\n", encoding="utf-8")
             fake_curl.chmod(0o755)
-
-            config_path = PROJECT_ROOT / "config.yaml"
-            backup_path = None
-            if config_path.exists():
-                backup_path = Path(tmpdir) / "config.yaml.backup"
-                shutil.copy2(config_path, backup_path)
-
-            config_path.write_text('output_dir: "/tmp/yt-transcript-preflight-test"\n', encoding="utf-8")
+            version_cache = Path("/tmp/yt-dlp-version-cache")
+            previous_cache = version_cache.read_text(encoding="utf-8") if version_cache.exists() else None
+            version_cache.unlink(missing_ok=True)
             try:
                 env = os.environ.copy()
                 env["PATH"] = f"{tmpdir}:{env['PATH']}"
                 env.pop("YT_TRANSCRIPT_YT_DLP_UPDATE", None)
-                result = subprocess.run(
-                    ["bash", str(PROJECT_ROOT / "scripts/preflight.sh")],
-                    cwd=PROJECT_ROOT,
-                    env=env,
-                    capture_output=True,
-                    text=True,
-                )
+                result = subprocess.run(["bash", str(PROJECT_ROOT / "scripts/update_yt_dlp.sh")],
+                                        env=env, capture_output=True, text=True)
             finally:
-                if backup_path is not None and backup_path.exists():
-                    shutil.copy2(backup_path, config_path)
-                else:
-                    config_path.unlink(missing_ok=True)
-                shutil.rmtree("/tmp/yt-transcript-preflight-test", ignore_errors=True)
+                if previous_cache is not None:
+                    version_cache.write_text(previous_cache, encoding="utf-8")
 
             self.assertEqual(result.returncode, 0)
             self.assertIn("Could not check for updates", result.stdout)
-            self.assertIn("All pre-flight checks passed", result.stdout)
 
-    def test_preflight_supports_gnu_stat_for_cache_age(self):
-        """Test preflight supports gnu stat for cache age."""
+    def test_yt_dlp_update_check_supports_gnu_stat_for_cache_age(self):
+        """The hourly version cache works with GNU `stat -c`."""
         with tempfile.TemporaryDirectory() as tmpdir:
             fake_yt_dlp = Path(tmpdir) / "yt-dlp"
-            fake_yt_dlp.write_text(
-                """#!/usr/bin/env bash
-if [ "$1" = "--version" ]; then
-  echo '2025.01.01'
-  exit 0
-fi
-exit 0
-""",
-                encoding="utf-8",
-            )
+            fake_yt_dlp.write_text("#!/usr/bin/env bash\necho '2025.01.01'\n", encoding="utf-8")
             fake_yt_dlp.chmod(0o755)
-
-            fake_ffmpeg = Path(tmpdir) / "ffmpeg"
-            fake_ffmpeg.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
-            fake_ffmpeg.chmod(0o755)
-
             fake_stat = Path(tmpdir) / "stat"
             fake_stat.write_text(
                 """#!/usr/bin/env bash
@@ -1048,37 +854,16 @@ exit 1
                 encoding="utf-8",
             )
             fake_stat.chmod(0o755)
-
             version_cache = Path("/tmp/yt-dlp-version-cache")
-            previous_cache = None
-            if version_cache.exists():
-                previous_cache = version_cache.read_text(encoding="utf-8")
+            previous_cache = version_cache.read_text(encoding="utf-8") if version_cache.exists() else None
             version_cache.write_text("2025.01.01", encoding="utf-8")
-
-            config_path = PROJECT_ROOT / "config.yaml"
-            backup_path = None
-            if config_path.exists():
-                backup_path = Path(tmpdir) / "config.yaml.backup"
-                shutil.copy2(config_path, backup_path)
-
-            config_path.write_text('output_dir: "/tmp/yt-transcript-preflight-test"\n', encoding="utf-8")
             try:
                 env = os.environ.copy()
                 env["PATH"] = f"{tmpdir}:{env['PATH']}"
                 env.pop("YT_TRANSCRIPT_YT_DLP_UPDATE", None)
-                result = subprocess.run(
-                    ["bash", str(PROJECT_ROOT / "scripts/preflight.sh")],
-                    cwd=PROJECT_ROOT,
-                    env=env,
-                    capture_output=True,
-                    text=True,
-                )
+                result = subprocess.run(["bash", str(PROJECT_ROOT / "scripts/update_yt_dlp.sh")],
+                                        env=env, capture_output=True, text=True)
             finally:
-                if backup_path is not None and backup_path.exists():
-                    shutil.copy2(backup_path, config_path)
-                else:
-                    config_path.unlink(missing_ok=True)
-                shutil.rmtree("/tmp/yt-transcript-preflight-test", ignore_errors=True)
                 if previous_cache is None:
                     version_cache.unlink(missing_ok=True)
                 else:
@@ -1086,7 +871,6 @@ exit 1
 
             self.assertEqual(result.returncode, 0)
             self.assertIn("yt-dlp is up to date (cached)", result.stdout)
-            self.assertIn("All pre-flight checks passed", result.stdout)
 
     def test_audio_download_uses_isolated_dir(self):
         """Test audio download uses isolated dir."""

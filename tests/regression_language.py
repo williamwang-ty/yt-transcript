@@ -213,7 +213,7 @@ class LanguageRegressionTests(unittest.TestCase):
                 self.assertNotIn("detect_language", captured["url"])
 
     def test_transcribe_deepgram_reports_detected_language(self):
-        """Test transcribe-deepgram returns the language Deepgram detected across chunks."""
+        """Test the Deepgram transcription returns the language Deepgram detected across chunks."""
         with tempfile.TemporaryDirectory() as tmpdir:
             audio_path = Path(tmpdir) / "source.mp3"
             output_segments = Path(tmpdir) / "segments.json"

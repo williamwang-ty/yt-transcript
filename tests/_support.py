@@ -4,6 +4,7 @@ import http.client
 import io
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -15,6 +16,7 @@ from unittest import mock
 
 import yt_transcript_utils as utils
 from kernel.long_text import agent_cli as _agent_cli
+from kernel.long_text import chunking as kernel_chunking
 
 # Tests must not hand chunks to whatever agent CLI runs the suite: drop the
 # host-agent markers so llm_backend=auto resolves to the mocked API.
@@ -43,20 +45,25 @@ __all__ = [
     "mock",
     "utils",
     "PROJECT_ROOT",
-    "FixedChunkExecutorTestCase",
     "FIXTURES_DIR",
+    "chunk_plain_text",
+    "tag_echo",
 ]
 
 
-class FixedChunkExecutorTestCase(unittest.TestCase):
-    """Base for tests of the fixed-chunk executor (`long_text_mode: chunks`).
+def chunk_plain_text(text: str, work_dir: Path, prompt_name: str = "cleanup_zh", **config) -> Path:
+    """Chunk plain text into a text work dir the way the text stage of `run` does."""
+    work_dir = Path(work_dir)
+    work_dir.parent.mkdir(parents=True, exist_ok=True)
+    normalized = work_dir.parent / f"{work_dir.name}_normalized_document.json"
+    normalized.write_text(json.dumps({"content": {"text": text}, "segments": []}, ensure_ascii=False),
+                          encoding="utf-8")
+    kernel_chunking.chunk_document(str(normalized), str(work_dir), prompt_name,
+                                   {**utils._default_config_values(), **config})
+    return work_dir
 
-    Window is the default executor; these tests pin chunks so process-chunks
-    runs the code they exercise.
-    """
 
-    def setUp(self):
-        super().setUp()
-        patcher = mock.patch("kernel.long_text.window.resolve_long_text_mode", return_value="chunks")
-        patcher.start()
-        self.addCleanup(patcher.stop)
+def tag_echo(prompt: str) -> str:
+    """Fake model answer for a window round: every numbered unit unchanged in one paragraph, then the end line."""
+    units = re.findall(r"^(\[S\d+\] .*)$", prompt, re.MULTILINE)
+    return "".join(units) + "\n\n<!--END-->"

@@ -138,12 +138,6 @@ def _resolve_normalized_document_path(work_dir: str, manifest_payload: dict,
     candidate = str(manifest_payload.get("normalized_document_path", "")).strip()
     if candidate:
         return str(Path(candidate).expanduser().resolve())
-
-    plan = manifest_payload.get("plan", {}) if isinstance(manifest_payload.get("plan", {}), dict) else {}
-    chunk_contract = plan.get("chunk_contract", {}) if isinstance(plan.get("chunk_contract", {}), dict) else {}
-    candidate = str(chunk_contract.get("normalized_document_path", "")).strip()
-    if candidate:
-        return str(Path(candidate).expanduser().resolve())
     return ""
 
 
@@ -184,7 +178,7 @@ def _load_metadata_context(metadata_json_path: str) -> list[tuple[str, str]]:
 
 
 def _load_chapter_titles(chapters_path: str) -> list[str]:
-    """Load titles from chapter JSON or chapter_plan JSON."""
+    """Load titles from a chapters JSON file."""
     payload = _read_json_document(chapters_path)
     if isinstance(payload, dict):
         chapters = payload.get("chapters", [])
@@ -201,12 +195,6 @@ def _load_chapter_titles(chapters_path: str) -> list[str]:
         if title:
             titles.append(title)
     return titles
-
-
-def _default_chapters_path_for(work_dir: str) -> str:
-    """Return the default chapter-plan path for a work directory when present."""
-    candidate = Path(str(work_dir or "")).expanduser().resolve() / "chapter_plan.json"
-    return str(candidate) if candidate.exists() else ""
 
 
 def _iter_transcript_contexts(work_dir: str, *, manifest_payload: dict | None = None,
@@ -256,8 +244,7 @@ def _iter_transcript_contexts(work_dir: str, *, manifest_payload: dict | None = 
                 "score_weight": TRANSCRIPT_SOURCE_WEIGHTS["metadata_description"],
             })
 
-    resolved_chapters_path = str(chapters_path or "").strip() or _default_chapters_path_for(work_dir)
-    for title in _load_chapter_titles(resolved_chapters_path):
+    for title in _load_chapter_titles(str(chapters_path or "").strip()):
         key = ("chapter_titles", title)
         if key in seen:
             continue
@@ -411,7 +398,7 @@ def build_glossary(work_dir: str, *, max_terms: int = 50,
         manifest_payload,
         normalized_document_path,
     )
-    resolved_chapters_path = str(chapters_path or "").strip() or _default_chapters_path_for(str(work_path))
+    resolved_chapters_path = str(chapters_path or "").strip()
     payload = {
         "schema_version": GLOSSARY_SCHEMA_VERSION,
         "format": GLOSSARY_FORMAT,

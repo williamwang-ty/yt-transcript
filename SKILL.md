@@ -30,7 +30,7 @@ Exit code 2 means the command line was wrong (for example, not a YouTube URL).
 
 Rules:
 
-- Do not run the internal steps yourself (`download.sh`, `process-chunks`, `assemble-final` and so on), do not edit anything in the work directory except `task.output_file`, and do not write or rewrite the article yourself. To change the outcome, rerun `run` with a flag below.
+- Do not run the internal steps yourself (`download.sh` or the debug commands of `yt_transcript_utils.py`), do not edit anything in the work directory except `task.output_file`, and do not write or rewrite the article yourself. To change the outcome, rerun `run` with a flag below.
 - Rerunning the same command resumes an interrupted or failed run where it stopped, including one your shell killed before it printed a result. A video that is already done returns `done` at once with the existing article.
 - The article is final. Do not summarize it, rewrite it, or pass it through another digest step unless the user asks, and do not read it into the conversation unless they ask (it can be long).
 

@@ -9,10 +9,7 @@ from .overlap import find_leading_overlap
 
 
 SENTENCE_TERMINATORS = "。！？!?；;"
-SOFT_CONTINUATION_ENDINGS = "，、；：,:([{（【《「『-"
 LIST_PREFIX_RE = re.compile(r"^(?:[-*+]\s|\d+\.\s)")
-ASCII_WORD_RE = re.compile(r"[A-Za-z0-9]+(?:[-'][A-Za-z0-9]+)?")
-CHUNK_SEAM_MARKER = "<!-- yt-transcript-chunk-seam -->"
 
 
 def build_empty_post_merge_diagnostics() -> dict:
@@ -21,7 +18,6 @@ def build_empty_post_merge_diagnostics() -> dict:
         "duplicate_body_blocks_removed": 0,
         "seam_overlap_trim_count": 0,
         "seam_overlap_trimmed_chars": 0,
-        "short_paragraph_merge_count": 0,
         "duplicate_heading_block_count": 0,
         "heading_line_dedup_count": 0,
         "blank_line_groups_collapsed": 0,
@@ -48,8 +44,6 @@ def _block_type(block: str) -> str:
     lines = [line.strip() for line in str(block or "").splitlines() if line.strip()]
     if not lines:
         return "empty"
-    if len(lines) == 1 and lines[0] == CHUNK_SEAM_MARKER:
-        return "seam"
     if len(lines) == 1 and re.fullmatch(r"-{3,}", lines[0]):
         return "hr"
     if lines[0].startswith(("```", "~~~")):
@@ -103,84 +97,6 @@ def _trim_seam_overlap(previous_block: str, current_block: str) -> tuple[str, in
     return str(current_block or "")[len(overlap):].lstrip(), len(overlap)
 
 
-def _ends_with_terminal_punctuation(text: str) -> bool:
-    """Return whether a body block ends with strong terminal punctuation."""
-    stripped = str(text or "").rstrip()
-    return bool(stripped) and stripped[-1] in SENTENCE_TERMINATORS
-
-
-def _contains_cjk(text: str) -> bool:
-    """Return whether the block contains any CJK-family character."""
-    return any(is_cjk_family_char(char) for char in str(text or ""))
-
-
-def _ascii_word_tokens(text: str) -> list[str]:
-    """Return lightweight ASCII word tokens for heading/fragment heuristics."""
-    return ASCII_WORD_RE.findall(str(text or ""))
-
-
-def _looks_like_titleish_ascii_line(text: str) -> bool:
-    """Return whether an ASCII line looks more like a short heading than a sentence fragment."""
-    stripped = str(text or "").strip()
-    if not stripped or "\n" in stripped:
-        return False
-    if re.search(r"[.!?,:;]", stripped):
-        return False
-
-    tokens = _ascii_word_tokens(stripped)
-    if not tokens or len(tokens) > 6:
-        return False
-
-    titleish_tokens = sum(1 for token in tokens if token.isupper() or token[:1].isupper())
-    return titleish_tokens >= max(1, len(tokens) - 1)
-
-
-def _looks_like_incomplete_fragment(text: str) -> bool:
-    """Return whether a body block looks like a split fragment."""
-    stripped = str(text or "").rstrip()
-    if not stripped:
-        return False
-    if _ends_with_terminal_punctuation(stripped):
-        return False
-    if LIST_PREFIX_RE.match(stripped) or stripped.startswith(("#", ">")):
-        return False
-    if stripped[-1] in SOFT_CONTINUATION_ENDINGS:
-        return True
-    if _contains_cjk(stripped):
-        punctuation_count = sum(1 for char in stripped if char in "，。！？；：,:;!?")
-        return punctuation_count == 0 and _meaningful_char_count(stripped) >= 8
-
-    tokens = _ascii_word_tokens(stripped)
-    if tokens:
-        if len(tokens) < 3 or _looks_like_titleish_ascii_line(stripped):
-            return False
-        return len(stripped) >= 12
-
-    return len(stripped) >= 16
-
-
-def _should_merge_short_body_blocks(previous_block: str, current_block: str) -> bool:
-    """Return whether two adjacent body blocks should become one paragraph."""
-    previous = str(previous_block or "").strip()
-    current = str(current_block or "").strip()
-    if not previous or not current:
-        return False
-    if len(previous) + len(current) > 280:
-        return False
-    return _looks_like_incomplete_fragment(previous)
-
-
-def _merge_body_blocks(previous_block: str, current_block: str) -> str:
-    """Merge two body blocks into one paragraph using a single newline seam."""
-    previous = str(previous_block or "").rstrip()
-    current = str(current_block or "").lstrip()
-    if not previous:
-        return current
-    if not current:
-        return previous
-    return f"{previous}\n{current}"
-
-
 def _strip_duplicate_heading_lines(previous_heading_block: str, current_block: str) -> tuple[str, int]:
     """Strip heading lines duplicated immediately after an injected chapter block."""
     previous_lines = {
@@ -208,7 +124,7 @@ def _strip_duplicate_heading_lines(previous_heading_block: str, current_block: s
     return "\n".join(trimmed_lines).strip(), removed
 
 
-def _cleanup_body_blocks(text: str, diagnostics: dict, *, join_fragments: bool = True) -> str:
+def _cleanup_body_blocks(text: str, diagnostics: dict) -> str:
     """Run markdown-safe cleanup on the merge body."""
     blocks = _split_blocks(text)
     if not blocks:
@@ -217,8 +133,6 @@ def _cleanup_body_blocks(text: str, diagnostics: dict, *, join_fragments: bool =
     cleaned_blocks: list[str] = []
     for raw_block in blocks:
         current_block = raw_block
-        if _block_type(current_block) == "seam":
-            continue
         if cleaned_blocks and _block_type(cleaned_blocks[-1]) == "heading":
             stripped_block, removed_heading_lines = _strip_duplicate_heading_lines(cleaned_blocks[-1], current_block)
             if removed_heading_lines:
@@ -247,31 +161,24 @@ def _cleanup_body_blocks(text: str, diagnostics: dict, *, join_fragments: bool =
                     if not current_block:
                         diagnostics["duplicate_body_blocks_removed"] += 1
                         continue
-                if join_fragments and _should_merge_short_body_blocks(previous_block, current_block):
-                    cleaned_blocks[-1] = _merge_body_blocks(previous_block, current_block)
-                    diagnostics["short_paragraph_merge_count"] += 1
-                    continue
 
         cleaned_blocks.append(current_block)
 
     return "\n\n".join(block.strip() for block in cleaned_blocks if block.strip()).strip()
 
 
-def post_merge_cleanup(text: str, *, has_header: bool = False, join_fragments: bool = True) -> tuple[str, dict]:
-    """Clean merge-body seams while preserving markdown structure.
+def post_merge_cleanup(text: str) -> tuple[str, dict]:
+    """Drop repeated headings, repeated paragraphs and repeated paragraph starts, keeping Markdown structure.
 
-    Callers should pass the merge body only. ``has_header`` is retained for
-    backward compatibility and is otherwise ignored. ``join_fragments=False``
-    keeps short paragraphs apart: window output has no chunk seams, and its
-    short paragraphs are speaker turns or the halves of a bilingual pair.
+    Short paragraphs stay apart: in window output they are speaker turns or
+    the halves of a bilingual pair.
     """
-    del has_header
     diagnostics = build_empty_post_merge_diagnostics()
     normalized = _normalize_text_body(text)
     if not normalized:
         return "", diagnostics
 
-    cleaned_text = _cleanup_body_blocks(normalized, diagnostics, join_fragments=join_fragments)
+    cleaned_text = _cleanup_body_blocks(normalized, diagnostics)
     cleaned_text, collapsed_count = re.subn(r"\n{3,}", "\n\n", cleaned_text)
     diagnostics["blank_line_groups_collapsed"] = collapsed_count
     return cleaned_text.strip(), diagnostics
