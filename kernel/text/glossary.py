@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import json
 import re
-import time
 from pathlib import Path
+
+from kernel.files import now_iso
 
 
 GLOSSARY_SCHEMA_VERSION = 1
@@ -32,11 +33,6 @@ TRANSCRIPT_SOURCE_WEIGHTS = {
     "metadata_description": 2,
 }
 HIGH_PRIORITY_SOURCE_KINDS = {"source_title", "source_channel", "chapter_titles", "metadata_description"}
-
-
-def _now_iso() -> str:
-    """Return the current local timestamp in ISO-like wall-clock format."""
-    return time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime())
 
 
 def glossary_path_for(work_dir: str) -> Path:
@@ -404,7 +400,7 @@ def build_glossary(work_dir: str, *, max_terms: int = 50,
         "format": GLOSSARY_FORMAT,
         "work_dir": str(work_path),
         "glossary_path": str(glossary_path),
-        "generated_at": _now_iso(),
+        "generated_at": now_iso(),
         "mode": resolved_mode,
         "source": "transcript_context" if resolved_mode == "transcript" else "manifest_raw_chunks",
         "source_details": {

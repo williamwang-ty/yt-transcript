@@ -24,7 +24,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from kernel.long_text import agent_cli as _agent_cli
+from kernel.llm import agent_cli as _agent_cli
 from kernel.pipeline import STAGES
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]

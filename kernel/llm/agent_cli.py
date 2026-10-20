@@ -15,13 +15,16 @@ import subprocess
 import tempfile
 import time
 
-LLM_BACKEND_MODES = ("auto", "api")
-DEFAULT_LLM_BACKEND = "auto"
+from kernel.config import (
+    DEFAULT_CLI_MAX_RETRIES,
+    DEFAULT_CLI_PROBE_TIMEOUT_SEC,
+    DEFAULT_CLI_TIMEOUT_SEC,
+    normalize_backend_mode,
+)
+from kernel.llm.api import LLMRequestError
+
 AGENT_CLI_ENV_VAR = "YT_TRANSCRIPT_AGENT_CLI"
 PROMPT_PLACEHOLDER = "{prompt}"
-DEFAULT_CLI_TIMEOUT_SEC = 600
-DEFAULT_CLI_MAX_RETRIES = 1
-DEFAULT_CLI_PROBE_TIMEOUT_SEC = 120
 CLI_PROBE_PROMPT = "Reply with OK only."
 
 # Ordered: the first agent whose marker variable is set wins. Markers are the
@@ -71,19 +74,6 @@ KNOWN_AGENTS = (
         "commands": (["cursor-agent", "-p", "--trust", "--output-format", "text", PROMPT_PLACEHOLDER],),
     },
 )
-
-
-def _llm_request_error():
-    """Return the shared LLMRequestError class."""
-    import yt_transcript_utils as utils
-
-    return utils.LLMRequestError
-
-
-def normalize_backend_mode(value) -> str:
-    """Normalize `llm_backend` to `auto` or `api`."""
-    text = str(value or "").strip().lower()
-    return text if text in LLM_BACKEND_MODES else DEFAULT_LLM_BACKEND
 
 
 def find_agent(name: str) -> dict | None:
@@ -172,8 +162,7 @@ def build_cli_invocation(command: list, prompt: str) -> tuple[list, str | None]:
 def call_cli_llm(command: list, prompt: str, *, timeout_sec: int = DEFAULT_CLI_TIMEOUT_SEC,
                  max_retries: int = DEFAULT_CLI_MAX_RETRIES, strip_env=(), agent: str = "",
                  runner=subprocess.run) -> dict:
-    """Run one prompt through an agent CLI; result mirrors `_call_llm_api`."""
-    LLMRequestError = _llm_request_error()
+    """Run one prompt through an agent CLI; result mirrors `call_llm_api`."""
     request_url = f"cli:{agent or (command[0] if command else 'unknown')}"
     argv, stdin_text = build_cli_invocation(command, prompt)
     child_env = {key: value for key, value in os.environ.items() if key not in set(strip_env or ())}

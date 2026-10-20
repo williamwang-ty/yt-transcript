@@ -28,11 +28,19 @@ import urllib.parse
 from datetime import datetime
 from pathlib import Path
 
-from kernel import subtitle_language as kernel_subtitle_language
+from kernel import config as kernel_config
 from kernel.files import atomic_write_text
-from kernel.long_text import chunking as kernel_chunking
-from kernel.long_text import merge as kernel_merge
-from kernel.long_text import window as kernel_window
+from kernel.quality import verify as kernel_verify
+from kernel.sources import deepgram as kernel_deepgram
+from kernel.sources import subtitle_language as kernel_subtitle_language
+from kernel.text import assemble as kernel_assemble
+from kernel.text import chunking as kernel_chunking
+from kernel.text import merge as kernel_merge
+from kernel.text import normalize as kernel_normalize
+from kernel.text import plan as kernel_plan
+from kernel.text import subtitle_quality as kernel_subtitle_quality
+from kernel.text import window as kernel_window
+from kernel.text.cleanup import subtitle as kernel_subtitle_cleanup
 
 STAGES = ("metadata", "source", "normalize", "plan", "text", "merge", "verify", "assemble", "cleanup")
 PLAN_STAGE = "plan"
@@ -174,11 +182,6 @@ class _StderrTail:
         return getattr(self.stream, name)
 
 
-def _utils():
-    import yt_transcript_utils as utils
-    return utils
-
-
 def _now() -> str:
     return datetime.now().astimezone().isoformat(timespec="milliseconds")
 
@@ -211,10 +214,6 @@ def parse_video_id(url: str) -> str:
 
 def canonical_url(video_id: str) -> str:
     return f"https://www.youtube.com/watch?v={video_id}"
-
-
-def language_family(code: str | None) -> str:
-    return kernel_subtitle_language.language_family(code)
 
 
 def iso_date(upload_date: str) -> str:
@@ -317,7 +316,7 @@ def run_finished(state: dict) -> bool:
 
 
 def _skill_command() -> str:
-    return f"python3 {shlex.quote(str(_utils()._skill_root() / 'yt_transcript_utils.py'))}"
+    return f"python3 {shlex.quote(str(kernel_config.skill_root() / 'yt_transcript_utils.py'))}"
 
 
 class _Run:
@@ -407,7 +406,7 @@ class _Run:
         self.state = read_state(self.work_dir) or _new_state(self.video_id, self.url)
         self.state["url"] = self.url
         try:
-            self.config = _utils().load_config(self.config_path, allow_missing=self.config_path is None)
+            self.config = kernel_config.load_config(self.config_path, allow_missing=self.config_path is None)
         except SystemExit:
             return self.finish("failed", stage="", reason="config_error", retryable=False,
                                message=(self.stderr_tail.last(1) if self.stderr_tail else "")
@@ -540,7 +539,7 @@ class _Run:
             if value not in (None, "") and not env.get(env_name):
                 env[env_name] = str(value)
         self.path(SOURCE_DIR).mkdir(parents=True, exist_ok=True)
-        script = _utils()._skill_root() / "scripts" / "download.sh"
+        script = kernel_config.skill_root() / "scripts" / "download.sh"
         try:
             proc = subprocess.run(["bash", str(script), self.url, mode], capture_output=True, text=True,
                                   timeout=DOWNLOAD_TIMEOUT_SEC, env=env)
@@ -570,7 +569,7 @@ class _Run:
         """
         if os.environ.get(YT_DLP_UPDATE_ENV) == "0" or not shutil.which("yt-dlp"):
             return
-        script = _utils()._skill_root() / "scripts" / "update_yt_dlp.sh"
+        script = kernel_config.skill_root() / "scripts" / "update_yt_dlp.sh"
         try:
             proc = subprocess.run(["bash", str(script)], capture_output=True, text=True,
                                   timeout=YT_DLP_UPDATE_TIMEOUT_SEC)
@@ -708,10 +707,9 @@ class _Run:
         vtt = Path(str(subs.get("selected_source_vtt") or ""))
         if not vtt.is_file():
             raise Stop("failed", "download_error", "download.sh subtitles returned no subtitle file", retryable=True)
-        utils = _utils()
-        self.path(RAW_TEXT_FILE).write_text(utils.parse_vtt(str(vtt)) + "\n", encoding="utf-8")
+        self.path(RAW_TEXT_FILE).write_text(kernel_subtitle_cleanup.parse_vtt(str(vtt)) + "\n", encoding="utf-8")
         self.path(SEGMENTS_FILE).write_text(
-            json.dumps(utils.parse_vtt_segments(str(vtt), language=language), ensure_ascii=False),
+            json.dumps(kernel_subtitle_cleanup.parse_vtt_segments(str(vtt), language=language), ensure_ascii=False),
             encoding="utf-8")
         route.update({
             "source": "subtitles",
@@ -722,7 +720,7 @@ class _Run:
             "fallback_used": bool(subs.get("fallback_used")),
         })
 
-        check = utils.build_normalized_document(
+        check = kernel_normalize.build_normalized_document(
             document_id=self.video_id,
             raw_text_path=str(self.path(RAW_TEXT_FILE)),
             segments_path=str(self.path(SEGMENTS_FILE)),
@@ -732,10 +730,11 @@ class _Run:
         )
         if not check.get("passed"):
             raise Stop("failed", "source_error", "; ".join(check.get("hard_failures", [])), retryable=False)
-        routing = utils._build_source_routing_signal("youtube", mode, check.get("subtitle_quality", {}))
+        routing = kernel_subtitle_quality.build_source_routing_signal("youtube", mode,
+                                                                      check.get("subtitle_quality", {}))
         score, band = routing["subtitle_quality_score"], routing["subtitle_quality_band"]
         route["subtitle_quality"] = {"score": score, "band": band}
-        family = LANGUAGE_NAMES.get(language_family(language), language)
+        family = LANGUAGE_NAMES.get(kernel_subtitle_language.language_family(language), language)
         spoken = LANGUAGE_NAMES.get(route["source_language"], route["source_language"] or "unknown-language")
         route["reason"] = f"{spoken} video with {'human' if kind == 'manual' else 'ASR'} {family} subtitles" \
             + (f" (preferred track blocked: {', '.join(route['blocked_tracks'])})" if route["blocked_tracks"] else "")
@@ -751,9 +750,10 @@ class _Run:
         return True
 
     def transcribe(self, route: dict, language: str) -> None:
+        requested_family = kernel_subtitle_language.language_family(language)
         route.update({"source": "deepgram", "track": None, "track_kind": None, "subtitle_quality": None,
-                      "language": language_family(language) if language != "auto" else "",
-                      "mode": kernel_subtitle_language.MODE_BY_FAMILY.get(language_family(language), "")})
+                      "language": requested_family if language != "auto" else "",
+                      "mode": kernel_subtitle_language.MODE_BY_FAMILY.get(requested_family, "")})
         if self.plan_only:
             raise Stop("plan_stop")
         api_key = str(self.config.get("deepgram_api_key") or "").strip()
@@ -768,9 +768,8 @@ class _Run:
                 raise Stop("failed", "download_error", "download.sh audio returned no audio file", retryable=True)
             record["audio_file"] = str(audio_file)
             self.save()
-        utils = _utils()
         try:
-            result = utils.transcribe_deepgram(
+            result = kernel_deepgram.transcribe_deepgram(
                 str(audio_file),
                 language=language,
                 config_path=self.config_path,
@@ -785,7 +784,7 @@ class _Run:
                 or f"{type(error).__name__}: {error}"
             raise Stop("failed", "deepgram_error", message, retryable=True) from error
         detected = str(result.get("language") or language)
-        family = language_family(detected)
+        family = kernel_subtitle_language.language_family(detected)
         if family not in kernel_subtitle_language.MODE_BY_FAMILY:
             raise Stop("unsupported", "unsupported_language",
                        f"Deepgram detected the spoken language {detected!r}, which is not supported yet; "
@@ -809,7 +808,7 @@ class _Run:
 
     def stage_normalize(self, record: dict) -> None:
         route = self.state["route"]
-        result = _utils().build_normalized_document(
+        result = kernel_normalize.build_normalized_document(
             document_id=self.video_id,
             raw_text_path=str(self.path(RAW_TEXT_FILE)),
             segments_path=str(self.path(SEGMENTS_FILE)),
@@ -825,8 +824,7 @@ class _Run:
 
     def stage_plan(self, record: dict) -> None:
         route = self.state["route"]
-        utils = _utils()
-        plan = utils.plan_text_operations(
+        plan = kernel_plan.plan_text_operations(
             video_id=self.video_id,
             duration=int(self.state["metadata"].get("duration") or 0),
             mode=route["mode"],
@@ -843,9 +841,9 @@ class _Run:
         tasks = []
         for index, operation in enumerate(plan.get("operations", [])):
             prompt = operation["prompt"]
-            ratio = utils._get_task_output_ratio(prompt, self.config)
+            ratio = kernel_config.get_task_output_ratio(prompt, self.config)
             write_tokens = max(1, int(self.config.get("window_write_tokens")
-                                      or kernel_window.DEFAULT_WINDOW_WRITE_TOKENS))
+                                      or kernel_config.DEFAULT_WINDOW_WRITE_TOKENS))
             tasks.append({
                 "prompt": prompt,
                 "input_key": operation.get("input_key") or ("raw_path" if index == 0 else "processed_path"),
@@ -971,7 +969,7 @@ class _Run:
         record["outputs"] = [OPTIMIZED_FILE]
 
     def stage_verify(self, record: dict) -> None:
-        result = _utils().verify_quality(
+        result = kernel_verify.verify_quality(
             str(self.path(OPTIMIZED_FILE)),
             raw_text_path=str(self.path(RAW_TEXT_FILE)),
             bilingual=self.state["route"]["mode"] == "bilingual",
@@ -990,12 +988,11 @@ class _Run:
         if not output_dir.strip():
             raise Stop("needs_user", "output_dir_missing", NEEDS_USER_MESSAGES["output_dir_missing"])
         meta = self.state["metadata"]
-        utils = _utils()
         date = iso_date(meta.get("upload_date", ""))
-        title = utils.sanitize_filename(str(meta.get("title") or "")).strip() or self.video_id
+        title = kernel_assemble.sanitize_filename(str(meta.get("title") or "")).strip() or self.video_id
         output_file = Path(output_dir).expanduser() / (f"{date}. {title}.md" if date else f"{title}.md")
         mode = self.state["route"]["mode"]
-        utils.assemble_final(
+        kernel_assemble.assemble_final(
             str(self.path(OPTIMIZED_FILE)),
             str(output_file),
             title=str(meta.get("title") or ""),

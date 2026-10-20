@@ -18,7 +18,8 @@ from pathlib import Path
 ROOT_DIR = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT_DIR))
 
-import yt_transcript_utils as utils  # noqa: E402
+from kernel import cli as kernel_cli  # noqa: E402
+from kernel.sources import deepgram as kernel_deepgram  # noqa: E402
 
 FIXTURES_ENV = "YT_TRANSCRIPT_E2E_FIXTURES"
 
@@ -32,9 +33,9 @@ def recorded_response(audio_path: str, *args, **kwargs) -> dict:
 
 
 def main() -> int:
-    utils._call_deepgram_api = recorded_response
+    kernel_deepgram._call_deepgram_api = recorded_response
     sys.argv = [str(ROOT_DIR / "yt_transcript_utils.py"), *sys.argv[1:]]
-    result = utils.main()
+    result = kernel_cli.main()
     return result if isinstance(result, int) else 0
 
 

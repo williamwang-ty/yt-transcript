@@ -3,11 +3,11 @@
 import re
 
 from tests._support import *  # noqa: F401,F403
-from kernel.long_text import agent_cli
-from kernel.long_text import chunking
-from kernel.long_text import merge as kernel_merge
-from kernel.long_text import outline
-from kernel.long_text import window
+from kernel.llm import agent_cli
+from kernel.text import chunking
+from kernel.text import merge as kernel_merge
+from kernel.text import outline
+from kernel.text import window
 
 
 SENTENCE_TAG = re.compile(r"^\[S(\d+)\] (.*)$", re.MULTILINE)
@@ -180,7 +180,7 @@ class WindowExecutorTests(unittest.TestCase):
         return chunk_plain_text("".join(_sentence(i) for i in range(1, count + 1)), Path(tmpdir) / "chunks")
 
     def _config(self, **overrides) -> dict:
-        config = utils._default_config_values()
+        config = kernel_config.default_config_values()
         config.update({
             "llm_backend": "api",
             "llm_api_key": "key",
@@ -196,8 +196,8 @@ class WindowExecutorTests(unittest.TestCase):
         return config
 
     def _run(self, work_dir: Path, config: dict, llm, prompt_name: str = "cleanup_zh", **kwargs):
-        with mock.patch.object(utils, "load_config", return_value=config), \
-            mock.patch.object(utils, "_call_llm_api", side_effect=llm) as api_call, \
+        with mock.patch.object(kernel_config, "load_config", return_value=config), \
+            mock.patch.object(kernel_llm_api, "call_llm_api", side_effect=llm) as api_call, \
             mock.patch("sys.stderr", new_callable=io.StringIO):
             result = window.process_window(str(work_dir), prompt_name, **kwargs)
         return result, api_call
@@ -212,7 +212,7 @@ class WindowExecutorTests(unittest.TestCase):
             output = Path(tmpdir) / "optimized.md"
             merge = kernel_merge.merge_content(str(work_dir), str(output))
             merged = output.read_text(encoding="utf-8")
-            report = utils.verify_quality(str(output), work_dir=str(work_dir))
+            report = kernel_verify.verify_quality(str(output), work_dir=str(work_dir))
 
         self.assertTrue(result["success"], result)
         self.assertEqual(result["coverage"]["coverage_ratio"], 1.0)
@@ -287,7 +287,7 @@ class WindowExecutorTests(unittest.TestCase):
         def flaky(**kwargs):
             calls["count"] += 1
             if calls["count"] == 3:
-                raise utils.LLMRequestError("provider down", error_type="timeout", retryable=True)
+                raise kernel_llm_api.LLMRequestError("provider down", error_type="timeout", retryable=True)
             return _api_result(respond(kwargs["messages"][0]["content"]))
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -313,7 +313,7 @@ class WindowExecutorTests(unittest.TestCase):
 
     def test_merge_refuses_an_unfinished_window_run(self):
         def down(**kwargs):
-            raise utils.LLMRequestError("provider down", error_type="timeout", retryable=True)
+            raise kernel_llm_api.LLMRequestError("provider down", error_type="timeout", retryable=True)
 
         with tempfile.TemporaryDirectory() as tmpdir:
             work_dir = self._make_work_dir(tmpdir)
@@ -357,10 +357,10 @@ class WindowExecutorTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmpdir:
             work_dir = self._make_work_dir(tmpdir)
-            with mock.patch.object(utils, "load_config", return_value=self._config(llm_backend="auto")), \
+            with mock.patch.object(kernel_config, "load_config", return_value=self._config(llm_backend="auto")), \
                 mock.patch.object(agent_cli, "resolve_llm_backend", return_value=cli_decision), \
                 mock.patch.object(agent_cli, "call_cli_llm", side_effect=cli) as cli_call, \
-                mock.patch.object(utils, "_call_llm_api") as api_call, \
+                mock.patch.object(kernel_llm_api, "call_llm_api") as api_call, \
                 mock.patch("sys.stderr", new_callable=io.StringIO):
                 result = window.process_window(str(work_dir), "cleanup_zh")
 
@@ -530,7 +530,7 @@ class WindowCueSplitTests(unittest.TestCase):
         path.write_text(json.dumps(document, ensure_ascii=False), encoding="utf-8")
         work_dir = Path(tmpdir) / "chunks"
         with mock.patch("sys.stderr", new_callable=io.StringIO):
-            chunking.chunk_document(str(path), str(work_dir), "cleanup_zh", utils._default_config_values())
+            chunking.chunk_document(str(path), str(work_dir), "cleanup_zh", kernel_config.default_config_values())
         return work_dir
 
     def test_long_unpunctuated_units_end_at_cue_pauses(self):
@@ -550,7 +550,7 @@ class WindowCueSplitTests(unittest.TestCase):
             self.assertIn(offset, ends, unit)
             # The units cover whole thoughts: they end where the long pauses are.
             self.assertTrue(unit.endswith("来决定下一轮从哪里开始") or unit.endswith("其实它的核心思想很简单"), unit)
-            self.assertLessEqual(utils._estimate_tokens(unit), 60)
+            self.assertLessEqual(kernel_measure.estimate_tokens(unit), 60)
 
     def test_without_matching_cues_units_fall_back_to_fixed_cuts(self):
         segments = _cue_segments()
@@ -874,7 +874,7 @@ class WindowOutlineTests(unittest.TestCase):
         def llm(**kwargs):
             prompt = kwargs["messages"][0]["content"]
             if prompt.startswith("# Transcript Outline"):
-                raise utils.LLMRequestError("provider down", error_type="timeout", retryable=True)
+                raise kernel_llm_api.LLMRequestError("provider down", error_type="timeout", retryable=True)
             return _api_result(_marker_writer()[0](prompt))
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -909,7 +909,7 @@ class WindowOutlineTests(unittest.TestCase):
         def flaky(prompt: str) -> str:
             failures["round"] += 1
             if failures["round"] == 3:
-                raise utils.LLMRequestError("provider down", error_type="timeout", retryable=True)
+                raise kernel_llm_api.LLMRequestError("provider down", error_type="timeout", retryable=True)
             return writer(prompt)
 
         first_llm, first_calls = self._llm(_outline_json(self.SECTIONS), writer=flaky)
@@ -976,7 +976,7 @@ class WindowOutlineTests(unittest.TestCase):
                                         "segments": segments}, ensure_ascii=False), encoding="utf-8")
             work_dir = Path(tmpdir) / "chunks"
             with mock.patch("sys.stderr", new_callable=io.StringIO):
-                chunking.chunk_document(str(path), str(work_dir), "cleanup_zh", utils._default_config_values(),
+                chunking.chunk_document(str(path), str(work_dir), "cleanup_zh", kernel_config.default_config_values(),
                                         chapters_path=str(chapters))
             result, _ = WindowExecutorTests._run(self, work_dir, self._config(), llm)
             _, merged = self._merged(work_dir, tmpdir)
@@ -1003,7 +1003,7 @@ class WindowOutlineTests(unittest.TestCase):
             path = Path(tmpdir) / "normalized_document.json"
             path.write_text(json.dumps(document, ensure_ascii=False), encoding="utf-8")
             work_dir = Path(tmpdir) / "chunks"
-            chunking.chunk_document(str(path), str(work_dir), "cleanup_zh", utils._default_config_values(),
+            chunking.chunk_document(str(path), str(work_dir), "cleanup_zh", kernel_config.default_config_values(),
                                     chapters_path=str(chapters))
             manifest = json.loads((work_dir / "manifest.json").read_text(encoding="utf-8"))
             offsets: list = []

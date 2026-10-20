@@ -2,7 +2,7 @@
 
 from tests._support import *
 
-from kernel import subtitle_language
+from kernel.sources import subtitle_language
 
 
 REAL_METADATA = json.loads(
@@ -205,10 +205,10 @@ class LanguageRegressionTests(unittest.TestCase):
             audio_path = Path(tmpdir) / "audio.mp3"
             audio_path.write_bytes(b"audio")
             with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
-                utils._call_deepgram_api_once(str(audio_path), api_key="key", language="auto")
+                kernel_deepgram._call_deepgram_api_once(str(audio_path), api_key="key", language="auto")
                 self.assertIn("detect_language=true", captured["url"])
                 self.assertNotIn("language=auto", captured["url"])
-                utils._call_deepgram_api_once(str(audio_path), api_key="key", language="zh")
+                kernel_deepgram._call_deepgram_api_once(str(audio_path), api_key="key", language="zh")
                 self.assertIn("language=zh", captured["url"])
                 self.assertNotIn("detect_language", captured["url"])
 
@@ -225,11 +225,11 @@ class LanguageRegressionTests(unittest.TestCase):
                 payload["results"]["channels"][0]["detected_language"] = detected
                 payloads.append(payload)
 
-            with mock.patch.object(utils, "split_audio", return_value={
+            with mock.patch.object(kernel_deepgram, "split_audio", return_value={
                 "chunks": [str(audio_path)] * 3,
                 "split_points": [10.0, 20.0],
-            }), mock.patch.object(utils, "_call_deepgram_api", side_effect=payloads):
-                result = utils.transcribe_deepgram(
+            }), mock.patch.object(kernel_deepgram, "_call_deepgram_api", side_effect=payloads):
+                result = kernel_deepgram.transcribe_deepgram(
                     str(audio_path),
                     "auto",
                     api_key="key",
@@ -244,5 +244,5 @@ class LanguageRegressionTests(unittest.TestCase):
 
     def test_transcribe_deepgram_keeps_explicit_language(self):
         """Test an explicit Deepgram language is reported unchanged and does not request detection."""
-        settings = utils._resolve_deepgram_request_settings({}, language="en")
+        settings = kernel_deepgram._resolve_deepgram_request_settings({}, language="en")
         self.assertNotIn("detect_language", settings)

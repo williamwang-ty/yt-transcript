@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from kernel.long_text import window as kernel_window
-from kernel.text_cleanup import post_merge as kernel_post_merge_cleanup
+from kernel.text import window as kernel_window
+from kernel.text.cleanup import post_merge as kernel_post_merge_cleanup
 
 
 def merge_content(work_dir: str, output_file: str) -> dict:
