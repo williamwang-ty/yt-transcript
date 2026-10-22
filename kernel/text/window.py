@@ -43,18 +43,25 @@ import statistics
 import sys
 from pathlib import Path
 
-from ..files import atomic_write_text
-from . import agent_cli as kernel_agent_cli
+from .. import config as kernel_config
+from ..config import (
+    DEFAULT_WINDOW_MARKER_RETRIES,
+    DEFAULT_WINDOW_READ_TOKENS,
+    DEFAULT_WINDOW_TAIL_TOKENS,
+    DEFAULT_WINDOW_WRITE_TOKENS,
+)
+from ..files import atomic_write_text, now_iso
+from ..llm import agent_cli as kernel_agent_cli
+from ..llm import api as kernel_llm_api
+from ..llm.api import LLMRequestError
 from . import glossary as kernel_glossary
+from . import measure as kernel_measure
 from . import outline as kernel_outline
+from . import prompting as kernel_prompting
 
 RAW_STAGE = "raw_path"
 PROCESSED_STAGE = "processed_path"
 
-DEFAULT_WINDOW_READ_TOKENS = 6000
-DEFAULT_WINDOW_WRITE_TOKENS = 3000
-DEFAULT_WINDOW_TAIL_TOKENS = 400
-DEFAULT_WINDOW_MARKER_RETRIES = 1
 # Raw sentences longer than this are split so one number never covers a huge
 # unpunctuated run (common in auto-generated Chinese captions).
 DEFAULT_WINDOW_SENTENCE_MAX_TOKENS = 120
@@ -265,10 +272,8 @@ def _split_at_cues(sentence: str, pauses: dict[int, float], max_tokens: int,
     `sentence`) to the silence there. Each piece stays within `max_tokens`
     except a single cue longer than that, which is hard-cut.
     """
-    import yt_transcript_utils as utils
-
     def tokens(text: str) -> int:
-        return utils._estimate_tokens(text)
+        return kernel_measure.estimate_tokens(text)
 
     visible = [index for index, char in enumerate(sentence) if not char.isspace()]
     cuts = sorted((visible[offset], pause) for offset, pause in pauses.items() if 0 < offset < len(visible))
@@ -289,7 +294,7 @@ def _split_at_cues(sentence: str, pauses: dict[int, float], max_tokens: int,
             # One cue alone is over the cap: hard-cut it. Its last piece is
             # kept with what follows, so the next cut is at a cue end again.
             next_cut = next((cut for cut, _ in cuts if cut > start), len(sentence))
-            hard = [part for part in utils._force_split_text_by_tokens(sentence[start:next_cut], max_tokens, config)
+            hard = [part for part in kernel_measure.force_split_text_by_tokens(sentence[start:next_cut], max_tokens, config)
                     if part]
             if len(hard) < 2:
                 pieces.append(sentence[start:next_cut])
@@ -330,29 +335,27 @@ def split_source_sentences(text: str, config: dict | None = None,
     `cue_pauses` (cue end -> pause, counted in non-whitespace characters of
     `text`) is given, otherwise every `max_sentence_tokens` tokens.
     """
-    import yt_transcript_utils as utils
-
     report = report if report is not None else _new_split_report()
     sentences = []
     offset = 0
-    for sentence in utils._split_sentences(text):
+    for sentence in kernel_measure.split_sentences(text):
         sentence = sentence.strip()
         if not sentence:
             continue
         sentence_start = offset
         offset += len(re.sub(r"\s+", "", sentence))
-        if max_sentence_tokens > 0 and utils._estimate_tokens(sentence) > max_sentence_tokens:
+        if max_sentence_tokens > 0 and kernel_measure.estimate_tokens(sentence) > max_sentence_tokens:
             if cue_pauses:
                 local = {position - sentence_start: pause for position, pause in cue_pauses.items()
                          if sentence_start < position < offset}
                 sentences.extend(_split_at_cues(sentence, local, max_sentence_tokens, config, report))
                 continue
             parts = [part.strip() for part in
-                     utils._force_split_text_by_tokens(sentence, max_sentence_tokens, config) if part.strip()]
+                     kernel_measure.force_split_text_by_tokens(sentence, max_sentence_tokens, config) if part.strip()]
             # A forced split can leave a scrap of a few characters at the end;
             # the model folds it into the paragraph before without its tag, so
             # keep it with the previous piece instead of numbering it alone.
-            if len(parts) > 1 and utils._estimate_tokens(parts[-1]) < \
+            if len(parts) > 1 and kernel_measure.estimate_tokens(parts[-1]) < \
                     max_sentence_tokens * MIN_SPLIT_PIECE_SHARE:
                 parts[-2:] = [parts[-2] + parts[-1]]
             report["hard_cuts"] += len(parts) - 1
@@ -433,15 +436,13 @@ def build_source_sentences(work_dir: str, config: dict | None = None,
 def split_paragraph_units(text: str, config: dict | None = None,
                           max_paragraph_tokens: int = DEFAULT_WINDOW_PARAGRAPH_MAX_TOKENS) -> list[str]:
     """Split structured text into paragraph units; only very long paragraphs are split further."""
-    import yt_transcript_utils as utils
-
     units = []
     for block in re.split(r"\n\s*\n", text or ""):
         block = block.strip()
         if not block:
             continue
         if not block.startswith("#") and max_paragraph_tokens > 0 and \
-                utils._estimate_tokens(block) > max_paragraph_tokens:
+                kernel_measure.estimate_tokens(block) > max_paragraph_tokens:
             units.extend(_group_sentences(split_source_sentences(block, config, 0), max_paragraph_tokens, config))
         else:
             units.append(block)
@@ -449,11 +450,9 @@ def split_paragraph_units(text: str, config: dict | None = None,
 
 
 def _group_sentences(sentences: list[str], max_tokens: int, config: dict | None) -> list[str]:
-    import yt_transcript_utils as utils
-
     groups, current, used = [], [], 0
     for sentence in sentences:
-        cost = utils._estimate_tokens(sentence)
+        cost = kernel_measure.estimate_tokens(sentence)
         if current and used + cost > max_tokens:
             groups.append(" ".join(current))
             current, used = [], 0
@@ -511,8 +510,6 @@ def build_window_prompt(prompt_template: str, *, sentences: list[str], cursor: i
     With `outline_text`, headings come from the global outline: the model
     gets the outline lines for this window and may only write those titles.
     """
-    import yt_transcript_utils as utils
-
     total = len(sentences)
     done_note = (
         f" {unit.capitalize()}s before [S{cursor + 1}] are already done; "
@@ -545,7 +542,7 @@ def build_window_prompt(prompt_template: str, *, sentences: list[str], cursor: i
     if tail_text.strip():
         context += "\n\n" + ALREADY_WRITTEN_BLOCK.format(tail=tail_text.strip())
     separator = "\n\n" if unit == "paragraph" else "\n"
-    return utils._build_chunk_prompt(
+    return kernel_prompting.build_chunk_prompt(
         prompt_template,
         number_sentences(sentences, cursor, window_end, separator),
         context_text=context,
@@ -556,10 +553,8 @@ def build_window_prompt(prompt_template: str, *, sentences: list[str], cursor: i
 def build_fallback_prompt(prompt_template: str, chunk_text: str, *, tail_text: str = "",
                           glossary_text: str = "") -> str:
     """Assemble a plain fixed-chunk request for one stretch of the source."""
-    import yt_transcript_utils as utils
-
     context = PREVIOUS_CONTEXT_BLOCK.format(tail=tail_text.strip()) if tail_text.strip() else ""
-    return utils._build_chunk_prompt(prompt_template, chunk_text, context_text=context,
+    return kernel_prompting.build_chunk_prompt(prompt_template, chunk_text, context_text=context,
                                      glossary_text=glossary_text)
 
 
@@ -772,19 +767,13 @@ def _new_state(prompt_name: str, input_key: str, sentences: list[str], params: d
         "paragraphs": [],
         "rounds": [],
         "llm_backend": {},
-        "created_at": _now_iso(),
-        "updated_at": _now_iso(),
+        "created_at": now_iso(),
+        "updated_at": now_iso(),
     }
 
 
-def _now_iso() -> str:
-    import yt_transcript_utils as utils
-
-    return utils._now_iso()
-
-
 def _write_state(out_dir: Path, state: dict) -> None:
-    state["updated_at"] = _now_iso()
+    state["updated_at"] = now_iso()
     atomic_write_text(out_dir / STATE_FILE_NAME, json.dumps(state, ensure_ascii=False, indent=2))
 
 
@@ -798,8 +787,6 @@ def _paragraph_text(out_dir: Path, entry: dict) -> str:
 
 def written_tail(out_dir: Path, state: dict, tail_tokens: int, config: dict | None = None) -> str:
     """Return the end of the committed output, capped at about `tail_tokens`."""
-    import yt_transcript_utils as utils
-
     if tail_tokens <= 0:
         return ""
     pieces = []
@@ -809,10 +796,10 @@ def written_tail(out_dir: Path, state: dict, tail_tokens: int, config: dict | No
         if not text:
             continue
         pieces.insert(0, text)
-        used += utils._estimate_tokens(text)
+        used += kernel_measure.estimate_tokens(text)
         if used >= tail_tokens:
             break
-    return utils._truncate_tail_text_to_tokens("\n\n".join(pieces), tail_tokens, config)
+    return kernel_measure.truncate_tail_text_to_tokens("\n\n".join(pieces), tail_tokens, config)
 
 
 def _commit_paragraphs(out_dir: Path, state: dict, paragraphs: list[dict], sentences: list[str],
@@ -951,20 +938,18 @@ def window_params(prompt_name: str, config: dict) -> dict:
     `read_tokens` and `write_tokens` are the caps / starting values; each
     round's actual sizes live in the state's `sizing`.
     """
-    import yt_transcript_utils as utils
-
     return {
-        "read_tokens": utils._parse_int_min(config.get("window_read_tokens"), DEFAULT_WINDOW_READ_TOKENS, 200),
-        "write_tokens": utils._parse_int_min(config.get("window_write_tokens"), DEFAULT_WINDOW_WRITE_TOKENS, 100),
-        "tail_tokens": utils._parse_int_min(config.get("window_tail_tokens"), DEFAULT_WINDOW_TAIL_TOKENS, 0),
-        "marker_retries": utils._parse_int_min(config.get("window_marker_retries"), DEFAULT_WINDOW_MARKER_RETRIES, 0),
+        "read_tokens": kernel_config.parse_int_min(config.get("window_read_tokens"), DEFAULT_WINDOW_READ_TOKENS, 200),
+        "write_tokens": kernel_config.parse_int_min(config.get("window_write_tokens"), DEFAULT_WINDOW_WRITE_TOKENS, 100),
+        "tail_tokens": kernel_config.parse_int_min(config.get("window_tail_tokens"), DEFAULT_WINDOW_TAIL_TOKENS, 0),
+        "marker_retries": kernel_config.parse_int_min(config.get("window_marker_retries"), DEFAULT_WINDOW_MARKER_RETRIES, 0),
         "sentence_max_tokens": DEFAULT_WINDOW_SENTENCE_MAX_TOKENS,
-        "fallback_chunk_tokens": utils._get_task_chunk_target(prompt_name, config),
-        "max_output_tokens": utils._get_task_max_output_tokens(prompt_name, config),
-        "expected_ratio": utils._get_task_output_ratio(prompt_name, config),
-        "timeout_sec": utils._parse_int_min(config.get("llm_timeout_sec"), 120, 1),
-        "cli_timeout_sec": utils._parse_int_min(
-            config.get("llm_cli_timeout_sec"), kernel_agent_cli.DEFAULT_CLI_TIMEOUT_SEC, 1),
+        "fallback_chunk_tokens": kernel_config.get_task_chunk_target(prompt_name, config),
+        "max_output_tokens": kernel_config.get_task_max_output_tokens(prompt_name, config),
+        "expected_ratio": kernel_config.get_task_output_ratio(prompt_name, config),
+        "timeout_sec": kernel_config.parse_int_min(config.get("llm_timeout_sec"), 120, 1),
+        "cli_timeout_sec": kernel_config.parse_int_min(
+            config.get("llm_cli_timeout_sec"), kernel_config.DEFAULT_CLI_TIMEOUT_SEC, 1),
     }
 
 
@@ -984,8 +969,6 @@ def run_window_rounds(work_dir: str, prompt_name: str, prompt_template: str, *, 
     heuristic glossary, and only the outline's headings are kept.
     `outline_terms` passes the raw stage's terms to the translation stage.
     """
-    import yt_transcript_utils as utils
-
     log = log or (lambda message: print(message, file=sys.stderr))
     params = state["params"]
     out_dir = stage_dir_for(work_dir, input_key)
@@ -997,16 +980,16 @@ def run_window_rounds(work_dir: str, prompt_name: str, prompt_template: str, *, 
 
     def unit_tokens(index: int) -> int:
         if index not in token_cache:
-            token_cache[index] = utils._estimate_tokens(sentences[index])
+            token_cache[index] = kernel_measure.estimate_tokens(sentences[index])
         return token_cache[index]
 
     def estimate(text: str) -> int:
-        return utils._estimate_tokens(text)
+        return kernel_measure.estimate_tokens(text)
 
     def span_tokens(start: int, end: int) -> int:
         return sum(unit_tokens(i) for i in range(start, end))
 
-    max_glossary_terms = max(0, utils._parse_int_min(config.get("chunk_glossary_max_prompt_terms"), 8, 0))
+    max_glossary_terms = max(0, kernel_config.parse_int_min(config.get("chunk_glossary_max_prompt_terms"), 8, 0))
     outline = state.get("outline") or {}
     sections = outline.get("sections", []) if outline.get("status") == "ok" and unit == "sentence" else []
     if outline.get("status") == "ok" and unit == "sentence":
@@ -1076,11 +1059,11 @@ def run_window_rounds(work_dir: str, prompt_name: str, prompt_template: str, *, 
             "write_target": None if use_fallback else plan["write_tokens"],
             "finish_round": bool(plan["finish"]) and not use_fallback,
             "prompt_tokens": estimate(prompt),
-            "started_at": _now_iso(),
+            "started_at": now_iso(),
         }
         try:
             result = call_llm(prompt, params["max_output_tokens"])
-        except utils.LLMRequestError as error:
+        except LLMRequestError as error:
             record.update({"result": "error", "error_type": error.error_type, "error": str(error)})
             state["rounds"].append(record)
             state["status"] = "failed"
@@ -1234,8 +1217,6 @@ def _prepare_outline(work_dir: str, prompt_name: str, state: dict, sentences: li
     before any output is retried. No outline is made when one round can
     process the whole source, since that round sees all of it.
     """
-    import yt_transcript_utils as utils
-
     if not kernel_outline.outline_supported(prompt_name):
         return
     existing = state.get("outline")
@@ -1247,7 +1228,7 @@ def _prepare_outline(work_dir: str, prompt_name: str, state: dict, sentences: li
     if not kernel_outline.outline_enabled(config):
         state["outline"] = {"status": "disabled"}
         return
-    total_tokens = sum(utils._estimate_tokens(sentence) for sentence in sentences)
+    total_tokens = sum(kernel_measure.estimate_tokens(sentence) for sentence in sentences)
     if plan_round(initial_sizing(state["params"]), state["params"], total_tokens)["finish"]:
         # One round reads the whole source anyway; an outline would only add a request.
         state["outline"] = {"status": "skipped", "error": "the whole source fits in one round"}
@@ -1258,7 +1239,7 @@ def _prepare_outline(work_dir: str, prompt_name: str, state: dict, sentences: li
         f"{f', {len(hints)} video chapters as hints' if hints else ''}).")
 
     def estimate(text: str) -> int:
-        return utils._estimate_tokens(text)
+        return kernel_measure.estimate_tokens(text)
 
     record = kernel_outline.generate_outline(
         sentences,
@@ -1266,14 +1247,14 @@ def _prepare_outline(work_dir: str, prompt_name: str, state: dict, sentences: li
         call_llm=call_llm,
         max_output_tokens=params["max_output_tokens"],
         estimate=estimate,
-        read_tokens=utils._parse_int_min(config.get("window_outline_read_tokens"),
-                                         kernel_outline.DEFAULT_OUTLINE_READ_TOKENS, 1000),
-        max_terms=utils._parse_int_min(config.get("window_outline_max_terms"),
-                                       kernel_outline.DEFAULT_OUTLINE_MAX_TERMS, 0),
+        read_tokens=kernel_config.parse_int_min(config.get("window_outline_read_tokens"),
+                                         kernel_config.DEFAULT_OUTLINE_READ_TOKENS, 1000),
+        max_terms=kernel_config.parse_int_min(config.get("window_outline_max_terms"),
+                                       kernel_config.DEFAULT_OUTLINE_MAX_TERMS, 0),
         hints=hints,
         log=log,
     )
-    record["generated_at"] = _now_iso()
+    record["generated_at"] = now_iso()
     record["next_section"] = 0
     state["outline"] = record
     if record["status"] == "ok":
@@ -1351,8 +1332,6 @@ def process_window(work_dir: str, prompt_name: str, extra_instruction: str = "",
     answers requests when no LLM backend is reachable: it returns a result like
     the backends do, or raises to stop the run until the agent has answered.
     """
-    import yt_transcript_utils as utils
-
     log = lambda message: print(message, file=sys.stderr)  # noqa: E731
     stage = _stage(input_key)
     work_path = Path(work_dir)
@@ -1361,7 +1340,7 @@ def process_window(work_dir: str, prompt_name: str, extra_instruction: str = "",
         sys.exit(1)
 
     try:
-        prompt_path = utils._resolve_prompt_template_path(prompt_name)
+        prompt_path = kernel_prompting.resolve_prompt_template_path(prompt_name)
     except ValueError as error:
         print(f"Error: {error}", file=sys.stderr)
         sys.exit(1)
@@ -1369,7 +1348,7 @@ def process_window(work_dir: str, prompt_name: str, extra_instruction: str = "",
     if extra_instruction:
         prompt_template += f"\n\n**Additional Instructions**: {extra_instruction}\n"
 
-    config = utils.load_config(config_path)
+    config = kernel_config.load_config(config_path)
     params = window_params(prompt_name, config)
     unit_offsets: list = []
     if stage == PROCESSED_STAGE:
@@ -1388,7 +1367,7 @@ def process_window(work_dir: str, prompt_name: str, extra_instruction: str = "",
         state["unit_split"] = unit_split
     previous_backend = state.get("llm_backend") or None
     backend_decision = kernel_agent_cli.resolve_llm_backend(config, previous=previous_backend)
-    api_request_url = utils._build_api_url(config.get("llm_base_url", ""), config.get("llm_api_format", "openai")) \
+    api_request_url = kernel_llm_api.build_api_url(config.get("llm_base_url", ""), config.get("llm_api_format", "openai")) \
         if config.get("llm_base_url") else ""
     use_cli = backend_decision["backend"] == "cli"
     request_url = f"cli:{backend_decision['agent']}" if use_cli else api_request_url
@@ -1419,8 +1398,8 @@ def process_window(work_dir: str, prompt_name: str, extra_instruction: str = "",
         if built.get("success", False):
             glossary_payload = built
 
-    cli_max_retries = utils._parse_int_min(config.get("llm_cli_max_retries"), kernel_agent_cli.DEFAULT_CLI_MAX_RETRIES, 0)
-    stream_mode = utils._normalize_stream_mode(config.get("llm_stream", "auto"))
+    cli_max_retries = kernel_config.parse_int_min(config.get("llm_cli_max_retries"), kernel_config.DEFAULT_CLI_MAX_RETRIES, 0)
+    stream_mode = kernel_config.normalize_stream_mode(config.get("llm_stream", "auto"))
 
     def call_llm(prompt_text: str, max_output_tokens: int) -> dict:
         nonlocal use_cli, request_url
@@ -1436,7 +1415,7 @@ def process_window(work_dir: str, prompt_name: str, extra_instruction: str = "",
                     strip_env=backend_decision.get("strip_env", []),
                     agent=backend_decision["agent"],
                 )
-            except utils.LLMRequestError as error:
+            except LLMRequestError as error:
                 if not backend_decision["api_configured"]:
                     raise
                 use_cli = False
@@ -1448,7 +1427,7 @@ def process_window(work_dir: str, prompt_name: str, extra_instruction: str = "",
                            "switching the remaining window rounds to the configured API.")
                 warnings.append(warning)
                 log(warning)
-        return utils._call_llm_api(
+        return kernel_llm_api.call_llm_api(
             api_key=config.get("llm_api_key", ""),
             base_url=config.get("llm_base_url", ""),
             model=config.get("llm_model", ""),

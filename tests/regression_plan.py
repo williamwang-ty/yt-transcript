@@ -1,7 +1,7 @@
 """Regression tests for the normalize and plan stages: the normalized document and the text operations."""
 
 from tests._support import *
-from kernel.long_text import chunking
+from kernel.text import chunking
 
 # Subtitle cleanup counters that score as critically poor captions.
 NOISY_CAPTION_DIAGNOSTICS = {
@@ -33,7 +33,7 @@ def _write_segments(path: Path, language: str, segments: list[dict], diagnostics
 
 def _normalize(tmpdir: str, *, raw_text: Path | None = None, segments: Path | None = None,
                source: dict | None = None, mode: str = "chinese") -> dict:
-    return utils.build_normalized_document(
+    return kernel_normalize.build_normalized_document(
         document_id="vid001",
         raw_text_path=str(raw_text or Path(tmpdir) / "missing_raw.txt"),
         segments_path=str(segments or Path(tmpdir) / "missing_segments.json"),
@@ -45,7 +45,7 @@ def _normalize(tmpdir: str, *, raw_text: Path | None = None, segments: Path | No
 
 def _plan(tmpdir: str, *, duration: int, mode: str, source: str = "youtube", normalization: dict | None = None,
           raw_text: Path | None = None) -> dict:
-    return utils.plan_text_operations(
+    return kernel_plan.plan_text_operations(
         video_id="vid001",
         duration=duration,
         mode=mode,
@@ -56,7 +56,7 @@ def _plan(tmpdir: str, *, duration: int, mode: str, source: str = "youtube", nor
         work_dir=str(Path(tmpdir) / "text"),
         structured_text=str(Path(tmpdir) / "text" / "structured.md"),
         optimized_text=str(Path(tmpdir) / "optimized.md"),
-        config=utils._default_config_values(),
+        config=kernel_config.default_config_values(),
     )
 
 
@@ -101,7 +101,7 @@ class NormalizedDocumentTests(unittest.TestCase):
             result = _normalize(tmpdir, raw_text=raw_text, segments=segments, source=_youtube("zh-Hans"))
             payload = json.loads(Path(result["normalized_document_path"]).read_text(encoding="utf-8"))
             chunked = chunking.chunk_document(result["normalized_document_path"], str(Path(tmpdir) / "text"),
-                                              "cleanup_zh", utils._default_config_values())
+                                              "cleanup_zh", kernel_config.default_config_values())
 
         self.assertTrue(result["passed"], result)
         self.assertEqual(result["source_adapter"], "segments_json")

@@ -1,8 +1,8 @@
 """Regression tests for the chunking step of the text stage and the post-merge cleanup."""
 
 from tests._support import *
-from kernel.long_text import chunking
-from kernel.text_cleanup import post_merge
+from kernel.text import chunking
+from kernel.text.cleanup import post_merge
 
 
 def _chunks(work_dir: Path) -> list[str]:
@@ -41,13 +41,13 @@ class ChunkingTests(unittest.TestCase):
             with mock.patch("sys.stderr", new_callable=io.StringIO):
                 normalized = Path(tmpdir) / "normalized.json"
                 normalized.write_text(json.dumps({"content": {"text": text}}, ensure_ascii=False), encoding="utf-8")
-                config = {**utils._default_config_values(), "chunk_size_override": 60}
+                config = {**kernel_config.default_config_values(), "chunk_size_override": 60}
                 result = chunking.chunk_document(str(normalized), str(Path(tmpdir) / "text"), "cleanup_zh", config)
             chunks = _chunks(Path(tmpdir) / "text")
 
         self.assertGreater(len(chunks), 1)
         self.assertTrue(any("fixed-width segment" in warning for warning in result["warnings"]))
-        self.assertTrue(all(utils._estimate_tokens(chunk) <= result["hard_cap_tokens"] for chunk in chunks))
+        self.assertTrue(all(kernel_measure.estimate_tokens(chunk) <= result["hard_cap_tokens"] for chunk in chunks))
         self.assertEqual("".join(chunks), text)
 
     def test_chunk_size_follows_the_task_prompt(self):
@@ -58,8 +58,8 @@ class ChunkingTests(unittest.TestCase):
             structure_manifest = json.loads((structure / "manifest.json").read_text(encoding="utf-8"))
             translate_manifest = json.loads((translate / "manifest.json").read_text(encoding="utf-8"))
 
-        self.assertEqual(structure_manifest["target_tokens"], utils.TASK_CHUNK_TOKEN_DEFAULTS["structure_only"])
-        self.assertEqual(translate_manifest["target_tokens"], utils.TASK_CHUNK_TOKEN_DEFAULTS["translate_only"])
+        self.assertEqual(structure_manifest["target_tokens"], kernel_config.TASK_CHUNK_TOKEN_DEFAULTS["structure_only"])
+        self.assertEqual(translate_manifest["target_tokens"], kernel_config.TASK_CHUNK_TOKEN_DEFAULTS["translate_only"])
         self.assertLess(len(structure_manifest["chunks"]), len(translate_manifest["chunks"]))
 
     def test_segments_start_a_new_chunk_at_each_chapter(self):
@@ -74,7 +74,7 @@ class ChunkingTests(unittest.TestCase):
             chapters.write_text(json.dumps({"chapters": [{"title": "Intro", "start_time": 0.0},
                                                          {"title": "Part", "start_time": 20.0}]}),
                                 encoding="utf-8")
-            config = {**utils._default_config_values(), "chunk_size_override": 1000}
+            config = {**kernel_config.default_config_values(), "chunk_size_override": 1000}
             result = chunking.chunk_document(str(normalized), str(Path(tmpdir) / "text"), "cleanup_zh", config,
                                              chapters_path=str(chapters))
             chunks = _chunks(Path(tmpdir) / "text")
@@ -95,7 +95,7 @@ class ChunkingTests(unittest.TestCase):
             normalized = _segment_document(Path(tmpdir) / "normalized.json", segments)
             chapters = Path(tmpdir) / "chapters.json"
             chapters.write_text(json.dumps({"chapters": [{"title": "Two", "start_time": 30.0}]}), encoding="utf-8")
-            config = {**utils._default_config_values(), "chunk_size_override": 100}
+            config = {**kernel_config.default_config_values(), "chunk_size_override": 100}
             with mock.patch("sys.stderr", new_callable=io.StringIO):
                 result = chunking.chunk_document(str(normalized), str(Path(tmpdir) / "text"), "cleanup_zh", config,
                                                  chapters_path=str(chapters))
@@ -115,7 +115,7 @@ class ChunkingTests(unittest.TestCase):
             normalized = Path(tmpdir) / "normalized.json"
             normalized.write_text(json.dumps(document, ensure_ascii=False), encoding="utf-8")
             result = chunking.chunk_document(str(normalized), str(Path(tmpdir) / "text"), "cleanup_zh",
-                                             utils._default_config_values())
+                                             kernel_config.default_config_values())
             chunks = _chunks(Path(tmpdir) / "text")
 
         self.assertEqual(result["source_kind"], "text")

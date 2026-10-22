@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import sys
 from pathlib import Path
 
 from .cjk import is_cjk_family_char, normalize_cjk_spacing
@@ -287,3 +288,57 @@ def parse_vtt_payload(content: str, *, language: str = "", vtt_path: str = "") -
         "segments": segments,
         "diagnostics": diagnostics,
     }
+
+
+def _parse_vtt_payload_or_exit(content: str, *, language: str = "", vtt_path: str = "") -> dict:
+    """Parse VTT content into aligned subtitle segments."""
+    try:
+        return parse_vtt_payload(content, language=language, vtt_path=vtt_path)
+    except ValueError as error:
+        print(f"Error: {error}", file=sys.stderr)
+        sys.exit(2)
+
+
+def parse_vtt(vtt_path: str) -> str:
+    """
+    Parse VTT subtitle file, extract plain text
+
+    Processing:
+    - Remove VTT header (WEBVTT, Kind:, Language:)
+    - Remove timestamp lines (00:00:00.000 --> 00:00:05.000)
+    - Remove VTT tags (<c>, </c>, <00:00:01.000>, etc.)
+    - Remove cue numbers (pure digit lines)
+    - Remove consecutive duplicate lines (common in auto-captions)
+    """
+    path = Path(vtt_path)
+    if not path.exists():
+        print(f"Error: File does not exist {vtt_path}", file=sys.stderr)
+        sys.exit(1)
+
+    parsed = parse_vtt_segments(vtt_path)
+    body = "\n".join(segment.get("text", "") for segment in parsed.get("segments", []) if segment.get("text"))
+    return normalize_subtitle_text(body)
+
+
+def parse_vtt_segments(vtt_path: str, *, language: str = "") -> dict:
+    """Parse a VTT file and return aligned segments with timing metadata.
+
+    Output schema (the segments file the normalizer reads):
+
+    {
+      "source": "vtt",
+      "language": "en" | "zh" | "..." | "",
+      "segments": [{"id": 0, "text": "...", "start_time": 0.0, "end_time": 1.2}, ...]
+    }
+    """
+    path = Path(vtt_path)
+    if not path.exists():
+        print(f"Error: File does not exist {vtt_path}", file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        content = path.read_text(encoding="utf-8")
+    except Exception as e:
+        print(f"Error: Cannot read file {e}", file=sys.stderr)
+        sys.exit(2)
+    return _parse_vtt_payload_or_exit(content, language=language, vtt_path=str(path))

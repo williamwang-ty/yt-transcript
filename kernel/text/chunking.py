@@ -15,12 +15,18 @@ import math
 import sys
 from pathlib import Path
 
+from kernel.config import (
+    DEFAULT_CHUNK_HARD_CAP_MULTIPLIER,
+    MAX_CHUNK_HARD_CAP_MULTIPLIER,
+    get_task_chunk_target,
+    parse_float_range,
+)
 from kernel.files import atomic_write_text
+from kernel.text.measure import estimate_tokens, force_split_text_by_tokens, split_sentences
+from kernel.text.normalize import load_normalized_document
 
 MANIFEST_FILE = "manifest.json"
 CHUNK_SEPARATOR = "\n\n"
-DEFAULT_HARD_CAP_MULTIPLIER = 1.33
-MAX_HARD_CAP_MULTIPLIER = 2.0
 DEFAULT_CHAPTER_BOUNDARY_TOLERANCE_SEC = 0.35
 
 
@@ -31,16 +37,14 @@ def chunk_document(normalized_document_path: str, output_dir: str, prompt_name: 
     Timed segments are used when the normalized document prefers them;
     otherwise its text is cut at sentence ends.
     """
-    import yt_transcript_utils as utils
-
-    payload = utils._load_normalized_document(normalized_document_path)
+    payload = load_normalized_document(normalized_document_path)
     content = payload.get("content", {}) if isinstance(payload.get("content", {}), dict) else {}
     segments = payload.get("segments", []) if isinstance(payload.get("segments", []), list) else []
     use_segments = bool(segments) and str(content.get("preferred_chunk_source", "")).strip().lower() == "segments"
 
-    target = utils._get_task_chunk_target(prompt_name, config)
-    multiplier = utils._parse_float_range(config.get("chunk_hard_cap_multiplier"), DEFAULT_HARD_CAP_MULTIPLIER,
-                                          1.0, MAX_HARD_CAP_MULTIPLIER)
+    target = get_task_chunk_target(prompt_name, config)
+    multiplier = parse_float_range(config.get("chunk_hard_cap_multiplier"), DEFAULT_CHUNK_HARD_CAP_MULTIPLIER,
+                                   1.0, MAX_CHUNK_HARD_CAP_MULTIPLIER)
     hard_cap = max(target, int(math.ceil(target * multiplier)))
 
     if use_segments:
@@ -50,7 +54,7 @@ def chunk_document(normalized_document_path: str, output_dir: str, prompt_name: 
         if not text:
             print("Error: Normalized document does not contain usable text", file=sys.stderr)
             sys.exit(2)
-        chunks, warnings = _chunk_sentences(utils._split_sentences(text), target, hard_cap)
+        chunks, warnings = _chunk_sentences(split_sentences(text), target, hard_cap)
 
     out_dir = Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -73,35 +77,23 @@ def chunk_document(normalized_document_path: str, output_dir: str, prompt_name: 
     return {"total_chunks": len(chunks), "warnings": warnings, **manifest}
 
 
-def _tokens(text: str) -> int:
-    import yt_transcript_utils as utils
-
-    return utils._estimate_tokens(text)
-
-
-def _force_split(text: str, max_tokens: int) -> list[str]:
-    import yt_transcript_utils as utils
-
-    return utils._force_split_text_by_tokens(text, max_tokens)
-
-
 def _chunk_sentences(sentences: list[str], target: int, hard_cap: int) -> tuple[list[str], list[str]]:
     """Pack sentences into chunks of about `target` tokens; a sentence over `hard_cap` is cut."""
     chunks = []
     current = []
     current_size = 0
     warnings = []
-    separator_size = _tokens(CHUNK_SEPARATOR)
+    separator_size = estimate_tokens(CHUNK_SEPARATOR)
 
     for index, sentence in enumerate(sentences):
         pieces = [sentence]
-        sentence_size = _tokens(sentence)
+        sentence_size = estimate_tokens(sentence)
         if sentence_size > hard_cap:
-            pieces = _force_split(sentence, hard_cap)
+            pieces = force_split_text_by_tokens(sentence, hard_cap)
             warnings.append(f"Sentence {index} exceeds chunk_size ({sentence_size} > {hard_cap}), "
                             f"split into {len(pieces)} fixed-width segment(s)")
         for piece in pieces:
-            piece_size = _tokens(piece)
+            piece_size = estimate_tokens(piece)
             candidate = current_size + piece_size + (separator_size if current else 0)
             if current and (candidate > target or candidate > hard_cap):
                 chunks.append(CHUNK_SEPARATOR.join(current))
@@ -134,7 +126,7 @@ def _chunk_segments(segments: list[dict], target: int, hard_cap: int,
     specs = []
     current = []
     current_size = 0
-    separator_size = _tokens(CHUNK_SEPARATOR)
+    separator_size = estimate_tokens(CHUNK_SEPARATOR)
 
     def finalize(parts: list[dict]) -> None:
         if not parts:
@@ -146,7 +138,7 @@ def _chunk_segments(segments: list[dict], target: int, hard_cap: int,
         })
 
     for part in prepared:
-        part_size = _tokens(part["text"])
+        part_size = estimate_tokens(part["text"])
         if current and _starts_chapter(part, break_ids):
             finalize(current)
             current = [part]
@@ -176,11 +168,11 @@ def _starts_chapter(part: dict, break_ids: set[int]) -> bool:
 def _split_timed_segment(segment: dict, max_tokens: int, index: int) -> tuple[list[dict], list[str]]:
     """Cut a segment over `max_tokens` into pieces; timings are spread by character share."""
     text = segment["text"]
-    size = _tokens(text)
+    size = estimate_tokens(text)
     if size <= max_tokens:
         return [segment], []
 
-    pieces = _force_split(text, max_tokens)
+    pieces = force_split_text_by_tokens(text, max_tokens)
     warnings = [f"Segment {index} exceeds chunk_size ({size} > {max_tokens}), "
                 f"split into {len(pieces)} fixed-width segment(s)"]
     start_time = segment.get("start_time")
@@ -275,7 +267,7 @@ def _coalesce_small_chunks(specs: list[dict], target: int, hard_cap: int) -> tup
         if len(merged) < 2:
             break
         current = merged[index]
-        size = _tokens(current["content"])
+        size = estimate_tokens(current["content"])
         if size >= minimum or (len(set(current["segment_ids"])) > 1 and size > max(20, minimum // 2)):
             index += 1
             continue
@@ -283,10 +275,10 @@ def _coalesce_small_chunks(specs: list[dict], target: int, hard_cap: int) -> tup
         chapter_start = current["starts_with_chapter_break"]
         candidates = []
         if index + 1 < len(merged):
-            total = _tokens(joined(current, merged[index + 1]))
+            total = estimate_tokens(joined(current, merged[index + 1]))
             candidates.append(("next", total, total <= hard_cap, 0 if chapter_start else 1))
         if index > 0 and not chapter_start:
-            total = _tokens(joined(merged[index - 1], current))
+            total = estimate_tokens(joined(merged[index - 1], current))
             candidates.append(("prev", total, total <= hard_cap, 0))
         if not candidates:
             index += 1
@@ -318,7 +310,7 @@ def _coalesce_small_chunks(specs: list[dict], target: int, hard_cap: int) -> tup
     if merged_count:
         warnings.append(f"Merged {merged_count} undersized chunk fragment(s) below the preferred floor of "
                         f"{minimum} tokens")
-    remaining = sum(1 for spec in merged if _tokens(spec["content"]) < minimum)
+    remaining = sum(1 for spec in merged if estimate_tokens(spec["content"]) < minimum)
     if remaining:
         warnings.append(f"{remaining} chunk(s) remain below the preferred floor of {minimum} tokens")
     return merged, warnings

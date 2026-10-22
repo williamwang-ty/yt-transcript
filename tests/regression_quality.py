@@ -4,7 +4,7 @@ import threading
 
 from tests._support import *
 from kernel import files as kernel_files
-from kernel.long_text import glossary as kernel_glossary
+from kernel.text import glossary as kernel_glossary
 
 
 class AtomicWriteTests(unittest.TestCase):
@@ -156,7 +156,7 @@ class VerifyQualityTests(unittest.TestCase):
             raw.write_text("访问 https://example.com 于 2026-03-08 完成 32% 进度。", encoding="utf-8")
             optimized.write_text("## 结果\n\n已完成进度。", encoding="utf-8")
 
-            result = utils.verify_quality(str(optimized), raw_text_path=str(raw), bilingual=False)
+            result = kernel_verify.verify_quality(str(optimized), raw_text_path=str(raw), bilingual=False)
 
             self.assertFalse(result["checks"]["semantic_anchor_coverage_ok"])
             self.assertGreater(result["checks"]["semantic_missing_count"], 0)
@@ -170,7 +170,7 @@ class VerifyQualityTests(unittest.TestCase):
             optimized.write_text("这是一大段没有章节标题的文本。" * 120, encoding="utf-8")
             raw.write_text("这是一大段没有章节标题的文本。" * 100, encoding="utf-8")
 
-            result = utils.verify_quality(str(optimized), str(raw), bilingual=False)
+            result = kernel_verify.verify_quality(str(optimized), str(raw), bilingual=False)
 
             self.assertFalse(result["passed"])
             self.assertTrue(any("section headers" in failure for failure in result["hard_failures"]))
@@ -190,7 +190,7 @@ class VerifyQualityTests(unittest.TestCase):
             )
             raw.write_text("English paragraph one. English paragraph two.", encoding="utf-8")
 
-            result = utils.verify_quality(str(optimized), str(raw), bilingual=True)
+            result = kernel_verify.verify_quality(str(optimized), str(raw), bilingual=True)
 
             self.assertTrue(result["passed"], result)
             self.assertGreaterEqual(result["checks"]["bilingual_pairs"], 1)
@@ -211,7 +211,7 @@ class VerifyQualityTests(unittest.TestCase):
             )
             raw.write_text("English paragraph one. English paragraph two.", encoding="utf-8")
 
-            result = utils.verify_quality(str(optimized), str(raw), bilingual=True)
+            result = kernel_verify.verify_quality(str(optimized), str(raw), bilingual=True)
 
             self.assertTrue(result["passed"], result)
             self.assertGreaterEqual(result["checks"]["bilingual_pairs"], 1)
@@ -229,7 +229,7 @@ class VerifyQualityTests(unittest.TestCase):
             )
             raw.write_text("English paragraph one. English paragraph two.", encoding="utf-8")
 
-            result = utils.verify_quality(str(optimized), str(raw), bilingual=True)
+            result = kernel_verify.verify_quality(str(optimized), str(raw), bilingual=True)
 
             self.assertFalse(result["passed"])
             self.assertTrue(any("paragraph pairs" in failure for failure in result["hard_failures"]))
@@ -247,7 +247,7 @@ class VerifyQualityTests(unittest.TestCase):
             )
             raw.write_text("原文。", encoding="utf-8")
 
-            result = utils.verify_quality(str(optimized), str(raw), bilingual=False)
+            result = kernel_verify.verify_quality(str(optimized), str(raw), bilingual=False)
 
             self.assertTrue(result["passed"], result)
             self.assertEqual(result["hard_failures"], [])
@@ -265,7 +265,7 @@ class VerifyQualityTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            result = utils.verify_quality(str(optimized), bilingual=False)
+            result = kernel_verify.verify_quality(str(optimized), bilingual=False)
 
             self.assertTrue(result["passed"], result)
             self.assertFalse(result["checks"]["cjk_spacing_ok"])
@@ -283,7 +283,7 @@ class VerifyQualityTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            result = utils.verify_quality(str(optimized), bilingual=False)
+            result = kernel_verify.verify_quality(str(optimized), bilingual=False)
 
             self.assertTrue(result["passed"], result)
             self.assertGreater(result["checks"]["chunk_seam_warning_count"], 0)
@@ -307,7 +307,7 @@ class VerifyQualityTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            result = utils.verify_quality(
+            result = kernel_verify.verify_quality(
                 str(optimized),
                 str(raw),
                 bilingual=False,
@@ -337,7 +337,7 @@ class VerifyQualityTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            result = utils.verify_quality(
+            result = kernel_verify.verify_quality(
                 str(optimized),
                 str(raw),
                 bilingual=False,
@@ -363,7 +363,7 @@ class VerifyQualityTests(unittest.TestCase):
             }), encoding="utf-8")
             optimized.write_text("## Section\n\nTransDigm 和 OpenAI 发布了财报。\n", encoding="utf-8")
 
-            result = utils.verify_quality(str(optimized), str(raw), bilingual=False, work_dir=str(work_dir))
+            result = kernel_verify.verify_quality(str(optimized), str(raw), bilingual=False, work_dir=str(work_dir))
 
             self.assertTrue(result["checks"]["glossary_drift_applicable"], result["checks"])
             self.assertEqual(result["checks"]["glossary_drift_count"], 0)
@@ -384,7 +384,7 @@ class VerifyQualityTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            result = utils.verify_quality(str(optimized), bilingual=False)
+            result = kernel_verify.verify_quality(str(optimized), bilingual=False)
 
             self.assertTrue(result["passed"], result)
             self.assertFalse(result["checks"]["short_paragraph_ratio_ok"])
@@ -404,7 +404,7 @@ class VerifyQualityTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            result = utils.verify_quality(str(optimized), bilingual=False)
+            result = kernel_verify.verify_quality(str(optimized), bilingual=False)
 
             self.assertTrue(result["passed"], result)
             self.assertEqual(result["warnings"], [], result)
@@ -429,7 +429,7 @@ class VerifyQualityTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            result = utils.verify_quality(str(optimized), str(raw), bilingual=False)
+            result = kernel_verify.verify_quality(str(optimized), str(raw), bilingual=False)
 
             self.assertTrue(result["passed"], result)
             self.assertTrue(result["checks"]["no_truncation"])

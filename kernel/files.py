@@ -1,9 +1,10 @@
-"""Small file helpers shared by the pipeline and the long-text executor."""
+"""Small file and clock helpers shared by the pipeline and the long-text executor."""
 
 from __future__ import annotations
 
 import os
 import tempfile
+import time
 from pathlib import Path
 
 
@@ -24,3 +25,8 @@ def atomic_write_text(path: Path, content: str) -> None:
         except FileNotFoundError:
             pass
         raise
+
+
+def now_iso() -> str:
+    """Return the current local timestamp in ISO-like wall-clock format."""
+    return time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime())

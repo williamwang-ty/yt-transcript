@@ -43,7 +43,8 @@ from pathlib import Path
 ROOT_DIR = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT_DIR))
 
-import yt_transcript_utils as utils  # noqa: E402
+from kernel import config as kernel_config  # noqa: E402
+from kernel.sources import deepgram as kernel_deepgram  # noqa: E402
 
 DOWNLOAD_SH = ROOT_DIR / "scripts" / "download.sh"
 DEFAULT_OUT = ROOT_DIR / "tests" / "fixtures" / "e2e"
@@ -202,7 +203,7 @@ def deepgram_from_vtt(text: str, language: str) -> dict:
 
 def load_saved_deepgram(path: str) -> dict:
     data = json.loads(Path(path).read_text(encoding="utf-8"))
-    if data.get("format") == utils.DEEPGRAM_CHUNK_CACHE_FORMAT:
+    if data.get("format") == kernel_deepgram.DEEPGRAM_CHUNK_CACHE_FORMAT:
         return data["payload"]
     if isinstance(data.get("chunks"), list) and data["chunks"]:
         return data["chunks"][0]["payload"]
@@ -288,9 +289,9 @@ def record(case: dict, out_dir: Path, config: dict, env: dict, saved_deepgram: d
             if not api_key:
                 raise RuntimeError("no deepgram_api_key in --config and no --deepgram-json for this video")
             audio = run_json(["bash", str(DOWNLOAD_SH), url, "audio"], env)
-            payload = utils._call_deepgram_api(
+            payload = kernel_deepgram._call_deepgram_api(
                 audio["audio_file"], api_key=api_key, language=sub_info.get("source_language") or "auto",
-                timeout=900, model=utils.DEFAULT_DEEPGRAM_MODEL, enable_utterances=True)
+                timeout=900, model=kernel_config.DEFAULT_DEEPGRAM_MODEL, enable_utterances=True)
             summary["deepgram"] = "requested"
         payload = cut_deepgram(payload, case["max_minutes"])
         (vdir / "deepgram.json").write_text(json.dumps(payload, ensure_ascii=False) + "\n", encoding="utf-8")
@@ -310,7 +311,7 @@ def main() -> int:
                         help=f"Only build the offline {OFFLINE_DEEPGRAM_ID} case from a recorded video")
     args = parser.parse_args()
 
-    config = utils.load_config(args.config) if args.config else {}
+    config = kernel_config.load_config(args.config) if args.config else {}
     env = dict(os.environ)
     cookie_args = []
     if config.get("yt_dlp_cookies_file"):

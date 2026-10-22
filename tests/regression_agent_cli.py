@@ -1,8 +1,8 @@
 """Regression tests for the llm_backend=auto agent-CLI backend."""
 
 from tests._support import *
-from kernel.long_text import agent_cli
-from kernel.long_text import window
+from kernel.llm import agent_cli
+from kernel.text import window
 
 
 def _which_all(name):
@@ -120,7 +120,7 @@ class AgentCliRegressionTests(unittest.TestCase):
     def test_call_cli_llm_raises_after_retries(self):
         """Empty output on every attempt raises a retryable LLMRequestError."""
         runner = mock.Mock(return_value=_completed(""))
-        with self.assertRaises(utils.LLMRequestError) as caught:
+        with self.assertRaises(kernel_llm_api.LLMRequestError) as caught:
             agent_cli.call_cli_llm(["pi", "-p"], "prompt", max_retries=1, runner=runner)
         self.assertEqual(caught.exception.error_type, "cli_empty_output")
         self.assertEqual(len(caught.exception.attempt_history), 2)
@@ -131,7 +131,7 @@ class AgentCliRegressionTests(unittest.TestCase):
 
     def _config(self, **overrides):
         """Default config with the API configured."""
-        config = utils._default_config_values()
+        config = kernel_config.default_config_values()
         config.update({
             "llm_api_key": "key",
             "llm_base_url": "https://api.deepseek.com",
@@ -153,11 +153,11 @@ class AgentCliRegressionTests(unittest.TestCase):
         }
         with tempfile.TemporaryDirectory() as tmpdir:
             work_dir = self._make_work_dir(tmpdir)
-            with mock.patch.object(utils, "load_config", return_value=self._config()), \
+            with mock.patch.object(kernel_config, "load_config", return_value=self._config()), \
                 mock.patch.object(agent_cli, "resolve_llm_backend", return_value=cli_decision), \
                 mock.patch.object(agent_cli, "call_cli_llm", side_effect=lambda command, prompt, **kw:
                                   self._cli_result(prompt)) as cli_call, \
-                mock.patch.object(utils, "_call_llm_api") as api_call, \
+                mock.patch.object(kernel_llm_api, "call_llm_api") as api_call, \
                 mock.patch("sys.stderr", new_callable=io.StringIO):
                 result = window.process_window(str(work_dir), "cleanup_zh")
             state = window.load_window_state(str(work_dir))
@@ -175,7 +175,7 @@ class AgentCliRegressionTests(unittest.TestCase):
             "command": ["codex", "exec", "-"], "strip_env": [], "api_configured": True,
             "probe": {"attempted": True, "ok": True}, "fallback_reason": "",
         }
-        cli_error = utils.LLMRequestError("codex exited", error_type="cli_exit_error", retryable=True)
+        cli_error = kernel_llm_api.LLMRequestError("codex exited", error_type="cli_exit_error", retryable=True)
 
         def api(**kwargs):
             return {"text": tag_echo(kwargs["messages"][0]["content"]), "latency_ms": 5,
@@ -184,10 +184,10 @@ class AgentCliRegressionTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmpdir:
             work_dir = self._make_work_dir(tmpdir)
-            with mock.patch.object(utils, "load_config", return_value=self._config()), \
+            with mock.patch.object(kernel_config, "load_config", return_value=self._config()), \
                 mock.patch.object(agent_cli, "resolve_llm_backend", return_value=cli_decision), \
                 mock.patch.object(agent_cli, "call_cli_llm", side_effect=cli_error), \
-                mock.patch.object(utils, "_call_llm_api", side_effect=api) as api_call, \
+                mock.patch.object(kernel_llm_api, "call_llm_api", side_effect=api) as api_call, \
                 mock.patch("sys.stderr", new_callable=io.StringIO):
                 result = window.process_window(str(work_dir), "cleanup_zh")
             state = window.load_window_state(str(work_dir))
@@ -207,7 +207,7 @@ class AgentCliRegressionTests(unittest.TestCase):
         }
         with tempfile.TemporaryDirectory() as tmpdir:
             work_dir = self._make_work_dir(tmpdir)
-            with mock.patch.object(utils, "load_config", return_value=self._config(llm_api_key="")), \
+            with mock.patch.object(kernel_config, "load_config", return_value=self._config(llm_api_key="")), \
                 mock.patch.object(agent_cli, "resolve_llm_backend", return_value=none_decision), \
                 mock.patch("sys.stderr", new_callable=io.StringIO) as stderr:
                 with self.assertRaises(SystemExit):
@@ -222,9 +222,9 @@ class AgentCliRegressionTests(unittest.TestCase):
                 f'output_dir: "{tmpdir}"\nllm_backend: "api"\nllm_agent_cli: "gemini"\nllm_cli_timeout_sec: 900\n',
                 encoding="utf-8",
             )
-            config = utils.load_config(str(config_path))
+            config = kernel_config.load_config(str(config_path))
             self.assertEqual(config["llm_backend"], "api")
             self.assertEqual(config["llm_agent_cli"], "gemini")
             self.assertEqual(config["llm_cli_timeout_sec"], 900)
             config_path.write_text(f'output_dir: "{tmpdir}"\nllm_backend: "weird"\n', encoding="utf-8")
-            self.assertEqual(utils.load_config(str(config_path))["llm_backend"], "auto")
+            self.assertEqual(kernel_config.load_config(str(config_path))["llm_backend"], "auto")

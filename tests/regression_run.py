@@ -19,9 +19,12 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-import yt_transcript_utils as utils
+from kernel import config as kernel_config
 from kernel import pipeline
-from kernel.long_text import agent_cli as _agent_cli
+from kernel.quality import verify as kernel_verify
+from kernel.sources import deepgram as kernel_deepgram
+from kernel.text import subtitle_quality as kernel_subtitle_quality
+from kernel.llm import agent_cli as _agent_cli
 from tests.e2e import fake_deepgram
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -61,7 +64,7 @@ class RunCommandTests(unittest.TestCase):
         for var in ("AGENT", "AI_AGENT", _agent_cli.AGENT_CLI_ENV_VAR, "FAKE_YT_DLP_RATE_LIMITED",
                     "FAKE_LLM_FAIL_FROM_UNIT"):
             os.environ.pop(var, None)
-        deepgram = mock.patch.object(utils, "_call_deepgram_api", fake_deepgram.recorded_response)
+        deepgram = mock.patch.object(kernel_deepgram, "_call_deepgram_api", fake_deepgram.recorded_response)
         deepgram.start()
         self.addCleanup(deepgram.stop)
         self.config = self.write_config("config.yaml")
@@ -336,7 +339,7 @@ class RunCommandTests(unittest.TestCase):
         for env in envs:
             self.assertEqual(str(cookies), env.get("YT_DLP_COOKIES_FILE"))
             self.assertEqual("7", env.get("YT_DLP_SOCKET_TIMEOUT_SEC"))
-            self.assertEqual(str(utils.DEFAULT_YT_DLP_RETRIES), env.get("YT_DLP_RETRIES"))
+            self.assertEqual(str(kernel_config.DEFAULT_YT_DLP_RETRIES), env.get("YT_DLP_RETRIES"))
 
     def test_no_llm_backend_hands_each_request_to_the_agent(self):
         expected = self.reference_article(LONG)
@@ -393,7 +396,7 @@ class RunCommandTests(unittest.TestCase):
 
     def test_quality_failure_stops_in_verify_and_from_text_redoes_the_text(self):
         failing = {"passed": False, "hard_failures": ["size ratio too low"], "warnings": [], "checks": {}}
-        with mock.patch.object(utils, "verify_quality", return_value=failing):
+        with mock.patch.object(kernel_verify, "verify_quality", return_value=failing):
             result = self.run_video(ENGLISH)
         self.assertEqual(("failed", "verify", "quality_hard_failure"),
                          (result["status"], result["stage"], result["reason"]))
@@ -412,7 +415,7 @@ class RunCommandTests(unittest.TestCase):
         self.assertNotEqual(starts["metadata"], self.stage_starts(ENGLISH)["metadata"])
 
     def test_from_stage_before_cleanup_keeps_earlier_stages(self):
-        with mock.patch.object(utils, "verify_quality",
+        with mock.patch.object(kernel_verify, "verify_quality",
                                return_value={"passed": False, "hard_failures": ["x"], "warnings": [], "checks": {}}):
             self.run_video(ENGLISH)
         starts = self.stage_starts(ENGLISH)
@@ -464,15 +467,15 @@ class RunCommandTests(unittest.TestCase):
             self.assertEqual(starts[name], self.stage_starts(ENGLISH)[name], name)
 
     def test_critical_subtitles_reroute_to_deepgram_in_the_source_stage(self):
-        real_signal = utils._build_source_routing_signal
+        real_signal = kernel_subtitle_quality.build_source_routing_signal
 
         def critical(*args, **kwargs):
             return {**real_signal(*args, **kwargs), "subtitle_quality_score": 0.2,
                     "subtitle_quality_band": "critical", "reroute_recommended": True, "reroute_target": "deepgram"}
 
         recorded = lambda *args, **kwargs: fake_deepgram.recorded_response(f"/x/{DEEPGRAM}.m4a")  # noqa: E731
-        with mock.patch.object(utils, "_build_source_routing_signal", critical), \
-                mock.patch.object(utils, "_call_deepgram_api", recorded):
+        with mock.patch.object(kernel_subtitle_quality, "build_source_routing_signal", critical), \
+                mock.patch.object(kernel_deepgram, "_call_deepgram_api", recorded):
             rerouted = self.run_video(LONG, stage="plan")
             self.assertEqual("deepgram", rerouted["route"]["source"])
             self.assertEqual({"track": "zh-Hans", "track_kind": "manual", "mode": "chinese",

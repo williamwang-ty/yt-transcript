@@ -20,13 +20,14 @@ import json
 import math
 import re
 
+from kernel.config import DEFAULT_OUTLINE_MAX_TERMS, DEFAULT_OUTLINE_READ_TOKENS, parse_bool
+from kernel.llm.api import LLMRequestError
+
 # Raw-stage prompts that write section headings, and the language of the titles.
 OUTLINE_PROMPTS = {
     "cleanup_zh": "zh",
     "structure_only": "source",
 }
-DEFAULT_OUTLINE_READ_TOKENS = 16000
-DEFAULT_OUTLINE_MAX_TERMS = 40
 # Target section length, in source tokens, for the "aim for" range.
 SECTION_TOKENS_MIN = 600
 SECTION_TOKENS_MAX = 2500
@@ -80,9 +81,7 @@ def outline_supported(prompt_name: str) -> bool:
 
 
 def outline_enabled(config: dict | None) -> bool:
-    import yt_transcript_utils as utils
-
-    return utils._parse_bool((config or {}).get("window_outline", True), True)
+    return parse_bool((config or {}).get("window_outline", True), True)
 
 
 # ---------------------------------------------------------------------------
@@ -331,8 +330,6 @@ def generate_outline(units: list[str], *, prompt_name: str, call_llm, max_output
     backend call; `LLMRequestError` from it is caught and reported as a
     failed outline. Returns the outline record kept in the window state.
     """
-    import yt_transcript_utils as utils
-
     log = log or (lambda message: None)
     unit_tokens = [estimate(f"[S{index + 1}] {unit}") for index, unit in enumerate(units)]
     parts = split_parts(unit_tokens, read_tokens)
@@ -348,7 +345,7 @@ def generate_outline(units: list[str], *, prompt_name: str, call_llm, max_output
         request = {"part": number, "first": start + 1, "last": end, "prompt_tokens": estimate(prompt)}
         try:
             result = call_llm(prompt, max_output_tokens)
-        except utils.LLMRequestError as error:
+        except LLMRequestError as error:
             request.update({"result": "error", "error_type": error.error_type, "error": str(error)})
             record["requests"].append(request)
             record.update({"error_type": error.error_type, "error": f"part {number}: {error}"})
