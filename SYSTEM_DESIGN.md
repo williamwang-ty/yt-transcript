@@ -157,7 +157,7 @@ Notes:
 - **Idempotent stages.** Rerunning an unfinished stage starts that stage over, except that expensive sub-steps keep their results inside the stage (the downloaded audio, the Deepgram result of each audio piece, the outline, finished window rounds), so an interrupted stage never pays twice.
 - **No separate preflight.** Each stage checks what it needs right before it needs it: yt-dlp before `metadata` (including the update check, at most hourly, because YouTube keeps breaking older yt-dlp releases), the Deepgram key only when `source` chooses Deepgram, an LLM backend only at `text`, `output_dir` only at `assemble`. Cheap paths stay cheap.
 - **The source is final before any LLM call.** The subtitle quality reroute happens inside `source`, so `normalize` and everything after it work on accepted text.
-- **One path for every length.** Short and long videos go through the same stages. `plan` marks the text `long` when the video runs 30 minutes or more, or when a shorter video's text is above the single-request limit (about 4,100 to 4,800 estimated tokens, depending on the route). For a `long` text, YouTube chapter starts also cut the chunks and become outline hints; a `short` text uses neither. The outline pass is skipped whenever one round can process the whole text (7.4), so a short video usually takes one request per task.
+- **One path for every length.** Short and long videos go through the same stages. `plan` marks the text `long` when the video runs 30 minutes or more, or when a shorter video's text is above the single-request limit (about 4,100 to 4,800 estimated tokens, depending on the route). For a `long` text, YouTube chapters become outline hints (on the segment path they also cut the chunks); a `short` text uses neither. The outline pass is skipped whenever one round can process the whole text (7.4), so a short video usually takes one request per task.
 - **Free routing check.** `--stage plan` runs `metadata` through `plan` without spending money. If the route needs Deepgram, it records that decision and stops inside `source`, without transcribing.
 
 ### 6.3 Source selection
@@ -353,7 +353,7 @@ Nothing depends on a provider's special request fields. `max_tokens` is sent as 
 
 ### 6.9 Quality check and assembly
 
-- `verify` checks structure, signs of truncation, the size ratio against the raw text, repeated phrases and seam duplicates, Chinese readability, bilingual pairing, glossary drift, semantic anchors (dates, numbers, versions, URLs), and the window run's coverage. Only hard failures stop the run (`failed`, stage `verify`, reason `quality_hard_failure`), and then no article is written: a missing or empty file, no `##` section heading in more than 1,200 characters, or a bilingual body without a single English-then-Chinese paragraph pair. Everything else is a warning, saved in `state.json` and returned with `done` for the agent to mention. It also records, with no warning, the longest paragraph, how many paragraphs pass the prompts' split point (500 characters of Chinese, or 250 words for the English paragraphs of bilingual output) and how many contain a single line break.
+- `verify` checks structure, signs of truncation, the size ratio against the raw text, repeated phrases and seam duplicates, Chinese readability, bilingual pairing, glossary drift, semantic anchors (dates, numbers, versions, URLs), and the window run's coverage. Only hard failures stop the run (`failed`, stage `verify`, reason `quality_hard_failure`), and then no article is written: a missing or empty file, no `##` section heading in more than 1,200 characters, or a bilingual body without a single English-then-Chinese paragraph pair. Everything else is a warning, saved in `state.json` and returned with `done` for the agent to mention. It also records, with no warning, the longest paragraph, how many paragraphs pass the prompts' split point (500 characters of Chinese, or 250 words for the English paragraphs of bilingual output), how many contain a single line break, and how many `##` headings follow a paragraph that stops mid-sentence (a heading that split a sentence).
 - `assemble` computes everything that used to be built by hand from state: the filename `yyyy-mm-dd. <title>.md` (illegal characters replaced, the video id when the title is empty, the date never in the raw `yyyymmdd` form), YAML frontmatter with quoted values (`title`, `source`, `url`, `channel`, `author`, `date`, `created`, `type`, `bilingual`, `duration`, `transcript_source`, `tags`, `via`), a header with the title, the channel link, the language mode and the duration, and a one-line footer naming the transcript source. The bilingual layout itself (each English paragraph followed by its Chinese translation) comes from `translate_only`.
 - `cleanup` runs only after the article exists. A failed or interrupted run keeps its whole directory so it can be resumed or inspected.
 
@@ -470,14 +470,14 @@ Paragraphs are written only by `cleanup_zh` and `structure_only`; `translate_onl
 - **normalized document**
   - built by the `normalize` stage: the cleaned text, the timed segments, and `preferred_chunk_source` (`text` for subtitles on the `chinese` route, `segments` otherwise); the segment times tell the executor where speech pauses are
 - **chunk**
-  - before the first round, the `text` stage cuts the normalized document into chunks of about `chunk_tokens_<task>` tokens (`kernel/text/chunking.py`, listed in `text/manifest.json`): at sentence ends on the text path, at subtitle cues on the segment path, and also at every YouTube chapter start when the plan says `long`. A chunk boundary stays a unit boundary.
+  - before the first round, the `text` stage cuts the normalized document into chunks of about `chunk_tokens_<task>` tokens (`kernel/text/chunking.py`, listed in `text/manifest.json`): at sentence ends on the text path, at subtitle cues on the segment path, where it also cuts before every YouTube chapter start when the plan says `long`. A chunk boundary stays a unit boundary. The text path (subtitles on the `chinese` route) has no chapter cuts, so a chapter can start inside a unit.
 - **unit / `[S<n>]`**
-  - one numbered source sentence. A sentence above about 120 tokens (common in unpunctuated ASR text) is cut at subtitle cue ends, longest pause first, or every ~120 tokens when the cues cannot be matched to the text. In `translate_only` a unit is one paragraph of the `structure_only` output, split only above about 600 tokens.
+  - one numbered source sentence. A sentence above about 120 tokens (common in unpunctuated ASR text) is cut at subtitle cue ends, longest pause first, or every ~120 tokens when the cues cannot be matched to the text, so in unpunctuated Chinese subtitles a unit often starts and ends in the middle of a sentence. In `translate_only` a unit is one paragraph of the `structure_only` output, split only above about 600 tokens.
 
 ##### Layer 2: document-level guidance
 
 - **global outline**
-  - for `cleanup_zh` and `structure_only` (`window_outline: true`), one pass over the numbered full text before the first round (`kernel/text/outline.py`), in parts when the text is longer than `window_outline_read_tokens`. It returns section titles with their first unit (checked to be in range and increasing) and a term list. It is skipped when one round can process the whole text, since that round sees all of it. When the plan says `long`, YouTube chapters are mapped to units through the cue times and given as hints; a section starting at a chapter keeps the chapter's own title, unless that title is not in the output language (an English chapter title in a `cleanup_zh` run keeps the model's translation). In a bilingual run each heading is an English `##` line followed by a Chinese one.
+  - for `cleanup_zh` and `structure_only` (`window_outline: true`), one pass over the numbered full text before the first round (`kernel/text/outline.py`), in parts when the text is longer than `window_outline_read_tokens`. It returns a term list and the sections, each with its title, its first unit (checked to be in range and increasing) and the first words of the sentence it begins with. Those words are looked up in the source within two units of the given one; when found, the section moves to the unit holding them and keeps them, copied from the source, as its anchor, which is where its heading goes (7.5 B). A unit number alone is not enough, because units of unpunctuated subtitles start mid-sentence. The outline is skipped when one round can process the whole text, since that round sees all of it. When the plan says `long`, YouTube chapters are mapped to units through the cue times, anchored at the text of the chapter's first cue (a chapter after the last cue is left out), and given as hints; the section nearest a chapter takes the chapter's unit, anchor and title, unless the title is a placeholder or not in the output language (an English chapter title in a `cleanup_zh` run keeps the model's translation). In a bilingual run each heading is an English `##` line followed by a Chinese one.
 - **terms (glossary)**
   - names and terms with their correct spellings and seen mis-recognitions. With an outline, each round gets the outline's terms that occur in its window, and `translate_only` gets them with their Chinese renderings. Without an outline, `cleanup_zh` rounds use `text/glossary.json`, a transcript glossary built locally (no LLM) from the chunks, the title, the channel and the chapter titles; `verify` checks the final text against the same file.
 
@@ -564,7 +564,7 @@ The model never decides where its output starts or stops in the source. It copie
 
 #### B. Structure decided once
 
-When the run has an outline, headings come only from it. A round may write a heading where the topic actually begins near the outline's start unit; otherwise the program inserts it. Without an outline (the whole source fits in one round, `window_outline: false`, or the outline failed), rounds place their own headings.
+When the run has an outline, headings come only from it. Each round is told, for every section starting in its window, the unit and the words the section begins with, and writes the heading before the sentence holding those words, never inside a sentence; a heading the model writes near the section's start unit is kept. A section the model does not head gets its heading from the program, between two paragraphs, before the first one whose middle reaches the section's start unit. Without an outline (the whole source fits in one round, `window_outline: false`, or the outline failed), rounds place their own headings.
 
 #### C. Sizes as soft targets
 
@@ -864,7 +864,7 @@ agent 从不编辑状态文件，也从不手动执行内部阶段。需要不�
 - **阶段幂等。** 重跑一个未完成的阶段，会把这个阶段从头做一遍；但昂贵的子步骤在阶段内部保留结果（下载好的音频、每段音频的 Deepgram 结果、大纲、已完成的窗口轮次），所以中断的阶段不会重复花钱。
 - **没有单独的 preflight。** 每个阶段在真正需要之前才检查它需要的东西：`metadata` 之前检查 yt-dlp（包括更新检查，最多每小时一次，因为 YouTube 经常让旧版 yt-dlp 失效），`source` 选了 Deepgram 才检查 Deepgram 密钥，到 `text` 才检查 LLM 后端，到 `assemble` 才检查 `output_dir`。便宜的路径保持便宜。
 - **第一次调用 LLM 之前来源已经定下来。** 字幕质量改道在 `source` 内部完成，所以 `normalize` 及之后的阶段处理的都是已经认可的文字。
-- **长短视频一条路径。** 短视频和长视频走同样的阶段。视频时长 30 分钟以上，或者较短视频的文字超过单次请求的上限（按路线不同，约 4100 到 4800 个估算 token），`plan` 就把文字标为 `long`。`long` 的文字会在 YouTube 章节开始处切分块，章节也作为大纲的提示；`short` 的文字两者都不用。只要一轮能处理完全文就跳过大纲调用（7.4），所以短视频通常每个任务只需要一次请求。
+- **长短视频一条路径。** 短视频和长视频走同样的阶段。视频时长 30 分钟以上，或者较短视频的文字超过单次请求的上限（按路线不同，约 4100 到 4800 个估算 token），`plan` 就把文字标为 `long`。`long` 的文字把 YouTube 章节作为大纲的提示（按片段切时还会在章节开始处切分块）；`short` 的文字两者都不用。只要一轮能处理完全文就跳过大纲调用（7.4），所以短视频通常每个任务只需要一次请求。
 - **免费的路由检查。** `--stage plan` 执行 `metadata` 到 `plan`，不花钱。如果路由需要 Deepgram，就记下这个决定，在 `source` 内部停下，不做转写。
 
 ### 6.3 来源选择
@@ -1060,7 +1060,7 @@ agent 从不编辑状态文件，也从不手动执行内部阶段。需要不�
 
 ### 6.9 质量检查与组装
 
-- `verify` 检查结构、截断迹象、相对原文的长度比、重复短语和接缝重复、中文可读性、双语配对、术语漂移、semantic anchors（日期、数字、版本号、URL）以及窗口运行的覆盖率。只有硬失败会让运行停下（`failed`，阶段 `verify`，原因 `quality_hard_failure`），这时不写文章：文件不存在或为空、超过 1200 个字符却没有一个 `##` 标题、双语正文里没有一组"英文段后接中文段"的配对。其余都是警告，存进 `state.json`，随 `done` 一起返回，由 agent 提及。另外它只记录、不警告：最长段落的长度、超过 prompt 分段点的段落数（中文 500 字；双语输出按英文段落，250 词），以及段内含单个换行的段落数。
+- `verify` 检查结构、截断迹象、相对原文的长度比、重复短语和接缝重复、中文可读性、双语配对、术语漂移、semantic anchors（日期、数字、版本号、URL）以及窗口运行的覆盖率。只有硬失败会让运行停下（`failed`，阶段 `verify`，原因 `quality_hard_failure`），这时不写文章：文件不存在或为空、超过 1200 个字符却没有一个 `##` 标题、双语正文里没有一组"英文段后接中文段"的配对。其余都是警告，存进 `state.json`，随 `done` 一起返回，由 agent 提及。另外它只记录、不警告：最长段落的长度、超过 prompt 分段点的段落数（中文 500 字；双语输出按英文段落，250 词）、段内含单个换行的段落数，以及有多少个 `##` 标题前面那段没有说完（标题把一句话切开了）。
 - `assemble` 计算以前要从状态里手工拼出来的所有东西：文件名 `yyyy-mm-dd. <标题>.md`（替换非法字符，标题为空时用视频 id，日期从不使用原始的 `yyyymmdd`）、值都加引号的 YAML frontmatter（`title`、`source`、`url`、`channel`、`author`、`date`、`created`、`type`、`bilingual`、`duration`、`transcript_source`、`tags`、`via`）、包含标题、频道链接、语言模式和时长的头部，以及注明转录来源的一行结尾。双语排版本身（每个英文段后面跟它的中文译文）由 `translate_only` 产生。
 - `cleanup` 只在文章存在之后运行。失败或中断的运行保留整个目录，便于续跑或检查。
 
@@ -1177,14 +1177,14 @@ prompts/*.md              任务 prompt：cleanup_zh、structure_only、translat
 - **规范化文档（normalized document）**
   - `normalize` 阶段生成：清理后的文字、带时间的片段，以及 `preferred_chunk_source`（`chinese` 路线上的字幕为 `text`，其余为 `segments`）；片段的时间告诉执行器哪里有停顿
 - **分块（chunk）**
-  - 第一轮之前，`text` 阶段把规范化文档切成约 `chunk_tokens_<task>` 个 token 的分块（`kernel/text/chunking.py`，列在 `text/manifest.json` 里）：按文字切时在句末切，按片段切时在字幕条之间切；计划判定为 `long` 时还会在每个 YouTube 章节开始处切。分块边界一定也是单元边界。
+  - 第一轮之前，`text` 阶段把规范化文档切成约 `chunk_tokens_<task>` 个 token 的分块（`kernel/text/chunking.py`，列在 `text/manifest.json` 里）：按文字切时在句末切，按片段切时在字幕条之间切，计划判定为 `long` 时还会在每个 YouTube 章节开始处切。分块边界一定也是单元边界。按文字切（`chinese` 路线上的字幕）时不在章节处切，所以章节可能从一个单元的中间开始。
 - **单元 / `[S<n>]`**
-  - 一个编号的原文句子。超过约 120 token 的句子（没有标点的 ASR 文字里很常见）在字幕条结束处切开，优先最长的停顿；字幕对不上文字时每约 120 token 切一次。`translate_only` 里一个单元是 `structure_only` 输出的一个段落，超过约 600 token 才拆开。
+  - 一个编号的原文句子。超过约 120 token 的句子（没有标点的 ASR 文字里很常见）在字幕条结束处切开，优先最长的停顿；字幕对不上文字时每约 120 token 切一次。所以在没有标点的中文字幕里，单元常常在句子中间开始和结束。`translate_only` 里一个单元是 `structure_only` 输出的一个段落，超过约 600 token 才拆开。
 
 ##### 第 2 层：文档级指导
 
 - **全局大纲**
-  - 用于 `cleanup_zh` 和 `structure_only`（`window_outline: true`）：第一轮之前对带编号的全文做一次调用（`kernel/text/outline.py`），全文超过 `window_outline_read_tokens` 时分几部分做。它返回章节标题和起始单元（检查是否在范围内且递增），以及一份术语表。一轮就能处理完全文时跳过，因为那一轮能看到全部内容。计划判定为 `long` 时，YouTube 章节通过字幕时间映射到单元，作为提示交给模型；从章节处开始的小节沿用章节自己的标题，除非该标题不是输出语言（`cleanup_zh` 里的英文章节标题保留模型的译文）。双语运行里每个标题是一行英文 `##` 加一行中文 `##`。
+  - 用于 `cleanup_zh` 和 `structure_only`（`window_outline: true`）：第一轮之前对带编号的全文做一次调用（`kernel/text/outline.py`），全文超过 `window_outline_read_tokens` 时分几部分做。它返回一份术语表和各节：标题、起始单元（检查是否在范围内且递增），以及这一节开头那句话的头几个字。程序在给出的单元前后两个单元内查找这几个字；找到了，这一节就移到包含它们的单元，并把从原文照抄的这几个字作为锚点，标题就放在这里（7.5 B）。只靠单元编号不够，因为没有标点的字幕切出来的单元会从句子中间开始。一轮就能处理完全文时跳过大纲，因为那一轮能看到全部内容。计划判定为 `long` 时，YouTube 章节通过字幕时间映射到单元，以章节第一条字幕的原文为锚点（在最后一条字幕之后才开始的章节不用），作为提示交给模型；离章节最近的那一节沿用章节的单元、锚点和标题，除非标题是占位标题或不是输出语言（`cleanup_zh` 里的英文章节标题保留模型的译文）。双语运行里每个标题是一行英文 `##` 加一行中文 `##`。
 - **术语（glossary）**
   - 人名、术语的正确写法和见到的识别错误。有大纲时，每轮拿到大纲术语中在本窗口出现的那些，`translate_only` 还会拿到它们的中文译法。没有大纲时，`cleanup_zh` 的各轮使用 `text/glossary.json`：一份本地生成（不用 LLM）的转录术语表，来源是分块、标题、频道和章节标题；`verify` 也用这份文件检查最终文字。
 
@@ -1271,7 +1271,7 @@ merge 阶段 -> verify 阶段 -> assemble 阶段
 
 #### B. 结构只决定一次
 
-有大纲时，标题只来自大纲。话题在大纲起始单元附近真正开始的地方，模型可以写出标题；否则由程序插入。没有大纲时（全文一轮就能写完、`window_outline: false` 或大纲失败），各轮自己放标题。
+有大纲时，标题只来自大纲。每一轮会拿到在本窗口开始的每一节的起始单元和开头那几个字，模型在这几个字所在的那句话前面写出标题，不在句子中间放标题；模型在起始单元附近写出的标题会被保留。模型没有写的标题由程序插在两段之间，放在第一个中点到达起始单元的段落前面。没有大纲时（全文一轮就能写完、`window_outline: false` 或大纲失败），各轮自己放标题。
 
 #### C. 大小是软目标
 

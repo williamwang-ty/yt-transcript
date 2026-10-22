@@ -29,6 +29,9 @@ QUALITY_CJK_SPACE_PATTERNS = (
 # Paragraph length past which the prompts ask the model to look for a split.
 PARAGRAPH_SPLIT_ABOVE_CHARS = 500
 PARAGRAPH_SPLIT_ABOVE_WORDS = 250
+# A paragraph ending like this finishes its last sentence (closing quotes,
+# brackets and Markdown emphasis may follow the punctuation).
+SENTENCE_END = re.compile(r"[。！？!?.…；;][\"'”’」』）)\]】》*_]*$")
 
 
 def _has_unbalanced_terminal_markers(text: str) -> bool:
@@ -213,6 +216,22 @@ def _compute_paragraph_length_metrics(body_paragraphs: list[str], *, bilingual: 
     }
 
 
+def _count_headings_mid_sentence(blocks: list[str]) -> int:
+    """Count `##` headings right after a paragraph that stops in the middle of a sentence (advisory only).
+
+    Such a heading usually splits one sentence in two, which happens when a
+    heading is put at a source unit boundary inside an unpunctuated subtitle
+    sentence instead of before the sentence its section begins with.
+    """
+    count = 0
+    previous = None
+    for block in blocks:
+        if block.startswith("## ") and previous is not None and not SENTENCE_END.search(previous):
+            count += 1
+        previous = None if block.startswith(("#", ">", "---")) else block
+    return count
+
+
 def _count_bilingual_paragraph_pairs(paragraphs: list[str]) -> int:
     """Count adjacent English-to-Chinese body paragraph pairs."""
     normalized_blocks = [str(block or "").strip() for block in paragraphs if str(block or "").strip()]
@@ -307,6 +326,7 @@ def verify_quality(optimized_text_path: str, raw_text_path: str = None,
     ]
     checks["paragraph_count"] = len(body_paragraphs)
     checks.update(_compute_paragraph_length_metrics(body_paragraphs, bilingual=bilingual))
+    checks["heading_mid_sentence_count"] = _count_headings_mid_sentence(paragraphs)
 
     # Check 1: Non-empty
     checks["non_empty"] = total_chars > 0

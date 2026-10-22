@@ -52,6 +52,7 @@
         "max_paragraph_len": 95,
         "over_limit_paragraph_count": 0,
         "paragraph_line_break_count": 0,
+        "heading_mid_sentence_count": 0,
         "total_chars": 8077,
         "cn_char_ratio": 0.157,
         "en_char_ratio": 0.627,
@@ -128,6 +129,7 @@
         "max_paragraph_len": 537,
         "over_limit_paragraph_count": 1,
         "paragraph_line_break_count": 0,
+        "heading_mid_sentence_count": 0,
         "total_chars": 3364,
         "header_density": 0.143,
         "chunk_seam_warning_count": 0,
@@ -197,15 +199,16 @@
         "Chinese punctuation density looks unusually low (density 0.001)"
       ],
       "checks": {
-        "size_ratio_vs_raw": 1.05,
-        "section_count": 16,
-        "paragraph_count": 29,
+        "size_ratio_vs_raw": 1.04,
+        "section_count": 15,
+        "paragraph_count": 28,
         "paragraph_length_unit": "chars",
-        "max_paragraph_len": 551,
-        "over_limit_paragraph_count": 6,
+        "max_paragraph_len": 591,
+        "over_limit_paragraph_count": 5,
         "paragraph_line_break_count": 0,
-        "total_chars": 11586,
-        "header_density": 0.552,
+        "heading_mid_sentence_count": 14,
+        "total_chars": 11566,
+        "header_density": 0.536,
         "chunk_seam_warning_count": 0,
         "glossary_drift_count": 0,
         "semantic_missing_count": 0
@@ -239,8 +242,7 @@
         "## 107个真实任务：无人干预条件下，最前沿模型通过率约61",
         "## 报价、钓鱼邮件、订船和纠纷：怎样才算真正完成任务？",
         "## 新版本也可能退步，评测必须持续做",
-        "## 多平台经营：有流水，不代表有利润",
-        "## 产品品味、市场判断与预算分配：老板仍要做的选择"
+        "## 多平台经营：有流水，不代表有利润"
       ]
     }
   },

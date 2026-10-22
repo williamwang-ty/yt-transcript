@@ -8,6 +8,7 @@ from kernel.text import chunking
 from kernel.text import merge as kernel_merge
 from kernel.text import outline
 from kernel.text import window
+from tests import fake_llm
 
 
 SENTENCE_TAG = re.compile(r"^\[S(\d+)\] (.*)$", re.MULTILINE)
@@ -766,26 +767,37 @@ class WindowOutlineTests(unittest.TestCase):
                     {"start": 20, "title": "第三部分"}]
         # The topic really starts a little after S10's tag: the model's heading stays there.
         text = "前一个话题的结尾。\n\n## 第二部分\n\n新话题开始了。\n\n## 自己编的标题\n\n继续。"
-        body, placed, next_section = outline.place_headings(sections, 1, text, 9, 12)
+        body, placed, next_section, written = outline.place_headings(sections, 1, text, 9, 12)
         self.assertEqual(body, "前一个话题的结尾。\n\n## 第二部分\n\n新话题开始了。\n\n继续。")
-        self.assertEqual((placed, next_section), ([10], 2))
+        self.assertEqual((placed, next_section, written), ([10], 2, 1))
         # A matching title far from its section start is not trusted; the program places it.
-        body, placed, next_section = outline.place_headings(sections, 1, "## 第三部分\n\n甲。", 9, 11)
-        self.assertEqual((body, placed, next_section), ("## 第二部分\n\n甲。", [10], 2))
+        body, placed, next_section, written = outline.place_headings(sections, 1, "## 第三部分\n\n甲。", 9, 11)
+        self.assertEqual((body, placed, next_section, written), ("## 第二部分\n\n甲。", [10], 2, 0))
         # Skipped sections before a model-placed one are headed with it, in order.
-        body, placed, next_section = outline.place_headings(sections, 1, "甲。\n\n## 第三部分\n\n乙。", 18, 21)
+        body, placed, next_section, written = outline.place_headings(sections, 1, "甲。\n\n## 第三部分\n\n乙。",
+                                                                     18, 21)
         self.assertEqual(body, "甲。\n\n## 第二部分\n\n## 第三部分\n\n乙。")
-        self.assertEqual((placed, next_section), ([10, 20], 3))
+        self.assertEqual((placed, next_section, written), ([10, 20], 3, 1))
 
     def test_round_context_lists_nearby_sections_and_terms_found_in_the_window(self):
-        sections = [{"start": 1, "title": "甲"}, {"start": 10, "title": "乙"}, {"start": 30, "title": "丙"},
-                    {"start": 50, "title": "丁"}]
+        sections = [{"start": 1, "title": "甲"}, {"start": 10, "title": "乙", "anchor": "可不可以具体举一个例子"},
+                    {"start": 14, "title": "戊"}, {"start": 30, "title": "丙"}, {"start": 50, "title": "丁"}]
         text = outline.round_outline_text(sections, cursor=4, window_end=20, next_section=1)
-        self.assertIn("[S1] 甲 (the section [S5] is in; already headed)", text)
-        self.assertIn("[S10] 乙 (starts in this window", text)
-        self.assertIn("put the line `## 乙` before it", text)
-        self.assertIn("[S30] 丙 (next section", text)
+        self.assertIn("- 甲 (the section [S5] is in; already headed)", text)
+        # The heading goes before the sentence holding the section's first words, not at the unit tag.
+        self.assertIn("- 乙 (starts in this window; it begins in [S10] at the words “可不可以具体举一个例子”: start a "
+                      "new paragraph at the beginning of the sentence that contains these words, and put the line "
+                      "`## 乙` before it)", text)
+        self.assertIn("- 戊 (starts in this window; it begins in or right after [S14], where this topic starts", text)
+        self.assertIn("- 丙 (next section", text)
         self.assertNotIn("丁", text)
+        self.assertNotIn("[S10] 乙", text)
+        # A section that began before the window and has no heading yet opens the output.
+        text = outline.round_outline_text(sections, cursor=11, window_end=20, next_section=1)
+        self.assertIn("- 乙 (starts in this window; it began before [S12], so start the output with the line `## 乙`)",
+                      text)
+        text = outline.round_outline_text(sections, cursor=9, window_end=20, next_section=1)
+        self.assertIn("- 乙 (starts in this window; it begins in [S10] at the words", text)
         terms = [{"term": "英伟达", "variants": ["因为达"], "kind": "organization"},
                  {"term": "CUDA", "variants": [], "kind": "product"},
                  {"term": "黄仁勋", "variants": [], "kind": "person"}]
@@ -795,16 +807,58 @@ class WindowOutlineTests(unittest.TestCase):
         self.assertNotIn("黄仁勋", glossary)
         self.assertEqual(outline.round_terms_text(terms, "没有相关的词"), "")
 
-    def test_chapter_titles_replace_reworded_section_titles(self):
-        sections = [{"start": 1, "title": "开场"}, {"start": 11, "title": "军火暴利与杠杆"},
-                    {"start": 20, "title": "被细分的小节"}, {"start": 40, "title": "Gauss"}]
-        hints = [{"start": 1, "title": "<Untitled Chapter 1>"}, {"start": 12, "title": "军火暴利4451%？TransDigm"},
+    def test_chapters_replace_reworded_section_titles_and_positions(self):
+        sections = [{"start": 1, "title": "开场"}, {"start": 11, "title": "军火暴利与杠杆", "anchor": "模型挑的开头"},
+                    {"start": 20, "title": "被细分的小节"}, {"start": 40, "title": "Gauss", "anchor": "So Gauss"}]
+        hints = [{"start": 1, "title": "<Untitled Chapter 1>", "anchor": "大家好"},
+                 {"start": 12, "title": "军火暴利4451%？TransDigm", "anchor": "接下来说说军火"},
                  {"start": 40, "title": "Gauss's Discovery"}]
-        restored = outline.restore_chapter_titles(sections, hints, "cleanup_zh")
+        restored = outline.apply_chapters(sections, hints, "cleanup_zh")
         # The placeholder and the English title (not the output language) keep the model's titles.
         self.assertEqual([s["title"] for s in restored], ["开场", "军火暴利4451%？TransDigm", "被细分的小节", "Gauss"])
-        restored = outline.restore_chapter_titles(sections, hints, "structure_only")
+        # The chapter's unit and words win over where the model started the section.
+        self.assertEqual([(s["start"], s.get("anchor")) for s in restored],
+                         [(1, "大家好"), (12, "接下来说说军火"), (20, None), (40, "So Gauss")])
+        restored = outline.apply_chapters(sections, hints, "structure_only")
         self.assertEqual(restored[3]["title"], "Gauss's Discovery")
+        # A chapter moved onto the unit of the model's next section replaces that section.
+        crowded = [{"start": 10, "title": "甲"}, {"start": 12, "title": "乙"}, {"start": 20, "title": "丙"}]
+        restored = outline.apply_chapters(crowded, [{"start": 12, "title": "第一章"}, {"start": 11, "title": "第二章"}],
+                                          "cleanup_zh")
+        self.assertEqual([(s["start"], s["title"]) for s in restored], [(11, "第二章"), (12, "第一章"), (20, "丙")])
+        restored = outline.apply_chapters(crowded, [{"start": 11, "title": "第一章"}], "cleanup_zh")
+        self.assertEqual([(s["start"], s["title"]) for s in restored], [(11, "第一章"), (12, "乙"), (20, "丙")])
+
+    def test_first_words_become_anchors_copied_from_the_source(self):
+        units = ["去管理你整个企业员工", "在整个日常经营里边的表现这个是现在我们看到的问题可不可以具体举一个例子比如说一个跨境商家",
+                 "他一开始用 Accio Work 是想要解决什么样的问题", "So, what's the plan? Let's start with the data."]
+        # Found inside S2 although the model wrote punctuation the source does not have.
+        self.assertEqual(outline.locate_words(units, "可不可以，具体举一个例子", 2), (1, units[1].index("可不可以")))
+        # The model gave the next unit; the words are looked for nearby.
+        self.assertEqual(outline.locate_words(units, "可不可以具体举一个例子", 3), (1, units[1].index("可不可以")))
+        # Words running over the end of a unit, an English sentence start, and a fixed-up word.
+        self.assertEqual(outline.locate_words(units, "跨境商家他一开始用", 2), (1, units[1].index("跨境商家")))
+        self.assertEqual(outline.locate_words(units, "let's start with", 4), (3, units[3].index("Let's")))
+        self.assertEqual(outline.locate_words(units, "可不可以具体讲一个例子", 2), (1, units[1].index("可不可以")))
+        self.assertIsNone(outline.locate_words(units, "完全不在原文里的话", 2))
+        self.assertIsNone(outline.locate_words(units, "问题", 2))
+        # As long as asked (an English word weighs two Chinese characters), running into the next
+        # unit only when the rest of this one is too short.
+        self.assertEqual(outline.anchor_text(units, 1, units[1].index("可不可以"), 11), "可不可以具体举一个例子")
+        self.assertEqual(outline.anchor_text(units, 1, units[1].index("跨境商家")), "跨境商家他一开始用 Accio Work")
+        self.assertEqual(outline.anchor_text(units, 3, units[3].index("Let's")), "Let's start with the data")
+
+        sections = outline.anchor_sections([
+            {"start": 1, "title": "甲", "first_words": "去管理你整个企业员工"},
+            {"start": 3, "title": "乙", "first_words": "可不可以具体举一个例子"},
+            {"start": 3, "title": "丙", "first_words": "没有这句话"},
+            {"start": 4, "title": "丁", "first_words": "可不可以具体举一个例子"},
+        ], units)
+        # 乙 moves to the unit holding its words; 丙 keeps its unit without an anchor; 丁 would not
+        # come after 丙 any more and is dropped.
+        self.assertEqual(sections, [{"start": 1, "title": "甲", "anchor": "去管理你整个企业员工"},
+                                    {"start": 2, "title": "乙", "anchor": "可不可以具体举一个例子"},
+                                    {"start": 3, "title": "丙"}])
 
     def test_youtube_chapter_times_map_to_the_unit_holding_that_cue(self):
         cue_starts = [(0, 0.0), (10, 5.0), (20, 10.0), (30, 15.0)]
@@ -819,6 +873,24 @@ class WindowOutlineTests(unittest.TestCase):
         self.assertEqual(hints, [{"start": 1, "title": "Intro"}, {"start": 3, "title": "Main"},
                                  {"start": 4, "title": "Late"}])
         self.assertEqual(outline.hints_from_times([{"title": "x", "start_time": 0}], cue_starts, [None] * 4), [])
+
+    def test_chapter_hints_are_anchored_at_the_chapter_cue_inside_its_unit(self):
+        # Two cues per unit; the second chapter starts at the second cue of unit 2.
+        cues = ["大家好欢迎来到节目", "今天聊聊章节", "上一个话题的结尾", "可不可以举个例子", "比如说一个商家", "后来怎么样了"]
+        units = [cues[0] + cues[1], cues[2] + " " + cues[3], cues[4] + cues[5]]
+        cue_starts, offset = [], 0
+        for index, cue in enumerate(cues):
+            cue_starts.append((offset, index * 5.0))
+            offset += len(cue)
+        unit_offsets = [0, len(cues[0] + cues[1]), len(cues[0] + cues[1] + cues[2] + cues[3])]
+        hints = outline.hints_from_times(
+            [{"title": "开场", "start_time": 0}, {"title": "举例", "start_time": 15.2},
+             {"title": "片尾", "start_time": 40.0}],
+            cue_starts, unit_offsets, units)
+        # Each chapter keeps its unit and begins with its first cue's words, from the middle of
+        # unit 2 for the second; the chapter after the last cue has no text and is left out.
+        self.assertEqual(hints, [{"start": 1, "title": "开场", "anchor": "大家好欢迎来到节目"},
+                                 {"start": 2, "title": "举例", "anchor": "可不可以举个例子"}])
 
     # --- executor -----------------------------------------------------------
 
@@ -840,7 +912,8 @@ class WindowOutlineTests(unittest.TestCase):
         self.assertIn(f"[S{self.SENTENCE_COUNT}] ", calls["outline"][0])
         first_round = calls["rounds"][0]
         self.assertIn("do not invent headers", first_round)
-        self.assertIn("[S1] 开场 (starts in this window", first_round)
+        self.assertIn("- 开场 (starts in this window; it begins in or right after [S1]", first_round)
+        self.assertIn('"first_words"', calls["outline"][0])
         self.assertIn("write 测验", first_round)
         self.assertNotIn("Terminology Guardrails", first_round)
         # Headings come only from the outline, each once, in order, at its section start.
@@ -855,6 +928,34 @@ class WindowOutlineTests(unittest.TestCase):
             self.assertEqual(merged.count(_sentence(i)), 1, i)
         self.assertEqual(merge["sections"], 3)
         self.assertEqual(sum(len(p.get("sections", [])) for p in state["paragraphs"]), 3)
+
+    def test_headings_go_before_the_words_a_section_begins_with_not_at_a_unit_tag(self):
+        # Unpunctuated text, like Chinese subtitles: units are fixed-size cuts that start mid-sentence.
+        text = "".join(f"第{i}个话题从这里开始然后讲了很多细节" for i in range(1, 61))
+        words = "第20个话题从这里开始"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            work_dir = chunk_plain_text(text, Path(tmpdir) / "chunks")
+            units, _ = window.build_source_sentences(str(work_dir), {})
+            holding = next(index for index, unit in enumerate(units) if words in unit)
+            self.assertGreater(units[holding].index(words), 0)
+            # The model names the unit after the one holding the words; they are found nearby.
+            llm, calls = self._llm(json.dumps({"sections": [
+                {"start": 1, "first_words": "第1个话题", "title": "开场"},
+                {"start": holding + 2, "first_words": words, "title": "第二部分"}]}, ensure_ascii=False),
+                writer=fake_llm.window_round)
+            result, _ = WindowExecutorTests._run(self, work_dir, self._config(), llm)
+            state = window.load_window_state(str(work_dir))
+            _, merged = self._merged(work_dir, tmpdir)
+
+        self.assertTrue(result["success"], result)
+        self.assertEqual(state["outline"]["sections"][1], {"start": holding + 1, "title": "第二部分", "anchor": words})
+        self.assertTrue(any(f"it begins in [S{holding + 1}] at the words “{words}”" in prompt
+                            for prompt in calls["rounds"]))
+        # The heading sits right before those words, inside what was one unit.
+        self.assertIn(f"\n\n## 第二部分\n\n{words}然后", merged)
+        self.assertEqual(merged.replace("\n", "").replace("## 开场", "").replace("## 第二部分", ""), text)
+        self.assertEqual(result["outline"]["anchored_sections"], 2)
+        self.assertEqual(result["outline"]["model_placed_sections"], 2)
 
     def test_failed_outline_falls_back_to_headings_from_the_rounds(self):
         llm, calls = self._llm("抱歉，我无法生成大纲。")

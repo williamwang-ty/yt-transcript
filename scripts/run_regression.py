@@ -67,6 +67,7 @@ TRACKED_CHECKS = (
     "max_paragraph_len",
     "over_limit_paragraph_count",
     "paragraph_line_break_count",
+    "heading_mid_sentence_count",
     "total_chars",
     "cn_char_ratio",
     "en_char_ratio",

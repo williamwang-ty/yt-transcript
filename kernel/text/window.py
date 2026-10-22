@@ -116,7 +116,7 @@ The input below is one window of a longer transcript. Every source {unit} starts
 - Start at [S{first}].{done_note}
 - {write_note}
 - Keep every [S<n>] tag in the output: write it right before the text that comes from that source {unit}, even in the middle of a sentence or paragraph. Do not add, drop or reorder tags, and cover the {units} in order without skipping any.
-- The tags are bookkeeping only; source {units} may start mid-sentence. Break paragraphs and place headers by meaning, never just because a tag starts there.
+- The tags are bookkeeping only; source {units} may start mid-sentence. Break paragraphs and place headers by meaning, never just because a tag starts there, and never inside a sentence.
 - Separate paragraphs with a blank line, and keep them as short as the task asks: split a long passage into several paragraphs rather than one block.{header_note}{task_note}
 - When you stop, end the output with a line <!--END--> after the last complete paragraph.
 - Output only the processed text, the tags and that end line."""
@@ -124,8 +124,9 @@ The input below is one window of a longer transcript. Every source {unit} starts
 HEADER_NOTE = " Put `##` headers on their own line."
 OUTLINE_HEADER_NOTE = (
     " Section headings come from the Outline block below, not from you: do not invent headers, even if the task "
-    "asks for them. Where a section the outline lists in this window begins, start a new paragraph and put that "
-    "section's `## ` title line, exactly as given, before it; write no other `#` lines."
+    "asks for them. For a section the outline says starts in this window, start a new paragraph at the beginning of "
+    "the sentence it names and put that section's `## ` title line, exactly as given, before it; write no other "
+    "`#` lines."
 )
 
 TASK_PROTOCOL_NOTES = {
@@ -808,8 +809,9 @@ def _commit_paragraphs(out_dir: Path, state: dict, paragraphs: list[dict], sente
 
     When the run has an outline, only headings for the outline's sections
     are kept (the model's, where it wrote one near the section start, else
-    the program's); see `outline.place_headings`. Heading text is not
-    counted in `output_chars`.
+    the program's); see `outline.place_headings`. The outline counts the
+    headings the model wrote in `model_placed`. Heading text is not counted
+    in `output_chars`.
     """
     outline = state.get("outline") or {}
     use_outline = outline.get("status") == "ok" and _stage(state.get("input_key", RAW_STAGE)) == RAW_STAGE
@@ -820,8 +822,9 @@ def _commit_paragraphs(out_dir: Path, state: dict, paragraphs: list[dict], sente
         text = paragraph["text"]
         placed = []
         if sections:
-            content, placed, outline["next_section"] = kernel_outline.place_headings(
+            content, placed, outline["next_section"], written = kernel_outline.place_headings(
                 sections, int(outline.get("next_section", 0) or 0), text, paragraph["start"] + 1, paragraph["end"] + 1)
+            outline["model_placed"] = int(outline.get("model_placed", 0) or 0) + written
             text = kernel_outline.strip_headers(content)
         elif use_outline:
             content = text = kernel_outline.strip_headers(text)
@@ -1192,8 +1195,11 @@ def _prepare_state(work_dir: str, prompt_name: str, input_key: str, sentences: l
     return _new_state(prompt_name, input_key, sentences, params), False
 
 
-def load_chapter_hints(work_dir: str, unit_offsets: list) -> list[dict]:
-    """YouTube chapters as outline hints, mapped onto source units through the subtitle cue times."""
+def load_chapter_hints(work_dir: str, unit_offsets: list, units: list[str] | None = None) -> list[dict]:
+    """YouTube chapters as outline hints, mapped onto source units through the subtitle cue times.
+
+    With `units`, each hint is anchored at the text of the chapter's first cue.
+    """
     chapters_value = str(_read_manifest(work_dir).get("chapters_path", "") or "").strip()
     cues = load_cue_stream(work_dir)
     if not (chapters_value and cues and cues.get("starts")):
@@ -1205,7 +1211,8 @@ def load_chapter_hints(work_dir: str, unit_offsets: list) -> list[dict]:
     chapters = payload.get("chapters", []) if isinstance(payload, dict) else payload
     if not isinstance(chapters, list):
         return []
-    return kernel_outline.hints_from_times([c for c in chapters if isinstance(c, dict)], cues["starts"], unit_offsets)
+    return kernel_outline.hints_from_times([c for c in chapters if isinstance(c, dict)], cues["starts"], unit_offsets,
+                                           units)
 
 
 def _prepare_outline(work_dir: str, prompt_name: str, state: dict, sentences: list[str], config: dict,
@@ -1234,7 +1241,7 @@ def _prepare_outline(work_dir: str, prompt_name: str, state: dict, sentences: li
         state["outline"] = {"status": "skipped", "error": "the whole source fits in one round"}
         return
 
-    hints = load_chapter_hints(work_dir, unit_offsets)
+    hints = load_chapter_hints(work_dir, unit_offsets, sentences)
     log(f"ℹ️ Building the outline and term list ({len(sentences)} units"
         f"{f', {len(hints)} video chapters as hints' if hints else ''}).")
 
@@ -1271,6 +1278,7 @@ def outline_summary(state: dict) -> dict:
     if outline.get("status") in {"ok", "failed"}:
         summary.update({
             "section_count": len(outline.get("sections", [])),
+            "anchored_sections": sum(1 for section in outline.get("sections", []) if section.get("anchor")),
             "term_count": len(outline.get("terms", [])),
             "parts": outline.get("parts", 0),
             "chapter_hints": len(outline.get("hints", [])),
@@ -1278,6 +1286,7 @@ def outline_summary(state: dict) -> dict:
         })
     if outline.get("status") == "ok" and state.get("status") == "done":
         summary["unplaced_sections"] = int(outline.get("unplaced_sections", 0) or 0)
+        summary["model_placed_sections"] = int(outline.get("model_placed", 0) or 0)
     if outline.get("error"):
         summary["error"] = outline["error"]
     return summary
