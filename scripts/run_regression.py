@@ -63,6 +63,10 @@ TRACKED_CHECKS = (
     "size_ratio_vs_raw",
     "section_count",
     "paragraph_count",
+    "paragraph_length_unit",
+    "max_paragraph_len",
+    "over_limit_paragraph_count",
+    "paragraph_line_break_count",
     "total_chars",
     "cn_char_ratio",
     "en_char_ratio",
@@ -354,6 +358,14 @@ def compare(current: dict, baseline: dict) -> list[str]:
     return lines
 
 
+def longest_paragraph(checks: dict) -> str:
+    """Longest paragraph and how many paragraphs pass the prompts' split point, e.g. `420 chars (0 over)`."""
+    if checks.get("max_paragraph_len") is None:
+        return ""
+    return (f"{checks['max_paragraph_len']} {checks.get('paragraph_length_unit', '')} "
+            f"({checks.get('over_limit_paragraph_count', 0)} over)")
+
+
 def render_markdown(report: dict, diff_lines: list[str] | None) -> str:
     out = [
         f"# yt-transcript regression run {report['started_at']}",
@@ -362,8 +374,8 @@ def render_markdown(report: dict, diff_lines: list[str] | None) -> str:
         f"{report['summary']['ok']}/{report['summary']['total']} ok · "
         f"{report['summary']['source_mismatch']} source mismatch (⚠)",
         "",
-        "| Video | Expected | Observed | Mode | Path | Sub quality | Verify | HF | Warn | Size ratio | Status | Notes |",
-        "|---|---|---|---|---|---|---|---|---|---|---|---|",
+        "| Video | Expected | Observed | Mode | Path | Sub quality | Verify | HF | Warn | Size ratio | Longest para | Status | Notes |",
+        "|---|---|---|---|---|---|---|---|---|---|---|---|---|",
     ]
     for item in report["videos"]:
         plan = item.get("plan") or {}
@@ -377,7 +389,8 @@ def render_markdown(report: dict, diff_lines: list[str] | None) -> str:
             f"{plan.get('subtitle_quality_band') or ''} {'' if plan.get('subtitle_quality_score') is None else plan['subtitle_quality_score']} | "
             f"{'' if not verify else ('pass' if verify.get('passed') else 'fail')} | "
             f"{len(verify.get('hard_failures', [])) if verify else ''} | {len(verify.get('warnings', [])) if verify else ''} | "
-            f"{f'{ratio:.2f}' if isinstance(ratio, (int, float)) else ''} | {status} | {source_notes(item)} |"
+            f"{f'{ratio:.2f}' if isinstance(ratio, (int, float)) else ''} | {longest_paragraph(checks)} | "
+            f"{status} | {source_notes(item)} |"
         )
     problems = [i for i in report["videos"] if i.get("error") or (i.get("verify") or {}).get("hard_failures") or (i.get("verify") or {}).get("warnings")]
     if problems:

@@ -413,6 +413,48 @@ class VerifyQualityTests(unittest.TestCase):
             self.assertTrue(result["checks"]["short_paragraph_ratio_ok"])
             self.assertTrue(result["checks"]["punctuation_density_ok"])
 
+    def test_verify_quality_records_long_chinese_paragraphs_without_failing(self):
+        """Test the longest Chinese paragraph is counted in characters and never warns or fails."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            optimized = Path(tmpdir) / "opt.md"
+            long_paragraph = "这一段一直在讲同一件事，没有找到可以分开的转折。" * 25
+            optimized.write_text(
+                "## 背景\n\n"
+                f"{long_paragraph}\n\n"
+                "这是一段长度正常的中文段落，讲的是另一件事。\n"
+                "这一行前面只有单个换行。\n",
+                encoding="utf-8",
+            )
+
+            result = kernel_verify.verify_quality(str(optimized), bilingual=False)
+
+            self.assertTrue(result["passed"], result)
+            self.assertEqual(result["checks"]["paragraph_length_unit"], "chars")
+            self.assertEqual(result["checks"]["max_paragraph_len"], len(long_paragraph))
+            self.assertEqual(result["checks"]["over_limit_paragraph_count"], 1)
+            self.assertEqual(result["checks"]["paragraph_line_break_count"], 1)
+            self.assertFalse(any("paragraph" in warning.lower() and "long" in warning.lower()
+                                 for warning in result["warnings"]))
+
+    def test_verify_quality_measures_bilingual_paragraphs_in_english_words(self):
+        """Test bilingual output is measured by its English paragraphs, in words."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            optimized = Path(tmpdir) / "opt.md"
+            optimized.write_text(
+                "## Section\n\n"
+                + "word " * 260 + "\n\n"
+                + "这是上一段很长的英文段落的中文翻译。" * 30 + "\n\n"
+                "A short English paragraph.\n\n"
+                "一段很短的中文翻译。\n",
+                encoding="utf-8",
+            )
+
+            result = kernel_verify.verify_quality(str(optimized), bilingual=True)
+
+            self.assertEqual(result["checks"]["paragraph_length_unit"], "words")
+            self.assertEqual(result["checks"]["max_paragraph_len"], 260)
+            self.assertEqual(result["checks"]["over_limit_paragraph_count"], 1)
+
     def test_verify_quality_does_not_flag_complete_chinese_tail_without_punctuation(self):
         """Test verify quality does not flag complete chinese tail without punctuation."""
         with tempfile.TemporaryDirectory() as tmpdir:
