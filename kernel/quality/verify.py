@@ -26,6 +26,9 @@ QUALITY_CJK_SPACE_PATTERNS = (
     re.compile(r"(?<=[（《「『【(])\s+(?=[\u3400-\u9fff\u3040-\u30ff\uac00-\ud7af])"),
     re.compile(r"(?<=[\u3400-\u9fff\u3040-\u30ff\uac00-\ud7af])\s+(?=[）》」』】)])"),
 )
+# Paragraph length past which the prompts ask the model to look for a split.
+PARAGRAPH_SPLIT_ABOVE_CHARS = 500
+PARAGRAPH_SPLIT_ABOVE_WORDS = 250
 
 
 def _has_unbalanced_terminal_markers(text: str) -> bool:
@@ -186,6 +189,30 @@ def _compute_cjk_readability_metrics(body_paragraphs: list[str]) -> dict:
     }
 
 
+def _compute_paragraph_length_metrics(body_paragraphs: list[str], *, bilingual: bool) -> dict:
+    """Measure the longest paragraph against the length guide in the prompts (advisory only).
+
+    Chinese output is counted in characters; bilingual output by its English
+    paragraphs in words, since each Chinese translation follows its English
+    paragraph. The limits are the "split above" points of the paragraph rule
+    in prompts/cleanup_zh.md and prompts/structure_only.md.
+    """
+    if bilingual:
+        unit, limit = "words", PARAGRAPH_SPLIT_ABOVE_WORDS
+        lengths = [len(block.split()) for block in body_paragraphs if count_cjk_chars(block) < 4]
+    else:
+        unit, limit = "chars", PARAGRAPH_SPLIT_ABOVE_CHARS
+        lengths = [len(re.sub(r"\s+", "", block)) for block in body_paragraphs if count_cjk_chars(block) >= 4]
+    return {
+        "paragraph_length_unit": unit,
+        "max_paragraph_len": max(lengths, default=0),
+        "over_limit_paragraph_count": sum(1 for length in lengths if length > limit),
+        # A paragraph with a single line break inside may be two paragraphs
+        # written without the blank line between them.
+        "paragraph_line_break_count": sum(1 for block in body_paragraphs if "\n" in block),
+    }
+
+
 def _count_bilingual_paragraph_pairs(paragraphs: list[str]) -> int:
     """Count adjacent English-to-Chinese body paragraph pairs."""
     normalized_blocks = [str(block or "").strip() for block in paragraphs if str(block or "").strip()]
@@ -279,7 +306,8 @@ def verify_quality(optimized_text_path: str, raw_text_path: str = None,
         if not block.startswith('#') and not block.startswith('>') and not block.startswith('---')
     ]
     checks["paragraph_count"] = len(body_paragraphs)
-    
+    checks.update(_compute_paragraph_length_metrics(body_paragraphs, bilingual=bilingual))
+
     # Check 1: Non-empty
     checks["non_empty"] = total_chars > 0
     if not checks["non_empty"]:

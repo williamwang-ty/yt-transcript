@@ -353,7 +353,7 @@ Nothing depends on a provider's special request fields. `max_tokens` is sent as 
 
 ### 6.9 Quality check and assembly
 
-- `verify` checks structure, signs of truncation, the size ratio against the raw text, repeated phrases and seam duplicates, Chinese readability, bilingual pairing, glossary drift, semantic anchors (dates, numbers, versions, URLs), and the window run's coverage. Only hard failures stop the run (`failed`, stage `verify`, reason `quality_hard_failure`), and then no article is written: a missing or empty file, no `##` section heading in more than 1,200 characters, or a bilingual body without a single English-then-Chinese paragraph pair. Everything else is a warning, saved in `state.json` and returned with `done` for the agent to mention.
+- `verify` checks structure, signs of truncation, the size ratio against the raw text, repeated phrases and seam duplicates, Chinese readability, bilingual pairing, glossary drift, semantic anchors (dates, numbers, versions, URLs), and the window run's coverage. Only hard failures stop the run (`failed`, stage `verify`, reason `quality_hard_failure`), and then no article is written: a missing or empty file, no `##` section heading in more than 1,200 characters, or a bilingual body without a single English-then-Chinese paragraph pair. Everything else is a warning, saved in `state.json` and returned with `done` for the agent to mention. It also records, with no warning, the longest paragraph, how many paragraphs pass the prompts' split point (500 characters of Chinese, or 250 words for the English paragraphs of bilingual output) and how many contain a single line break.
 - `assemble` computes everything that used to be built by hand from state: the filename `yyyy-mm-dd. <title>.md` (illegal characters replaced, the video id when the title is empty, the date never in the raw `yyyymmdd` form), YAML frontmatter with quoted values (`title`, `source`, `url`, `channel`, `author`, `date`, `created`, `type`, `bilingual`, `duration`, `transcript_source`, `tags`, `via`), a header with the title, the channel link, the language mode and the duration, and a one-line footer naming the transcript source. The bilingual layout itself (each English paragraph followed by its Chinese translation) comes from `translate_only`.
 - `cleanup` runs only after the article exists. A failed or interrupted run keeps its whole directory so it can be resumed or inspected.
 
@@ -460,6 +460,8 @@ Once a video is long enough, the quality of the whole project is decided more by
 #### One executor
 
 The sliding-window executor (`kernel/text/window.py`) is the only executor. It runs `cleanup_zh`, or the bilingual pair `structure_only` → `translate_only`, where the second task numbers the paragraphs the first one wrote. It replaced a fixed-chunk executor that needed a stack of patches (continuity context, autotune, replanning) to hide its seams. Fixed chunks remain only as the layout of the window run's input and as its fallback for one stretch (below).
+
+Paragraphs are written only by `cleanup_zh` and `structure_only`; `translate_only` keeps the English paragraphs and puts each one's translation under it. Both prompts carry the same Paragraph Rule: one paragraph covers one thing (a point, an example, a step, a speaker's turn); a new speaker or section always starts one, a turn of topic, example or scene usually does, a pause or a filler sentence does not; length is a guide (100-300 Chinese characters, or 2-6 sentences of about 50-150 words), and a paragraph above about 500 characters or 250 words is split at a turn of meaning if it has one. The program never splits or rejects a paragraph by length; `verify` only records the longest one (6.9).
 
 #### Long-text vocabulary by layer
 
@@ -1058,7 +1060,7 @@ agent 从不编辑状态文件，也从不手动执行内部阶段。需要不�
 
 ### 6.9 质量检查与组装
 
-- `verify` 检查结构、截断迹象、相对原文的长度比、重复短语和接缝重复、中文可读性、双语配对、术语漂移、semantic anchors（日期、数字、版本号、URL）以及窗口运行的覆盖率。只有硬失败会让运行停下（`failed`，阶段 `verify`，原因 `quality_hard_failure`），这时不写文章：文件不存在或为空、超过 1200 个字符却没有一个 `##` 标题、双语正文里没有一组"英文段后接中文段"的配对。其余都是警告，存进 `state.json`，随 `done` 一起返回，由 agent 提及。
+- `verify` 检查结构、截断迹象、相对原文的长度比、重复短语和接缝重复、中文可读性、双语配对、术语漂移、semantic anchors（日期、数字、版本号、URL）以及窗口运行的覆盖率。只有硬失败会让运行停下（`failed`，阶段 `verify`，原因 `quality_hard_failure`），这时不写文章：文件不存在或为空、超过 1200 个字符却没有一个 `##` 标题、双语正文里没有一组"英文段后接中文段"的配对。其余都是警告，存进 `state.json`，随 `done` 一起返回，由 agent 提及。另外它只记录、不警告：最长段落的长度、超过 prompt 分段点的段落数（中文 500 字；双语输出按英文段落，250 词），以及段内含单个换行的段落数。
 - `assemble` 计算以前要从状态里手工拼出来的所有东西：文件名 `yyyy-mm-dd. <标题>.md`（替换非法字符，标题为空时用视频 id，日期从不使用原始的 `yyyymmdd`）、值都加引号的 YAML frontmatter（`title`、`source`、`url`、`channel`、`author`、`date`、`created`、`type`、`bilingual`、`duration`、`transcript_source`、`tags`、`via`）、包含标题、频道链接、语言模式和时长的头部，以及注明转录来源的一行结尾。双语排版本身（每个英文段后面跟它的中文译文）由 `translate_only` 产生。
 - `cleanup` 只在文章存在之后运行。失败或中断的运行保留整个目录，便于续跑或检查。
 
@@ -1165,6 +1167,8 @@ prompts/*.md              任务 prompt：cleanup_zh、structure_only、translat
 #### 一个执行器
 
 滑动窗口执行器（`kernel/text/window.py`）是唯一的执行器。它执行 `cleanup_zh`，或者双语的 `structure_only` → `translate_only` 两步，第二步给第一步写出的段落编号。它取代了旧的固定分块执行器，后者需要一堆补丁（continuity 上下文、autotune、replan）来掩盖接缝。固定分块只剩两个用处：作为窗口运行输入的切分方式，以及窗口对某一段的兜底（见下文）。
+
+段落只由 `cleanup_zh` 和 `structure_only` 写出；`translate_only` 保留英文段落，把每段的译文放在它下面。这两个 prompt 带同一条分段规则：一段只讲一件事（一个观点、一个例子、一个步骤、一个人的一次发言）；换说话人或新的一节一定另起一段，话题、例子或场景转换通常另起一段，停顿和一句过渡话不分段；长度只作参考（中文 100 到 300 字，英文 2 到 6 句、约 50 到 150 词），超过约 500 字或 250 词时，有意思转折就在那里分开。程序不按长度切分或拒收段落，`verify` 只记录最长的段落（6.9）。
 
 #### 分层理解长文本子系统词汇表
 
