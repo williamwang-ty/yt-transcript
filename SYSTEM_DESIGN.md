@@ -684,6 +684,15 @@ Behavior changes compared with the agent-driven flow before stage 3:
 
 Subtitle language selection, Deepgram transcription, the window executor's algorithms, the outline and glossary, and the quality checks moved without changing behavior, apart from two output fixes made in stage 3: merged window output no longer joins short paragraphs (which had glued bilingual pairs together), and `structure_only` drops `-` speaker marks.
 
+The design notes written before this refactor were deleted in stage 6, together with the old version of this document. They stay readable at the last commit before stage 6 and in the git history (`git log -- SYSTEM_DESIGN.md system_design_notes/`):
+
+- [Research notes, 2026-03-19](https://github.com/williamwang-ty/yt-transcript/blob/f33bb9f302cc41c4b8fc436db611f2212f6d2efc/system_design_notes/20260319_SYSTEM_DESIGN_RESEARCH_NOTES.md): what kind of architecture the project is, and the case for the "adaptive runtime" that became the runtime contract layer (removed in stage 4, see 8.4).
+- [Final deliverable quality plan, 2026-03-25](https://github.com/williamwang-ty/yt-transcript/blob/f33bb9f302cc41c4b8fc436db611f2212f6d2efc/system_design_notes/20260325_SYSTEM_DESIGN_FINAL_DELIVERABLE_QUALITY_PLAN.md): where article quality problems come from, and which belong to code and which to the LLM.
+- [Architecture review, 2026-03-30](https://github.com/williamwang-ty/yt-transcript/blob/f33bb9f302cc41c4b8fc436db611f2212f6d2efc/system_design_notes/20260330_SYSTEM_DESIGN_ARCHITECTURE_REVIEW.md): the boundary between scripts and the LLM.
+- [This document before stage 6](https://github.com/williamwang-ty/yt-transcript/blob/f33bb9f302cc41c4b8fc436db611f2212f6d2efc/SYSTEM_DESIGN.md): section 9 there maps each old file and command to where it went, stage by stage.
+
+Each stage's reasoning and checks are in its pull request and issue linked in the table above.
+
 ---
 
 ## 10. One-Sentence Summary
@@ -1375,6 +1384,15 @@ merge 阶段 -> verify 阶段 -> assemble 阶段
 5. 新增：`--max-seconds` 和 `in_progress` 结果，用于 shell 有时间上限的宿主。
 
 字幕语言选择、Deepgram 转写、窗口执行器的算法、大纲和术语表、质量检查都只是搬了位置，行为没变；唯一的例外是第 3 阶段的两处输出修正：窗口输出合并时不再拼接短段落（这曾把双语的中英两段粘在一起），`structure_only` 去掉 `-` 说话人标记。
+
+这次重构之前写的设计笔记和本文的旧版本在第 6 阶段删除，但在第 6 阶段之前的最后一个提交和 git 历史里仍然可以读到（`git log -- SYSTEM_DESIGN.md system_design_notes/`）：
+
+- [研究笔记，2026-03-19](https://github.com/williamwang-ty/yt-transcript/blob/f33bb9f302cc41c4b8fc436db611f2212f6d2efc/system_design_notes/20260319_SYSTEM_DESIGN_RESEARCH_NOTES.md)：项目属于哪种架构，以及"adaptive runtime"的设想，它后来成了 runtime 契约层（第 4 阶段删除，见 8.4）。
+- [最终交付物质量规划，2026-03-25](https://github.com/williamwang-ty/yt-transcript/blob/f33bb9f302cc41c4b8fc436db611f2212f6d2efc/system_design_notes/20260325_SYSTEM_DESIGN_FINAL_DELIVERABLE_QUALITY_PLAN.md)：文章质量问题从哪里来，哪些归代码、哪些归 LLM。
+- [架构 review，2026-03-30](https://github.com/williamwang-ty/yt-transcript/blob/f33bb9f302cc41c4b8fc436db611f2212f6d2efc/system_design_notes/20260330_SYSTEM_DESIGN_ARCHITECTURE_REVIEW.md)：脚本和 LLM 的边界。
+- [第 6 阶段之前的本文](https://github.com/williamwang-ty/yt-transcript/blob/f33bb9f302cc41c4b8fc436db611f2212f6d2efc/SYSTEM_DESIGN.md)：其中第 9 节逐个列出旧文件和旧命令在每个阶段去了哪里。
+
+每个阶段的理由和验证记录在上表链接的 pull request 和 issue 里。
 
 ---
 
