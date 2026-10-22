@@ -2,19 +2,19 @@
 
 ## English Version
 
-> [!IMPORTANT]
-> **This document describes the target architecture.** It is being implemented step by step under tracker [#23](https://github.com/williamwang-ty/yt-transcript/issues/23). Since stage 3, `SKILL.md` has the agent drive everything through `run`; the old step-by-step commands stay in the repository until stage 4 removes them. Section 9 maps today's code to the target, names the stage that moves each piece, and lists the behavior changes.
-
 ## 1. Document Positioning
 
 This document explains the **system design of the whole `yt-transcript` project**: what it builds, how the work is divided between code and the model, and why.
 
-`README.md` is the operator-facing quickstart. `SKILL.md` is the short contract the host agent reads. This document is neither; it explains structure, boundaries, and trade-offs. It is not a coding spec: field names, file names, and reason codes below show the shape of the design and may still change while it is implemented.
+`README.md` is the operator-facing guide (install, configure, commands). `SKILL.md` is the short contract the host agent reads. This document is neither; it explains structure, boundaries, and trade-offs. It is not a coding spec, but the names it uses (stages, files, state and result fields, reason codes, flags, config keys) are the ones in the code.
 
-It works at two levels:
+It works at three levels:
 
 - **Project level** (sections 2 to 6): how one command turns a YouTube URL into a Markdown article, and what the agent around it is responsible for.
 - **Subsystem level** (section 7): how the hardest stage, long-text transformation, works inside that command.
+- **Implementation map** (section 9): which module implements each part, where the code differs from the plan it was built from, and how it got to this shape.
+
+**Design history**: [section 9.3](#93-design-history) lists each stage of the refactor that produced this design, with its pull request, and links to the earlier design notes and the previous version of this document. Those were deleted from the repository but stay readable there.
 
 `SYSTEM_DESIGN.md` is the single authoritative design document for this repository.
 
@@ -60,7 +60,7 @@ Past a certain length, the text no longer fits one reliable call, interruptions 
 
 ### 3.5 The flow itself must not depend on the model following instructions
 
-In the old design the agent executed the flow by reading about 370 lines of `SKILL.md` plus three workflow documents, running some twenty commands, and hand-writing a `state.md` file. That had predictable costs:
+In the old design (before stage 3; see [9.3](#93-design-history)) the agent executed the flow by reading about 370 lines of `SKILL.md` plus three workflow documents, running some twenty commands, and hand-writing a `state.md` file. That had predictable costs:
 
 - weaker hosts skipped or reordered steps, and the documented Quick Mode skipped planning and the quality check outright
 - the flow could not be tested end to end, because it existed only as prose
@@ -138,40 +138,41 @@ The agent never edits the state file and never runs internal stages by hand. If 
 
 ### 6.2 Stages
 
-`run` executes a fixed list of stages. Each stage reads what earlier stages recorded, writes its outputs atomically into the video's work directory, and only then marks itself `done` in `state.json`. A stage that is `done` and whose recorded outputs still exist is skipped on a rerun.
+`run` executes a fixed list of stages. Each stage reads what earlier stages recorded, writes its outputs into the video's work directory, and only then marks itself `done` in `state.json`. A stage that is `done` and whose recorded outputs still exist is skipped on a rerun; once a stage runs again, every later stage runs again too.
 
 | Stage | What it does | Main outputs | Can stop with |
 |---|---|---|---|
-| `metadata` | Fetch the video's yt-dlp info once (title, channel, date, duration, chapters, track list, audio-track languages); later stages read this file instead of calling yt-dlp again | `metadata.json` | `needs_user` (bot check or login after the automatic browser-cookie retries, rate limit, yt-dlp missing), `failed` |
-| `source` | Detect the spoken language and pick the trusted track (6.3); download it and parse it into raw text and timed segments; score the subtitle quality and switch to Deepgram when the scoring rule calls for it; or transcribe with Deepgram directly | `source/`, `raw_text.txt`, `segments.json`, the route decision | `unsupported`, `needs_user` (preferred track rate-limited, Deepgram key missing), `failed` |
-| `normalize` | Build the normalized document (sentences with their timed cues) from the segments | `normalized_document.json` | `failed` |
-| `plan` | Choose the text tasks for the mode (Chinese: `cleanup_zh`; bilingual: `structure_only`, then `translate_only`) and estimate their size (input tokens, expected rounds) | `plan.json` | `failed` |
-| `text` | Run each planned task through the window executor (section 7); each task is recorded separately | `text/<task>/` | `needs_agent_text`, `in_progress`, `failed` |
-| `merge` | Concatenate the final task's paragraphs in order | `optimized.md` | `failed` |
+| `metadata` | Run the yt-dlp update check, then fetch the video's yt-dlp info once (title, channel, date, duration, chapters, track list, audio-track languages); later stages read this file instead of asking yt-dlp again | `metadata.json`, `chapters.json` | `needs_user` (`cookies_required` after the automatic browser-cookie retries, `login_required`, `rate_limited`, `tool_missing`), `failed` |
+| `source` | Detect the spoken language and pick the trusted track (6.3); download it and parse it into raw text and timed segments; score the subtitle quality and switch to Deepgram when the scoring rule calls for it; or transcribe with Deepgram directly | `source/`, `raw_text.txt`, `segments.json`, the route in `state.json` | `unsupported`, `needs_user` (preferred track refused, Deepgram key missing, or a yt-dlp case above), `failed` |
+| `normalize` | Build the normalized document: the cleaned text, the timed segments, and whether chunking follows the text or the segments | `normalized_document.json` | `failed` |
+| `plan` | Choose the text tasks for the mode (Chinese: `cleanup_zh`; bilingual: `structure_only`, then `translate_only`), mark the text `short` or `long`, and estimate its size (input tokens, expected rounds per task). Chinese Deepgram text gets an extra instruction to repair recognition artifacts | `plan.json` | `failed` |
+| `text` | Cut the normalized document into chunks, then run each planned task through the window executor (section 7); each task is recorded separately | `text/` | `needs_agent_text`, `in_progress`, `failed` |
+| `merge` | Join the final task's paragraphs in order, then drop headings, paragraphs and paragraph openings repeated at round seams | `optimized.md` | `failed` |
 | `verify` | Run the quality check against the raw text | `quality.json` | `failed` (hard failures only; warnings are recorded) |
-| `assemble` | Build the final file: frontmatter, cleaned title, `yyyy-mm-dd. <title>.md` filename, bilingual layout | the article in `output_dir` | `failed` |
+| `assemble` | Write the article: frontmatter, header, body and footer, named `yyyy-mm-dd. <title>.md` | the article in `output_dir` | `needs_user` (`output_dir_missing`), `failed` |
 | `cleanup` | Delete the intermediate files once the article exists; keep `state.json` | — | — |
 
 Notes:
 
-- **Idempotent stages.** Rerunning an unfinished stage starts that stage over, except that expensive sub-steps keep their results inside the stage (downloaded audio, Deepgram chunk results, the outline, finished window rounds), so an interrupted stage never pays twice.
-- **No separate preflight.** Each stage checks what it needs right before it needs it: yt-dlp before `metadata` (including the update check preflight used to run, at most hourly, because YouTube keeps breaking older yt-dlp releases), the Deepgram key only when `source` chooses Deepgram, an LLM backend only at `text`. Cheap paths stay cheap.
-- **The source is final before any LLM call.** The subtitle quality reroute moves from planning into `source`, so `normalize` and everything after it work on accepted text.
-- **One path for every length.** Short and long videos go through the same stages. A short video's text fits one window round, and the outline pass is skipped when the whole text fits one round. YouTube chapters are passed to the outline as hints when the plan says `long`; a short text has no outline to use them.
-- **Free routing check.** `--stage plan` runs `metadata` through `plan` without spending money. If the route needs Deepgram, it records that decision and stops after the decision in `source`, without transcribing.
+- **Idempotent stages.** Rerunning an unfinished stage starts that stage over, except that expensive sub-steps keep their results inside the stage (the downloaded audio, the Deepgram result of each audio piece, the outline, finished window rounds), so an interrupted stage never pays twice.
+- **No separate preflight.** Each stage checks what it needs right before it needs it: yt-dlp before `metadata` (including the update check, at most hourly, because YouTube keeps breaking older yt-dlp releases), the Deepgram key only when `source` chooses Deepgram, an LLM backend only at `text`, `output_dir` only at `assemble`. Cheap paths stay cheap.
+- **The source is final before any LLM call.** The subtitle quality reroute happens inside `source`, so `normalize` and everything after it work on accepted text.
+- **One path for every length.** Short and long videos go through the same stages. `plan` marks the text `long` when the video runs 30 minutes or more, or when a shorter video's text is above the single-request limit (about 4,100 to 4,800 estimated tokens, depending on the route). For a `long` text, YouTube chapter starts also cut the chunks and become outline hints; a `short` text uses neither. The outline pass is skipped whenever one round can process the whole text (7.4), so a short video usually takes one request per task.
+- **Free routing check.** `--stage plan` runs `metadata` through `plan` without spending money. If the route needs Deepgram, it records that decision and stops inside `source`, without transcribing.
 
 ### 6.3 Source selection
 
-These rules exist today and only move into the `source` stage:
+The `source` stage applies these rules (`kernel/sources/subtitle_language.py` picks the candidates):
 
-1. Detect the spoken language: the audio track YouTube marks as original first, then metadata `language`, then an `xx-orig` ASR track, then a non-translated ASR track.
+1. Detect the spoken language from the strongest signal available: the audio track YouTube marks as original, then the metadata `language`, then the original-language ASR track (when exactly one language has one), then the human subtitle tracks (when they all share one language).
 2. Trust only human subtitles and the ASR track in the spoken language. YouTube's machine-translated tracks are dropped.
-3. Chinese video: human Chinese subtitles, else the Chinese ASR track; mode `chinese`.
-4. English video: human Chinese subtitles if present (mode `chinese`), else English subtitles (mode `bilingual`: English source plus Chinese translation).
-5. Other spoken languages: `unsupported`, unless human Chinese subtitles exist.
-6. No trusted track, or a track whose quality score triggers the reroute rule (today: critical quality on the `chinese` route): transcribe with Deepgram in the detected language. Deepgram is automatic; there is no confirmation step. A Deepgram result in an unsupported language also returns `unsupported`.
+3. Human Chinese subtitles come first for every video; mode `chinese`.
+4. Chinese video: otherwise the Chinese ASR track; mode `chinese`.
+5. English video: otherwise English subtitles, human ones first; mode `bilingual` (English source plus Chinese translation).
+6. Other spoken languages: `unsupported` (reason `unsupported_language`), unless human Chinese subtitles exist. When no signal names the language, every trusted Chinese or English track is a candidate.
+7. No trusted track, or a track whose quality score triggers the reroute rule (critical quality on the `chinese` route): transcribe with Deepgram in the detected language, or with Deepgram's own language detection when none was detected. Deepgram runs automatically; there is no confirmation step. A Deepgram result in an unsupported language also returns `unsupported`.
 
-One rule changes. When YouTube refuses the preferred track (rate limiting) after the automatic retries, the old flow silently fell back to the next track, for example English subtitles instead of human Chinese ones, which turned a Chinese article into a bilingual one and made results differ between runs. `source` now returns `needs_user` with reason `rate_limited` and names the fallback track. The agent can rerun later, or accept the fallback explicitly with an override (`--mode bilingual` in that example).
+When YouTube refuses the preferred track (rate limit or bot check) even after the automatic retries with browser cookies, `source` does not quietly take the next track. The old agent-driven flow did, which turned a Chinese article into a bilingual one and made results differ between runs. `source` returns `needs_user` with reason `rate_limited` (`cookies_required` for a bot check), names `preferred_track` and `fallback_track`, and gives an `accept_command`: the same command with `--mode <fallback mode>`. The agent asks the user whether to wait and rerun, or to accept the fallback.
 
 `yt-dlp` stays the acquisition dependency. Direct YouTube InnerTube fetching was evaluated: it is lighter for subtitle-only runs but is an unofficial, interface-sensitive surface, does not remove the need for the Deepgram fallback, and would move extraction maintenance into this project. It remains a possible future fast path, not the default.
 
@@ -181,79 +182,98 @@ Each video has one work directory:
 
 ```text
 /tmp/yt-transcript/<video_id>/
-  state.json                 the only state file
-  .runtime_owner.json        the lock, held while a run is active
+  state.json                 the only state file; kept after cleanup
+  .runtime_owner.json        the lock: pid of the active run
   metadata.json  chapters.json
-  source/                    downloaded track or audio, subtitle quality check, Deepgram JSON and chunk cache
+  source/                    subtitles/ or audio/ from download.sh (plus audio pieces when split),
+                             subtitle_document.json (the subtitle quality check),
+                             deepgram.json, deepgram_chunk_NNN.json (Deepgram result per audio piece)
   raw_text.txt  segments.json  normalized_document.json
   plan.json
-  text/                      window executor state for every task (cursor, outline, sizes, paragraphs)
-  agent_task/                present only while a needs_agent_text task is open
+  text/                      manifest.json and chunk_NNN.txt (the chunks), glossary.json (cleanup_zh),
+                             window/ (first task: state.json, out_NNNNN.md per paragraph),
+                             window/processed/ (translate_only)
+  agent_task/                prompt.md, task.json, output.txt, answers/; only while requests go to the agent
   optimized.md  quality.json
 ```
 
-`YT_TRANSCRIPT_WORK_ROOT` replaces `/tmp/yt-transcript` and `YT_TRANSCRIPT_OUTPUT_DIR` replaces the configured `output_dir`; the regression runner uses both so it never touches real runs or the vault.
+`YT_TRANSCRIPT_WORK_ROOT` replaces `/tmp/yt-transcript` and `YT_TRANSCRIPT_OUTPUT_DIR` replaces the configured `output_dir`; the regression runner uses both so it never touches real runs or the notes folder.
 
-`state.json` is written atomically after every stage and every window round. Its shape:
+`state.json` is written atomically whenever a stage starts or ends and before every window round. Its shape, from a finished bilingual run (shortened):
 
 ```json
 {
   "schema": 1,
   "video_id": "abc123",
   "url": "https://www.youtube.com/watch?v=abc123",
-  "status": "running",
+  "status": "done",
+  "created_at": "2026-10-22T16:59:52.758+00:00",
+  "updated_at": "2026-10-22T16:59:53.611+00:00",
   "overrides": {"source": null, "mode": null},
+  "metadata": {"title": "Some Talk", "channel": "Some Channel", "upload_date": "20261001", "duration": 437},
   "route": {
     "source_language": "en",
     "language_signal": "original_audio_track",
     "source": "subtitles",
+    "language": "en",
     "track": "en",
     "track_kind": "manual",
     "mode": "bilingual",
-    "subtitle_quality": {"score": 0.82, "band": "good"},
+    "subtitle_quality": {"score": 1.0, "band": "excellent"},
     "blocked_tracks": [],
+    "fallback_used": false,
     "rerouted_from": null,
     "reason": "English video with human English subtitles"
   },
   "stages": {
-    "metadata": {"status": "done", "seconds": 2.1, "outputs": ["metadata.json"]},
-    "text": {"status": "running", "tasks": {
-      "structure_only": {"status": "done", "rounds": 4},
-      "translate_only": {"status": "running", "rounds": 2}
-    }}
+    "metadata": {"status": "done", "started_at": "…", "finished_at": "…", "seconds": 0.2,
+                 "outputs": ["metadata.json", "chapters.json"]},
+    "plan": {"status": "done", "summary": {"tasks": ["…"], "video_path": "short", "estimated_input_tokens": 1800}},
+    "text": {"status": "done", "tasks": {
+      "structure_only": {"status": "done", "cursor": 94, "units": 94, "rounds": 1, "round_count": 1,
+                         "invalid_rounds": 0, "fallback_rounds": 0,
+                         "outline": {"status": "skipped"}, "coverage": {"…": "…"}, "efficiency": {"…": "…"}},
+      "translate_only": {"status": "done", "cursor": 27, "units": 27, "rounds": 1}
+    }},
+    "verify": {"status": "done", "summary": {"passed": true, "hard_failures": [], "warnings": [], "checks": {"…": "…"}}}
   },
-  "llm": {"backend": "claude-cli", "requests": 9, "input_tokens": 41200, "output_tokens": 18700},
+  "llm": {"backend": "claude-code-cli", "requests": 2, "input_tokens": 4794, "output_tokens": 4819,
+          "estimated_tokens": true},
   "warnings": [],
-  "last_result": {"status": "failed", "stage": "text", "reason": "llm_timeout"},
-  "output_file": null
+  "last_result": {"status": "done", "at": "2026-10-22T16:59:53.611+00:00"},
+  "output_file": "/Users/me/notes/01.input/01.articles/2026-10-01. Some Talk.md",
+  "raw_chars": 6539
 }
 ```
+
+`status` is `running` while a call is active, `planned` after a `--stage plan` call, and otherwise the status of the last result. A stage record also keeps what later stages need: `normalize` its result, `plan` the task list (`summary`), `source` the path of the downloaded audio. The `llm` token counts are local estimates from the prompts and outputs, because CLI backends report no usage.
 
 Rules:
 
 - **Resume** means rerunning the same command: `run` reads `state.json` and starts at the first stage that is not `done`. Inside `text`, the window executor resumes at its cursor.
 - **Finished runs stay finished.** `cleanup` keeps `state.json`, so rerunning `run` on a finished video returns `done` with the existing article at once, as long as that file still exists (if it was deleted, the run starts over). Rerunning a whole batch therefore only does the unfinished videos. `--restart` produces the article again.
-- **Overrides are sticky.** `--source` and `--mode` are saved in `state.json` and stay in effect on reruns of that video until `--restart`, so a resume never silently flips the route.
-- **Config is read on every run**, but finished stages are not redone when it changes. `--from <stage>` redoes them. After `cleanup` the intermediate files are gone, so `--from` on a finished run redoes every stage; it is meant for unfinished runs (for example `--from text` after a quality failure).
-- **The lock** keeps two processes from writing one work directory. A second `run` on a locked video returns `failed` with reason `locked`; a lock left by a dead process is taken over. Different videos can run in parallel because they share no files.
-- **What it replaces**: the hand-written `state.md`, `machine_state.json`, the chunk `manifest.json`, `telemetry.jsonl`, and the scattered `/tmp/<video_id>_*` files. Downloads and the normalized document move under the video's own directory, so runs never collide on shared paths.
+- **Overrides are sticky.** `--source` and `--mode` are saved in `state.json` and stay in effect on reruns of that video until `--restart`, so a resume never silently flips the route. An override that cannot be honored (`override_not_applicable`) is not saved, so a plain rerun goes back to the earlier route.
+- **Config is read on every call**, but finished stages are not redone when it changes. `--from <stage>` redoes them. After `cleanup` the intermediate files are gone, so `--from` on a finished run redoes every stage; it is meant for unfinished runs (for example `--from text` after a quality failure).
+- **The lock** keeps two processes from writing one work directory. A second `run` on a locked video returns `failed` with reason `locked`; a lock whose process has exited is taken over. Different videos can run in parallel because they share no files.
 - **Hygiene**: `video_id` must match `[A-Za-z0-9_-]+` before it becomes a path. `state.json` never holds API keys; it records the backend's name, not its credentials.
 - **Lifetime**: the directory lives under `/tmp`, so a reboot loses unfinished runs. This is an accepted limitation.
 
 ### 6.5 Results handed back to the agent
 
-Every `run` call prints exactly one JSON object on stdout and exits with a fixed code. Progress lines (stage, round n of m) go to stderr.
+Every `run` call prints exactly one JSON object on stdout and exits with a fixed code. Progress lines (stages, window rounds, yt-dlp messages) go to stderr.
 
-| `status` | Exit | Meaning | What the agent does |
+| `status` | Exit | Meaning and fields | What the agent does |
 |---|---|---|---|
-| `done` | 0 | Article written, or `--stage plan` finished | Report `output_file`, route, warnings, and LLM usage |
-| `failed` | 1 | A stage failed: `stage`, `reason`, `message`, `retryable`, `next_command` | Retry once if `retryable`, otherwise report; may suggest an override |
-| `needs_user` | 3 | Only the user can fix it: `cookies_required`, `login_required`, `rate_limited`, `deepgram_key_missing`, `tool_missing`, `output_dir_missing` | Tell the user exactly what to do; rerun after they do it |
-| `unsupported` | 4 | The spoken language is not supported | Report; do not retry |
-| `needs_agent_text` | 5 | No LLM backend is reachable; one text request is handed over | Do the task, write the output file, rerun the same command |
-| `in_progress` | 6 | The `--max-seconds` budget ran out at a clean boundary: `stage`, progress | Rerun the same command; optionally tell the user the progress |
+| `done` | 0 | Article written: `output_file`, `title`, `route`, `warnings`, `llm`. After `--stage plan`: `stage`, `route`, `plan`, and a `message` when the route needs Deepgram | Report the result |
+| `failed` | 1 | A stage failed: `stage`, `reason`, `message`, `retryable` (plus `hard_failures` for a quality failure) | Rerun `next_command` once if `retryable`, otherwise report; may suggest an override |
+| `needs_user` | 3 | Only the user can fix it. `reason` is `cookies_required`, `login_required`, `rate_limited`, `deepgram_key_missing`, `tool_missing` or `output_dir_missing`; `message` says what to do. A refused preferred track adds `preferred_track`, `fallback_track` and `accept_command` | Tell the user; rerun after they act, or run `accept_command` if they accept the fallback |
+| `unsupported` | 4 | The spoken language is not supported: `reason` `unsupported_language`, `language` | Report; do not retry |
+| `needs_agent_text` | 5 | No LLM backend is reachable; one request is handed over: `task.name`, `task.prompt_file`, `task.output_file` | Answer it, write the answer to the output file, rerun `next_command` |
+| `in_progress` | 6 | The `--max-seconds` budget ran out at a safe point: `stage`, `progress` (`stages_done`, `text_tasks`) | Rerun `next_command` until the status changes |
 
-Exit code 2 stays reserved for command-line usage errors. Typical `failed` reasons: `download_error`, `deepgram_error`, `llm_error`, `llm_timeout`, `quality_hard_failure`, `locked`, `override_not_applicable`.
+Every result also has `video_id`, `work_dir` and `seconds`. Every result except `done` and `unsupported`, and every result of a `--stage plan` call, has `next_command`: the command that continues the run. Exit code 2 is reserved for command-line usage errors (`{"status": "usage_error", "message": …}`), such as an argument that is not a YouTube URL.
+
+`failed` reasons: `download_error`, `deepgram_error`, `llm_error`, `llm_timeout` and `locked` are retryable. `source_error`, `normalize_error`, `plan_error`, `merge_error`, `quality_hard_failure`, `override_not_applicable` and `config_error` are not, and neither is `<stage>_error`, which wraps an unexpected exception in that stage.
 
 A `done` result:
 
@@ -262,10 +282,13 @@ A `done` result:
   "status": "done",
   "video_id": "abc123",
   "output_file": "/Users/me/notes/01.input/01.articles/2026-10-01. Some Talk.md",
-  "route": {"source": "subtitles", "track": "en", "track_kind": "manual", "mode": "bilingual"},
-  "warnings": ["glossary term 'Kubernetes' appears in 2 spellings"],
-  "llm": {"backend": "claude-cli", "requests": 9, "input_tokens": 41200, "output_tokens": 18700},
-  "seconds": 412
+  "title": "Some Talk",
+  "route": {"source": "subtitles", "language": "en", "track": "en", "track_kind": "manual", "mode": "bilingual"},
+  "warnings": ["Size ratio 4.30x vs raw text is outside expected range (1.2-4.0x for bilingual)"],
+  "llm": {"backend": "claude-code-cli", "requests": 9, "input_tokens": 41200, "output_tokens": 18700,
+          "estimated_tokens": true},
+  "work_dir": "/tmp/yt-transcript/abc123",
+  "seconds": 412.3
 }
 ```
 
@@ -276,15 +299,20 @@ A `needs_agent_text` result names a prompt file (the whole request, numbered uni
   "status": "needs_agent_text",
   "video_id": "abc123",
   "stage": "text",
+  "reason": "no_llm_backend",
+  "message": "No LLM backend is reachable (…). Answer the request in task.prompt_file exactly as the model would, write only the answer to task.output_file, then run next_command.",
   "task": {
+    "name": "structure_only",
     "prompt_file": "/tmp/yt-transcript/abc123/agent_task/prompt.md",
     "output_file": "/tmp/yt-transcript/abc123/agent_task/output.txt"
   },
-  "next_command": "run https://www.youtube.com/watch?v=abc123"
+  "next_command": "python3 /path/to/yt-transcript/yt_transcript_utils.py run https://www.youtube.com/watch?v=abc123",
+  "work_dir": "/tmp/yt-transcript/abc123",
+  "seconds": 1.4
 }
 ```
 
-The task is exactly one LLM request: an outline pass or one window round, with the same prompt, numbered units, and end marker an LLM backend would receive. On the rerun, `run` validates the output file the same way it validates any response (section 7) and moves on. A short video needs one handoff per text task; a long video needs several. The agent is therefore simply the slowest LLM backend, with no separate text path to maintain. It is a fallback: normally `auto` reaches the host CLI or the API.
+The task is exactly one LLM request: an outline request, a window round, or a fallback chunk, with the same prompt, numbered units, and end marker an LLM backend would receive. On the rerun, `run` moves the answer to `agent_task/answers/<sha256 of the prompt>.txt`, gives it back when the same prompt comes up, and validates it the same way it validates any response (section 7); answers stay until the text stage finishes. A short video needs about one handoff per text task; a long video needs several. The agent is therefore simply the slowest LLM backend, with no separate text path to maintain. It is a fallback: normally `auto` reaches the host CLI or the API.
 
 ### 6.6 Override flags
 
@@ -293,9 +321,10 @@ The task is exactly one LLM request: an outline pass or one window round, with t
 | `--source subtitles\|deepgram` | yes | Force the source. `deepgram` skips subtitles; `subtitles` keeps the chosen track even when its quality score would trigger the reroute. Redoes `source` and every later stage. |
 | `--mode chinese\|bilingual` | yes | Force the output form. The mode follows the source text (Chinese text gives `chinese`, English text gives `bilingual`), so this picks the track: on an English video, `bilingual` uses the English subtitles even when human Chinese subtitles exist, and `chinese` uses the human Chinese subtitles. Redoes `source` and every later stage. |
 | `--from <stage>` | no | Mark that stage and every later stage not done, then run. For recovery and debugging. |
-| `--stage plan` | no | Stop after `plan`: the free routing check. |
-| `--max-seconds <n>` | no | Start no new stage or window round after n seconds, once the call has finished at least one; return `in_progress`. |
+| `--stage plan` | repeated in `next_command` | Stop after `plan`: the free routing check. |
+| `--max-seconds <n>` | repeated in `next_command` | Start no new stage or window round after n seconds, once the call has finished at least one; return `in_progress`. |
 | `--restart` | no | Delete the work directory, including saved overrides, and start over. |
+| `--config-path <file>` | repeated in `next_command` | Read another `config.yaml` instead of the one in the skill root. |
 
 These are the agent's escape hatches. A user request like "use Deepgram for this one" or "just give me Chinese" maps to a flag, not to hand-run steps. A combination that cannot be honored (`--mode bilingual` on a Chinese video, `--mode chinese` on an English video without human Chinese subtitles, `--source subtitles` when no trusted track exists) returns `failed` with reason `override_not_applicable`; nothing is guessed.
 
@@ -304,69 +333,99 @@ These are the agent's escape hatches. A user request like "use Deepgram for this
 A long video can take a quarter of an hour or more, while many hosts kill shell commands after a few minutes. Two properties make that safe on any host:
 
 - `run` can be killed at any moment. Every finished stage and window round is already on disk, the lock of a dead process is taken over, and rerunning loses at most the request that was in flight.
-- `--max-seconds <n>` lets the agent avoid the kill: `run` stops at the first stage or round boundary after n seconds and returns `in_progress` with the progress so far. SKILL.md tells the agent to pass about half of its shell tool's time limit when it has one, and to rerun until the status changes.
+- `--max-seconds <n>` lets the agent avoid the kill: `run` stops at the first stage or round boundary after n seconds and returns `in_progress` with the progress so far. SKILL.md has the agent pass `--max-seconds 300` with a 10-minute shell timeout (about half of the limit when its shell limit is shorter), and rerun until the status changes.
 
 This needs nothing host-specific such as background jobs.
 
 ### 6.8 LLM backend
 
-All text processing goes through one backend interface with three implementations:
+Every text request of the `text` stage goes through one request function in the window executor, with three backends behind it:
 
-- **host CLI**: the host agent's own command line (a built-in table covers Claude Code, Codex, opencode, pi, Gemini, and Cursor; `llm_agent_cli` names any other), run without tools in an empty temporary directory
-- **API**: any OpenAI-compatible endpoint from config
-- **agent handoff**: the `needs_agent_text` result above
+- **host CLI**: the host agent's own command line from a built-in table (Claude Code `claude -p`, Codex `codex exec`, opencode, pi, Gemini CLI, Cursor `cursor-agent`), or any non-interactive command given in `llm_agent_cli` or the `YT_TRANSCRIPT_AGENT_CLI` environment variable. It runs in an empty temporary directory, with tools switched off where the CLI has a flag for it (Claude Code, pi).
+- **API**: an OpenAI-compatible or Anthropic Messages endpoint from config (`llm_api_format`, `llm_base_url`, `llm_model`, `llm_api_key`), with retries, backoff and optional streaming.
+- **agent handoff**: the `needs_agent_text` result above.
 
-With `llm_backend: auto` (the default) `run` probes the host CLI once, then the API, and hands the request to the agent only if neither works. `llm_backend: api` uses only the API. The chosen backend is recorded in `state.json`. Nothing depends on a provider's special request fields: truncation is detected through the window protocol's markers, which also works for CLI output that has no `finish_reason`.
+With `llm_backend: auto` (the default), each task picks its backend when its window run starts: an explicit command first (the environment variable, then `llm_agent_cli`), else the CLI an earlier call of the same task used, else the host detected from its environment variables. The CLI is used only after it answers a one-line probe within `llm_cli_probe_timeout_sec`; otherwise the API is used if it is configured, and the agent handoff if not. A CLI that still fails mid-run after `llm_cli_max_retries` hands the remaining rounds to the API when one is configured. `llm_backend: api` skips the CLI. `state.json` records the backend as `<agent>-cli`, `api` or `agent-handoff`.
+
+Nothing depends on a provider's special request fields. `max_tokens` is sent as a loose ceiling; truncation is detected through the window protocol's end line, which also works for CLI output that has no `finish_reason`. A reported `finish_reason` of `length` (or the provider's equivalent) only makes later rounds write less.
 
 ### 6.9 Quality check and assembly
 
-- `verify` reports the length ratio, structure, glossary, semantic anchors, and bilingual pairing. Only hard failures stop the run (`failed`, stage `verify`, with the reasons), and then no article is written. Warnings are saved in `state.json` and returned with `done` for the agent to mention.
-- `assemble` computes everything that used to be built by hand from state: the cleaned title, `yyyy-mm-dd` dates (never the raw `yyyymmdd` from metadata), the filename, frontmatter, and the transcript-source label.
+- `verify` checks structure, signs of truncation, the size ratio against the raw text, repeated phrases and seam duplicates, Chinese readability, bilingual pairing, glossary drift, semantic anchors (dates, numbers, versions, URLs), and the window run's coverage. Only hard failures stop the run (`failed`, stage `verify`, reason `quality_hard_failure`), and then no article is written: a missing or empty file, no `##` section heading in more than 1,200 characters, or a bilingual body without a single English-then-Chinese paragraph pair. Everything else is a warning, saved in `state.json` and returned with `done` for the agent to mention.
+- `assemble` computes everything that used to be built by hand from state: the filename `yyyy-mm-dd. <title>.md` (illegal characters replaced, the video id when the title is empty, the date never in the raw `yyyymmdd` form), YAML frontmatter with quoted values (`title`, `source`, `url`, `channel`, `author`, `date`, `created`, `type`, `bilingual`, `duration`, `transcript_source`, `tags`, `via`), a header with the title, the channel link, the language mode and the duration, and a one-line footer naming the transcript source. The bilingual layout itself (each English paragraph followed by its Chinese translation) comes from `translate_only`.
 - `cleanup` runs only after the article exists. A failed or interrupted run keeps its whole directory so it can be resumed or inspected.
 
 ### 6.10 Public commands
 
+Every command runs as `python3 <skill-root>/yt_transcript_utils.py <command>`.
+
 | Command | Purpose |
 |---|---|
-| `run <url> [flags]` | The whole flow (sections 6.2 to 6.9) |
-| `status [<video_id>]` | Without an id: unfinished runs under `/tmp/yt-transcript/` with their stage and last result. With an id: that video's state, finished or not. Replaces `find-unfinished`. |
-| `cleanup <video_id> [--force]` | Remove a work directory; refuses an unfinished run without `--force` |
-| `subtitle-info <url>` | Debug: language detection and track candidates, without downloading |
-| `verify-quality <file> --raw-text <file>` | Debug: rerun the quality check on any file |
+| `run <url> [flags]` | The whole flow (sections 6.2 to 6.9); `<url>` may also be a bare 11-character video id |
+| `status [<video_id>]` | Without an id: every run under the work root, split into `unfinished` (each with `next_stage`, `last_result` and `next_command`) and `finished`. With an id: that video's entry plus its whole `state.json` |
+| `cleanup <video_id> [--force]` | Remove a work directory; refuses an active run, and an unfinished run without `--force` |
+| `subtitle-info` | Debug: read `yt-dlp -J` metadata on stdin and print the language detection and the track candidates (`--from-list-subs` reads `yt-dlp --list-subs` output instead); `download.sh` uses it too |
+| `verify-quality <file> [--raw-text <file>] [--bilingual] [--work-dir <dir>]` | Debug: rerun the quality check on any file |
 
-Everything else becomes internal functions. Pause, cancel, telemetry queries, and the external runtime API are removed: interrupting the process stops a run, rerunning resumes it, and `state.json` holds the timings and usage.
+Everything else is internal. Pause, cancel, telemetry queries and the external runtime API were removed: interrupting the process stops a run, rerunning resumes it, and `state.json` holds the timings and usage.
 
 ### 6.11 Module structure
 
 ```text
-cli          argument parsing, the five commands, JSON results and exit codes
-  └─ pipeline    stage list, state.json, lock, resume, overrides, results
-       ├─ sources    yt-dlp (metadata, tracks, audio), language selection,
-       │             subtitle quality, Deepgram
-       ├─ text       VTT parsing, normalization, units, window executor,
-       │             outline, glossary, merge, CJK and overlap cleanup
-       ├─ quality    verify-quality, semantic anchors
-       └─ llm        backends (host CLI, API, agent handoff), retries, truncation
-config       loading, defaults, validation (used by every module)
+yt_transcript_utils.py    entry script at the skill root; calls kernel.cli.main()
+kernel/
+  cli.py                  argument parsing, the five commands, JSON output and exit codes
+  pipeline.py             stage list, state.json, lock, resume, overrides, results;
+                          download.sh calls; the agent handoff; status and cleanup
+  sources/
+    subtitle_language.py  spoken language, trusted tracks, subtitle candidates
+    deepgram.py           audio splitting, the Deepgram API with retries and a per-piece cache, parsing
+  text/
+    cleanup/              VTT parsing and subtitle cleanup, CJK spacing, overlap trimming, post-merge cleanup
+    normalize.py          the normalized document
+    subtitle_quality.py   subtitle quality score and the reroute signal
+    plan.py               text tasks, short or long, size estimate
+    chunking.py           the chunks the window run reads
+    window.py             the sliding-window executor and the backend choice per task
+    outline.py            global outline, chapter hints, heading placement, terms per round
+    glossary.py           transcript glossary and drift checks
+    prompting.py  measure.py  merge.py  assemble.py
+  llm/
+    api.py                HTTP client for OpenAI- and Anthropic-format APIs
+    agent_cli.py          host CLI table, detection, probe, call
+  quality/
+    verify.py  semantic.py   the checks of the verify stage
+  config.py               config.yaml parsing and the default of every setting
+  files.py                atomic writes, timestamps
+scripts/download.sh       yt-dlp: metadata, subtitle-info, subtitles, audio (run as a subprocess)
+scripts/update_yt_dlp.sh  the hourly yt-dlp update check
+prompts/*.md              task prompts: cleanup_zh, structure_only, translate_only
 ```
 
-Dependencies point downward only. Kernel modules stop copying `yt_transcript_utils`' namespace into their globals (`_bind_utils_globals`); every module imports what it uses, and the 8,000-line `yt_transcript_utils.py` is split along these lines. `prompts/*.md` stay files. `download.sh` keeps working as a subprocess while `run` is introduced, and its logic moves into `sources` when utils is split. During stages 2 to 4 the command is `python3 <skill-root>/yt_transcript_utils.py run <url>`; stage 5 moves the code into one package and leaves a thin entry script at the skill root, so the command that SKILL.md shows changes once.
+Dependencies point one way. `config` and `files` import nothing else from the kernel; `llm` and `sources` use only `config`; `text` uses `config`, `files` and `llm`; `quality` uses `text`; `pipeline` uses all of them; `cli` uses `pipeline`, plus `sources` and `quality` for the debug commands. Nothing in `kernel/` imports `yt_transcript_utils.py`. The only loop runs across processes: `pipeline` starts `download.sh`, which pipes metadata through the `subtitle-info` command.
+
+The module plan written before the split (stage 0 of the refactor) differs from the result in four places, for these reasons:
+
+- **Subtitle quality lives in `text/subtitle_quality.py`, not in `sources`.** It scores cleaned subtitle text, and `normalize` uses it as well as the `source` stage; in `sources` it would make `text` depend on `sources`. The `source` stage reaches it through `pipeline`.
+- **`download.sh` stays a subprocess** instead of moving into `sources`. Its yt-dlp handling (cookie retries, per-track refusal detection, audio format choice) is about 950 lines of shell that works and is covered by tests and the real-video regression; porting it would risk behavior for no user-visible gain. `pipeline` passes it paths and yt-dlp settings through environment variables and reads the JSON it prints.
+- **The agent handoff stays in `pipeline`** (`AgentHandoff`), not in `llm`. It belongs to the run rather than to a backend: it writes into the work directory and ends the call with a `needs_agent_text` result. The window executor receives it as a callback and treats it like any other backend.
+- **`config.py` owns the defaults.** It defines the default of every setting, and `load_config` always returns every key filled in, so the modules that read a setting get a complete value instead of keeping defaults of their own.
 
 ### 6.12 Testing
 
-- **Unit tests** per module. Tests of deleted code are deleted with it, not kept alive.
-- **End-to-end tests** run the whole flow offline: recorded fixtures replace YouTube and Deepgram at the `sources` boundary (the yt-dlp and Deepgram calls), and a fake LLM CLI, plugged in through `llm_agent_cli`, implements the window protocol and the outline JSON. Cases: Chinese human subtitles, English subtitles (bilingual), no subtitles (Deepgram), and an unsupported language; plus resume after an interruption inside `text`, sticky overrides, and every result status.
-- **Real-video regression** on the Mac (`scripts/run_regression.py`, which calls `run`) before merging any stage that touches the main path.
+- **Unit tests** per area in `tests/regression_*.py`, all run by `python3 -m unittest tests.test_regressions` (offline, well under a minute). Tests of deleted code were deleted with it.
+- **End-to-end tests** (`tests/regression_e2e.py`) run the whole flow offline through `scripts/run_regression.py --fixtures tests/fixtures/e2e`: a fake `yt-dlp` on `PATH` (`tests/e2e/`) serves recorded metadata and subtitles, a fake Deepgram answers from a recorded response, and a fake LLM CLI (`tests/fake_llm.py`, plugged in through `llm_agent_cli`) implements the window protocol and the outline JSON. Cases: Chinese human subtitles (long, several rounds with an outline), English subtitles (bilingual), no subtitles (Deepgram), and an unsupported language. Routes and outputs are compared with `tests/fixtures/e2e/baseline.json`; `UPDATE_E2E_BASELINE=1` rewrites it after an intended change. `tests/regression_run.py` covers resume inside `text`, sticky and rejected overrides, the lock, `--max-seconds`, `--from`, `--restart`, `--stage plan`, the quality reroute, and every result status.
+- **Real-video regression** on a machine that can reach YouTube (`scripts/run_regression.py`, which calls `run`; see `tests/live_regression/README.md`) before merging any change to the main path. `--stage plan` and `--no-deepgram` keep it free or cheap.
 
-### 6.13 What SKILL.md becomes
+### 6.13 What SKILL.md contains
 
-A few dozen lines: run `run <url>` (with `--max-seconds` if the shell tool has a time limit); act on each result status as in the table in 6.5; map user requests to override flags; for several URLs, call `run` once per URL and summarize in a table; use `status` to find interrupted runs. No state schema, no step list, no Quick Mode.
+About 80 lines: run `run <url> --max-seconds 300`; act on each result status as in 6.5; map user requests to override flags; for several URLs, call `run` once per URL, stop the batch only on results that would hit every video (`cookies_required`, `rate_limited`, `tool_missing`, `output_dir_missing`), and summarize in a table; use `status` to find interrupted runs. No state schema, no step list, no Quick Mode.
 
 ---
 
 ## 7. Core Subsystem Design: Long-Text Transformation
 
-The previous sections describe the whole project. This section zooms in on the `text` stage. Its algorithms (units, outline and glossary, window rounds, validation, fallback) stay as they are; the refactor changes where its state lives and who calls it.
+The previous sections describe the whole project. This section zooms in on the `text` stage, which turns the normalized document into the article body.
 
 ### 7.1 Why long-text transformation is the core difficulty
 
@@ -398,49 +457,49 @@ Once a video is long enough, the quality of the whole project is decided more by
 
 #### One executor
 
-The sliding-window executor is the only executor. It covers `cleanup_zh` and the bilingual `structure_only` → `translate_only` pair. The old fixed-chunk executor, the `long_text_mode` switch, `summarize`, `quick_cleanup`, and the chapter plan are removed in stage 4 of #23. Fixed chunks survive only as the window's own fallback for one stretch (below).
-
-The window executor was introduced because small fixed chunks needed a stack of patches (continuity context, autotune, replanning) to hide their seams; those patches were removed when window mode became the default.
+The sliding-window executor (`kernel/text/window.py`) is the only executor. It runs `cleanup_zh`, or the bilingual pair `structure_only` → `translate_only`, where the second task numbers the paragraphs the first one wrote. It replaced a fixed-chunk executor that needed a stack of patches (continuity context, autotune, replanning) to hide its seams. Fixed chunks remain only as the layout of the window run's input and as its fallback for one stretch (below).
 
 #### Long-text vocabulary by layer
 
 ##### Layer 1: source shaping
 
 - **normalized document**
-  - the canonical input built by the `normalize` stage from the timed segments; its cues tell the executor where speech pauses are
+  - built by the `normalize` stage: the cleaned text, the timed segments, and `preferred_chunk_source` (`text` for subtitles on the `chinese` route, `segments` otherwise); the segment times tell the executor where speech pauses are
+- **chunk**
+  - before the first round, the `text` stage cuts the normalized document into chunks of about `chunk_tokens_<task>` tokens (`kernel/text/chunking.py`, listed in `text/manifest.json`): at sentence ends on the text path, at subtitle cues on the segment path, and also at every YouTube chapter start when the plan says `long`. A chunk boundary stays a unit boundary.
 - **unit / `[S<n>]`**
-  - one numbered source sentence (in the `translate_only` task, one paragraph of the `structure_only` output, split only above ~600 tokens); an over-long unpunctuated sentence is cut at subtitle cue ends (longest pause first), otherwise every ~120 tokens
+  - one numbered source sentence. A sentence above about 120 tokens (common in unpunctuated ASR text) is cut at subtitle cue ends, longest pause first, or every ~120 tokens when the cues cannot be matched to the text. In `translate_only` a unit is one paragraph of the `structure_only` output, split only above about 600 tokens.
 
 ##### Layer 2: document-level guidance
 
 - **global outline**
-  - one upfront pass over the numbered full text (`window_outline`, for `cleanup_zh` and `structure_only`) that returns section titles with their first unit; YouTube chapters are mapped to units, and a section starting at a chapter keeps the chapter title (translated into Chinese for `cleanup_zh` when the title has none)
-- **glossary**
-  - names and terms with their correct spellings and seen mis-recognitions; the outline pass returns one, and a locally built transcript glossary (no LLM) is used by rounds when there is no outline and by the quality check
+  - for `cleanup_zh` and `structure_only` (`window_outline: true`), one pass over the numbered full text before the first round (`kernel/text/outline.py`), in parts when the text is longer than `window_outline_read_tokens`. It returns section titles with their first unit (checked to be in range and increasing) and a term list. It is skipped when one round can process the whole text, since that round sees all of it. When the plan says `long`, YouTube chapters are mapped to units through the cue times and given as hints; a section starting at a chapter keeps the chapter's own title, unless that title is not in the output language (an English chapter title in a `cleanup_zh` run keeps the model's translation). In a bilingual run each heading is an English `##` line followed by a Chinese one.
+- **terms (glossary)**
+  - names and terms with their correct spellings and seen mis-recognitions. With an outline, each round gets the outline's terms that occur in its window, and `translate_only` gets them with their Chinese renderings. Without an outline, `cleanup_zh` rounds use `text/glossary.json`, a transcript glossary built locally (no LLM) from the chunks, the title, the channel and the chapter titles; `verify` checks the final text against the same file.
 
 ##### Layer 3: round execution and control
 
 - **cursor**
   - the first unit not yet written; everything before it is saved as complete paragraphs
 - **read window / write target**
-  - how much source a round reads from the cursor and how much output it should aim for; both adapt per round (`window_read_tokens`, `window_write_tokens`)
+  - how much source a round reads from the cursor and how much output it should aim for; both adapt per round, capped by `window_read_tokens` and `window_write_tokens`
 - **round**
-  - one model call: read window + tail of written output + nearby outline lines + matching terms; the model copies each unit's `[S<n>]` tag and ends with `<!--END-->`
+  - one model call: read window + the tail of the written output (`window_tail_tokens`) + nearby outline lines + matching terms; the model copies each unit's `[S<n>]` tag in front of that unit's text and ends with `<!--END-->`
 - **fallback**
-  - after repeated invalid rounds, the stretch is processed once as one fixed chunk so the run still advances
+  - after more than `window_marker_retries` invalid rounds in a row at the same cursor, the stretch is processed once as one plain fixed chunk of about `chunk_tokens_<task>` tokens, so the run still advances
 - **ownership**
   - the `run` lock on the video's work directory; the executor has no lock of its own
 
 ##### Layer 4: verification, merge, and final outputs
 
 - **round validation**
-  - tags present, in range, and increasing; output/source length ratio within bounds
+  - tags present, inside the window, and never going backwards; the output/source ratio between 0.4 and 2.5 times the expected one (checked once a round covers at least 200 source tokens)
 - **coverage / efficiency**
-  - which units were written and how much source was read twice; recorded in `state.json`
+  - which units were written, which stretches came out much shorter than the run's typical ratio, and how much source was read twice; recorded per task in `state.json`
 - **merge**
-  - deterministic ordered concatenation of the final task's paragraphs
+  - ordered concatenation of the final task's paragraphs, followed by the deterministic post-merge cleanup of repeated headings, paragraphs and paragraph openings
 - **quality gate**
-  - the `verify` stage; semantic anchors (dates, numbers, versions, URLs) are checked there as warnings
+  - the `verify` stage (6.9)
 
 #### Small long-text information flow
 
@@ -448,13 +507,16 @@ The window executor was introduced because small fixed chunks needed a stack of 
 normalized_document.json
         |
         v
+chunks (text/manifest.json, chunk_NNN.txt)
+        |
+        v
 numbered units [S1..Sn]
         |
         v
-Global outline + glossary (once, cached in text/<task>/)
+Global outline + terms (once, kept in the window state)
         |
         v
-Round: read window from cursor + written tail + outline + terms
+Round: read window from cursor + written tail + outline lines + terms
         |
         v
 LLM backend (host CLI, API, or agent handoff)
@@ -463,7 +525,7 @@ LLM backend (host CLI, API, or agent handoff)
 Validate tags / END line / length ratio
         |
         +-------------------------+
-        | valid                   | invalid (repeated)
+        | valid                   | invalid (repeatedly)
         v                         v
 Keep complete paragraphs     Process this stretch as one fixed chunk
 Advance cursor                    |
@@ -479,12 +541,18 @@ A response cut off before `<!--END-->` only loses its last paragraph: the cursor
 
 ### 7.5 Long-text subsystem architecture
 
-#### Implementation view (target modules)
+#### Implementation view
 
-- **`text`**: unit numbering, outline pass, round loop, adaptive sizes, validation, fallback, coverage, merge
-- **`llm`**: one request interface over the three backends; retries, timeouts, and the `max_tokens` stop line (config values are honored as given; a window round keeps the complete paragraphs of a cut-off response and shrinks the write target)
-- **`quality`**: the semantic-anchor and glossary checks used by `verify`
-- **`pipeline`**: calls the executor once per planned task, owns the lock, and records progress and usage
+| Concern | Code |
+|---|---|
+| Chunks | `kernel/text/chunking.py` (`chunk_document`), called once by the `text` stage |
+| Units, rounds, sizing, validation, fallback, coverage | `kernel/text/window.py` (`process_window`, `run_window_rounds`, `parse_window_output`, `plan_round`, `update_sizing`) |
+| Backend choice per task and the mid-run switch to the API | the request function in `process_window`, over `kernel/llm/agent_cli.py` and `kernel/llm/api.py` |
+| Outline, chapter hints, heading placement, terms per round | `kernel/text/outline.py` |
+| Transcript glossary and drift check | `kernel/text/glossary.py` |
+| Prompt assembly | `kernel/text/prompting.py` and `prompts/*.md` |
+| Merge and seam cleanup | `kernel/text/merge.py`, `kernel/text/cleanup/post_merge.py` |
+| One executor call per task, the time budget, the agent handoff, progress and usage in `state.json` | `kernel/pipeline.py` (`stage_text`, `AgentHandoff`, `llm_usage`) |
 
 #### A. The program owns boundaries, not the model
 
@@ -496,7 +564,7 @@ When the run has an outline, headings come only from it. A round may write a hea
 
 #### C. Sizes as soft targets
 
-`max_tokens` is only a loose stop line. The write target shrinks after truncated or slow rounds; the read window follows the write target and the measured output/source ratio, so little source is read twice. The last stretch goes in one round when it fits.
+`max_tokens` (`max_output_tokens_<task>`, 8192 by default) is only a loose stop line. The write target starts at `window_write_tokens`, shrinks by a quarter after a round that was truncated or took more than half the request timeout, and grows by a tenth after two clean rounds, never above `window_write_tokens` or three quarters of `max_tokens`. The read window follows the write target and the measured output/source ratio, plus a quarter of look-ahead, so little source is read twice. The last stretch goes in one round when it fits.
 
 #### D. Deterministic-first verification
 
@@ -508,7 +576,7 @@ When rounds keep failing on one stretch, the executor processes that stretch as 
 
 #### F. Persisted state
 
-Each task's window state (cursor, outline, adaptive sizes, saved paragraphs) lives under `text/<task>/` in the video's work directory, so a rerun of `run` resumes at the cursor. Request counts, token usage, and timings go into `state.json`. There is no separate telemetry file and no pause or cancel signal: stopping the process and rerunning is the control, and `--max-seconds` stops cleanly between rounds.
+Each task's window state lives in the video's work directory: `text/window/` for the first task and `text/window/processed/` for `translate_only`, each with a `state.json` (cursor, outline, sizes, a record of every round) and one `out_NNNNN.md` file per saved paragraph. A rerun of `run` resumes at the cursor as long as the units, the prompt and the state format are unchanged; otherwise that task starts over. Request counts, estimated tokens and per-task coverage go into the video's `state.json`. There is no separate telemetry file and no pause or cancel signal: stopping the process and rerunning is the control, and `--max-seconds` stops cleanly between rounds.
 
 ### 7.6 Why this subsystem design fits the whole project
 
@@ -532,9 +600,9 @@ So `run` owns the middle and stops at the edges with an explicit state and a rea
 
 Earlier versions put the flow in `SKILL.md` prose. Section 3.5 lists the result: steps skipped by weaker hosts, a hand-written state file that could disagree with reality, no end-to-end test, and layer after layer added to compensate. Each layer made the instructions longer, which made skipping more likely. Moving the flow into code breaks that loop: a missing step becomes a failing test instead of a silent difference in output.
 
-### 8.4 Why the runtime contract layer is removed
+### 8.4 Why the runtime contract layer was removed
 
-The March runtime layer (policy, evaluator, decision records, recovery hints, ledger, artifact graph, and an external create/inspect/advance API) was meant to give weak models and harnesses a structured contract: the current state, the allowed next actions, and a recommended decision. The intent was sound, but the contract never reached the model: it was printed only with `--api-envelope`, which `SKILL.md` never passed, and nothing else read it. With `run` owning the flow, the model no longer chooses next actions, so the contract has no reader. What the model still needs is the result of a whole run, which section 6.5 gives in a few fields. The parts that did work (the ownership lock, resumable state, usage records) move into `pipeline` and `state.json`; the rest is deleted.
+The March runtime layer (policy, evaluator, decision records, recovery hints, ledger, artifact graph, and an external create/inspect/advance API) was meant to give weak models and harnesses a structured contract: the current state, the allowed next actions, and a recommended decision. The intent was sound, but the contract never reached the model: it was printed only with `--api-envelope`, which `SKILL.md` never passed, and nothing else read it. Once `run` owned the flow, the model no longer chose next actions, so the contract had no reader. What the model still needs is the result of a whole run, which section 6.5 gives in a few fields. The parts that did work (the ownership lock, resumable state, usage records) moved into `pipeline` and `state.json`; the rest was deleted in stage 4. The layer's original rationale is in the 2026-03-19 research notes linked from [9.3](#93-design-history).
 
 ### 8.5 Why long-text transformation is a subsystem, not the whole project
 
@@ -560,42 +628,72 @@ Because the project still has to find the source text, decide how to acquire it,
 
 ---
 
-## 9. Implementation Mapping and Migration (Appendix)
+## 9. Implementation Map (Appendix)
 
-This section relates today's code to the target. Stage numbers refer to tracker #23.
+### 9.1 Where each part of the design lives
 
-| Today | Target | Stage |
-|---|---|---|
-| `SKILL.md` (≈370 lines) and `workflows/*.md` drive the flow | `run <url>` drives it; `SKILL.md` shrinks to a few dozen lines; `workflows/` is deleted | 2, 3 |
-| Quick Mode for videos under 15 minutes; short videos' text processed by the host model in the conversation | removed; short videos go through `run`, one window round, through the LLM backend | 3 |
-| `scripts/run_regression.py` holds the only scripted copy of the flow | its flow becomes `pipeline`; the regression script calls `run` | 2 |
-| No end-to-end test | fixtures from 4 real videos and a fake LLM CLI, run offline | 1 |
-| `/tmp/<video_id>_state.md`, `machine_state.json`, chunk `manifest.json`, `telemetry.jsonl`, `/tmp/<video_id>_*` files | `/tmp/yt-transcript/<video_id>/` with one `state.json` | 2, 4 |
-| `validate-state` stage checks | internal assertions in `pipeline` | 4 |
-| `find-unfinished` | `status` | 2 |
-| `scripts/preflight.sh` | per-stage checks inside `run` | 4 |
-| `scripts/cleanup.sh` | the `cleanup` stage and command | 2, 4 |
-| `kernel/task_runtime/*` (policy, decision, evaluator, recovery, ledger, artifacts, api, lifecycle, contracts), `--api-envelope`, 11 outer-orchestration commands, pause and cancel | deleted; the lock and state move into `pipeline` | 4 |
-| Fixed-chunk executor (`kernel/long_text/processing.py`, its manifest and contracts in `lifecycle.py` and `contracts.py`, the router `execution.py`), `long_text_mode`, `summarize`, `chapter_plan` / `build-chapter-plan`, `prompts/summarize.md`, `prompts/quick_cleanup.md` | deleted; window executor only | 4 |
-| `chunk-document`, `chunk-segments`, `chunk-text` (`kernel/long_text/chunking.py`) | one internal step that builds units from the normalized document | 4 |
-| Legacy switches (`chunk_mode: chars`, old config names, `--legacy-flat-output`, old manifest compatibility) | deleted | 4 |
-| `yt_transcript_utils.py` (≈8,000 lines) and `_bind_utils_globals` in kernel modules | `cli`, `pipeline`, `sources`, `text`, `llm`, `quality`, `config` with explicit imports | 5 |
-| `kernel/subtitle_language.py` | `sources` | 5 |
-| `kernel/long_text/window.py`, `outline.py`, `glossary.py`, `merge.py`, `prompting.py`, `kernel/text_cleanup/*` | `text` | 5 |
-| `kernel/long_text/llm.py`, `agent_cli.py` | `llm` | 5 |
-| `kernel/long_text/semantic.py`, the quality checks in utils | `quality` | 5 |
-| `scripts/download.sh` | called by `sources` as a subprocess, then folded into `sources` | 2, 5 |
-| `system_design_notes/`, the "target architecture" banner above | deleted; README rewritten for the new entry point | 6 |
+| Design | Code |
+|---|---|
+| Entry script and commands (6.10) | `yt_transcript_utils.py` → `kernel/cli.py` |
+| Stage list, `state.json`, lock, resume, overrides, results and exit codes (6.2, 6.4 to 6.6) | `kernel/pipeline.py`: `STAGES`, `EXIT_CODES`, `_Run.execute`, `_Run.run_stage`, `_Run.invalidate`, `acquire_lock`, `run`, `status`, `cleanup` |
+| `--max-seconds` and `in_progress` (6.7) | `_Run.deadline_passed` and the `stop_check` that `stage_text` passes to the window executor |
+| yt-dlp calls, the update check, `needs_user` reasons (6.2) | `_Run.download`, `_Run.update_yt_dlp`, `classify_download_error`; `scripts/download.sh`, `scripts/update_yt_dlp.sh` |
+| Language detection and track choice (6.3) | `kernel/sources/subtitle_language.py` (`select_subtitle_candidates`), `_Run.stage_source`, `_Run.subtitle_route` |
+| Subtitle quality score and reroute (6.3) | `kernel/text/subtitle_quality.py`, applied in `_Run.subtitle_route` |
+| Deepgram (6.3) | `kernel/sources/deepgram.py` (`transcribe_deepgram`), `_Run.transcribe` |
+| VTT parsing and subtitle cleanup | `kernel/text/cleanup/subtitle.py`, `cjk.py`, `overlap.py` |
+| Normalized document | `kernel/text/normalize.py` |
+| Text plan | `kernel/text/plan.py`, `_Run.stage_plan` |
+| Long-text subsystem (section 7) | see 7.5 |
+| LLM backends (6.8) | `kernel/llm/agent_cli.py`, `kernel/llm/api.py`; the choice in `kernel/text/window.py`; the handoff in `kernel/pipeline.py` (`AgentHandoff`) |
+| Quality check (6.9) | `kernel/quality/verify.py`, `kernel/quality/semantic.py` |
+| Article assembly (6.9) | `kernel/text/assemble.py`, `_Run.stage_assemble` |
+| Config and defaults | `kernel/config.py`, documented key by key in `config.example.yaml` |
+| Host contract (6.13) | `SKILL.md` |
+| Tests (6.12) | `tests/`, `scripts/run_regression.py` |
 
-Unchanged throughout: subtitle language selection, Deepgram transcription, the window executor's algorithms, the outline and glossary, and the quality checks. They move; they do not change behavior.
+### 9.2 Where the code differs from the plan
 
-Behavior changes the user will notice:
+The plan this design was implemented from differs from the code in a few places, all deliberate:
+
+- the four module-structure points in 6.11: subtitle quality is in `text`, `download.sh` is still a subprocess, the agent handoff is in `pipeline`, and `config.py` owns every default;
+- `subtitle-info` reads yt-dlp metadata on stdin instead of taking a URL, because `download.sh` pipes into it and `run` uses the metadata it already fetched;
+- the `text` stage still cuts the source into chunks before the window run, because a chunk is both the boundary layout of the units and the size of the fallback.
+
+### 9.3 Design history
+
+The design was implemented in seven stages, one pull request each, under tracker [#23](https://github.com/williamwang-ty/yt-transcript/issues/23):
+
+| Stage | Change |
+|---|---|
+| 0 ([#31](https://github.com/williamwang-ty/yt-transcript/pull/31)) | This design document |
+| 1 ([#32](https://github.com/williamwang-ty/yt-transcript/pull/32)) | Offline end-to-end tests over recorded fixtures, with a fake yt-dlp, Deepgram and LLM |
+| 2 ([#33](https://github.com/williamwang-ty/yt-transcript/pull/33)) | The `run` command and one `state.json` per video, built from the regression script's copy of the flow |
+| 3 ([#34](https://github.com/williamwang-ty/yt-transcript/pull/34)) | `SKILL.md` reduced to driving `run`; Quick Mode and `workflows/` removed; the yt-dlp update check moved into `run` |
+| 4 ([#35](https://github.com/williamwang-ty/yt-transcript/pull/35)) | Redundant layers deleted: the hand-written `state.md` and its checks, the runtime contract layer (policy, decision, evaluator, recovery, ledger, artifacts, the external API, pause and cancel, telemetry), the fixed-chunk executor with `summarize` and the chapter plan, legacy switches, `preflight.sh` and `cleanup.sh`, and most public commands |
+| 5 ([#36](https://github.com/williamwang-ty/yt-transcript/pull/36)) | `yt_transcript_utils.py` (about 8,000 lines) split into the `kernel/` packages with explicit imports |
+| 6 | Documentation: this document completed, `system_design_notes/` deleted, README rewritten |
+
+`state.json` replaced the hand-written `state.md`, `machine_state.json`, the execution state in the chunk `manifest.json` (the `text/manifest.json` that remains only lists the chunk files), `telemetry.jsonl`, and the scattered `/tmp/<video_id>_*` files.
+
+Behavior changes compared with the agent-driven flow before stage 3:
 
 1. Short videos' text goes through the LLM backend (normally the host CLI) instead of being written by the host model in the conversation.
-2. A rate-limited preferred subtitle track stops the run with `needs_user` instead of silently falling back to another track (6.3).
+2. A refused preferred subtitle track stops the run with `needs_user` instead of silently falling back to another track (6.3).
 3. Rerunning a finished video returns the existing article instead of starting over; `--restart` redoes it.
 4. The subtitle quality reroute happens inside `source`, before normalization; the outcome is the same.
 5. New: `--max-seconds` and the `in_progress` result for hosts with shell time limits.
+
+Subtitle language selection, Deepgram transcription, the window executor's algorithms, the outline and glossary, and the quality checks moved without changing behavior, apart from two output fixes made in stage 3: merged window output no longer joins short paragraphs (which had glued bilingual pairs together), and `structure_only` drops `-` speaker marks.
+
+The design notes written before this refactor were deleted in stage 6, together with the old version of this document. They stay readable at the last commit before stage 6 and in the git history (`git log -- SYSTEM_DESIGN.md system_design_notes/`):
+
+- [Research notes, 2026-03-19](https://github.com/williamwang-ty/yt-transcript/blob/f33bb9f302cc41c4b8fc436db611f2212f6d2efc/system_design_notes/20260319_SYSTEM_DESIGN_RESEARCH_NOTES.md): what kind of architecture the project is, and the case for the "adaptive runtime" that became the runtime contract layer (removed in stage 4, see 8.4).
+- [Final deliverable quality plan, 2026-03-25](https://github.com/williamwang-ty/yt-transcript/blob/f33bb9f302cc41c4b8fc436db611f2212f6d2efc/system_design_notes/20260325_SYSTEM_DESIGN_FINAL_DELIVERABLE_QUALITY_PLAN.md): where article quality problems come from, and which belong to code and which to the LLM.
+- [Architecture review, 2026-03-30](https://github.com/williamwang-ty/yt-transcript/blob/f33bb9f302cc41c4b8fc436db611f2212f6d2efc/system_design_notes/20260330_SYSTEM_DESIGN_ARCHITECTURE_REVIEW.md): the boundary between scripts and the LLM.
+- [This document before stage 6](https://github.com/williamwang-ty/yt-transcript/blob/f33bb9f302cc41c4b8fc436db611f2212f6d2efc/SYSTEM_DESIGN.md): section 9 there maps each old file and command to where it went, stage by stage.
+
+Each stage's reasoning and checks are in its pull request and issue linked in the table above.
 
 ---
 
@@ -607,19 +705,19 @@ Behavior changes the user will notice:
 
 ## 中文版
 
-> [!IMPORTANT]
-> **本文描述的是目标架构**，按 tracker [#23](https://github.com/williamwang-ty/yt-transcript/issues/23) 逐步实现。从第 3 阶段起，`SKILL.md` 让 agent 只通过 `run` 处理视频；旧的逐步命令暂时留在仓库里，第 4 阶段删除。第 9 节列出现有代码和目标的对应关系、每一部分在哪个阶段迁移，以及用户能感觉到的行为变化。
-
 ## 1. 文档定位
 
 本文说明 **整个 `yt-transcript` 项目的系统设计**：它构建什么，代码和模型怎样分工，以及为什么这样分。
 
-`README.md` 是给使用者的快速上手文档，`SKILL.md` 是宿主 agent 读的简短约定。本文两者都不是，它解释结构、边界和取舍。它也不是编码规范：下面出现的字段名、文件名和原因代码用来说明设计的形状，实现过程中还可能调整。
+`README.md` 是给使用者的说明（安装、配置、命令），`SKILL.md` 是宿主 agent 读的简短约定。本文两者都不是，它解释结构、边界和取舍。它也不是编码规范，但文中用到的名字（阶段、文件、状态和结果字段、原因代码、参数、配置项）都和代码里一致。
 
-本文分两个层次：
+本文分三个层次：
 
 - **项目层**（第 2 到 6 节）：一条命令怎样把 YouTube 链接变成一篇 Markdown 文章，以及外面的 agent 负责什么。
 - **子系统层**（第 7 节）：这条命令里最难的阶段，也就是长文本变换，是怎样工作的。
+- **实现对照**（第 9 节）：每一部分由哪个模块实现，代码和当初的计划有哪些不同，以及代码是怎样走到现在这个样子的。
+
+**设计历史**：[第 9.3 节](#93-设计历史)列出产生这份设计的重构的每个阶段及其 pull request，并链接到早期的设计笔记和本文的旧版本。它们已从仓库中删除，但从那里仍然可以阅读。
 
 `SYSTEM_DESIGN.md` 是本仓库唯一权威的设计文档。
 
@@ -665,7 +763,7 @@ LLM 只用来处理文字，从不决定下一步做什么。
 
 ### 3.5 流程本身不能依赖模型遵守说明
 
-旧设计里，agent 要读约 370 行的 `SKILL.md` 和三份 workflow 文档，执行二十来条命令，还要手写一个 `state.md` 文件，以此来执行流程。代价是可以预见的：
+旧设计里（第 3 阶段之前，见 [9.3](#93-设计历史)），agent 要读约 370 行的 `SKILL.md` 和三份 workflow 文档，执行二十来条命令，还要手写一个 `state.md` 文件，以此来执行流程。代价是可以预见的：
 
 - 弱一些的宿主会跳步或打乱顺序，文档里的 Quick Mode 干脆跳过了规划和质量检查
 - 流程只存在于文字说明里，没法做端到端测试
@@ -743,40 +841,41 @@ agent 从不编辑状态文件，也从不手动执行内部阶段。需要不�
 
 ### 6.2 阶段
 
-`run` 按固定的阶段列表执行。每个阶段读取前面阶段记下的内容，把产物原子地写进该视频的工作目录，然后才在 `state.json` 里把自己标为 `done`。重跑时，已经 `done` 且记录的产物仍然存在的阶段会被跳过。
+`run` 按固定的阶段列表执行。每个阶段读取前面阶段记下的内容，把产物写进该视频的工作目录，然后才在 `state.json` 里把自己标为 `done`。重跑时，已经 `done` 且记录的产物仍然存在的阶段会被跳过；某个阶段一旦重新执行，它之后的所有阶段也都重新执行。
 
 | 阶段 | 做什么 | 主要产物 | 可能的停止状态 |
 |---|---|---|---|
-| `metadata` | 用 yt-dlp 取一次视频信息（标题、频道、日期、时长、章节、字幕轨列表、音轨语言）；后面的阶段读这个文件，不再调用 yt-dlp 取信息 | `metadata.json` | `needs_user`（自动用浏览器 cookies 重试后仍遇到机器人验证或要求登录、限流、没有 yt-dlp）、`failed` |
-| `source` | 判断口语语言并选出可信的字幕轨（6.3）；下载并解析成纯文本和带时间的片段；给字幕质量打分，评分规则要求时改用 Deepgram；或者直接用 Deepgram 转写 | `source/`、`raw_text.txt`、`segments.json`、路由决定 | `unsupported`、`needs_user`（首选字幕轨被限流、缺少 Deepgram 密钥）、`failed` |
-| `normalize` | 从片段生成规范化文档（句子及其对应的字幕时间） | `normalized_document.json` | `failed` |
-| `plan` | 按模式选择文字任务（中文：`cleanup_zh`；双语：先 `structure_only` 再 `translate_only`），并估算规模（输入 token、预计轮数） | `plan.json` | `failed` |
-| `text` | 用窗口执行器（第 7 节）逐个执行规划好的任务；每个任务单独记账 | `text/<task>/` | `needs_agent_text`、`in_progress`、`failed` |
-| `merge` | 按顺序拼接最后一个任务的段落 | `optimized.md` | `failed` |
+| `metadata` | 先做 yt-dlp 更新检查，再用 yt-dlp 取一次视频信息（标题、频道、日期、时长、章节、字幕轨列表、音轨语言）；后面的阶段读这个文件，不再向 yt-dlp 要这些信息 | `metadata.json`、`chapters.json` | `needs_user`（自动用浏览器 cookies 重试后仍要求机器人验证 `cookies_required`、`login_required`、`rate_limited`、`tool_missing`）、`failed` |
+| `source` | 判断口语语言并选出可信的字幕轨（6.3）；下载并解析成纯文本和带时间的片段；给字幕质量打分，评分规则要求时改用 Deepgram；或者直接用 Deepgram 转写 | `source/`、`raw_text.txt`、`segments.json`、`state.json` 里的路由 | `unsupported`、`needs_user`（首选字幕轨被拒、缺少 Deepgram 密钥，或上面的 yt-dlp 情况）、`failed` |
+| `normalize` | 生成规范化文档：清理后的文字、带时间的片段，以及分块时按文字切还是按片段切 | `normalized_document.json` | `failed` |
+| `plan` | 按模式选择文字任务（中文：`cleanup_zh`；双语：先 `structure_only` 再 `translate_only`），把文字标为 `short` 或 `long`，并估算规模（输入 token、每个任务预计轮数）。中文的 Deepgram 文字会多一条修复识别错误的说明 | `plan.json` | `failed` |
+| `text` | 先把规范化文档切成分块，再用窗口执行器（第 7 节）逐个执行规划好的任务；每个任务单独记账 | `text/` | `needs_agent_text`、`in_progress`、`failed` |
+| `merge` | 按顺序拼接最后一个任务的段落，再去掉在轮次接缝处重复的标题、段落和段首 | `optimized.md` | `failed` |
 | `verify` | 对照原始文字做质量检查 | `quality.json` | `failed`（只有硬失败才停；警告只记录） |
-| `assemble` | 生成最终文件：frontmatter、清理后的标题、`yyyy-mm-dd. <标题>.md` 文件名、双语排版 | `output_dir` 里的文章 | `failed` |
+| `assemble` | 写出文章：frontmatter、头部、正文和结尾，文件名为 `yyyy-mm-dd. <标题>.md` | `output_dir` 里的文章 | `needs_user`（`output_dir_missing`）、`failed` |
 | `cleanup` | 文章写出后删除中间文件，保留 `state.json` | — | — |
 
 说明：
 
-- **阶段幂等。** 重跑一个未完成的阶段，会把这个阶段从头做一遍；但昂贵的子步骤在阶段内部保留结果（下载好的音频、Deepgram 分段结果、大纲、已完成的窗口轮次），所以中断的阶段不会重复花钱。
-- **没有单独的 preflight。** 每个阶段在真正需要之前才检查它需要的东西：`metadata` 之前检查 yt-dlp（包括原来由 preflight 做的更新检查，最多每小时一次，因为 YouTube 经常让旧版 yt-dlp 失效），`source` 选了 Deepgram 才检查 Deepgram 密钥，到 `text` 才检查 LLM 后端。便宜的路径保持便宜。
-- **第一次调用 LLM 之前来源已经定下来。** 字幕质量改道从规划阶段移到 `source`，所以 `normalize` 及之后的阶段处理的都是已经认可的文字。
-- **长短视频一条路径。** 短视频和长视频走同样的阶段。短视频的文字一轮窗口就能处理完，全文一轮能写完时也会跳过大纲调用。规划结果为 `long` 时，YouTube 章节作为提示交给大纲；短文本没有大纲，也就用不上章节。
-- **免费的路由检查。** `--stage plan` 执行 `metadata` 到 `plan`，不花钱。如果路由需要 Deepgram，就记下这个决定，在 `source` 做完决定后停下，不做转写。
+- **阶段幂等。** 重跑一个未完成的阶段，会把这个阶段从头做一遍；但昂贵的子步骤在阶段内部保留结果（下载好的音频、每段音频的 Deepgram 结果、大纲、已完成的窗口轮次），所以中断的阶段不会重复花钱。
+- **没有单独的 preflight。** 每个阶段在真正需要之前才检查它需要的东西：`metadata` 之前检查 yt-dlp（包括更新检查，最多每小时一次，因为 YouTube 经常让旧版 yt-dlp 失效），`source` 选了 Deepgram 才检查 Deepgram 密钥，到 `text` 才检查 LLM 后端，到 `assemble` 才检查 `output_dir`。便宜的路径保持便宜。
+- **第一次调用 LLM 之前来源已经定下来。** 字幕质量改道在 `source` 内部完成，所以 `normalize` 及之后的阶段处理的都是已经认可的文字。
+- **长短视频一条路径。** 短视频和长视频走同样的阶段。视频时长 30 分钟以上，或者较短视频的文字超过单次请求的上限（按路线不同，约 4100 到 4800 个估算 token），`plan` 就把文字标为 `long`。`long` 的文字会在 YouTube 章节开始处切分块，章节也作为大纲的提示；`short` 的文字两者都不用。只要一轮能处理完全文就跳过大纲调用（7.4），所以短视频通常每个任务只需要一次请求。
+- **免费的路由检查。** `--stage plan` 执行 `metadata` 到 `plan`，不花钱。如果路由需要 Deepgram，就记下这个决定，在 `source` 内部停下，不做转写。
 
 ### 6.3 来源选择
 
-这些规则现在已经存在，只是挪进 `source` 阶段：
+`source` 阶段按下面的规则选择（候选字幕轨由 `kernel/sources/subtitle_language.py` 给出）：
 
-1. 判断口语语言：先看 YouTube 标为原始的音轨，再看元数据的 `language`，再看 `xx-orig` ASR 轨，最后看非翻译的 ASR 轨。
+1. 用能拿到的最强信号判断口语语言：先看 YouTube 标为原始的音轨，再看元数据的 `language`，再看原始语言的 ASR 轨（只有一种语言有 ASR 轨时），最后看人工字幕轨（所有人工字幕是同一种语言时）。
 2. 只信任人工字幕和口语语言的 ASR 轨，丢弃 YouTube 的机器翻译轨。
-3. 中文视频：人工中文字幕，没有就用中文 ASR 轨；模式 `chinese`。
-4. 英文视频：有人工中文字幕就用它（模式 `chinese`），否则用英文字幕（模式 `bilingual`：英文原文加中文翻译）。
-5. 其他口语语言：`unsupported`，除非有人工中文字幕。
-6. 没有可信的字幕轨，或者字幕质量分触发改道规则（目前是 `chinese` 路线上质量为 critical）：按检测出的语言用 Deepgram 转写。Deepgram 自动执行，没有确认步骤。Deepgram 识别出的语言不受支持时，同样返回 `unsupported`。
+3. 任何视频，人工中文字幕都排在第一位；模式 `chinese`。
+4. 中文视频：否则用中文 ASR 轨；模式 `chinese`。
+5. 英文视频：否则用英文字幕，人工优先；模式 `bilingual`（英文原文加中文翻译）。
+6. 其他口语语言：`unsupported`（原因 `unsupported_language`），除非有人工中文字幕。没有任何信号说明语言时，所有可信的中文或英文字幕轨都是候选。
+7. 没有可信的字幕轨，或者字幕质量分触发改道规则（`chinese` 路线上质量为 critical）：按检测出的语言用 Deepgram 转写，没检测出语言时让 Deepgram 自己识别。Deepgram 自动执行，没有确认步骤。Deepgram 识别出的语言不受支持时，同样返回 `unsupported`。
 
-有一条规则改变了。首选字幕轨在自动重试后仍被 YouTube 限流时，旧流程会悄悄换用下一条字幕轨，比如用英文字幕代替人工中文字幕，结果中文文章变成了双语文章，而且每次运行结果可能不一样。现在 `source` 返回 `needs_user`，原因是 `rate_limited`，并说明备用的字幕轨是哪条。agent 可以稍后重跑，也可以用覆盖参数明确接受备用字幕轨（上面的例子里是 `--mode bilingual`）。
+首选字幕轨在自动用浏览器 cookies 重试后仍被 YouTube 拒绝（限流或机器人验证）时，`source` 不会悄悄换用下一条字幕轨。旧的 agent 驱动流程会这样做，结果中文文章变成了双语文章，而且每次运行结果可能不一样。现在 `source` 返回 `needs_user`，原因是 `rate_limited`（机器人验证时是 `cookies_required`），列出 `preferred_track` 和 `fallback_track`，并给出 `accept_command`：同一条命令加上 `--mode <备用字幕轨的模式>`。agent 问用户是等一会儿再重跑，还是接受备用字幕轨。
 
 `yt-dlp` 仍然是获取来源的依赖。直接调用 YouTube InnerTube 获取字幕评估过：对只需要字幕的场景更轻，但它是非官方、接口敏感的入口，不能取代 Deepgram 兜底，还会把维护提取逻辑的负担转到本项目。它可以作为将来的快速路径，但不是默认方案。
 
@@ -786,79 +885,98 @@ agent 从不编辑状态文件，也从不手动执行内部阶段。需要不�
 
 ```text
 /tmp/yt-transcript/<video_id>/
-  state.json                 唯一的状态文件
-  .runtime_owner.json        锁，运行期间持有
+  state.json                 唯一的状态文件；cleanup 后保留
+  .runtime_owner.json        运行锁：当前运行的进程号
   metadata.json  chapters.json
-  source/                    下载的字幕或音频、字幕质量检查、Deepgram JSON 及分段缓存
+  source/                    download.sh 下载的 subtitles/ 或 audio/（音频被切开时还有各段音频），
+                             subtitle_document.json（字幕质量检查），
+                             deepgram.json、deepgram_chunk_NNN.json（每段音频的 Deepgram 结果）
   raw_text.txt  segments.json  normalized_document.json
   plan.json
-  text/                      所有任务的窗口执行器状态（游标、大纲、大小、段落）
-  agent_task/                只在有未完成的 needs_agent_text 任务时存在
+  text/                      manifest.json 和 chunk_NNN.txt（分块）、glossary.json（cleanup_zh），
+                             window/（第一个任务：state.json、每段一个 out_NNNNN.md），
+                             window/processed/（translate_only）
+  agent_task/                prompt.md、task.json、output.txt、answers/；只在把请求交给 agent 期间存在
   optimized.md  quality.json
 ```
 
 `YT_TRANSCRIPT_WORK_ROOT` 可以代替 `/tmp/yt-transcript`，`YT_TRANSCRIPT_OUTPUT_DIR` 可以代替配置里的 `output_dir`；回归脚本两个都用，所以不会碰到真实的运行目录和笔记库。
 
-每个阶段、每轮窗口之后都原子地写一次 `state.json`。它的形状：
+每个阶段开始和结束时、每轮窗口之前，都原子地写一次 `state.json`。下面是一次已完成的双语运行的 `state.json`（有删节）：
 
 ```json
 {
   "schema": 1,
   "video_id": "abc123",
   "url": "https://www.youtube.com/watch?v=abc123",
-  "status": "running",
+  "status": "done",
+  "created_at": "2026-10-22T16:59:52.758+00:00",
+  "updated_at": "2026-10-22T16:59:53.611+00:00",
   "overrides": {"source": null, "mode": null},
+  "metadata": {"title": "Some Talk", "channel": "Some Channel", "upload_date": "20261001", "duration": 437},
   "route": {
     "source_language": "en",
     "language_signal": "original_audio_track",
     "source": "subtitles",
+    "language": "en",
     "track": "en",
     "track_kind": "manual",
     "mode": "bilingual",
-    "subtitle_quality": {"score": 0.82, "band": "good"},
+    "subtitle_quality": {"score": 1.0, "band": "excellent"},
     "blocked_tracks": [],
+    "fallback_used": false,
     "rerouted_from": null,
     "reason": "English video with human English subtitles"
   },
   "stages": {
-    "metadata": {"status": "done", "seconds": 2.1, "outputs": ["metadata.json"]},
-    "text": {"status": "running", "tasks": {
-      "structure_only": {"status": "done", "rounds": 4},
-      "translate_only": {"status": "running", "rounds": 2}
-    }}
+    "metadata": {"status": "done", "started_at": "…", "finished_at": "…", "seconds": 0.2,
+                 "outputs": ["metadata.json", "chapters.json"]},
+    "plan": {"status": "done", "summary": {"tasks": ["…"], "video_path": "short", "estimated_input_tokens": 1800}},
+    "text": {"status": "done", "tasks": {
+      "structure_only": {"status": "done", "cursor": 94, "units": 94, "rounds": 1, "round_count": 1,
+                         "invalid_rounds": 0, "fallback_rounds": 0,
+                         "outline": {"status": "skipped"}, "coverage": {"…": "…"}, "efficiency": {"…": "…"}},
+      "translate_only": {"status": "done", "cursor": 27, "units": 27, "rounds": 1}
+    }},
+    "verify": {"status": "done", "summary": {"passed": true, "hard_failures": [], "warnings": [], "checks": {"…": "…"}}}
   },
-  "llm": {"backend": "claude-cli", "requests": 9, "input_tokens": 41200, "output_tokens": 18700},
+  "llm": {"backend": "claude-code-cli", "requests": 2, "input_tokens": 4794, "output_tokens": 4819,
+          "estimated_tokens": true},
   "warnings": [],
-  "last_result": {"status": "failed", "stage": "text", "reason": "llm_timeout"},
-  "output_file": null
+  "last_result": {"status": "done", "at": "2026-10-22T16:59:53.611+00:00"},
+  "output_file": "/Users/me/notes/01.input/01.articles/2026-10-01. Some Talk.md",
+  "raw_chars": 6539
 }
 ```
+
+`status` 在调用进行中是 `running`，`--stage plan` 调用之后是 `planned`，其余时候是上一次结果的状态。阶段记录里还保存后面阶段要用的东西：`normalize` 的结果、`plan` 的任务列表（`summary`）、`source` 下载的音频路径。`llm` 里的 token 数是根据 prompt 和输出在本地估算的，因为命令行后端不报告用量。
 
 规则：
 
 - **续跑**就是重跑同一条命令：`run` 读 `state.json`，从第一个不是 `done` 的阶段开始。在 `text` 阶段内部，窗口执行器从游标处继续。
 - **完成的就保持完成。** `cleanup` 保留 `state.json`，所以对已完成的视频重跑 `run`，会立即返回 `done` 和已有的文章，前提是这篇文章还在（被删掉了就从头再做）。因此整批重跑时只会处理没完成的视频。要重新生成文章就用 `--restart`。
-- **覆盖参数会保留。** `--source` 和 `--mode` 存进 `state.json`，在这个视频之后的重跑里一直有效，直到 `--restart`，所以续跑不会悄悄改变路由。
-- **每次运行都会读配置**，但配置改了，已完成的阶段也不会重做；要重做就用 `--from <阶段>`。`cleanup` 之后中间文件已经删掉，所以对已完成的运行用 `--from` 会重做所有阶段；它是给未完成的运行用的（比如质量检查失败后 `--from text`）。
-- **运行锁**防止两个进程同时写一个工作目录。对一个被锁住的视频再执行 `run`，返回 `failed`，原因是 `locked`；已退出进程留下的锁会被接管。不同视频之间不共享文件，可以并行运行。
-- **取代的东西**：手写的 `state.md`、`machine_state.json`、分块的 `manifest.json`、`telemetry.jsonl`，以及散落的 `/tmp/<video_id>_*` 文件。下载文件和规范化文档都移到该视频自己的目录下，不同运行之间不会在共享路径上撞车。
+- **覆盖参数会保留。** `--source` 和 `--mode` 存进 `state.json`，在这个视频之后的重跑里一直有效，直到 `--restart`，所以续跑不会悄悄改变路由。无法满足的覆盖参数（`override_not_applicable`）不会保存，所以直接重跑会回到原来的路由。
+- **每次调用都会读配置**，但配置改了，已完成的阶段也不会重做；要重做就用 `--from <阶段>`。`cleanup` 之后中间文件已经删掉，所以对已完成的运行用 `--from` 会重做所有阶段；它是给未完成的运行用的（比如质量检查失败后 `--from text`）。
+- **运行锁**防止两个进程同时写一个工作目录。对一个被锁住的视频再执行 `run`，返回 `failed`，原因是 `locked`；进程已退出的锁会被接管。不同视频之间不共享文件，可以并行运行。
 - **安全**：`video_id` 必须匹配 `[A-Za-z0-9_-]+` 才能用作路径。`state.json` 不存 API 密钥，只记后端名字，不记凭据。
 - **寿命**：目录在 `/tmp` 下，重启后未完成的任务会丢失。这是接受的限制。
 
 ### 6.5 交回给 agent 的结果
 
-每次 `run` 调用都在 stdout 打印且只打印一个 JSON 对象，并以固定的退出码结束。进度信息（阶段、第 n 轮共 m 轮）输出到 stderr。
+每次 `run` 调用都在 stdout 打印且只打印一个 JSON 对象，并以固定的退出码结束。进度信息（阶段、窗口轮次、yt-dlp 的消息）输出到 stderr。
 
-| `status` | 退出码 | 含义 | agent 怎么做 |
+| `status` | 退出码 | 含义和字段 | agent 怎么做 |
 |---|---|---|---|
-| `done` | 0 | 文章已写出，或 `--stage plan` 已完成 | 汇报 `output_file`、路由、警告和 LLM 用量 |
-| `failed` | 1 | 某个阶段失败：`stage`、`reason`、`message`、`retryable`、`next_command` | `retryable` 时重试一次，否则汇报；可以建议某个覆盖参数 |
-| `needs_user` | 3 | 只有用户能解决：`cookies_required`、`login_required`、`rate_limited`、`deepgram_key_missing`、`tool_missing`、`output_dir_missing` | 准确告诉用户要做什么；用户做完后重跑 |
-| `unsupported` | 4 | 口语语言不受支持 | 汇报；不重试 |
-| `needs_agent_text` | 5 | 没有可用的 LLM 后端，交出一次文字请求 | 完成任务、写出输出文件、重跑同一条命令 |
-| `in_progress` | 6 | `--max-seconds` 时间用完，在干净的边界停下：`stage`、进度 | 重跑同一条命令；可以顺便告诉用户进度 |
+| `done` | 0 | 文章已写出：`output_file`、`title`、`route`、`warnings`、`llm`。`--stage plan` 之后：`stage`、`route`、`plan`，路由需要 Deepgram 时还有 `message` | 汇报结果 |
+| `failed` | 1 | 某个阶段失败：`stage`、`reason`、`message`、`retryable`（质量检查失败时还有 `hard_failures`） | `retryable` 时重跑一次 `next_command`，否则汇报；可以建议某个覆盖参数 |
+| `needs_user` | 3 | 只有用户能解决。`reason` 是 `cookies_required`、`login_required`、`rate_limited`、`deepgram_key_missing`、`tool_missing` 或 `output_dir_missing`；`message` 说明该怎么做。首选字幕轨被拒时还有 `preferred_track`、`fallback_track` 和 `accept_command` | 告诉用户；用户处理后重跑，用户接受备用字幕轨时执行 `accept_command` |
+| `unsupported` | 4 | 口语语言不受支持：`reason` 为 `unsupported_language`，还有 `language` | 汇报；不重试 |
+| `needs_agent_text` | 5 | 没有可用的 LLM 后端，交出一次请求：`task.name`、`task.prompt_file`、`task.output_file` | 完成请求，把答案写进输出文件，重跑 `next_command` |
+| `in_progress` | 6 | `--max-seconds` 时间用完，在安全点停下：`stage`、`progress`（`stages_done`、`text_tasks`） | 重跑 `next_command`，直到状态改变 |
 
-退出码 2 留给命令行用法错误。`failed` 的常见原因：`download_error`、`deepgram_error`、`llm_error`、`llm_timeout`、`quality_hard_failure`、`locked`、`override_not_applicable`。
+每个结果还有 `video_id`、`work_dir` 和 `seconds`。除了 `done` 和 `unsupported`，每个结果都有 `next_command`，也就是继续这次运行的命令；`--stage plan` 调用的结果也都有。退出码 2 留给命令行用法错误（`{"status": "usage_error", "message": …}`），比如参数不是 YouTube 链接。
+
+`failed` 的原因：`download_error`、`deepgram_error`、`llm_error`、`llm_timeout` 和 `locked` 可以重试；`source_error`、`normalize_error`、`plan_error`、`merge_error`、`quality_hard_failure`、`override_not_applicable` 和 `config_error` 不能重试，`<阶段>_error`（某个阶段里出现意外异常）也不能重试。
 
 一个 `done` 结果：
 
@@ -867,10 +985,13 @@ agent 从不编辑状态文件，也从不手动执行内部阶段。需要不�
   "status": "done",
   "video_id": "abc123",
   "output_file": "/Users/me/notes/01.input/01.articles/2026-10-01. Some Talk.md",
-  "route": {"source": "subtitles", "track": "en", "track_kind": "manual", "mode": "bilingual"},
-  "warnings": ["glossary term 'Kubernetes' appears in 2 spellings"],
-  "llm": {"backend": "claude-cli", "requests": 9, "input_tokens": 41200, "output_tokens": 18700},
-  "seconds": 412
+  "title": "Some Talk",
+  "route": {"source": "subtitles", "language": "en", "track": "en", "track_kind": "manual", "mode": "bilingual"},
+  "warnings": ["Size ratio 4.30x vs raw text is outside expected range (1.2-4.0x for bilingual)"],
+  "llm": {"backend": "claude-code-cli", "requests": 9, "input_tokens": 41200, "output_tokens": 18700,
+          "estimated_tokens": true},
+  "work_dir": "/tmp/yt-transcript/abc123",
+  "seconds": 412.3
 }
 ```
 
@@ -881,15 +1002,20 @@ agent 从不编辑状态文件，也从不手动执行内部阶段。需要不�
   "status": "needs_agent_text",
   "video_id": "abc123",
   "stage": "text",
+  "reason": "no_llm_backend",
+  "message": "No LLM backend is reachable (…). Answer the request in task.prompt_file exactly as the model would, write only the answer to task.output_file, then run next_command.",
   "task": {
+    "name": "structure_only",
     "prompt_file": "/tmp/yt-transcript/abc123/agent_task/prompt.md",
     "output_file": "/tmp/yt-transcript/abc123/agent_task/output.txt"
   },
-  "next_command": "run https://www.youtube.com/watch?v=abc123"
+  "next_command": "python3 /path/to/yt-transcript/yt_transcript_utils.py run https://www.youtube.com/watch?v=abc123",
+  "work_dir": "/tmp/yt-transcript/abc123",
+  "seconds": 1.4
 }
 ```
 
-这个任务恰好是一次 LLM 请求：一次大纲调用或一轮窗口，prompt、编号单元和结束标记都和 LLM 后端收到的一样。重跑时，`run` 用校验任何响应的同一套规则（第 7 节）校验输出文件，然后继续。短视频每个文字任务交一次；长视频要交好几次。所以 agent 就是最慢的一种 LLM 后端，不需要单独维护一条文字处理路径。它只是兜底：正常情况下 `auto` 会用上宿主 CLI 或 API。
+这个任务恰好是一次 LLM 请求：一次大纲请求、一轮窗口或一个兜底分块，prompt、编号单元和结束标记都和 LLM 后端收到的一样。重跑时，`run` 把答案移到 `agent_task/answers/<prompt 的 sha256>.txt`，遇到同一个 prompt 时交回这个答案，并用校验任何响应的同一套规则（第 7 节）校验它；答案一直保留到 `text` 阶段结束。短视频大约每个文字任务交一次；长视频要交好几次。所以 agent 就是最慢的一种 LLM 后端，不需要单独维护一条文字处理路径。它只是兜底：正常情况下 `auto` 会用上宿主 CLI 或 API。
 
 ### 6.6 覆盖参数
 
@@ -898,9 +1024,10 @@ agent 从不编辑状态文件，也从不手动执行内部阶段。需要不�
 | `--source subtitles\|deepgram` | 是 | 强制来源。`deepgram` 跳过字幕；`subtitles` 即使质量分会触发改道也坚持用选中的字幕轨。从 `source` 起重做后面所有阶段。 |
 | `--mode chinese\|bilingual` | 是 | 强制输出形式。模式跟着来源文字走（中文文字对应 `chinese`，英文文字对应 `bilingual`），所以这个参数实际上决定用哪条字幕轨：英文视频上，`bilingual` 即使有人工中文字幕也用英文字幕，`chinese` 用人工中文字幕。从 `source` 起重做后面所有阶段。 |
 | `--from <阶段>` | 否 | 把该阶段及之后的阶段标为未完成，然后运行。用于恢复和调试。 |
-| `--stage plan` | 否 | 做完 `plan` 就停：免费的路由检查。 |
-| `--max-seconds <n>` | 否 | n 秒后、且本次调用至少完成了一个阶段或一轮窗口时，不再开始新的阶段或新一轮窗口，返回 `in_progress`。 |
+| `--stage plan` | 写进 `next_command` | 做完 `plan` 就停：免费的路由检查。 |
+| `--max-seconds <n>` | 写进 `next_command` | n 秒后、且本次调用至少完成了一个阶段或一轮窗口时，不再开始新的阶段或新一轮窗口，返回 `in_progress`。 |
 | `--restart` | 否 | 删除工作目录（包括保存的覆盖参数），从头开始。 |
+| `--config-path <文件>` | 写进 `next_command` | 读取另一个 `config.yaml`，而不是 skill 根目录下的那个。 |
 
 这些是 agent 的逃生口。用户说"这个用 Deepgram"或"只要中文"，对应的是一个参数，而不是手动执行几步。无法满足的组合（中文视频上用 `--mode bilingual`，没有人工中文字幕的英文视频上用 `--mode chinese`，没有可信字幕轨时用 `--source subtitles`）返回 `failed`，原因是 `override_not_applicable`；不做任何猜测。
 
@@ -909,69 +1036,99 @@ agent 从不编辑状态文件，也从不手动执行内部阶段。需要不�
 长视频可能要跑一刻钟甚至更久，而很多宿主几分钟后就会结束 shell 命令。下面两点让任何宿主都能安全运行：
 
 - `run` 随时可以被杀掉。每个完成的阶段和每轮窗口都已经落盘，已退出进程的锁会被接管，重跑最多损失正在进行的那一次请求。
-- `--max-seconds <n>` 让 agent 不必被动挨杀：`run` 在 n 秒后的第一个阶段或轮次边界停下，返回 `in_progress` 和目前的进度。SKILL.md 告诉 agent：如果自己的 shell 工具有时间上限，就传大约一半的上限值，然后一直重跑到状态改变。
+- `--max-seconds <n>` 让 agent 不必被动挨杀：`run` 在 n 秒后的第一个阶段或轮次边界停下，返回 `in_progress` 和目前的进度。SKILL.md 让 agent 带上 `--max-seconds 300`，并把 shell 超时设为 10 分钟（shell 上限更短时传大约一半的上限值），然后一直重跑到状态改变。
 
 这不需要后台任务之类宿主特有的能力。
 
 ### 6.8 LLM 后端
 
-所有文字处理都走同一个后端接口，有三种实现：
+`text` 阶段的每个文字请求都经过窗口执行器里的同一个请求函数，背后有三种后端：
 
-- **宿主 CLI**：宿主 agent 自己的命令行（内置表覆盖 Claude Code、Codex、opencode、pi、Gemini 和 Cursor；其他的用 `llm_agent_cli` 指定），在空的临时目录里、不带工具运行
-- **API**：配置里的任意 OpenAI 兼容接口
-- **交给 agent**：上面的 `needs_agent_text` 结果
+- **宿主 CLI**：宿主 agent 自己的命令行，来自内置表（Claude Code `claude -p`、Codex `codex exec`、opencode、pi、Gemini CLI、Cursor `cursor-agent`），也可以是 `llm_agent_cli` 或环境变量 `YT_TRANSCRIPT_AGENT_CLI` 指定的任意非交互命令。它在空的临时目录里运行，命令行有对应参数时关闭工具（Claude Code、pi）。
+- **API**：配置里的 OpenAI 兼容接口或 Anthropic Messages 接口（`llm_api_format`、`llm_base_url`、`llm_model`、`llm_api_key`），带重试、退避和可选的流式响应。
+- **交给 agent**：上面的 `needs_agent_text` 结果。
 
-`llm_backend: auto`（默认）时，`run` 先探测一次宿主 CLI，再试 API，两者都不行才把请求交给 agent。`llm_backend: api` 只用 API。选中的后端记在 `state.json` 里。不依赖任何提供方的特殊请求字段：截断通过窗口协议的标记检测，没有 `finish_reason` 的命令行输出也适用。
+`llm_backend: auto`（默认）时，每个任务在它的窗口运行开始时选后端：先看明确指定的命令（先环境变量，再 `llm_agent_cli`），再看同一任务之前的调用用过的 CLI，最后根据环境变量识别宿主。CLI 要在 `llm_cli_probe_timeout_sec` 内答出一次一行的试调才会被使用；否则配置了 API 就用 API，没配置就交给 agent。CLI 在运行中途失败、`llm_cli_max_retries` 次重试后仍不行时，如果配置了 API，剩下的轮次改走 API。`llm_backend: api` 跳过 CLI。`state.json` 里把后端记为 `<agent>-cli`、`api` 或 `agent-handoff`。
+
+不依赖任何提供方的特殊请求字段。`max_tokens` 只作为宽松的上限发送；截断通过窗口协议的结束行检测，没有 `finish_reason` 的命令行输出也适用。报告了 `finish_reason` 为 `length`（或提供方的同义值）时，只会让后面的轮次少写一些。
 
 ### 6.9 质量检查与组装
 
-- `verify` 报告长度比、结构、术语、semantic anchors 和双语配对。只有硬失败会让运行停下（`failed`，阶段 `verify`，附原因），这时不写文章。警告存进 `state.json`，随 `done` 一起返回，由 agent 提及。
-- `assemble` 计算以前要从状态里手工拼出来的所有东西：清理后的标题、`yyyy-mm-dd` 格式的日期（从不使用元数据里原始的 `yyyymmdd`）、文件名、frontmatter 和转录来源标签。
+- `verify` 检查结构、截断迹象、相对原文的长度比、重复短语和接缝重复、中文可读性、双语配对、术语漂移、semantic anchors（日期、数字、版本号、URL）以及窗口运行的覆盖率。只有硬失败会让运行停下（`failed`，阶段 `verify`，原因 `quality_hard_failure`），这时不写文章：文件不存在或为空、超过 1200 个字符却没有一个 `##` 标题、双语正文里没有一组"英文段后接中文段"的配对。其余都是警告，存进 `state.json`，随 `done` 一起返回，由 agent 提及。
+- `assemble` 计算以前要从状态里手工拼出来的所有东西：文件名 `yyyy-mm-dd. <标题>.md`（替换非法字符，标题为空时用视频 id，日期从不使用原始的 `yyyymmdd`）、值都加引号的 YAML frontmatter（`title`、`source`、`url`、`channel`、`author`、`date`、`created`、`type`、`bilingual`、`duration`、`transcript_source`、`tags`、`via`）、包含标题、频道链接、语言模式和时长的头部，以及注明转录来源的一行结尾。双语排版本身（每个英文段后面跟它的中文译文）由 `translate_only` 产生。
 - `cleanup` 只在文章存在之后运行。失败或中断的运行保留整个目录，便于续跑或检查。
 
 ### 6.10 对外命令
 
+所有命令的形式都是 `python3 <skill-root>/yt_transcript_utils.py <命令>`。
+
 | 命令 | 用途 |
 |---|---|
-| `run <url> [参数]` | 整个流程（6.2 到 6.9 节） |
-| `status [<video_id>]` | 不带 id：列出 `/tmp/yt-transcript/` 下未完成的运行、所在阶段和上次结果。带 id：显示该视频的状态，不论是否完成。取代 `find-unfinished`。 |
-| `cleanup <video_id> [--force]` | 删除一个工作目录；未完成的运行不带 `--force` 时拒绝 |
-| `subtitle-info <url>` | 调试用：语言判断和候选字幕轨，不下载 |
-| `verify-quality <file> --raw-text <file>` | 调试用：对任意文件重跑质量检查 |
+| `run <url> [参数]` | 整个流程（6.2 到 6.9 节）；`<url>` 也可以是 11 个字符的视频 id |
+| `status [<video_id>]` | 不带 id：列出工作根目录下的所有运行，分为 `unfinished`（各带 `next_stage`、`last_result` 和 `next_command`）和 `finished`。带 id：该视频的条目加上完整的 `state.json` |
+| `cleanup <video_id> [--force]` | 删除一个工作目录；正在运行的拒绝，未完成的运行不带 `--force` 也拒绝 |
+| `subtitle-info` | 调试用：从 stdin 读 `yt-dlp -J` 的元数据，输出语言判断和候选字幕轨（`--from-list-subs` 改为读 `yt-dlp --list-subs` 的输出）；`download.sh` 也用它 |
+| `verify-quality <文件> [--raw-text <文件>] [--bilingual] [--work-dir <目录>]` | 调试用：对任意文件重跑质量检查 |
 
-其余都变成内部函数。暂停、取消、telemetry 查询和对外 runtime API 都删除：中断进程就停下，重跑就续跑，耗时和用量记在 `state.json` 里。
+其余都是内部函数。暂停、取消、telemetry 查询和对外 runtime API 已经删除：中断进程就停下，重跑就续跑，耗时和用量记在 `state.json` 里。
 
 ### 6.11 模块结构
 
 ```text
-cli          参数解析、五个命令、JSON 结果和退出码
-  └─ pipeline    阶段列表、state.json、运行锁、续跑、覆盖参数、结果
-       ├─ sources    yt-dlp（元数据、字幕轨、音频）、语言选择、
-       │             字幕质量、Deepgram
-       ├─ text       VTT 解析、规范化、单元、窗口执行器、
-       │             大纲、术语表、合并、CJK 和重叠清理
-       ├─ quality    verify-quality、semantic anchors
-       └─ llm        后端（宿主 CLI、API、交给 agent）、重试、截断
-config       加载、默认值、校验（所有模块都用）
+yt_transcript_utils.py    skill 根目录下的入口脚本；调用 kernel.cli.main()
+kernel/
+  cli.py                  参数解析、五个命令、JSON 输出和退出码
+  pipeline.py             阶段列表、state.json、运行锁、续跑、覆盖参数、结果；
+                          调用 download.sh；交给 agent；status 和 cleanup
+  sources/
+    subtitle_language.py  口语语言、可信字幕轨、候选字幕轨
+    deepgram.py           切分音频、带重试和分段缓存的 Deepgram API 调用、解析结果
+  text/
+    cleanup/              VTT 解析和字幕清理、CJK 空格、重叠裁剪、合并后清理
+    normalize.py          规范化文档
+    subtitle_quality.py   字幕质量分和改道信号
+    plan.py               文字任务、short 或 long、规模估算
+    chunking.py           窗口运行读取的分块
+    window.py             滑动窗口执行器，以及每个任务的后端选择
+    outline.py            全局大纲、章节提示、标题放置、每轮的术语
+    glossary.py           转录术语表和漂移检查
+    prompting.py  measure.py  merge.py  assemble.py
+  llm/
+    api.py                OpenAI 和 Anthropic 格式 API 的 HTTP 客户端
+    agent_cli.py          宿主 CLI 表、识别、试调、调用
+  quality/
+    verify.py  semantic.py   verify 阶段的各项检查
+  config.py               解析 config.yaml，定义每个配置项的默认值
+  files.py                原子写入、时间戳
+scripts/download.sh       yt-dlp：metadata、subtitle-info、subtitles、audio（作为子进程运行）
+scripts/update_yt_dlp.sh  每小时最多一次的 yt-dlp 更新检查
+prompts/*.md              任务 prompt：cleanup_zh、structure_only、translate_only
 ```
 
-依赖只向下。kernel 模块不再把 `yt_transcript_utils` 的命名空间复制进自己的全局变量（`_bind_utils_globals`）；每个模块显式导入自己用到的东西，8000 行的 `yt_transcript_utils.py` 按上面的结构拆开。`prompts/*.md` 仍然是文件。引入 `run` 期间 `download.sh` 继续作为子进程使用，拆分 utils 时它的逻辑并入 `sources`。第 2 到 4 阶段期间命令是 `python3 <skill-root>/yt_transcript_utils.py run <url>`；第 5 阶段把代码移进一个包，在 skill 根目录留一个很薄的入口脚本，所以 SKILL.md 里的命令只改一次。
+依赖只朝一个方向。`config` 和 `files` 不引用 kernel 里的其他模块；`llm` 和 `sources` 只用 `config`；`text` 用 `config`、`files` 和 `llm`；`quality` 用 `text`；`pipeline` 用上面所有模块；`cli` 用 `pipeline`，调试命令另外用 `sources` 和 `quality`。`kernel/` 里没有任何模块引用 `yt_transcript_utils.py`。唯一的回路跨越进程：`pipeline` 启动 `download.sh`，`download.sh` 再把元数据交给 `subtitle-info` 命令。
+
+拆分之前（重构第 0 阶段）写下的模块计划和结果有四处不同，原因如下：
+
+- **字幕质量放在 `text/subtitle_quality.py`，不在 `sources`。** 它给清理后的字幕文字打分，`normalize` 和 `source` 阶段都要用；放在 `sources` 会让 `text` 依赖 `sources`。`source` 阶段通过 `pipeline` 调用它。
+- **`download.sh` 仍然作为子进程运行**，没有并入 `sources`。它处理 yt-dlp 的部分（cookies 重试、逐条字幕轨识别被拒、选择音频格式）是约 950 行能正常工作的 shell，有测试和真实视频回归覆盖；移植它有改变行为的风险，用户却得不到任何好处。`pipeline` 通过环境变量把路径和 yt-dlp 设置传给它，并读取它输出的 JSON。
+- **交给 agent 的逻辑留在 `pipeline`**（`AgentHandoff`），不在 `llm`。它属于这次运行，而不是某个后端：它往工作目录里写文件，并以 `needs_agent_text` 结果结束本次调用。窗口执行器把它作为回调接收，和其他后端一样对待。
+- **默认值都归 `config.py`。** 它定义每个配置项的默认值，`load_config` 返回的结果里每个键都已填好，所以读取配置的模块拿到的总是完整的值，不再各自保留默认值。
 
 ### 6.12 测试
 
-- **单元测试**按模块组织。被删除代码的测试随代码一起删除，不保留。
-- **端到端测试**离线跑整个流程：在 `sources` 的边界（yt-dlp 和 Deepgram 调用处）用录好的 fixtures 代替 YouTube 和 Deepgram，通过 `llm_agent_cli` 接入一个假 LLM 命令行，它实现窗口协议和大纲 JSON。用例：中文人工字幕、英文字幕（双语）、无字幕（Deepgram）、不支持的语言；另外覆盖在 `text` 阶段中断后续跑、覆盖参数的保留，以及每一种结果状态。
-- **真实视频回归**：任何动到主路径的阶段合并前，在 Mac 上跑 `scripts/run_regression.py`（它调用 `run`）。
+- **单元测试**按领域放在 `tests/regression_*.py`，用 `python3 -m unittest tests.test_regressions` 全部运行（离线，不到一分钟）。被删除代码的测试已随代码一起删除。
+- **端到端测试**（`tests/regression_e2e.py`）通过 `scripts/run_regression.py --fixtures tests/fixtures/e2e` 离线跑整个流程：`PATH` 上的假 `yt-dlp`（`tests/e2e/`）提供录好的元数据和字幕，假 Deepgram 用录好的响应回答，假 LLM 命令行（`tests/fake_llm.py`，通过 `llm_agent_cli` 接入）实现窗口协议和大纲 JSON。用例：中文人工字幕（长视频，带大纲的多轮窗口）、英文字幕（双语）、无字幕（Deepgram）、不支持的语言。路由和产物与 `tests/fixtures/e2e/baseline.json` 对比；有意的改动之后用 `UPDATE_E2E_BASELINE=1` 重新生成。`tests/regression_run.py` 覆盖 `text` 阶段内的续跑、覆盖参数的保留和拒绝、运行锁、`--max-seconds`、`--from`、`--restart`、`--stage plan`、质量改道，以及每一种结果状态。
+- **真实视频回归**：任何动到主路径的改动合并前，在能访问 YouTube 的机器上跑 `scripts/run_regression.py`（它调用 `run`；见 `tests/live_regression/README.md`）。`--stage plan` 和 `--no-deepgram` 可以让它免费或很便宜。
 
-### 6.13 SKILL.md 会变成什么样
+### 6.13 SKILL.md 的内容
 
-几十行：执行 `run <url>`（shell 工具有时间上限时带上 `--max-seconds`）；按 6.5 的表处理每种结果状态；把用户的要求换成覆盖参数；多个链接时每个链接调用一次 `run`，最后用表格汇总；用 `status` 找中断的运行。没有状态文件格式，没有步骤清单，没有 Quick Mode。
+约 80 行：执行 `run <url> --max-seconds 300`；按 6.5 的表处理每种结果状态；把用户的要求换成覆盖参数；多个链接时每个链接调用一次 `run`，只在会影响所有视频的结果（`cookies_required`、`rate_limited`、`tool_missing`、`output_dir_missing`）上停下整批，最后用表格汇总；用 `status` 找中断的运行。没有状态文件格式，没有步骤清单，没有 Quick Mode。
 
 ---
 
 ## 7. 核心子系统设计：长文本变换
 
-前面几节讲的是整个项目；这一节放大看 `text` 阶段。它的算法（单元、大纲和术语表、窗口轮次、校验、兜底）保持不变；重构改变的是它的状态放在哪里、由谁调用。
+前面几节讲的是整个项目；这一节放大看 `text` 阶段，它把规范化文档变成文章正文。
 
 ### 7.1 为什么长文本变换是核心难点
 
@@ -1003,49 +1160,49 @@ config       加载、默认值、校验（所有模块都用）
 
 #### 一个执行器
 
-滑动窗口执行器是唯一的执行器，覆盖 `cleanup_zh` 以及双语的 `structure_only` → `translate_only` 两步。旧的固定分块执行器、`long_text_mode` 开关、`summarize`、`quick_cleanup` 和 chapter plan 在 #23 的第 4 阶段删除。固定分块只作为窗口对某一段的兜底保留下来（见下文）。
-
-引入窗口执行器，是因为小的固定分块需要一堆补丁（continuity 上下文、autotune、replan）来掩盖接缝；窗口模式转为默认后，这些补丁已经删除。
+滑动窗口执行器（`kernel/text/window.py`）是唯一的执行器。它执行 `cleanup_zh`，或者双语的 `structure_only` → `translate_only` 两步，第二步给第一步写出的段落编号。它取代了旧的固定分块执行器，后者需要一堆补丁（continuity 上下文、autotune、replan）来掩盖接缝。固定分块只剩两个用处：作为窗口运行输入的切分方式，以及窗口对某一段的兜底（见下文）。
 
 #### 分层理解长文本子系统词汇表
 
 ##### 第 1 层：源文本整形
 
 - **规范化文档（normalized document）**
-  - `normalize` 阶段从带时间的片段生成的标准输入；其中的字幕时间告诉执行器哪里有停顿
+  - `normalize` 阶段生成：清理后的文字、带时间的片段，以及 `preferred_chunk_source`（`chinese` 路线上的字幕为 `text`，其余为 `segments`）；片段的时间告诉执行器哪里有停顿
+- **分块（chunk）**
+  - 第一轮之前，`text` 阶段把规范化文档切成约 `chunk_tokens_<task>` 个 token 的分块（`kernel/text/chunking.py`，列在 `text/manifest.json` 里）：按文字切时在句末切，按片段切时在字幕条之间切；计划判定为 `long` 时还会在每个 YouTube 章节开始处切。分块边界一定也是单元边界。
 - **单元 / `[S<n>]`**
-  - 一个编号的原文句子（`translate_only` 任务里是 `structure_only` 输出的一个段落，超过约 600 token 才拆开）；没有标点的长句在字幕条结束处切开（优先最长停顿），对不上字幕时每约 120 token 切一次
+  - 一个编号的原文句子。超过约 120 token 的句子（没有标点的 ASR 文字里很常见）在字幕条结束处切开，优先最长的停顿；字幕对不上文字时每约 120 token 切一次。`translate_only` 里一个单元是 `structure_only` 输出的一个段落，超过约 600 token 才拆开。
 
 ##### 第 2 层：文档级指导
 
 - **全局大纲**
-  - 对带编号全文的一次前置调用（`window_outline`，用于 `cleanup_zh` 和 `structure_only`），返回章节标题和起始单元；YouTube 章节会映射到单元，从章节处开始的小节沿用章节标题（`cleanup_zh` 下标题没有中文时用译文）
-- **术语表（glossary）**
-  - 人名、术语的正确写法和见到的识别错误；大纲调用会返回一份，另有一份本地生成的转录术语表（不用 LLM），在没有大纲时供各轮使用，并用于质量检查
+  - 用于 `cleanup_zh` 和 `structure_only`（`window_outline: true`）：第一轮之前对带编号的全文做一次调用（`kernel/text/outline.py`），全文超过 `window_outline_read_tokens` 时分几部分做。它返回章节标题和起始单元（检查是否在范围内且递增），以及一份术语表。一轮就能处理完全文时跳过，因为那一轮能看到全部内容。计划判定为 `long` 时，YouTube 章节通过字幕时间映射到单元，作为提示交给模型；从章节处开始的小节沿用章节自己的标题，除非该标题不是输出语言（`cleanup_zh` 里的英文章节标题保留模型的译文）。双语运行里每个标题是一行英文 `##` 加一行中文 `##`。
+- **术语（glossary）**
+  - 人名、术语的正确写法和见到的识别错误。有大纲时，每轮拿到大纲术语中在本窗口出现的那些，`translate_only` 还会拿到它们的中文译法。没有大纲时，`cleanup_zh` 的各轮使用 `text/glossary.json`：一份本地生成（不用 LLM）的转录术语表，来源是分块、标题、频道和章节标题；`verify` 也用这份文件检查最终文字。
 
 ##### 第 3 层：轮次执行与控制
 
 - **游标（cursor）**
   - 第一个还没写出的单元；它之前的内容都已存为完整段落
 - **读窗口 / 写目标**
-  - 一轮从游标读多少原文、输出大约写多少；两者每轮自适应（`window_read_tokens`、`window_write_tokens`）
+  - 一轮从游标读多少原文、输出大约写多少；两者每轮自适应，上限分别是 `window_read_tokens` 和 `window_write_tokens`
 - **轮次（round）**
-  - 一次模型调用：读窗口 + 已写内容的结尾 + 附近的大纲行 + 匹配的术语；模型照抄每个单元的 `[S<n>]` 编号，最后输出 `<!--END-->`
+  - 一次模型调用：读窗口 + 已写内容的结尾（`window_tail_tokens`）+ 附近的大纲行 + 匹配的术语；模型把每个单元的 `[S<n>]` 编号抄在该单元文字前面，最后输出 `<!--END-->`
 - **兜底（fallback）**
-  - 连续多轮无效后，把这一段按一个固定分块处理一次，保证任务继续推进
+  - 同一个游标处连续无效的轮次超过 `window_marker_retries` 次后，把这一段按一个约 `chunk_tokens_<task>` token 的普通固定分块处理一次，保证任务继续推进
 - **占有（ownership）**
-  - 就是 `run` 对视频工作目录的运行锁；执行器自己不再有锁
+  - 就是 `run` 对视频工作目录的运行锁；执行器自己没有锁
 
 ##### 第 4 层：校验、合并与最终输出
 
 - **轮次校验**
-  - 编号齐全、在范围内且递增；输出/原文长度比在合理范围
+  - 编号存在、在窗口范围内且不倒退；输出/原文比例在预期比例的 0.4 到 2.5 倍之间（一轮覆盖至少 200 个原文 token 时才检查）
 - **覆盖率 / 效率**
-  - 哪些单元已写出，多少原文被重复阅读；记在 `state.json` 里
+  - 哪些单元已写出，哪些段落明显短于本次运行的典型比例，多少原文被重复阅读；按任务记在 `state.json` 里
 - **合并（merge）**
-  - 把最后一个任务的段落按顺序确定性拼接
+  - 把最后一个任务的段落按顺序拼接，然后用确定性的合并后清理去掉重复的标题、段落和段首
 - **质量门禁**
-  - 即 `verify` 阶段；semantic anchors（日期、数字、版本号、URL）在那里作为警告检查
+  - 即 `verify` 阶段（6.9）
 
 #### 精简版长文本信息流
 
@@ -1053,13 +1210,16 @@ config       加载、默认值、校验（所有模块都用）
 normalized_document.json
         |
         v
+分块（text/manifest.json、chunk_NNN.txt）
+        |
+        v
 编号单元 [S1..Sn]
         |
         v
-全局大纲 + 术语表（只做一次，缓存在 text/<task>/）
+全局大纲 + 术语（只做一次，保存在窗口状态里）
         |
         v
-一轮：从游标读窗口 + 已写结尾 + 大纲 + 术语
+一轮：从游标读窗口 + 已写结尾 + 大纲行 + 术语
         |
         v
 LLM 后端（宿主 CLI、API 或交给 agent）
@@ -1084,12 +1244,18 @@ merge 阶段 -> verify 阶段 -> assemble 阶段
 
 ### 7.5 长文本子系统的架构设计
 
-#### 实现视图（目标模块）
+#### 实现视图
 
-- **`text`**：单元编号、大纲调用、轮次循环、自适应大小、校验、兜底、覆盖率、合并
-- **`llm`**：三种后端之上的统一请求接口；重试、超时和 `max_tokens` 停止线（配置值按原样使用；窗口轮次遇到被截断的响应时保留完整段落并调小写目标）
-- **`quality`**：`verify` 使用的 semantic anchor 和术语检查
-- **`pipeline`**：每个规划好的任务调用一次执行器，持有运行锁，记录进度和用量
+| 事项 | 代码 |
+|---|---|
+| 分块 | `kernel/text/chunking.py`（`chunk_document`），由 `text` 阶段调用一次 |
+| 单元、轮次、大小调整、校验、兜底、覆盖率 | `kernel/text/window.py`（`process_window`、`run_window_rounds`、`parse_window_output`、`plan_round`、`update_sizing`） |
+| 每个任务的后端选择，以及运行中途改走 API | `process_window` 里的请求函数，底层是 `kernel/llm/agent_cli.py` 和 `kernel/llm/api.py` |
+| 大纲、章节提示、标题放置、每轮的术语 | `kernel/text/outline.py` |
+| 转录术语表和漂移检查 | `kernel/text/glossary.py` |
+| 组装 prompt | `kernel/text/prompting.py` 和 `prompts/*.md` |
+| 合并和接缝清理 | `kernel/text/merge.py`、`kernel/text/cleanup/post_merge.py` |
+| 每个任务调用一次执行器、时间预算、交给 agent、把进度和用量记进 `state.json` | `kernel/pipeline.py`（`stage_text`、`AgentHandoff`、`llm_usage`） |
 
 #### A. 边界由程序决定，而不是模型
 
@@ -1101,7 +1267,7 @@ merge 阶段 -> verify 阶段 -> assemble 阶段
 
 #### C. 大小是软目标
 
-`max_tokens` 只是宽松的停止线。被截断或太慢的轮次之后写目标会调小；读窗口跟着写目标和实测的输出/原文比例走，尽量少重复读原文。剩下的原文一轮能写完时就一次发完。
+`max_tokens`（`max_output_tokens_<task>`，默认 8192）只是宽松的停止线。写目标从 `window_write_tokens` 开始；某轮被截断或用时超过请求超时的一半，就缩小四分之一；连续两轮正常，就增大十分之一，但不超过 `window_write_tokens`，也不超过 `max_tokens` 的四分之三。读窗口跟着写目标和实测的输出/原文比例走，再加四分之一的余量，尽量少重复读原文。剩下的原文一轮能写完时就一次发完。
 
 #### D. 优先确定性校验
 
@@ -1113,7 +1279,7 @@ merge 阶段 -> verify 阶段 -> assemble 阶段
 
 #### F. 持久化状态
 
-每个任务的窗口状态（游标、大纲、自适应大小、已保存段落）放在视频工作目录的 `text/<task>/` 下，重跑 `run` 会从游标续跑。请求数、token 用量和耗时记进 `state.json`。没有单独的 telemetry 文件，也没有暂停或取消信号：停掉进程再重跑就是控制手段，`--max-seconds` 则在两轮之间干净地停下。
+每个任务的窗口状态放在视频工作目录里：第一个任务在 `text/window/`，`translate_only` 在 `text/window/processed/`，各有一个 `state.json`（游标、大纲、大小、每轮的记录），每个保存的段落一个 `out_NNNNN.md` 文件。只要单元、prompt 和状态格式没变，重跑 `run` 就从游标续跑；否则这个任务从头开始。请求数、估算的 token 数和每个任务的覆盖率记进视频的 `state.json`。没有单独的 telemetry 文件，也没有暂停或取消信号：停掉进程再重跑就是控制手段，`--max-seconds` 则在两轮之间干净地停下。
 
 ### 7.6 为什么这个子系统设计适合整个项目
 
@@ -1139,7 +1305,7 @@ merge 阶段 -> verify 阶段 -> assemble 阶段
 
 ### 8.4 为什么删掉 runtime 契约层
 
-三月加入的 runtime 层（policy、evaluator、decision 记录、recovery 提示、ledger、artifact graph，以及对外的 create/inspect/advance API）本意是给弱模型和 harness 一个结构化契约：当前状态、允许的下一步动作和推荐的决定。用意是对的，但这个契约从没送到模型面前：只有带 `--api-envelope` 才会输出，而 `SKILL.md` 从不传这个参数，也没有别的东西读它。`run` 接管流程以后，模型不再选择下一步动作，这个契约就没有读者了。模型仍然需要的是整次运行的结果，6.5 节用几个字段给出。真正起作用的部分（占有锁、可续跑的状态、用量记录）移进 `pipeline` 和 `state.json`，其余删除。
+三月加入的 runtime 层（policy、evaluator、decision 记录、recovery 提示、ledger、artifact graph，以及对外的 create/inspect/advance API）本意是给弱模型和 harness 一个结构化契约：当前状态、允许的下一步动作和推荐的决定。用意是对的，但这个契约从没送到模型面前：只有带 `--api-envelope` 才会输出，而 `SKILL.md` 从不传这个参数，也没有别的东西读它。`run` 接管流程以后，模型不再选择下一步动作，这个契约就没有读者了。模型仍然需要的是整次运行的结果，6.5 节用几个字段给出。真正起作用的部分（占有锁、可续跑的状态、用量记录）已移进 `pipeline` 和 `state.json`，其余在第 4 阶段删除。这一层当初的设计理由见 [9.3](#93-设计历史) 链接的 2026-03-19 研究笔记。
 
 ### 8.5 为什么长文本变换是子系统，而不是整个项目
 
@@ -1165,42 +1331,72 @@ merge 阶段 -> verify 阶段 -> assemble 阶段
 
 ---
 
-## 9. 实现映射与迁移（附录）
+## 9. 实现对照（附录）
 
-本节把现有代码和目标对应起来。阶段编号指 tracker #23 里的阶段。
+### 9.1 设计的每一部分在哪里实现
 
-| 现在 | 目标 | 阶段 |
-|---|---|---|
-| `SKILL.md`（约 370 行）和 `workflows/*.md` 驱动流程 | `run <url>` 驱动流程；`SKILL.md` 缩到几十行；删除 `workflows/` | 2、3 |
-| 15 分钟以下视频走 Quick Mode；短视频的文字由宿主模型在对话里处理 | 删除；短视频走 `run`，一轮窗口，通过 LLM 后端处理 | 3 |
-| `scripts/run_regression.py` 里有流程唯一的脚本化副本 | 它的流程变成 `pipeline`；回归脚本改为调用 `run` | 2 |
-| 没有端到端测试 | 4 个真实视频的 fixtures 加假 LLM 命令行，离线运行 | 1 |
-| `/tmp/<video_id>_state.md`、`machine_state.json`、分块 `manifest.json`、`telemetry.jsonl`、`/tmp/<video_id>_*` 文件 | `/tmp/yt-transcript/<video_id>/`，只有一个 `state.json` | 2、4 |
-| `validate-state` 的阶段检查 | `pipeline` 内部断言 | 4 |
-| `find-unfinished` | `status` | 2 |
-| `scripts/preflight.sh` | `run` 内部各阶段的检查 | 4 |
-| `scripts/cleanup.sh` | `cleanup` 阶段和命令 | 2、4 |
-| `kernel/task_runtime/*`（policy、decision、evaluator、recovery、ledger、artifacts、api、lifecycle、contracts）、`--api-envelope`、11 个外层编排命令、暂停和取消 | 删除；运行锁和状态移进 `pipeline` | 4 |
-| 固定分块执行器（`kernel/long_text/processing.py`，它在 `lifecycle.py`、`contracts.py` 里的 manifest 和契约，执行器路由 `execution.py`）、`long_text_mode`、`summarize`、`chapter_plan` / `build-chapter-plan`、`prompts/summarize.md`、`prompts/quick_cleanup.md` | 删除；只保留窗口执行器 | 4 |
-| `chunk-document`、`chunk-segments`、`chunk-text`（`kernel/long_text/chunking.py`） | 一个从规范化文档生成单元的内部步骤 | 4 |
-| legacy 开关（`chunk_mode: chars`、旧配置名、`--legacy-flat-output`、旧 manifest 兼容） | 删除 | 4 |
-| `yt_transcript_utils.py`（约 8000 行）和 kernel 模块里的 `_bind_utils_globals` | `cli`、`pipeline`、`sources`、`text`、`llm`、`quality`、`config`，显式导入 | 5 |
-| `kernel/subtitle_language.py` | `sources` | 5 |
-| `kernel/long_text/window.py`、`outline.py`、`glossary.py`、`merge.py`、`prompting.py`、`kernel/text_cleanup/*` | `text` | 5 |
-| `kernel/long_text/llm.py`、`agent_cli.py` | `llm` | 5 |
-| `kernel/long_text/semantic.py`、utils 里的质量检查 | `quality` | 5 |
-| `scripts/download.sh` | 先由 `sources` 作为子进程调用，后并入 `sources` | 2、5 |
-| `system_design_notes/`、本文开头的"目标架构"标注 | 删除；README 按新入口重写 | 6 |
+| 设计 | 代码 |
+|---|---|
+| 入口脚本和命令（6.10） | `yt_transcript_utils.py` → `kernel/cli.py` |
+| 阶段列表、`state.json`、运行锁、续跑、覆盖参数、结果和退出码（6.2、6.4 到 6.6） | `kernel/pipeline.py`：`STAGES`、`EXIT_CODES`、`_Run.execute`、`_Run.run_stage`、`_Run.invalidate`、`acquire_lock`、`run`、`status`、`cleanup` |
+| `--max-seconds` 和 `in_progress`（6.7） | `_Run.deadline_passed`，以及 `stage_text` 交给窗口执行器的 `stop_check` |
+| 调用 yt-dlp、更新检查、`needs_user` 的原因（6.2） | `_Run.download`、`_Run.update_yt_dlp`、`classify_download_error`；`scripts/download.sh`、`scripts/update_yt_dlp.sh` |
+| 语言判断和字幕轨选择（6.3） | `kernel/sources/subtitle_language.py`（`select_subtitle_candidates`）、`_Run.stage_source`、`_Run.subtitle_route` |
+| 字幕质量分和改道（6.3） | `kernel/text/subtitle_quality.py`，在 `_Run.subtitle_route` 里使用 |
+| Deepgram（6.3） | `kernel/sources/deepgram.py`（`transcribe_deepgram`）、`_Run.transcribe` |
+| VTT 解析和字幕清理 | `kernel/text/cleanup/subtitle.py`、`cjk.py`、`overlap.py` |
+| 规范化文档 | `kernel/text/normalize.py` |
+| 文字处理计划 | `kernel/text/plan.py`、`_Run.stage_plan` |
+| 长文本子系统（第 7 节） | 见 7.5 |
+| LLM 后端（6.8） | `kernel/llm/agent_cli.py`、`kernel/llm/api.py`；选择在 `kernel/text/window.py`；交给 agent 在 `kernel/pipeline.py`（`AgentHandoff`） |
+| 质量检查（6.9） | `kernel/quality/verify.py`、`kernel/quality/semantic.py` |
+| 组装文章（6.9） | `kernel/text/assemble.py`、`_Run.stage_assemble` |
+| 配置和默认值 | `kernel/config.py`，每一项在 `config.example.yaml` 里有说明 |
+| 与宿主的约定（6.13） | `SKILL.md` |
+| 测试（6.12） | `tests/`、`scripts/run_regression.py` |
 
-全程不变的：字幕语言选择、Deepgram 转写、窗口执行器的算法、大纲和术语表、质量检查。它们只搬位置，不改行为。
+### 9.2 代码和计划不同的地方
 
-用户能感觉到的行为变化：
+实现这份设计时依据的计划，和代码有几处不同，都是有意为之：
+
+- 6.11 里模块结构的四点：字幕质量在 `text`，`download.sh` 仍是子进程，交给 agent 的逻辑在 `pipeline`，默认值都归 `config.py`；
+- `subtitle-info` 从 stdin 读 yt-dlp 元数据，而不是接收一个链接，因为 `download.sh` 把元数据管道给它，而 `run` 直接用已经取到的元数据；
+- `text` 阶段在窗口运行之前仍然先把原文切成分块，因为分块既决定单元边界的切分方式，也是兜底处理的大小。
+
+### 9.3 设计历史
+
+这份设计分七个阶段实现，每个阶段一个 pull request，总 tracker 是 [#23](https://github.com/williamwang-ty/yt-transcript/issues/23)：
+
+| 阶段 | 改动 |
+|---|---|
+| 0（[#31](https://github.com/williamwang-ty/yt-transcript/pull/31)） | 这份设计文档 |
+| 1（[#32](https://github.com/williamwang-ty/yt-transcript/pull/32)） | 基于录好的 fixtures 的离线端到端测试，配有假的 yt-dlp、Deepgram 和 LLM |
+| 2（[#33](https://github.com/williamwang-ty/yt-transcript/pull/33)） | `run` 命令和每个视频一个的 `state.json`，从回归脚本里那份流程副本改造而来 |
+| 3（[#34](https://github.com/williamwang-ty/yt-transcript/pull/34)） | `SKILL.md` 缩减为驱动 `run`；删除 Quick Mode 和 `workflows/`；yt-dlp 更新检查移进 `run` |
+| 4（[#35](https://github.com/williamwang-ty/yt-transcript/pull/35)） | 删除冗余层：手写的 `state.md` 及其检查，runtime 契约层（policy、decision、evaluator、recovery、ledger、artifacts、对外 API、暂停和取消、telemetry），固定分块执行器连同 `summarize` 和 chapter plan，legacy 开关，`preflight.sh` 和 `cleanup.sh`，以及大部分对外命令 |
+| 5（[#36](https://github.com/williamwang-ty/yt-transcript/pull/36)） | 把约 8000 行的 `yt_transcript_utils.py` 拆成 `kernel/` 下的各个包，显式导入 |
+| 6 | 文档：补全本文，删除 `system_design_notes/`，重写 README |
+
+`state.json` 取代了手写的 `state.md`、`machine_state.json`、分块 `manifest.json` 里的执行状态（现在留下的 `text/manifest.json` 只列出分块文件）、`telemetry.jsonl`，以及散落的 `/tmp/<video_id>_*` 文件。
+
+和第 3 阶段之前由 agent 驱动的流程相比，用户能感觉到的行为变化：
 
 1. 短视频的文字改由 LLM 后端（通常是宿主 CLI）处理，不再由宿主模型在对话里直接写。
-2. 首选字幕轨被限流时，运行以 `needs_user` 停下，不再悄悄换用另一条字幕轨（6.3）。
+2. 首选字幕轨被拒时，运行以 `needs_user` 停下，不再悄悄换用另一条字幕轨（6.3）。
 3. 对已完成的视频重跑会返回已有的文章，而不是从头再做；要重做用 `--restart`。
 4. 字幕质量改道在 `source` 内部、规范化之前完成；结果不变。
 5. 新增：`--max-seconds` 和 `in_progress` 结果，用于 shell 有时间上限的宿主。
+
+字幕语言选择、Deepgram 转写、窗口执行器的算法、大纲和术语表、质量检查都只是搬了位置，行为没变；唯一的例外是第 3 阶段的两处输出修正：窗口输出合并时不再拼接短段落（这曾把双语的中英两段粘在一起），`structure_only` 去掉 `-` 说话人标记。
+
+这次重构之前写的设计笔记和本文的旧版本在第 6 阶段删除，但在第 6 阶段之前的最后一个提交和 git 历史里仍然可以读到（`git log -- SYSTEM_DESIGN.md system_design_notes/`）：
+
+- [研究笔记，2026-03-19](https://github.com/williamwang-ty/yt-transcript/blob/f33bb9f302cc41c4b8fc436db611f2212f6d2efc/system_design_notes/20260319_SYSTEM_DESIGN_RESEARCH_NOTES.md)：项目属于哪种架构，以及"adaptive runtime"的设想，它后来成了 runtime 契约层（第 4 阶段删除，见 8.4）。
+- [最终交付物质量规划，2026-03-25](https://github.com/williamwang-ty/yt-transcript/blob/f33bb9f302cc41c4b8fc436db611f2212f6d2efc/system_design_notes/20260325_SYSTEM_DESIGN_FINAL_DELIVERABLE_QUALITY_PLAN.md)：文章质量问题从哪里来，哪些归代码、哪些归 LLM。
+- [架构 review，2026-03-30](https://github.com/williamwang-ty/yt-transcript/blob/f33bb9f302cc41c4b8fc436db611f2212f6d2efc/system_design_notes/20260330_SYSTEM_DESIGN_ARCHITECTURE_REVIEW.md)：脚本和 LLM 的边界。
+- [第 6 阶段之前的本文](https://github.com/williamwang-ty/yt-transcript/blob/f33bb9f302cc41c4b8fc436db611f2212f6d2efc/SYSTEM_DESIGN.md)：其中第 9 节逐个列出旧文件和旧命令在每个阶段去了哪里。
+
+每个阶段的理由和验证记录在上表链接的 pull request 和 issue 里。
 
 ---
 

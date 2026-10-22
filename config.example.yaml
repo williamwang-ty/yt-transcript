@@ -9,25 +9,34 @@ deepgram_api_key: "your_deepgram_api_key_here"
 # Optional advanced Deepgram model override. The default path is Nova 3.
 # Legacy nova-2 variants are automatically upgraded to nova-3 at runtime.
 deepgram_model: "nova-3"
-# Structured transcript assembly now defaults on.
-# Set either flag to false only when debugging parity with the legacy flat path.
+# The transcript is built from Deepgram's utterances (one block per speaker
+# turn), falling back to its paragraphs and then its words. Set
+# deepgram_enable_utterances to false to stop requesting utterances, or
+# deepgram_prefer_structured_output to false to use Deepgram's plain
+# transcript string instead. Both are meant for debugging; keep them true.
 deepgram_enable_utterances: true
 deepgram_prefer_structured_output: true
 
 # Output directory for transcribed files. This is the only always-required field.
+# The YT_TRANSCRIPT_OUTPUT_DIR environment variable replaces it.
 output_dir: "~/Downloads"
 
 # yt-dlp tuning (optional)
 # These default to conservative bounded values to avoid long hangs.
 # Invalid, empty, or negative values automatically fall back to these defaults.
+# YT_DLP_SOCKET_TIMEOUT_SEC, YT_DLP_RETRIES, YT_DLP_EXTRACTOR_RETRIES,
+# YT_DLP_COOKIES_FROM_BROWSER and YT_DLP_COOKIES_FILE in the environment win
+# over the keys in this file.
 yt_dlp_socket_timeout_sec: 15
 yt_dlp_retries: 1
 yt_dlp_extractor_retries: 1
 
 # YouTube anti-bot / login handling (optional)
 # Default behavior: yt-transcript does NOT read browser cookies up front.
-# If yt-dlp hits "Sign in to confirm you're not a bot", download.sh will
-# automatically retry (up to 3 attempts) with: --cookies-from-browser chrome
+# If yt-dlp hits "Sign in to confirm you're not a bot" (or a rate limit or a
+# sign-in request), download.sh automatically retries (up to 3 attempts) with
+# --cookies-from-browser chrome. If that does not help, `run` stops with
+# needs_user; a bot check or a sign-in wall is fixed with an option below.
 #
 # Leave these blank unless you want to force a specific auth source.
 # This is useful when:
@@ -47,11 +56,14 @@ yt_dlp_cookies_file: ""
 # LLM backend for the text of every video: auto | api
 # auto: send the requests to the calling agent's own CLI (Claude Code `claude -p`,
 #       Codex `codex exec`, OpenCode, pi, Gemini CLI, Cursor), detected from the
-#       environment or named in llm_agent_cli below. The CLI must answer a
-#       short probe first; if it can't, or fails mid-run, the API below is
-#       used instead. With neither, `run` hands each request to the calling
-#       agent (`needs_agent_text`).
-# api:  always use the API below.
+#       environment or named in llm_agent_cli below (the YT_TRANSCRIPT_AGENT_CLI
+#       environment variable wins over both). The CLI runs in an empty temporary
+#       directory and must answer a short probe first; if it can't, or fails
+#       mid-run, the API below is used instead when it is configured.
+# api:  skip the CLI and use the API below.
+# With no working CLI and no configured API (llm_api_key, llm_base_url and
+# llm_model all set), `run` hands each request to the calling agent
+# (`needs_agent_text`).
 llm_backend: "auto"
 # Optional fixed agent for auto mode: a name above or a full non-interactive
 # command (use {prompt} where the prompt goes; otherwise it is sent on stdin).
@@ -62,9 +74,10 @@ llm_cli_probe_timeout_sec: 120
 
 # LLM API Configuration
 # Fallback for llm_backend=auto, and the only backend for llm_backend=api.
+# Leave llm_api_key empty to not use an API.
 # Format: "openai" (OpenAI-compatible) or "anthropic" (Anthropic Messages API)
 llm_api_format: "openai"
-llm_api_key: "your_llm_api_key_here"
+llm_api_key: ""
 # Can be either provider root URL or a /v1 URL; the tool normalizes both.
 llm_base_url: "https://api.deepseek.com"
 llm_model: "deepseek-v4-pro"
@@ -98,10 +111,11 @@ window_marker_retries: 1
 # outline (section titles + first unit) and a list of names and terms with
 # their correct spellings. Rounds get the nearby outline lines and the terms
 # found in their window; section headings come only from the outline (written
-# by the model where the topic really starts, else placed by the program). The
-# video's YouTube chapters are given as hints. If the outline fails, rounds
-# place their own headings. The source is outlined in parts when it is longer
-# than window_outline_read_tokens; raise it for long-context models.
+# by the model where the topic really starts, else placed by the program). For
+# a long video, its YouTube chapters are given as hints. The outline is skipped
+# when one round can process the whole text; if it fails, rounds place their
+# own headings. The source is outlined in parts when it is longer than
+# window_outline_read_tokens; raise it for long-context models.
 window_outline: true
 window_outline_read_tokens: 16000
 window_outline_max_terms: 40
