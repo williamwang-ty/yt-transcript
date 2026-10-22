@@ -14,6 +14,8 @@ It works at three levels:
 - **Subsystem level** (section 7): how the hardest stage, long-text transformation, works inside that command.
 - **Implementation map** (section 9): which module implements each part, where the code differs from the plan it was built from, and how it got to this shape.
 
+**Design history**: [section 9.3](#93-design-history) lists each stage of the refactor that produced this design, with its pull request, and links to the earlier design notes and the previous version of this document. Those were deleted from the repository but stay readable there.
+
 `SYSTEM_DESIGN.md` is the single authoritative design document for this repository.
 
 ---
@@ -58,7 +60,7 @@ Past a certain length, the text no longer fits one reliable call, interruptions 
 
 ### 3.5 The flow itself must not depend on the model following instructions
 
-In the old design the agent executed the flow by reading about 370 lines of `SKILL.md` plus three workflow documents, running some twenty commands, and hand-writing a `state.md` file. That had predictable costs:
+In the old design (before stage 3; see [9.3](#93-design-history)) the agent executed the flow by reading about 370 lines of `SKILL.md` plus three workflow documents, running some twenty commands, and hand-writing a `state.md` file. That had predictable costs:
 
 - weaker hosts skipped or reordered steps, and the documented Quick Mode skipped planning and the quality check outright
 - the flow could not be tested end to end, because it existed only as prose
@@ -600,7 +602,7 @@ Earlier versions put the flow in `SKILL.md` prose. Section 3.5 lists the result:
 
 ### 8.4 Why the runtime contract layer was removed
 
-The March runtime layer (policy, evaluator, decision records, recovery hints, ledger, artifact graph, and an external create/inspect/advance API) was meant to give weak models and harnesses a structured contract: the current state, the allowed next actions, and a recommended decision. The intent was sound, but the contract never reached the model: it was printed only with `--api-envelope`, which `SKILL.md` never passed, and nothing else read it. Once `run` owned the flow, the model no longer chose next actions, so the contract had no reader. What the model still needs is the result of a whole run, which section 6.5 gives in a few fields. The parts that did work (the ownership lock, resumable state, usage records) moved into `pipeline` and `state.json`; the rest was deleted in stage 4.
+The March runtime layer (policy, evaluator, decision records, recovery hints, ledger, artifact graph, and an external create/inspect/advance API) was meant to give weak models and harnesses a structured contract: the current state, the allowed next actions, and a recommended decision. The intent was sound, but the contract never reached the model: it was printed only with `--api-envelope`, which `SKILL.md` never passed, and nothing else read it. Once `run` owned the flow, the model no longer chose next actions, so the contract had no reader. What the model still needs is the result of a whole run, which section 6.5 gives in a few fields. The parts that did work (the ownership lock, resumable state, usage records) moved into `pipeline` and `state.json`; the rest was deleted in stage 4. The layer's original rationale is in the 2026-03-19 research notes linked from [9.3](#93-design-history).
 
 ### 8.5 Why long-text transformation is a subsystem, not the whole project
 
@@ -658,7 +660,7 @@ The plan this design was implemented from differs from the code in a few places,
 - `subtitle-info` reads yt-dlp metadata on stdin instead of taking a URL, because `download.sh` pipes into it and `run` uses the metadata it already fetched;
 - the `text` stage still cuts the source into chunks before the window run, because a chunk is both the boundary layout of the units and the size of the fallback.
 
-### 9.3 How the code got here
+### 9.3 Design history
 
 The design was implemented in seven stages, one pull request each, under tracker [#23](https://github.com/williamwang-ty/yt-transcript/issues/23):
 
@@ -715,6 +717,8 @@ Each stage's reasoning and checks are in its pull request and issue linked in th
 - **子系统层**（第 7 节）：这条命令里最难的阶段，也就是长文本变换，是怎样工作的。
 - **实现对照**（第 9 节）：每一部分由哪个模块实现，代码和当初的计划有哪些不同，以及代码是怎样走到现在这个样子的。
 
+**设计历史**：[第 9.3 节](#93-设计历史)列出产生这份设计的重构的每个阶段及其 pull request，并链接到早期的设计笔记和本文的旧版本。它们已从仓库中删除，但从那里仍然可以阅读。
+
 `SYSTEM_DESIGN.md` 是本仓库唯一权威的设计文档。
 
 ---
@@ -759,7 +763,7 @@ LLM 只用来处理文字，从不决定下一步做什么。
 
 ### 3.5 流程本身不能依赖模型遵守说明
 
-旧设计里，agent 要读约 370 行的 `SKILL.md` 和三份 workflow 文档，执行二十来条命令，还要手写一个 `state.md` 文件，以此来执行流程。代价是可以预见的：
+旧设计里（第 3 阶段之前，见 [9.3](#93-设计历史)），agent 要读约 370 行的 `SKILL.md` 和三份 workflow 文档，执行二十来条命令，还要手写一个 `state.md` 文件，以此来执行流程。代价是可以预见的：
 
 - 弱一些的宿主会跳步或打乱顺序，文档里的 Quick Mode 干脆跳过了规划和质量检查
 - 流程只存在于文字说明里，没法做端到端测试
@@ -1301,7 +1305,7 @@ merge 阶段 -> verify 阶段 -> assemble 阶段
 
 ### 8.4 为什么删掉 runtime 契约层
 
-三月加入的 runtime 层（policy、evaluator、decision 记录、recovery 提示、ledger、artifact graph，以及对外的 create/inspect/advance API）本意是给弱模型和 harness 一个结构化契约：当前状态、允许的下一步动作和推荐的决定。用意是对的，但这个契约从没送到模型面前：只有带 `--api-envelope` 才会输出，而 `SKILL.md` 从不传这个参数，也没有别的东西读它。`run` 接管流程以后，模型不再选择下一步动作，这个契约就没有读者了。模型仍然需要的是整次运行的结果，6.5 节用几个字段给出。真正起作用的部分（占有锁、可续跑的状态、用量记录）已移进 `pipeline` 和 `state.json`，其余在第 4 阶段删除。
+三月加入的 runtime 层（policy、evaluator、decision 记录、recovery 提示、ledger、artifact graph，以及对外的 create/inspect/advance API）本意是给弱模型和 harness 一个结构化契约：当前状态、允许的下一步动作和推荐的决定。用意是对的，但这个契约从没送到模型面前：只有带 `--api-envelope` 才会输出，而 `SKILL.md` 从不传这个参数，也没有别的东西读它。`run` 接管流程以后，模型不再选择下一步动作，这个契约就没有读者了。模型仍然需要的是整次运行的结果，6.5 节用几个字段给出。真正起作用的部分（占有锁、可续跑的状态、用量记录）已移进 `pipeline` 和 `state.json`，其余在第 4 阶段删除。这一层当初的设计理由见 [9.3](#93-设计历史) 链接的 2026-03-19 研究笔记。
 
 ### 8.5 为什么长文本变换是子系统，而不是整个项目
 
@@ -1359,7 +1363,7 @@ merge 阶段 -> verify 阶段 -> assemble 阶段
 - `subtitle-info` 从 stdin 读 yt-dlp 元数据，而不是接收一个链接，因为 `download.sh` 把元数据管道给它，而 `run` 直接用已经取到的元数据；
 - `text` 阶段在窗口运行之前仍然先把原文切成分块，因为分块既决定单元边界的切分方式，也是兜底处理的大小。
 
-### 9.3 代码是怎样走到现在的
+### 9.3 设计历史
 
 这份设计分七个阶段实现，每个阶段一个 pull request，总 tracker 是 [#23](https://github.com/williamwang-ty/yt-transcript/issues/23)：
 

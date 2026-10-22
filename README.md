@@ -8,7 +8,7 @@
 
 An agent skill that turns a YouTube video into one formatted Markdown article: a Chinese article for a Chinese video, or the English text with a Chinese translation for an English video. It uses the video's own subtitles, or Deepgram speech-to-text when there are none worth trusting, and an LLM to restore punctuation, paragraphs and headings.
 
-[SKILL.md](SKILL.md) is what the host agent reads. [SYSTEM_DESIGN.md](SYSTEM_DESIGN.md) explains the design and why it is built this way. This README covers installing, configuring and running it.
+[SKILL.md](SKILL.md) is what the host agent reads. [SYSTEM_DESIGN.md](SYSTEM_DESIGN.md) explains the design and why it is built this way; its [design history](SYSTEM_DESIGN.md#93-design-history) section shows how the design changed, with links to the earlier design notes. This README covers installing, configuring and running it.
 
 ### How it works
 
@@ -235,7 +235,7 @@ MIT License
 
 一个 agent skill：把 YouTube 视频变成一篇排好版的 Markdown 文章。中文视频得到一篇中文文章，英文视频得到英文原文加中文翻译。它使用视频自带的字幕，没有可信字幕时用 Deepgram 语音转文字，再用 LLM 恢复标点、分段和小标题。
 
-[SKILL.md](SKILL.md) 是宿主 agent 读的说明，[SYSTEM_DESIGN.md](SYSTEM_DESIGN.md) 讲设计以及为什么这样设计。本文讲安装、配置和使用。
+[SKILL.md](SKILL.md) 是宿主 agent 读的说明，[SYSTEM_DESIGN.md](SYSTEM_DESIGN.md) 讲设计以及为什么这样设计，其中的[设计历史](SYSTEM_DESIGN.md#93-设计历史)一节说明设计是怎样演变的，并链接到早期的设计笔记。本文讲安装、配置和使用。
 
 ### 工作方式
 
