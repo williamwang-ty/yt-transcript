@@ -32,7 +32,7 @@ class LanguageRegressionTests(unittest.TestCase):
             "ijFSEb2W6_8": ("en", True, True, "en", "auto", "bilingual"),
             "nmgFG7PUHfo": ("en", True, True, "en", "manual", "bilingual"),
             "tGVSOK3PNUI": ("ja", False, False, "", "", ""),
-            "DQGrPstFRVI": ("", None, False, "", "", ""),
+            "DQGrPstFRVI": ("zh", True, False, "", "", ""),
             "Fhx_qNS2P8g": ("zh", True, True, "zh-Hans", "manual", "chinese"),
         }
         self.assertEqual(set(expected), set(REAL_METADATA))
@@ -63,6 +63,69 @@ class LanguageRegressionTests(unittest.TestCase):
         self.assertEqual(info["source_language_signal"], "original_audio_track")
         self.assertEqual(info["listed_candidates"], [])
         self.assertEqual(info["unsupported_reason"], "")
+
+    def test_video_text_guesses_the_language_only_when_nothing_else_names_it(self):
+        """Test the title/description script guess, on the real regression-set text."""
+        # DQGrPstFRVI has no tracks and no language field: its Chinese title and description decide.
+        info = subtitle_language.build_subtitle_info(REAL_METADATA["DQGrPstFRVI"])
+        self.assertEqual(info["source_language_signal"], "video_text")
+        self.assertEqual(info["listed_candidates"], [])
+        self.assertEqual(info["unsupported_reason"], "")
+        # Every other video keeps its stronger signal.
+        for vid, metadata in REAL_METADATA.items():
+            if vid != "DQGrPstFRVI":
+                with self.subTest(vid=vid):
+                    signal = subtitle_language.build_subtitle_info(metadata)["source_language_signal"]
+                    self.assertNotIn(signal, subtitle_language.GUESSED_SIGNALS)
+        # With the stronger signals removed, the text alone names each video's spoken language,
+        # except English, which Latin script cannot tell apart from other languages.
+        expected = {"H_peyIigkkc": "zh", "wu0zS1AuI_E": "zh", "JkMWjp5AXhM": "zh", "DQGrPstFRVI": "zh",
+                    "Fhx_qNS2P8g": "zh", "tGVSOK3PNUI": "ja", "CIatbV3_Rjg": "", "ijFSEb2W6_8": "",
+                    "nmgFG7PUHfo": ""}
+        for vid, language in expected.items():
+            with self.subTest(vid=vid):
+                text_only = {key: REAL_METADATA[vid][key] for key in ("title", "description", "tags", "chapters")}
+                detected = subtitle_language.detect_source_language(text_only)
+                self.assertEqual(detected["language"], language)
+                self.assertEqual(detected["signal"], "video_text" if language else "unknown")
+
+    def test_video_text_reads_the_script_not_the_words(self):
+        """Test which text gives a language guess."""
+        links = "".join(f"https://www.youtube.com/watch?v=id{n}\n" for n in range(20))
+        cases = {
+            "오늘의 뉴스 요약": "ko",
+            "東京の桜が満開になりました": "ja",
+            "小明の日常 第一集": "zh",            # one stylistic kana does not make it Japanese
+            "Berita terbaru hari ini": "",       # Latin script: English, Indonesian, ... look alike
+            "Elon Musk interview 中文字幕": "",   # too few CJK characters
+            "冰河期": "",
+        }
+        for title, language in cases.items():
+            with self.subTest(title=title):
+                self.assertEqual(subtitle_language.detect_source_language({"title": title})["language"], language)
+        # Links in the description are not words.
+        payload = {"title": "2030 冰河期 | 老高與小茉 Mr & Mrs Gao", "description": links}
+        self.assertEqual(subtitle_language.detect_source_language(payload)["language"], "zh")
+        # Mostly English text with a little Chinese gives no guess.
+        payload = {"title": "AI 中文学习", "description": "An English description of this English talk. " * 3}
+        self.assertEqual(subtitle_language.detect_source_language(payload)["signal"], "unknown")
+
+    def test_video_text_never_beats_a_track_signal(self):
+        """Test a Chinese title does not override the spoken language the ASR track names."""
+        payload = {
+            "id": "vid",
+            "title": "马斯克最新访谈：人工智能将改变一切",
+            "automatic_captions": {"en": _caption("vid", lang="en", kind="asr")},
+        }
+        info = subtitle_language.build_subtitle_info(payload)
+        self.assertEqual((info["source_language"], info["source_language_signal"]), ("en", "asr_track"))
+        self.assertEqual(info["mode"], "bilingual")
+
+    def test_unsupported_guess_says_it_comes_from_the_title(self):
+        """Test a Japanese title without tracks stops as unsupported and says the language was guessed."""
+        info = subtitle_language.build_subtitle_info({"id": "vid", "title": "東京の桜が満開になりました"})
+        self.assertEqual((info["source_language"], info["source_language_supported"]), ("ja", False))
+        self.assertIn("guessed from the video's title and description", info["unsupported_reason"])
 
     def test_unsupported_language_explains_why(self):
         """Test a Japanese video reports the unsupported spoken language."""

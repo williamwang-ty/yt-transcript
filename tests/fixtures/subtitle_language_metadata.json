@@ -1,9 +1,59 @@
 {
- "description": "Trimmed yt-dlp 2026.08.19 metadata (yt-dlp -J, 2026-10-14) for the live regression videos: caption maps keep only the URL query fields that matter (lang, kind, tlang) and a sample of the ~155 auto-translation targets.",
+ "description": "Trimmed yt-dlp 2026.08.19 metadata (yt-dlp -J, 2026-10-14) for the live regression videos: caption maps keep only the URL query fields that matter (lang, kind, tlang) and a sample of the ~155 auto-translation targets. Title, channel, tags, chapter titles and the first 1500 characters of the description come from yt-dlp -J on 2026-10-22.",
  "videos": {
   "H_peyIigkkc": {
    "id": "H_peyIigkkc",
    "language": "zh-Hant",
+   "title": "不想投 AI 了？MCD、MA……5 家被低估的极深护城河公司",
+   "channel": "美股IRR手记",
+   "description": "被低估的5大“印钞机”美股！不靠AI、垄断定价、估值罕见跌出安全边际\n\n过去两年美股全靠AI赛道狂飙，但万一大盘回调、AI叙事降温，你的账户还能睡得着觉吗？\n\n本期视频深度盘点 5 家业务硬核、几乎不受AI泡沫影响的“收税型/收费站”美股巨头。它们的共同特质是：商业壁垒极深、现金流极其充沛、拥有无可替代的垄断级定价权，且当前估值普遍跌入过去5年的历史低位或合理区间。其中一家更是全市场罕见的“霸道定价权垄断者”，我近期正打算择机建仓！\n\n\n0:00 开篇引言：AI狂欢下的隐忧与非AI印钞机\n1:10 标的一（MCD）：麦当劳的本质其实是地产地主\n2:41 麦当劳的当前困境与估值错杀分析\n4:34 标的二（MA）：万事达的双边网络效应与过路费生意\n6:33 万事达的暴利财务模型与溢价抹平机会\n8:14 标的三（ISRG）：直觉外科的“剃刀+刀片”耗材闭环\n10:00 ISRG的手术量增长与罕见估值窗口\n11:15 标的四（SPGI）：标普全球的两大天然垄断印钞机\n12:50 标普如何暗发“AI财”？被恐慌错杀的估值底\n14:25 标的五（TDG）：霸道定价权的航空零部件垄断巨头\n16:07 军火暴利4451%？TransDigm的杠杆模式与买入逻辑\n17:48 终极对比总结：5大收税型资产与个人重点建仓标的\n\n欢迎在评论区留下你心目中护城河最宽的非AI现金流好公司！如果视频对你有启发，请别忘了点赞、订阅并打开小铃铛！\n\n\n【The IRR Desk】\n用 IRR 思维做投资决策：护城河评分 → 情景估值 → 仓位管理，一条完整的分析流水线。\n📊 完整评分表模板 研报与工具：https://irrdesk.com\n🌐：https://irrdesk.com\n🐦 X/Twitter：https://x.com/chrisirrdesk\n⸻\n这个频道不给目标价，只给算法。不靠感觉，不听消息——No feelings. No tips. Just math.\n⚠️ 免责声明：本视频内容仅为个人研究分享与教育用途，不构成任何投资建议。投资有风险，决策请独立判断。",
+   "tags": [
+    "#美股投资",
+    "#价值投资",
+    "#美股研究",
+    "#基本面分析",
+    "股票估值",
+    "数据分析",
+    "美股入门"
+   ],
+   "chapters": [
+    {
+     "title": "开篇引言：AI狂欢下的隐忧与非AI印钞机"
+    },
+    {
+     "title": "标的一（MCD）：麦当劳的本质其实是地产地主"
+    },
+    {
+     "title": "麦当劳的当前困境与估值错杀分析"
+    },
+    {
+     "title": "标的二（MA）：万事达的双边网络效应与过路费生意"
+    },
+    {
+     "title": "万事达的暴利财务模型与溢价抹平机会"
+    },
+    {
+     "title": "标的三（ISRG）：直觉外科的“剃刀+刀片”耗材闭环"
+    },
+    {
+     "title": "ISRG的手术量增长与罕见估值窗口"
+    },
+    {
+     "title": "标的四（SPGI）：标普全球的两大天然垄断印钞机"
+    },
+    {
+     "title": "标普如何暗发“AI财”？被恐慌错杀的估值底"
+    },
+    {
+     "title": "标的五（TDG）：霸道定价权的航空零部件垄断巨头"
+    },
+    {
+     "title": "军火暴利4451%？TransDigm的杠杆模式与买入逻辑"
+    },
+    {
+     "title": "终极对比总结：5大收税型资产与个人重点建仓标的"
+    }
+   ],
    "subtitles": {
     "zh-Hans": [
      {
@@ -98,6 +148,11 @@
   "wu0zS1AuI_E": {
    "id": "wu0zS1AuI_E",
    "language": null,
+   "title": "史上最大现金收购案 富二代如何正确拼爹",
+   "channel": "小Lin说",
+   "description": "追踪投资热点、交流学习，富途moomoo 一站式打通投资全环节\n一账户配置美股/港股/债券/基金/星股/马股/澳股/加股多元资产\n更有 AI 智能投资助手加持，助你捕捉全球市场先机\n小Lin说专属福利：AI大礼包 + 英伟达股票免费送！\n moomoo【US/SG/MY/AU/CA/JP】：https://start.moomoo.com/0yKINf \n富途牛牛【香港地区】：https://start.futunn.com/045f2I\n现金收益计划存取灵活高收益【美国8.1%； 澳洲最高7%； 加拿大最高 6%； 新加坡4.01%； 马来西亚6%；中国香港 3.5%】\n\nTerms and Conditions apply. Securities are offered through Moomoo Financial Inc. (MFI), Member FINRA/SIPC. The creator is a paid influencer and is not affiliated with MFI, and their experiences may not be representative of other moomoo users. Investing is risky.",
+   "tags": [],
+   "chapters": [],
    "subtitles": {
     "zh": [
      {
@@ -153,6 +208,20 @@
   "JkMWjp5AXhM": {
    "id": "JkMWjp5AXhM",
    "language": "zh-Hant",
+   "title": "【曲博科技教室 EP324】川湖、鋒霈、英特爾、友達、Lumentum、Coherent、群創、昱鐳應材、兆通光電、Corning、大立光",
+   "channel": "曲博科技教室 Dr. J Class",
+   "description": "曲博新書購買連結\n👉 晶圓代工與先進封裝產業技術實務 https://www.books.com.tw/products/0011000068\n👉 矽光子與共同封裝光學產業科技實務 https://www.books.com.tw/products/0011024092\n\n曲博官方Line群正式開張，歡迎大家加入，一起從討論中成長！\n加入連結 👉  https://ansforce.page.link/Drjline3\n\n※曲博頻道會員已開啟，想要加入的伙伴可以直接點選這個連結，一起讓科技成長茁壯！👉 https://ansforce.page.link/JoinYT\n\n※曲博科技教室所有的影片可以在這裡直接用關鍵字搜尋👉\nhttps://ansforce.page.link/Drjlist\n\n訂閱我的Youtube頻道：https://ansforce.page.link/DrjYT\n按讚粉絲專頁，掌握最新趨勢：https://ansforce.page.link/DrjFB\n\n曲博 Facetime 每個禮拜四晚上在這邊跟大家見面，聊聊最新的科技，掌握最新的趨勢！\n\n知識力專家社群\nhttps://www.ansforce.com\n\n客服請洽知識力官方Line\nhttps://bit.ly/ansforceline\n\n【免責聲明】本頻道內容僅供參考，雖已力求正確完整，但可能因時間及市場客觀因素改變所造成產業、市場、個股之相關條件改變，投資人需自行考量投資之實際狀況與風險承受度，並就投資結果自行負責，本公司不負擔任何法律責任及做任何保證。",
+   "tags": [
+    "Micro LED",
+    "多模光纖",
+    "雷射",
+    "玻璃基版",
+    "EML",
+    "COPOS",
+    "TGV",
+    "CPO"
+   ],
+   "chapters": [],
    "subtitles": {},
    "automatic_captions": {
     "en-orig": [
@@ -243,6 +312,40 @@
   "CIatbV3_Rjg": {
    "id": "CIatbV3_Rjg",
    "language": "en-US",
+   "title": "Why Abraham Lincoln was killed | Gary Gallagher and Lex Fridman",
+   "channel": "Lex Clips",
+   "description": "Lex Fridman Podcast full episode: https://www.youtube.com/watch?v=XyXBwO5jYpw\nThank you for listening ❤ Check out our sponsors: https://lexfridman.com/sponsors/cv9929-sb\nSee below for guest bio, links, and to give feedback, submit questions, contact Lex, etc.\n\n*GUEST BIO:*\nGary Gallagher is a historian of the American Civil War.\n\n*CONTACT LEX:*\n*Feedback* - give feedback to Lex: https://lexfridman.com/survey\n*AMA* - submit questions, videos or call-in: https://lexfridman.com/ama\n*Hiring* - join our team: https://lexfridman.com/hiring\n*Other* - other ways to get in touch: https://lexfridman.com/contact\n\n*EPISODE LINKS:*\nGary's UVA page: https://history.virginia.edu/people/gary-w-gallagher\nGary's Wikipedia: https://en.wikipedia.org/wiki/Gary_W._Gallagher\nThe Confederate War (book): https://amzn.to/4yletel\nThe Union War (book): https://amzn.to/3QT1jED\nLee and His Generals in War and Memory (book): https://amzn.to/4fdrbD5\nCauses Won, Lost, and Forgotten (book): https://amzn.to/4wFxk1X\nThe Myth of the Lost Cause and Civil War History (book): https://amzn.to/4vsAogU\nThe Great Courses - The American Civil War: https://bit.ly/4gDX3mQ\n\n*SPONSORS:*\nTo support this podcast, check out our sponsors & get discounts:\n*Upwork:* Platform for hiring freelancers.\nGo to https://lexfridman.com/s/upwork-cv9929-sb\n*NetSuite:* Business management software.\nGo to https://lexfridman.com/s/netsuite-cv9929-sb\n*Shopify:* Sell stuff online.\nGo to https://lexfridman.com/s/shopify-cv9929-sb\n*LMNT:* Zero-sug",
+   "tags": [
+    "alex friedman",
+    "lex ai",
+    "lex clips",
+    "lex debate",
+    "lex freedman",
+    "lex fridman",
+    "lex friedman",
+    "lex interview",
+    "lex lecture",
+    "lex mit",
+    "lex podcast",
+    "lex transcript"
+   ],
+   "chapters": [
+    {
+     "title": "The assassination of Lincoln"
+    },
+    {
+     "title": "John Wilkes Booth's motives"
+    },
+    {
+     "title": "Trials and consequences"
+    },
+    {
+     "title": "Conspiracy theories"
+    },
+    {
+     "title": "The legacy of Lincoln's death"
+    }
+   ],
    "subtitles": {
     "en": [
      {
@@ -282,6 +385,70 @@
   "ijFSEb2W6_8": {
    "id": "ijFSEb2W6_8",
    "language": "en",
+   "title": "I’ve Wanted This Robot for 10 Years",
+   "channel": "Linus Tech Tips",
+   "description": "Get 20% off DeleteMe US consumer plans when you go to http://joindeleteme.com/LTT20 and use promo code LTT20 at checkout.\n\nDeleteMe International Plans: https://international.joindeleteme.com/\n\nTen years ago Linus saw the badminton robot of his dreams. He finally decided to bite the bullet and buy one as a birthday gift to himself. Little did he know it would take an entire year to arrive. Will this robot live up to his hype and improve his badminton game?\n\nDiscuss on the forum: https://linustechtips.com/topic/1643290-i%E2%80%99ve-wanted-this-robot-for-10-years/\n\nCheck out our Channel Partners:\n\nSecretlab \n- Grab a TITAN Evo ergonomic gaming chair:  https://lmg.gg/secretlabltt\n- Grab an ATLAS ergonomic office chair:  https://lmg.gg/secretlablttatlas\n\nPIA \n- Get the VPN of our choice: https://www.piavpn.com/ltt\n\ndbrand \n- Buy a \"Circuit\" series skin for your device: https://dbrand.com/pcb\n\n► SHOP LTT PRODUCTS: https://lttstore.com\n► GET EXCLUSIVE CONTENT ON FLOATPLANE: https://lmg.gg/lttfloatplane\n► DIVE DEEPER ON THE LTT LABS WEBSITE: https://lmg.gg/labs\n► SPONSORS, AFFILIATES, AND PARTNERS: https://lmg.gg/partners\n\nPurchases made through some store links may provide some compensation to Linus Media Group. Affiliate links powered in part by https://affilimate.com/?aid=ghz1izbpb\n\nLinus Sebastian is an investor in Framework Computer, Inc and HexOS by Eshtek.\n\nCHAPTERS\n---------------------------------------------------\n0:00 Intro\n1:28 Unboxing\n3:22 The hoppers\n4:06 Looking at t",
+   "tags": [
+    "Linus Tech Tips",
+    "Badminton",
+    "Sports",
+    "Basketball",
+    "soccer",
+    "football",
+    "LTT",
+    "Linus",
+    "Shuttle Cock",
+    "Badminton Tips",
+    "Robot",
+    "AI",
+    "Gadget",
+    "Fun",
+    "Tech",
+    "Technology",
+    "Smash Champs",
+    "Professional"
+   ],
+   "chapters": [
+    {
+     "title": "Intro"
+    },
+    {
+     "title": "Unboxing"
+    },
+    {
+     "title": "The hoppers"
+    },
+    {
+     "title": "Looking at the feeder"
+    },
+    {
+     "title": "Oooooo keyfob"
+    },
+    {
+     "title": "Setting it up"
+    },
+    {
+     "title": "It's aliiiiivee"
+    },
+    {
+     "title": "How the heck does this work"
+    },
+    {
+     "title": "Boy gets to play"
+    },
+    {
+     "title": "Linus tries it"
+    },
+    {
+     "title": "Pro Badminton tries it"
+    },
+    {
+     "title": "Linus tries the same pattern"
+    },
+    {
+     "title": "Outro"
+    }
+   ],
    "subtitles": {},
    "automatic_captions": {
     "en-orig": [
@@ -372,6 +539,37 @@
   "nmgFG7PUHfo": {
    "id": "nmgFG7PUHfo",
    "language": "en",
+   "title": "The Most Underrated Algorithm",
+   "channel": "Veritasium",
+   "description": "The Fast Fourier Transform is used everywhere but it has a fascinating origin story that could have ended the nuclear arms race. This video is sponsored by 80,000 Hours. Head to http://80000hours.org/veritasium to sign up for their newsletter and get sent a free copy of their in-depth career guide.\n\nA huge thank you to Dr. Richard Garwin for taking the time to speak with us. \nThanks to Dr. Steve Brunton of the University of Washington for his help with understanding the Fast Fourier Transform. \n\nThanks to Dr. Cliff Thurber of the University of Wisconsin-Madison, Dr. Paul Richards of Columbia University, and Dr. Steven Gibbons of the Norwegian Geotechnical Institute for their expertise. \n\nThanks to Grant Sanderson of 3Blue1Brown for his helpful feedback on the script. His great video on the Fourier Transform is here - https://youtu.be/spUNpyF58BY\n\n▀▀▀\nReferences:\n\nKristensen, H.M., Korda, M. (2022). Status of World Nuclear Forces. Federation of American Scientists (FAS). https://ve42.co/Stockpile2022\n\nBarth, K. H. (1998). Science and politics in early nuclear test ban negotiations. Physics Today, 51(3), 34-39. - https://ve42.co/Barth1998\n\nSchmalberger, T. (1991). In pursuit of a nuclear test ban treaty - https://ve42.co/Schmalberger1991\n\nBowers, D., & Selby, N. D. (2009). Forensic seismology and the comprehensive nuclear-test-ban treaty. Annual Review of Earth and Planetary Sciences, 37, 209-236 - https://ve42.co/Bowers2009\n\nIncorporated Research Institutions for Seismology (I",
+   "tags": [
+    "veritasium",
+    "science",
+    "physics"
+   ],
+   "chapters": [
+    {
+     "title": "Intro"
+    },
+    {
+     "title": "The Nuclear Arms Race"
+    },
+    {
+     "title": "The Modern Peace Sign"
+    },
+    {
+     "title": "Fourier Transforms"
+    },
+    {
+     "title": "Discrete Fourier Transform"
+    },
+    {
+     "title": "Fast Fourier Transform"
+    },
+    {
+     "title": "Sponsor"
+    }
+   ],
    "subtitles": {
     "en": [
      {
@@ -482,6 +680,28 @@
   "tGVSOK3PNUI": {
    "id": "tGVSOK3PNUI",
    "language": "ja",
+   "title": "めらマシュマロ雑談とつづりに変な事言ってしまった件の裏話【熱千めら/ホロライブ切り抜き/アソビまわり隊】",
+   "channel": "ホロDEV_ISの部屋",
+   "description": "配信、元動画様\n【マシュマロ雑談】１００個の質問に答えますのじゃ【ホロライブ/アソビ★まわり隊！/熱千めら】\nhttps://www.youtube.com/live/W6shqY3W-Es?si=uJh_WdezMJNwN5l8\n\n\n\n\nタイムスタンプ\n0:00　めらメンバー4人の関係\n5:44　よしよし失言の真相\n8:46　ガチ恋はしょうがない\n11:01　自身の春画について\n\n\n\n\n出演者\n\n\n\n\n\n＃あちちめら\n＃熱千めら\n＃ホロライブ切り抜き\n＃ホロライブ\n＃アソビ★まわり隊\n\n\n\n\n\n当チャンネルはカバー株式会社様のガイドラインに則って運営しており、届け出も提出済みです。\n\n\n【効果音BGM絵使用元】\nいらすとや \nhttps://www.youtube.com/redirect?event=video_description&redir_token=QUFFLUhqbFV0N0QwNUt2blpELW00ZHp0bjBsWFc0Ni1JUXxBQ3Jtc0ttRDliVnFlcjE0YnNfbm1GenBkXy1KMEdmRGV6RUxobjE0WmJVWFBpRlpMSjZQekw5bkRPcXFpSGc5Q1FHUWZzWXhqS3BXOGlNWDkxUkxXVThESjd5bGxfc0xJYVd2WW1JSTE3dEZjLUt6cE9wYUMzcw&q=https%3A%2F%2Fwww.irasutoya.com%2F&v=jtH6XsqrsLs\n\n効果音ラボ\nhttps://www.youtube.com/redirect?event=video_description&redir_token=QUFFLUhqbk5HdDl5TklRUUk0dzJXcmM4X01PVXBTTjJmUXxBQ3Jtc0tueS1WMFBKRVFUaXNLQ01DdzNIN2o3Vy1IWHBsc3JFQ2tvRXBiVzBXcmcwdHlLOWdNVGdocE9GSUtJbWVncnQ2RVdBWWNIeW05UHRZQl9vT3JFeDN3cmZJMjM5V3puTVFWUjN3eF9IR3N2c2Nyd1VIVQ&q=http%3A%2F%2Fsoundeffect",
+   "tags": [
+    "hololive",
+    "ホロライブ",
+    "切り抜き"
+   ],
+   "chapters": [
+    {
+     "title": "めらメンバー4人の関係"
+    },
+    {
+     "title": "よしよし失言の真相"
+    },
+    {
+     "title": "ガチ恋はしょうがない"
+    },
+    {
+     "title": "自身の春画について"
+    }
+   ],
    "subtitles": {},
    "automatic_captions": {
     "ja-orig": [
@@ -572,6 +792,11 @@
   "DQGrPstFRVI": {
    "id": "DQGrPstFRVI",
    "language": null,
+   "title": "2030 冰河期 | 老高與小茉 Mr & Mrs Gao",
+   "channel": "老高與小茉 Mr & Mrs Gao",
+   "description": "【加入會員按鈕】https://www.youtube.com/channel/UCMUnInmOkrWN4gof9KlhNmQ/join\n【訂閱頻道按鈕】https://goo.gl/VhzZeS\n------------------------------------------------\n相關鏈接：\n\n超出你想象的深海世界\nhttps://www.youtube.com/watch?v=dNmwPWRdv_0\n\n【神作】四十分鐘講完三體\nhttps://www.youtube.com/watch?v=2vowHo2y-hI\n\n目前第二長的一期，多重人格分裂\nhttps://www.youtube.com/watch?v=QAGDGja7kbs\n\n人為什麼是人，人類最不可思議的六個特征\nhttps://www.youtube.com/watch?v=EiWuajug1W4\n\n【震撼】這是一部解開所有宇宙之謎的影片\nhttps://www.youtube.com/watch?v=3QS5hyXpNyw\n\n【震撼】這是一部你明天還會再看一遍的影片\nhttps://www.youtube.com/watch?v=odc0ajxCq2c\n\n南極和北極，地球上最不可思議的兩個地方\nhttps://www.youtube.com/watch?v=jSSIeOlIqu0\n\n千萬不要去！世界十大人類禁地\nhttps://www.youtube.com/watch?v=6SwJpgNLvTk\n\n目前信息量最大的一期，重力\nhttps://www.youtube.com/watch?v=-TDVKQjmf7c\n\n人類的隱藏能力，從氣功到超能力還有另一個世界的存在\nhttps://www.youtube.com/watch?v=3Okf8nOIVLY\n\n超出你想象的地球故事\nhttps://www.youtube.com/watch?v=5AseSLCG7wI\n\n目前最長的一期，只有五歲抬頭才能看懂的天能（信条）\nhttps://www.youtube.com/watch?v=UiyWuEwxCNQ\n\n【震撼】2045年，人類究竟是滅絕還是成神\nhttps://www.youtube.com/watch?v=WY4XLDBDyuk\n\n【震撼】智商200也無法解答，宇宙最大的謎團，時間\nhttps://www.youtube.com/watch?v=6SkbNlWMG5w\n\n現代技術也無法再現的七個奇跡\nhttps://www.youtube.com/watch?v=KtDGWBqCmtk\n\n【震撼】海奧華預言，人類起源，耶穌是誰，金字塔之謎，你想知道的答案這裡都有\nhttps://www.youtube.com/watch?v=1rUWY2z4wUk\n\n【神作】三十六分鐘完全解説這部完美閉合的漫畫\nhttps://www.youtube.com/watch?v=ZN4yFKJuS4Y\n\n前往地球中心的旅行，超出你想象的地下世界\nhttps://www.youtube.com/watch?v=lRVSC97q8ew\n\n人類不能再次登上月球的真正原因真是難以置信\nhttps://www.youtube.com/watch?v=2vzwtqhhJv8\n\n“他們”究竟是誰？比金字塔還誇張的遠古文明\nhttps://www.youtube.com/watch?v=vA7IJRaW0Eo\n\n最神奇的星球，地球以及人類存在的真正原因\nhttps://www.youtube.c",
+   "tags": [],
+   "chapters": [],
    "subtitles": {},
    "automatic_captions": {},
    "formats": [
@@ -612,6 +837,87 @@
   "Fhx_qNS2P8g": {
    "id": "Fhx_qNS2P8g",
    "language": null,
+   "title": "E255｜模型越来越强，为什么用户没感觉？再访阿里国际站总裁张阔",
+   "channel": "硅谷101播客",
+   "description": "模型在榜单上越来越强，为什么真正把工作交给AI，还是需要人反复解释、检查和兜底？\n半年前，我们与阿里国际站总裁张阔聊了Accio Work，以及Agent如何参与采购和日常经营。半年后，我们再次请到他，聊聊这半年来商家使用Accio Work的真实案例，试图回答这个问题：模型能力的提升，究竟有多少变成了商家工作里的进步？\n张阔分享，很多模型的通用评测成绩已经接近满分，但团队在真实经营中，并没有感受到同样幅度的提升。为此，他们从实际业务中整理了107个任务，包括比较供应商报价、识别钓鱼邮件、预订船期和处理交易纠纷。据他介绍，在这套特定评测中，最前沿模型在无人干预条件下的任务通过率约为61%。\n这些任务没有数学竞赛那么耀眼，却直接关系到商家的成本、交期和利润。一个好用的Agent，既要能把工作做完，也要让人用得起；既要理解工具和流程，也要理解这盘生意究竟想追求什么。\n这期节目，我们聊聊榜单成绩与实际交付之间的落差、通用模型与垂直产品的竞争，以及当AI接手越来越多的执行工作，人还需要保留哪些判断。\n\n【主播】\nYiwen，硅谷101主持人\n【嘉宾】\n张阔，阿里国际站总裁\n\n【你将听到】\n从写代码到做生意，Agent还差什么？\n01:18 AI同事市场：编程之外，专业工作走到了哪一步？\n02:38 商业任务为什么比编程更难？\n03:48 从采购搜索到日常经营，Accio Work的任务边界如何扩展\n06:12 商家案例：植物监测产品，从创意走到设计、供应链和销售\n07:47 找工厂、比报价、拿样品：采购流程里，人和AI如何协作\n\n通用模型越来越强，垂直产品还有什么优势？\n10:13 中美Agent生态的差异：垂直SaaS与平台工具\n11:30 AI会替代SaaS吗？\n14:11 独立站与平台电商：不同市场如何影响产品设计\n15:16 Agent公式：模型 × 工程框架 × 上下文\n17:46 模型与工程联合优化，不能只等模型升级\n\n榜单接近满分，真实工作为什么还会失败？\n20:29 107个真实任务：无人干预条件下，最前沿模型通过率约61%\n24:32 报价、钓鱼邮件、订船和纠纷：怎样才算真正完成任务？\n26:33 新版本也可能退步，评测必须持续做\n28:55 多平台经营：有流水，不代表有利润\n32:39 产品品味、市场判断与预算分配：老板仍要做的选择\n\n最贵的模型，不一定是最好的选择\n33:44 多模型路由：如何为不同任务匹配能力与成本？\n38:05 多个Agent建议冲突，商家该听谁的？\n40:35 上云、定时任务、事件响应与长期经营，是不同的能力\n43:05 CoCreate现场：商家对Agent有哪些期待？\n44:43 小企业如何借助AI，把生意做得更大\n\n【往期相关】\nhttps://youtu.be/B6eAjzDVhr8\n\n【欢迎加入硅谷101 Discord讨论群】\nhttps://discord.com/invite/PACWRvyfCm\n\n【监制】\n泓君\n【后期】\nAmei\n【运营】\n朱婕\n【BGM】\nTrace - Lennon Hutton\nSignal Containment - Out To The World\nReclaim - Megan Wofford",
+   "tags": [
+    "AI",
+    "电商",
+    "Agent",
+    "AccioWork",
+    "运营",
+    "采购",
+    "Token经济学",
+    "阿里国际站",
+    "模型能力",
+    "Benchmark",
+    "评测基准"
+   ],
+   "chapters": [
+    {
+     "title": "<Untitled Chapter 1>"
+    },
+    {
+     "title": "AI同事市场：编程之外，专业工作走到了哪一步？"
+    },
+    {
+     "title": "商业任务为什么比编程更难？"
+    },
+    {
+     "title": "从采购搜索到日常经营，Accio Work的任务边界如何扩展"
+    },
+    {
+     "title": "商家案例：植物监测产品，从创意走到设计、供应链和销售"
+    },
+    {
+     "title": "找工厂、比报价、拿样品：采购流程里，人和AI如何协作"
+    },
+    {
+     "title": "中美Agent生态的差异：垂直SaaS与平台工具"
+    },
+    {
+     "title": "AI会替代SaaS吗？"
+    },
+    {
+     "title": "独立站与平台电商：不同市场如何影响产品设计"
+    },
+    {
+     "title": "Agent公式：模型 × 工程框架 × 上下文"
+    },
+    {
+     "title": "模型与工程联合优化，不能只等模型升级"
+    },
+    {
+     "title": "107个真实任务：无人干预条件下，最前沿模型通过率约61"
+    },
+    {
+     "title": "报价、钓鱼邮件、订船和纠纷：怎样才算真正完成任务？"
+    },
+    {
+     "title": "新版本也可能退步，评测必须持续做"
+    },
+    {
+     "title": "多平台经营：有流水，不代表有利润"
+    },
+    {
+     "title": "产品品味、市场判断与预算分配：老板仍要做的选择"
+    },
+    {
+     "title": "多模型路由：如何为不同任务匹配能力与成本？"
+    },
+    {
+     "title": "多个Agent建议冲突，商家该听谁的？"
+    },
+    {
+     "title": "上云、定时任务、事件响应与长期经营，是不同的能力"
+    },
+    {
+     "title": "CoCreate现场：商家对Agent有哪些期待？"
+    },
+    {
+     "title": "小企业如何借助AI，把生意做得更大"
+    }
+   ],
    "subtitles": {
     "zh-Hans": [
      {

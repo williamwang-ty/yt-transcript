@@ -93,6 +93,8 @@ STAGE_OWNED_PATHS = {
 
 SOURCE_LABELS = {"subtitles": "YouTube Subtitles", "deepgram": "Deepgram Transcription"}
 LANGUAGE_NAMES = {"zh": "Chinese", "en": "English"}
+MODE_OVERRIDE_HINT = ("If the audio is actually Chinese or English, rerun with --mode chinese or --mode bilingual "
+                      "to transcribe it in that language.")
 VIDEO_ID_PATTERN = re.compile(r"[A-Za-z0-9_-]+")
 DOWNLOAD_TIMEOUT_SEC = 1800
 # scripts/update_yt_dlp.sh skips itself when this is "0" (the offline tests set it).
@@ -652,12 +654,18 @@ class _Run:
         }
         self.state["route"] = route
         candidates = [c for c in sub_info.get("listed_candidates", []) if isinstance(c, dict)]
-        if not candidates and sub_info.get("source_language_supported") is False:
-            raise Stop("unsupported", "unsupported_language",
-                       sub_info.get("unsupported_reason") or f"Spoken language {source_language!r} is not supported",
-                       language=source_language)
-
         want_source, want_mode = self.overrides.get("source"), self.overrides.get("mode")
+        guessed = route["language_signal"] in kernel_subtitle_language.GUESSED_SIGNALS
+        if want_mode and guessed:
+            # Nothing firm names the spoken language, so --mode does: a chinese article
+            # comes from Chinese audio, a bilingual one from English audio.
+            source_language = kernel_subtitle_language.FAMILY_BY_MODE[want_mode]
+            route.update({"source_language": source_language, "language_signal": "mode_override"})
+        elif not candidates and sub_info.get("source_language_supported") is False:
+            message = sub_info.get("unsupported_reason") or f"Spoken language {source_language!r} is not supported"
+            raise Stop("unsupported", "unsupported_language",
+                       f"{message}. {MODE_OVERRIDE_HINT}" if guessed else message, language=source_language)
+
         usable = [c for c in candidates if not want_mode or c.get("mode") == want_mode]
         spoken_mode = kernel_subtitle_language.MODE_BY_FAMILY.get(source_language)
         if want_mode and not usable and (want_source == "subtitles" or (spoken_mode and spoken_mode != want_mode)):
@@ -786,9 +794,10 @@ class _Run:
         detected = str(result.get("language") or language)
         family = kernel_subtitle_language.language_family(detected)
         if family not in kernel_subtitle_language.MODE_BY_FAMILY:
+            message = (f"Deepgram detected the spoken language {detected!r}, which is not supported yet; "
+                       "only Chinese and English videos can be transcribed")
             raise Stop("unsupported", "unsupported_language",
-                       f"Deepgram detected the spoken language {detected!r}, which is not supported yet; "
-                       "only Chinese and English videos can be transcribed", language=detected)
+                       f"{message}. {MODE_OVERRIDE_HINT}" if language == "auto" else message, language=detected)
         mode = kernel_subtitle_language.MODE_BY_FAMILY[family]
         want_mode = self.overrides.get("mode")
         if want_mode and want_mode != mode:

@@ -62,7 +62,7 @@ CASES = (
 )
 
 INFO_KEYS = ("id", "title", "fulltitle", "channel", "uploader", "upload_date", "duration", "language",
-             "webpage_url", "chapters")
+             "webpage_url", "chapters", "description", "tags")
 FORMAT_KEYS = ("format_id", "ext", "acodec", "vcodec", "language", "language_preference", "format_note",
                "audio_channels", "abr")
 TRACK_QUERY_KEYS = ("lang", "tlang", "kind")

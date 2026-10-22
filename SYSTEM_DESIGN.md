@@ -164,13 +164,15 @@ Notes:
 
 The `source` stage applies these rules (`kernel/sources/subtitle_language.py` picks the candidates):
 
-1. Detect the spoken language from the strongest signal available: the audio track YouTube marks as original, then the metadata `language`, then the original-language ASR track (when exactly one language has one), then the human subtitle tracks (when they all share one language).
+1. Detect the spoken language from the strongest signal available: the audio track YouTube marks as original, then the metadata `language`, then the original-language ASR track (when exactly one language has one), then the human subtitle tracks (when they all share one language). When none of these exists, the script of the video's own text (title, description, chapter titles, tags) gives a guess (`video_text`): Han characters mean Chinese, kana Japanese, hangul Korean. Latin script gives no guess, because English, Indonesian or Spanish look alike; neither does text with only a few CJK characters or mostly Latin words.
 2. Trust only human subtitles and the ASR track in the spoken language. YouTube's machine-translated tracks are dropped.
 3. Human Chinese subtitles come first for every video; mode `chinese`.
 4. Chinese video: otherwise the Chinese ASR track; mode `chinese`.
 5. English video: otherwise English subtitles, human ones first; mode `bilingual` (English source plus Chinese translation).
 6. Other spoken languages: `unsupported` (reason `unsupported_language`), unless human Chinese subtitles exist. When no signal names the language, every trusted Chinese or English track is a candidate.
-7. No trusted track, or a track whose quality score triggers the reroute rule (critical quality on the `chinese` route): transcribe with Deepgram in the detected language, or with Deepgram's own language detection when none was detected. Deepgram runs automatically; there is no confirmation step. A Deepgram result in an unsupported language also returns `unsupported`.
+7. No trusted track, or a track whose quality score triggers the reroute rule (critical quality on the `chinese` route): transcribe with Deepgram in the detected language, or with Deepgram's own language detection when nothing, not even the video's text, names it. Deepgram runs automatically; there is no confirmation step. A Deepgram result in an unsupported language also returns `unsupported`.
+
+A language that comes only from the video's text, or from nothing, is not firm: `--mode` names the spoken language instead (`chinese` = Chinese audio, `bilingual` = English audio), Deepgram is asked for that language, and the route records `language_signal: mode_override`. The `unsupported` result for such a guess, and for a language Deepgram detected itself, says so in its message. The text signal exists because a video with no caption track and no metadata language otherwise depends on Deepgram's detection alone, and that detection heard a Mandarin video (DQGrPstFRVI, whose title and description are Chinese) as Indonesian. Deepgram-specific options (restricting detection to Chinese and English, confidence thresholds) were not used.
 
 When YouTube refuses the preferred track (rate limit or bot check) even after the automatic retries with browser cookies, `source` does not quietly take the next track. The old agent-driven flow did, which turned a Chinese article into a bilingual one and made results differ between runs. `source` returns `needs_user` with reason `rate_limited` (`cookies_required` for a bot check), names `preferred_track` and `fallback_track`, and gives an `accept_command`: the same command with `--mode <fallback mode>`. The agent asks the user whether to wait and rerun, or to accept the fallback.
 
@@ -267,7 +269,7 @@ Every `run` call prints exactly one JSON object on stdout and exits with a fixed
 | `done` | 0 | Article written: `output_file`, `title`, `route`, `warnings`, `llm`. After `--stage plan`: `stage`, `route`, `plan`, and a `message` when the route needs Deepgram | Report the result |
 | `failed` | 1 | A stage failed: `stage`, `reason`, `message`, `retryable` (plus `hard_failures` for a quality failure) | Rerun `next_command` once if `retryable`, otherwise report; may suggest an override |
 | `needs_user` | 3 | Only the user can fix it. `reason` is `cookies_required`, `login_required`, `rate_limited`, `deepgram_key_missing`, `tool_missing` or `output_dir_missing`; `message` says what to do. A refused preferred track adds `preferred_track`, `fallback_track` and `accept_command` | Tell the user; rerun after they act, or run `accept_command` if they accept the fallback |
-| `unsupported` | 4 | The spoken language is not supported: `reason` `unsupported_language`, `language` | Report; do not retry |
+| `unsupported` | 4 | The spoken language is not supported: `reason` `unsupported_language`, `language` | Report; do not retry. When `message` suggests `--mode` (the language was guessed from the title or detected by Deepgram) and the user says the video is Chinese or English, rerun with that `--mode` |
 | `needs_agent_text` | 5 | No LLM backend is reachable; one request is handed over: `task.name`, `task.prompt_file`, `task.output_file` | Answer it, write the answer to the output file, rerun `next_command` |
 | `in_progress` | 6 | The `--max-seconds` budget ran out at a safe point: `stage`, `progress` (`stages_done`, `text_tasks`) | Rerun `next_command` until the status changes |
 
@@ -319,7 +321,7 @@ The task is exactly one LLM request: an outline request, a window round, or a fa
 | Flag | Kept for reruns | Effect |
 |---|---|---|
 | `--source subtitles\|deepgram` | yes | Force the source. `deepgram` skips subtitles; `subtitles` keeps the chosen track even when its quality score would trigger the reroute. Redoes `source` and every later stage. |
-| `--mode chinese\|bilingual` | yes | Force the output form. The mode follows the source text (Chinese text gives `chinese`, English text gives `bilingual`), so this picks the track: on an English video, `bilingual` uses the English subtitles even when human Chinese subtitles exist, and `chinese` uses the human Chinese subtitles. Redoes `source` and every later stage. |
+| `--mode chinese\|bilingual` | yes | Force the output form. The mode follows the source text (Chinese text gives `chinese`, English text gives `bilingual`), so this picks the track: on an English video, `bilingual` uses the English subtitles even when human Chinese subtitles exist, and `chinese` uses the human Chinese subtitles. When no track or metadata names the spoken language (6.3), it also names it for Deepgram: `chinese` = Chinese audio, `bilingual` = English audio. Redoes `source` and every later stage. |
 | `--from <stage>` | no | Mark that stage and every later stage not done, then run. For recovery and debugging. |
 | `--stage plan` | repeated in `next_command` | Stop after `plan`: the free routing check. |
 | `--max-seconds <n>` | repeated in `next_command` | Start no new stage or window round after n seconds, once the call has finished at least one; return `in_progress`. |
@@ -867,13 +869,15 @@ agent 从不编辑状态文件，也从不手动执行内部阶段。需要不�
 
 `source` 阶段按下面的规则选择（候选字幕轨由 `kernel/sources/subtitle_language.py` 给出）：
 
-1. 用能拿到的最强信号判断口语语言：先看 YouTube 标为原始的音轨，再看元数据的 `language`，再看原始语言的 ASR 轨（只有一种语言有 ASR 轨时），最后看人工字幕轨（所有人工字幕是同一种语言时）。
+1. 用能拿到的最强信号判断口语语言：先看 YouTube 标为原始的音轨，再看元数据的 `language`，再看原始语言的 ASR 轨（只有一种语言有 ASR 轨时），再看人工字幕轨（所有人工字幕是同一种语言时）。这些都没有时，用视频自己的文字（标题、简介、章节名、标签）是哪种文字来推测（`video_text`）：汉字为中文，假名为日语，韩文为韩语。拉丁字母不下结论，因为英语、印尼语、西班牙语分不出来；CJK 字符很少或以拉丁单词为主的文字也不下结论。
 2. 只信任人工字幕和口语语言的 ASR 轨，丢弃 YouTube 的机器翻译轨。
 3. 任何视频，人工中文字幕都排在第一位；模式 `chinese`。
 4. 中文视频：否则用中文 ASR 轨；模式 `chinese`。
 5. 英文视频：否则用英文字幕，人工优先；模式 `bilingual`（英文原文加中文翻译）。
 6. 其他口语语言：`unsupported`（原因 `unsupported_language`），除非有人工中文字幕。没有任何信号说明语言时，所有可信的中文或英文字幕轨都是候选。
-7. 没有可信的字幕轨，或者字幕质量分触发改道规则（`chinese` 路线上质量为 critical）：按检测出的语言用 Deepgram 转写，没检测出语言时让 Deepgram 自己识别。Deepgram 自动执行，没有确认步骤。Deepgram 识别出的语言不受支持时，同样返回 `unsupported`。
+7. 没有可信的字幕轨，或者字幕质量分触发改道规则（`chinese` 路线上质量为 critical）：按检测出的语言用 Deepgram 转写，连视频文字也说明不了语言时才让 Deepgram 自己识别。Deepgram 自动执行，没有确认步骤。Deepgram 识别出的语言不受支持时，同样返回 `unsupported`。
+
+只来自视频文字的语言、或者完全没有信号时，语言都不算确定：这时 `--mode` 直接指定口语语言（`chinese` 为中文音频，`bilingual` 为英文音频），Deepgram 按这个语言转写，路由里记为 `language_signal: mode_override`。这种推测出的语言、以及 Deepgram 自己识别出的语言不受支持时，`unsupported` 的 `message` 会说明可以这样重跑。加视频文字这个信号，是因为没有任何字幕轨、元数据也没写语言的视频，原来只能靠 Deepgram 自己识别，而它把一个普通话视频（DQGrPstFRVI，标题和简介都是中文）识别成了印尼语。没有使用 Deepgram 专有的做法（把识别范围限定在中英文、按置信度定阈值）。
 
 首选字幕轨在自动用浏览器 cookies 重试后仍被 YouTube 拒绝（限流或机器人验证）时，`source` 不会悄悄换用下一条字幕轨。旧的 agent 驱动流程会这样做，结果中文文章变成了双语文章，而且每次运行结果可能不一样。现在 `source` 返回 `needs_user`，原因是 `rate_limited`（机器人验证时是 `cookies_required`），列出 `preferred_track` 和 `fallback_track`，并给出 `accept_command`：同一条命令加上 `--mode <备用字幕轨的模式>`。agent 问用户是等一会儿再重跑，还是接受备用字幕轨。
 
@@ -970,7 +974,7 @@ agent 从不编辑状态文件，也从不手动执行内部阶段。需要不�
 | `done` | 0 | 文章已写出：`output_file`、`title`、`route`、`warnings`、`llm`。`--stage plan` 之后：`stage`、`route`、`plan`，路由需要 Deepgram 时还有 `message` | 汇报结果 |
 | `failed` | 1 | 某个阶段失败：`stage`、`reason`、`message`、`retryable`（质量检查失败时还有 `hard_failures`） | `retryable` 时重跑一次 `next_command`，否则汇报；可以建议某个覆盖参数 |
 | `needs_user` | 3 | 只有用户能解决。`reason` 是 `cookies_required`、`login_required`、`rate_limited`、`deepgram_key_missing`、`tool_missing` 或 `output_dir_missing`；`message` 说明该怎么做。首选字幕轨被拒时还有 `preferred_track`、`fallback_track` 和 `accept_command` | 告诉用户；用户处理后重跑，用户接受备用字幕轨时执行 `accept_command` |
-| `unsupported` | 4 | 口语语言不受支持：`reason` 为 `unsupported_language`，还有 `language` | 汇报；不重试 |
+| `unsupported` | 4 | 口语语言不受支持：`reason` 为 `unsupported_language`，还有 `language` | 汇报；不重试。`message` 建议了 `--mode`（语言是从标题推测的或由 Deepgram 自己识别的），而用户说视频其实是中文或英文时，用对应的 `--mode` 重跑 |
 | `needs_agent_text` | 5 | 没有可用的 LLM 后端，交出一次请求：`task.name`、`task.prompt_file`、`task.output_file` | 完成请求，把答案写进输出文件，重跑 `next_command` |
 | `in_progress` | 6 | `--max-seconds` 时间用完，在安全点停下：`stage`、`progress`（`stages_done`、`text_tasks`） | 重跑 `next_command`，直到状态改变 |
 
@@ -1022,7 +1026,7 @@ agent 从不编辑状态文件，也从不手动执行内部阶段。需要不�
 | 参数 | 重跑时保留 | 作用 |
 |---|---|---|
 | `--source subtitles\|deepgram` | 是 | 强制来源。`deepgram` 跳过字幕；`subtitles` 即使质量分会触发改道也坚持用选中的字幕轨。从 `source` 起重做后面所有阶段。 |
-| `--mode chinese\|bilingual` | 是 | 强制输出形式。模式跟着来源文字走（中文文字对应 `chinese`，英文文字对应 `bilingual`），所以这个参数实际上决定用哪条字幕轨：英文视频上，`bilingual` 即使有人工中文字幕也用英文字幕，`chinese` 用人工中文字幕。从 `source` 起重做后面所有阶段。 |
+| `--mode chinese\|bilingual` | 是 | 强制输出形式。模式跟着来源文字走（中文文字对应 `chinese`，英文文字对应 `bilingual`），所以这个参数实际上决定用哪条字幕轨：英文视频上，`bilingual` 即使有人工中文字幕也用英文字幕，`chinese` 用人工中文字幕。没有字幕轨或元数据说明口语语言时（6.3），它也替 Deepgram 指定语言：`chinese` 为中文音频，`bilingual` 为英文音频。从 `source` 起重做后面所有阶段。 |
 | `--from <阶段>` | 否 | 把该阶段及之后的阶段标为未完成，然后运行。用于恢复和调试。 |
 | `--stage plan` | 写进 `next_command` | 做完 `plan` 就停：免费的路由检查。 |
 | `--max-seconds <n>` | 写进 `next_command` | n 秒后、且本次调用至少完成了一个阶段或一轮窗口时，不再开始新的阶段或新一轮窗口，返回 `in_progress`。 |
