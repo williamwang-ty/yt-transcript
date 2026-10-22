@@ -231,6 +231,64 @@ class RunCommandTests(unittest.TestCase):
                          (result["stage"], result["reason"], result["language"]))
         self.assertEqual([], self.llm_calls())
 
+    def record_deepgram_languages(self, detected_when_auto: str = "") -> list:
+        """Answer Deepgram from the fixture and return the list of requested languages.
+
+        With detected_when_auto, a request that asks Deepgram to detect the language
+        gets that language back.
+        """
+        requested = []
+
+        def answer(audio_path, *args, **kwargs):
+            requested.append(kwargs.get("language"))
+            payload = fake_deepgram.recorded_response(audio_path)
+            if detected_when_auto and kwargs.get("language") in ("", "auto"):
+                payload["results"]["channels"][0]["detected_language"] = detected_when_auto
+            return payload
+
+        patcher = mock.patch.object(kernel_deepgram, "_call_deepgram_api", answer)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return requested
+
+    def test_chinese_title_names_the_language_of_a_video_without_subtitles(self):
+        requested = self.record_deepgram_languages(detected_when_auto="id")
+        self.assert_finished(DEEPGRAM, self.run_video(DEEPGRAM))
+        self.assertEqual(["zh"], requested)  # no language detection left to Deepgram
+        route = self.state(DEEPGRAM)["route"]
+        self.assertEqual(("zh", "video_text", "chinese"),
+                         (route["source_language"], route["language_signal"], route["mode"]))
+
+        # The title is only a guess, so --mode can still name the language.
+        planned = self.run_video(DEEPGRAM, mode="bilingual", stage="plan")
+        self.assertEqual(("done", "en", "bilingual"),
+                         (planned["status"], planned["route"]["language"], planned["route"]["mode"]))
+        self.assertEqual("mode_override", self.state(DEEPGRAM)["route"]["language_signal"])
+
+    def test_unknown_language_detected_as_unsupported_can_be_named_with_mode(self):
+        # The no-subtitles video with a title that names no language.
+        fixtures = self.root / "fixtures"
+        (fixtures / DEEPGRAM).mkdir(parents=True)
+        info = json.loads((FIXTURES / DEEPGRAM / "info.json").read_text(encoding="utf-8"))
+        info.update(title="Fixture: no subtitles", channel="Fixture", uploader="Fixture")
+        (fixtures / DEEPGRAM / "info.json").write_text(json.dumps(info), encoding="utf-8")
+        (fixtures / DEEPGRAM / "deepgram.json").symlink_to(FIXTURES / DEEPGRAM / "deepgram.json")
+        os.environ[fake_deepgram.FIXTURES_ENV] = str(fixtures)
+        requested = self.record_deepgram_languages(detected_when_auto="id")
+
+        result = self.run_video(DEEPGRAM)
+        self.assertEqual(("unsupported", "source", "unsupported_language", "id"),
+                         (result["status"], result["stage"], result["reason"], result["language"]))
+        self.assertIn("--mode chinese", result["message"])
+        self.assertEqual(["auto"], requested)
+
+        named = self.run_video(DEEPGRAM, mode="chinese")
+        self.assert_finished(DEEPGRAM, named)
+        self.assertEqual(["auto", "zh"], requested)
+        self.assertEqual(("deepgram", "zh", "chinese"),
+                         (named["route"]["source"], named["route"]["language"], named["route"]["mode"]))
+        self.assertEqual("mode_override", self.state(DEEPGRAM)["route"]["language_signal"])
+
     def test_missing_deepgram_key_needs_user_then_resumes(self):
         result = self.run_video(DEEPGRAM, config=self.write_config("nokey.yaml", deepgram_api_key=None))
         self.assertEqual(("needs_user", "source", "deepgram_key_missing"),

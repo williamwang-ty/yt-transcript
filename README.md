@@ -22,7 +22,7 @@ python3 yt_transcript_utils.py run "<youtube-url>"
 
 How the source and the output language are chosen:
 
-- The spoken language comes from the video's original audio track, its metadata, or its speech-recognition (ASR) track.
+- The spoken language comes from the video's original audio track, its metadata, or its speech-recognition (ASR) track. When none of these names it, the script of the title and description gives a guess (Chinese characters mean a Chinese video); `--mode chinese` or `--mode bilingual` names the language when it is only guessed.
 - Human Chinese subtitles win for any video. Otherwise a Chinese video gets a Chinese article from its Chinese subtitles, and an English video gets English text with a Chinese translation (`bilingual`) from its English subtitles.
 - YouTube's machine-translated subtitle tracks are never used.
 - A video without trusted subtitles in its spoken language is transcribed with Deepgram (`nova-3`). So is a Chinese article whose subtitles score as critically poor.
@@ -249,7 +249,7 @@ python3 yt_transcript_utils.py run "<youtube-url>"
 
 来源和输出语言怎么定：
 
-- 视频的口语语言来自原始音轨、视频元数据或语音识别（ASR）字幕轨。
+- 视频的口语语言来自原始音轨、视频元数据或语音识别（ASR）字幕轨。这些都没有时，按标题和简介用的文字推测（汉字为主就是中文视频）；语言只是推测时，可以用 `--mode chinese` 或 `--mode bilingual` 指定。
 - 任何视频只要有人工中文字幕，就用它。否则中文视频用中文字幕出中文文章，英文视频用英文字幕出英文原文加中文翻译（`bilingual`）。
 - 从不使用 YouTube 的机器翻译字幕轨。
 - 口语语言没有可信字幕的视频，用 Deepgram（`nova-3`）转写；出中文文章而字幕质量评分为极差的，也改用 Deepgram。

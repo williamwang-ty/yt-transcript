@@ -15,10 +15,22 @@ import urllib.parse
 
 SUPPORTED_SOURCE_FAMILIES = ("zh", "en")
 MODE_BY_FAMILY = {"zh": "chinese", "en": "bilingual"}
+FAMILY_BY_MODE = {mode: family for family, mode in MODE_BY_FAMILY.items()}
+
+# Language signals that only guess (or do not know) the spoken language. An
+# explicit ``--mode`` names the spoken language instead of them.
+GUESSED_SIGNALS = ("video_text", "unknown")
 
 # Without caption URLs (``--list-subs`` output, old fixtures) a translation list
 # can only be recognised by its size: YouTube offers 100+ targets at once.
 _UNLABELLED_AUTO_TRACK_LIMIT = 10
+
+_URL = re.compile(r"(?:https?://|www\.)\S+")
+_HAN = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]")
+_KANA = re.compile(r"[\u3041-\u3096\u30a1-\u30fa\uff66-\uff9d]")
+_HANGUL = re.compile(r"[\u1100-\u11ff\u3131-\u318e\uac00-\ud7a3]")
+_LATIN_WORD = re.compile(r"[A-Za-z\u00c0-\u024f]+")
+_MIN_TEXT_CJK_CHARS = 5
 
 
 def language_family(code: str | None) -> str:
@@ -136,6 +148,30 @@ def _original_audio_language(payload: dict) -> str:
     return ""
 
 
+def _video_text_language(payload: dict) -> str:
+    """Return the language the video's own text is written in, when its script tells.
+
+    Reads the title, description, chapter titles and tags. Chinese, Japanese and
+    Korean are told apart by script (kana means Japanese, hangul Korean, Han
+    characters alone Chinese). Latin-script text gives no answer: English,
+    Indonesian or Spanish look alike by script. Text that is mostly Latin words,
+    or has only a few CJK characters, gives no answer either.
+    """
+    chapters = [str(c.get("title") or "") for c in payload.get("chapters") or [] if isinstance(c, dict)]
+    tags = [str(tag) for tag in payload.get("tags") or []]
+    text = _URL.sub(" ", "\n".join([str(payload.get("title") or ""), str(payload.get("description") or ""),
+                                     *chapters, *tags]))
+    han, kana, hangul = (len(pattern.findall(text)) for pattern in (_HAN, _KANA, _HANGUL))
+    cjk = han + kana + hangul
+    if cjk < _MIN_TEXT_CJK_CHARS or cjk < len(_LATIN_WORD.findall(text)):
+        return ""
+    if hangul * 2 >= cjk:
+        return "ko"
+    if kana >= 3 and kana * 10 >= han + kana:
+        return "ja"
+    return "zh"
+
+
 def detect_source_language(payload: dict, tracks: dict | None = None) -> dict:
     """Decide the spoken language of a video from metadata signals, strongest first.
 
@@ -143,6 +179,8 @@ def detect_source_language(payload: dict, tracks: dict | None = None) -> dict:
     2. the top-level ``language`` field
     3. the original-language ASR caption track
     4. the manual subtitle tracks, when they all share one language
+    5. the script of the video's own text (title, description, chapters, tags);
+       only a guess, used when nothing above names the language
     """
     tracks = tracks if tracks is not None else classify_tracks(payload)
     candidates = (
@@ -160,6 +198,10 @@ def detect_source_language(payload: dict, tracks: dict | None = None) -> dict:
     manual_families = list(dict.fromkeys(language_family(lang) for lang in tracks["manual"]))
     if len(manual_families) == 1:
         return {"language": manual_families[0], "signal": "manual_tracks", "raw": tracks["manual"][0]}
+
+    text_language = _video_text_language(payload)
+    if text_language:
+        return {"language": text_language, "signal": "video_text", "raw": text_language}
 
     return {"language": "", "signal": "unknown", "raw": ""}
 
@@ -225,8 +267,10 @@ def build_subtitle_info(payload: dict, video_id: str = "", yt_dlp_runtime: dict 
 
     unsupported_reason = ""
     if supported is False and not candidates:
+        guessed = " (guessed from the video's title and description)" \
+            if selection["source_language_signal"] == "video_text" else ""
         unsupported_reason = (
-            f"Spoken language '{source_family}' is not supported yet; only Chinese and English "
+            f"Spoken language '{source_family}'{guessed} is not supported yet; only Chinese and English "
             "videos can be transcribed, and no manual Chinese subtitles are available"
         )
 
