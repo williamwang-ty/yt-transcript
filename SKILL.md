@@ -22,7 +22,7 @@ python3 <skill-root>/yt_transcript_utils.py run "<youtube-url>" --max-seconds 30
 | `done` (0) | Report it (see Reporting below). |
 | `in_progress` (6) | Not an error: the time budget ran out at a safe point. Run `next_command` again at once, and keep going until the status changes. |
 | `needs_agent_text` (5) | No LLM backend was reachable, so one text request is handed to you. Read `task.prompt_file` and do exactly what it asks (keep every `[S<n>]` tag, end with the `<!--END-->` line it describes). Write only your answer to `task.output_file`, then run `next_command`. A video can need several such requests; repeat until the status changes. |
-| `needs_user` (3) | Only the user can fix this. Tell them what `message` says and stop. For reason `rate_limited` with an `accept_command`: ask whether to wait and retry later, or accept the `fallback_track` now; run `accept_command` only if they accept. |
+| `needs_user` (3) | Only the user can fix this. Tell them what `message` says and stop. If the result has an `accept_command` (YouTube refused the preferred subtitle track; reason `rate_limited` or `cookies_required`): ask whether to retry later (after setting cookies for `cookies_required`), or accept the `fallback_track` now; run `accept_command` only if they accept. |
 | `unsupported` (4) | Tell the user the video's spoken language is not supported (only Chinese and English are). Do not retry or force another source. |
 | `failed` (1) | If `retryable` is true, run `next_command` once more. Otherwise, or if it fails again, report `stage`, `reason` and `message`. `locked`: another run of this video is still active; do not start a second one. `override_not_applicable`: the flag the user asked for cannot apply to this video; say why. |
 
