@@ -1027,9 +1027,9 @@ class _Run:
                 self.update_llm_usage()
                 raise Stop(
                     "needs_agent_text", "no_llm_backend",
-                    "No LLM backend is reachable (no host agent CLI answered and no API is configured). Answer "
-                    "the request in task.prompt_file exactly as the model would, write only the answer to "
-                    "task.output_file, then run next_command.",
+                    "No LLM backend is reachable (no host agent CLI answered, and the API is not configured or "
+                    "the user declined it). Answer the request in task.prompt_file exactly as the model would, "
+                    "write only the answer to task.output_file, then run next_command.",
                     task={**needed.task, "name": prompt},
                 ) from None
             task_record.update({key: result.get(key) for key in (
