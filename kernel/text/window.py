@@ -1327,13 +1327,16 @@ def _build_result(work_dir: str, state: dict, outcome: dict, *, prompt_name: str
 
 def process_window(work_dir: str, prompt_name: str, extra_instruction: str = "",
                    config_path: str = None, input_key: str = RAW_STAGE, stop_check=None,
-                   agent_handoff=None) -> dict:
+                   agent_handoff=None, api_fallback: str | None = None) -> dict:
     """Run (or resume) the sliding-window executor for one stage of a work dir.
 
     `stop_check()` returns "paused" to stop at the next round boundary (the
     `run` command's time budget). `agent_handoff(prompt_text, max_output_tokens)`
     answers requests when no LLM backend is reachable: it returns a result like
     the backends do, or raises to stop the run until the agent has answered.
+    `api_fallback` ("auto" or "never") is the user's answer for this video and
+    takes the place of `llm_api_fallback`; with "ask" a CLI that cannot be used
+    raises `ApiFallbackNeeded` when the API is configured.
     """
     log = lambda message: print(message, file=sys.stderr)  # noqa: E731
     stage = _stage(input_key)
@@ -1372,6 +1375,18 @@ def process_window(work_dir: str, prompt_name: str, extra_instruction: str = "",
     backend_decision = kernel_agent_cli.resolve_llm_backend(config, previous=previous_backend)
     api_request_url = kernel_llm_api.build_api_url(config.get("llm_base_url", ""), config.get("llm_api_format", "openai")) \
         if config.get("llm_base_url") else ""
+    # Only auto mode with the API configured can move to the API, and only as
+    # llm_api_fallback (or this video's answer to it) says.
+    fallback = kernel_config.normalize_api_fallback(api_fallback or config.get("llm_api_fallback"))
+    can_use_api = backend_decision["mode"] == "auto" and backend_decision["api_configured"]
+    if backend_decision["backend"] == "none" and can_use_api:
+        reason = backend_decision["fallback_reason"] or "no agent CLI answered"
+        if fallback == "ask":
+            raise kernel_agent_cli.ApiFallbackNeeded("cli_unavailable", reason, agent=backend_decision["agent"])
+        if fallback == "auto":
+            backend_decision["backend"] = "api"
+            log(f"ℹ️ No agent CLI can be used ({reason}); window requests use the configured API "
+                "(llm_api_fallback: auto).")
     use_cli = backend_decision["backend"] == "cli"
     request_url = f"cli:{backend_decision['agent']}" if use_cli else api_request_url
 
@@ -1380,7 +1395,7 @@ def process_window(work_dir: str, prompt_name: str, extra_instruction: str = "",
         print(
             "Error: no LLM backend available. "
             f"{backend_decision['fallback_reason'] or 'Agent CLI unavailable'}; "
-            "and the fallback API is not configured (set llm_api_key, llm_base_url, llm_model in config.yaml)",
+            "to use the API instead, set llm_backend: api with llm_api_key, llm_base_url and llm_model",
             file=sys.stderr,
         )
         sys.exit(1)
@@ -1392,8 +1407,6 @@ def process_window(work_dir: str, prompt_name: str, extra_instruction: str = "",
             "window requests are handed to the agent.")
     elif use_cli:
         log(f"ℹ️ Window requests use the {backend_decision['agent']} CLI ({' '.join(backend_decision['command'])}).")
-    elif backend_decision["mode"] == "auto" and backend_decision["fallback_reason"]:
-        log(f"ℹ️ Window requests use the configured API: {backend_decision['fallback_reason']}")
 
     glossary_payload = kernel_glossary.load_glossary(work_dir)
     if not glossary_payload and prompt_name == "cleanup_zh":
@@ -1415,19 +1428,25 @@ def process_window(work_dir: str, prompt_name: str, extra_instruction: str = "",
                     prompt_text,
                     timeout_sec=params["cli_timeout_sec"],
                     max_retries=cli_max_retries,
+                    backoff_sec=config.get("llm_backoff_sec", 1.5),
                     strip_env=backend_decision.get("strip_env", []),
                     agent=backend_decision["agent"],
                 )
             except LLMRequestError as error:
-                if not backend_decision["api_configured"]:
+                # Still failing after its retries: stop the run (retryable), ask
+                # the user, or move the rest to the API, as llm_api_fallback says.
+                if not can_use_api or fallback == "never":
                     raise
+                if fallback == "ask":
+                    raise kernel_agent_cli.ApiFallbackNeeded(
+                        "cli_failed", str(error), agent=backend_decision["agent"]) from None
                 use_cli = False
                 request_url = api_request_url
                 backend_decision["backend"] = "api"
                 backend_decision["fallback_reason"] = f"Agent CLI failed mid-run: {error}"
                 state["llm_backend"] = backend_decision
-                warning = (f"⚠️ {backend_decision['agent']} CLI failed ({error.error_type}); "
-                           "switching the remaining window rounds to the configured API.")
+                warning = (f"⚠️ {backend_decision['agent']} CLI failed ({error.error_type}); the remaining "
+                           "requests use the configured API (llm_api_fallback: auto).")
                 warnings.append(warning)
                 log(warning)
         return kernel_llm_api.call_llm_api(

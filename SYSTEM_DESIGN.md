@@ -146,7 +146,7 @@ The agent never edits the state file and never runs internal stages by hand. If 
 | `source` | Detect the spoken language and pick the trusted track (6.3); download it and parse it into raw text and timed segments; score the subtitle quality and switch to Deepgram when the scoring rule calls for it; or transcribe with Deepgram directly | `source/`, `raw_text.txt`, `segments.json`, the route in `state.json` | `unsupported`, `needs_user` (preferred track refused, Deepgram key missing, or a yt-dlp case above), `failed` |
 | `normalize` | Build the normalized document: the cleaned text, the timed segments, and whether chunking follows the text or the segments | `normalized_document.json` | `failed` |
 | `plan` | Choose the text tasks for the mode (Chinese: `cleanup_zh`; bilingual: `structure_only`, then `translate_only`), mark the text `short` or `long`, and estimate its size (input tokens, expected rounds per task). Chinese Deepgram text gets an extra instruction to repair recognition artifacts | `plan.json` | `failed` |
-| `text` | Cut the normalized document into chunks, then run each planned task through the window executor (section 7); each task is recorded separately | `text/` | `needs_agent_text`, `in_progress`, `failed` |
+| `text` | Cut the normalized document into chunks, then run each planned task through the window executor (section 7); each task is recorded separately | `text/` | `needs_agent_text`, `needs_user` (`llm_api_fallback`, 6.8), `in_progress`, `failed` |
 | `merge` | Join the final task's paragraphs in order (the first task's with the outline's headings and whole sentences, 7.5 B), then drop headings, paragraphs and paragraph openings repeated at round seams | `optimized.md` | `failed` |
 | `verify` | Run the quality check against the raw text | `quality.json` | `failed` (hard failures only; warnings are recorded) |
 | `assemble` | Write the article: frontmatter, header, body and footer, named `yyyy-mm-dd. <title>.md` | the article in `output_dir` | `needs_user` (`output_dir_missing`), `failed` |
@@ -198,7 +198,7 @@ Each video has one work directory:
   optimized.md  quality.json
 ```
 
-Beside the video directories, `/tmp/yt-transcript/.locks/` holds the lock files (`video-<video_id>.lock` per video, `youtube.lock`) and two small records: `youtube_rate_limit.json` (YouTube's last refusal of this machine) and `yt-dlp-update.stamp` (the last Homebrew check). None of them is ever deleted.
+Beside the video directories, `/tmp/yt-transcript/.locks/` holds the lock files (`video-<video_id>.lock` per video, `youtube.lock`, `articles.lock`) and two small records: `youtube_rate_limit.json` (YouTube's last refusal of this machine) and `yt-dlp-update.stamp` (the last Homebrew check). None of them is ever deleted.
 
 `YT_TRANSCRIPT_WORK_ROOT` replaces `/tmp/yt-transcript` and `YT_TRANSCRIPT_OUTPUT_DIR` replaces the configured `output_dir`; the regression runner uses both so it never touches real runs or the notes folder. The video locks move with the work root. The YouTube lock and the two records stay in `/tmp/yt-transcript/.locks/` whatever the work root, because they are about the machine; only `YT_TRANSCRIPT_LOCK_DIR` moves them, which the offline tests do.
 
@@ -285,7 +285,7 @@ Every `run` call prints exactly one JSON object on stdout and exits with a fixed
 |---|---|---|---|
 | `done` | 0 | Article written: `output_file`, `title`, `route`, `warnings`, `llm`. After `--stage plan`: `stage`, `route`, `plan`, and a `message` when the route needs Deepgram | Report the result |
 | `failed` | 1 | A stage failed: `stage`, `reason`, `message`, `retryable` (plus `hard_failures` for a quality failure) | Rerun `next_command` once if `retryable`, otherwise report; may suggest an override |
-| `needs_user` | 3 | Only the user can fix it. `reason` is `cookies_required`, `login_required`, `rate_limited`, `deepgram_key_missing`, `tool_missing` or `output_dir_missing`; `message` says what to do. A refused preferred track adds `preferred_track`, `fallback_track` and `accept_command` | Tell the user; rerun after they act, or run `accept_command` if they accept the fallback |
+| `needs_user` | 3 | Only the user can fix it. `reason` is `cookies_required`, `login_required`, `rate_limited`, `deepgram_key_missing`, `tool_missing`, `output_dir_missing` or `llm_api_fallback`; `message` says what to do. A refused preferred track adds `preferred_track`, `fallback_track` and `accept_command`. `llm_api_fallback` (6.8) adds `choices`, each with `answer`, `label` and `command` | Tell the user; rerun after they act, run `accept_command` if they accept the fallback, or run the `command` of the choice they pick |
 | `unsupported` | 4 | The spoken language is not supported: `reason` `unsupported_language`, `language` | Report; do not retry. When `message` suggests `--mode` (the language was guessed from the title or detected by Deepgram) and the user says the video is Chinese or English, rerun with that `--mode` |
 | `needs_agent_text` | 5 | No LLM backend is reachable; one request is handed over: `task.name`, `task.prompt_file`, `task.output_file` | Answer it, write the answer to the output file, rerun `next_command` |
 | `in_progress` | 6 | The `--max-seconds` budget ran out at a safe point: `stage`, `progress` (`stages_done`, `text_tasks`). Also when the budget ran out while waiting for another run of the same video or for YouTube (6.4); `message` names the holder | Rerun `next_command` until the status changes |
@@ -331,7 +331,7 @@ A `needs_agent_text` result names a prompt file (the whole request, numbered uni
 }
 ```
 
-The task is exactly one LLM request: an outline request, a window round, or a fallback chunk, with the same prompt, numbered units, and end marker an LLM backend would receive. On the rerun, `run` moves the answer to `agent_task/answers/<sha256 of the prompt>.txt`, gives it back when the same prompt comes up, and validates it the same way it validates any response (section 7); answers stay until the text stage finishes. A short video needs about one handoff per text task; a long video needs several. The agent is therefore simply the slowest LLM backend, with no separate text path to maintain. It is a fallback: normally `auto` reaches the host CLI or the API.
+The task is exactly one LLM request: an outline request, a window round, or a fallback chunk, with the same prompt, numbered units, and end marker an LLM backend would receive. On the rerun, `run` moves the answer to `agent_task/answers/<sha256 of the prompt>.txt`, gives it back when the same prompt comes up, and validates it the same way it validates any response (section 7); answers stay until the text stage finishes. A short video needs about one handoff per text task; a long video needs several. The agent is therefore simply the slowest LLM backend, with no separate text path to maintain. It is a fallback: normally `auto` reaches the host CLI, and `llm_backend: api` the API.
 
 ### 6.6 Override flags
 
@@ -342,6 +342,7 @@ The task is exactly one LLM request: an outline request, a window round, or a fa
 | `--from <stage>` | no | Mark that stage and every later stage not done, then run. For recovery and debugging. |
 | `--stage plan` | repeated in `next_command` | Stop after `plan`: the free routing check. |
 | `--max-seconds <n>` | repeated in `next_command` | Start no new stage or window round after n seconds, once the call has finished at least one; return `in_progress`. |
+| `--llm-api once\|always\|no\|never` | yes | Answer the `llm_api_fallback` question (6.8) for this video; `always` and `never` also save the answer in `config.yaml`. Redoes nothing. |
 | `--restart` | no | Delete the work directory, including saved overrides, and start over. |
 | `--config-path <file>` | repeated in `next_command` | Read another `config.yaml` instead of the one in the skill root. |
 
@@ -364,14 +365,24 @@ Every text request of the `text` stage goes through one request function in the 
 - **API**: an OpenAI-compatible or Anthropic Messages endpoint from config (`llm_api_format`, `llm_base_url`, `llm_model`, `llm_api_key`), with retries, backoff and optional streaming.
 - **agent handoff**: the `needs_agent_text` result above.
 
-With `llm_backend: auto` (the default), each task picks its backend when its window run starts: an explicit command first (the environment variable, then `llm_agent_cli`), else the CLI an earlier call of the same task used, else the host detected from its environment variables. The CLI is used only after it answers a one-line probe within `llm_cli_probe_timeout_sec`; otherwise the API is used if it is configured, and the agent handoff if not. A CLI that still fails mid-run after `llm_cli_max_retries` hands the remaining rounds to the API when one is configured. `llm_backend: api` skips the CLI. `state.json` records the backend as `<agent>-cli`, `api` or `agent-handoff`.
+With `llm_backend: auto` (the default), each task picks its backend when its window run starts: an explicit command first (the environment variable, then `llm_agent_cli`), else the CLI an earlier call of the same task used, else the host detected from its environment variables. The CLI is used only after it answers a one-line probe within `llm_cli_probe_timeout_sec`. A failed CLI request is retried `llm_cli_max_retries` times after the same exponential backoff the API uses (`llm_backoff_sec`). `llm_backend: api` uses the API and skips the CLI. `state.json` records the backend as `<agent>-cli`, `api` or `agent-handoff`.
+
+In `auto` mode the CLI can still be unusable: none was found, its probe failed, or a request still failed after its retries. With the API configured, `llm_api_fallback` decides what happens then. The API is billed per request, and several parallel videos would all switch to it at once, so the default asks the user instead of choosing:
+
+| `llm_api_fallback` | No usable CLI | A CLI request still failing |
+|---|---|---|
+| `ask` (default) | `needs_user`, reason `llm_api_fallback`, with four `choices` (below) | the same, at that request (the outline or a round) |
+| `auto` | the API takes every request | the API takes the rest of the run, with a warning |
+| `never` | agent handoff | a retryable `llm_error`; the rerun continues at that round |
+
+Without the API configured, the run behaves as with `never`. The question lists four answers, each with its command (`next_command` plus `--llm-api <answer>`): `once` (the API for this video), `always` (the API, and `llm_api_fallback: auto` saved in `config.yaml`), `no` (not for this video) and `never` (not for this video, and `llm_api_fallback: never` saved). The video keeps its answer in `state.json` until `--restart`, like an override. Saving changes only that one line of `config.yaml` and keeps the file's mode, since the file holds API keys. Asking costs one stop per video at most, and a batch asks once (SKILL.md); the alternative, a silent switch, is how the paid API used to run up without anyone deciding.
 
 Nothing depends on a provider's special request fields. `max_tokens` is sent as a loose ceiling; truncation is detected through the window protocol's end line, which also works for CLI output that has no `finish_reason`. A reported `finish_reason` of `length` (or the provider's equivalent) only makes later rounds write less.
 
 ### 6.9 Quality check and assembly
 
 - `verify` checks structure, signs of truncation, the size ratio against the raw text, repeated phrases and seam duplicates, Chinese readability, bilingual pairing, glossary drift, semantic anchors (dates, numbers, versions, URLs), and the window run's coverage. Only hard failures stop the run (`failed`, stage `verify`, reason `quality_hard_failure`), and then no article is written: a missing or empty file, no `##` section heading in more than 1,200 characters, or a bilingual body without a single English-then-Chinese paragraph pair. Everything else is a warning, saved in `state.json` and returned with `done` for the agent to mention. It also records, with no warning, the longest paragraph, how many paragraphs pass the prompts' split point (500 characters of Chinese, or 250 words for the English paragraphs of bilingual output), how many contain a single line break, and how many `##` headings follow a paragraph that stops mid-sentence (a heading that split a sentence: what the placement in 7.5 B let through, such as a paragraph ending on a dash).
-- `assemble` computes everything that used to be built by hand from state: the filename `yyyy-mm-dd. <title>.md` (illegal characters replaced, the video id when the title is empty, the date never in the raw `yyyymmdd` form), YAML frontmatter with quoted values (`title`, `source`, `url`, `channel`, `author`, `date`, `created`, `type`, `bilingual`, `duration`, `transcript_source`, `tags`, `via`), a header with the title, the channel link, the language mode and the duration, and a one-line footer naming the transcript source. The bilingual layout itself (each English paragraph followed by its Chinese translation) comes from `translate_only`.
+- `assemble` computes everything that used to be built by hand from state: the filename `yyyy-mm-dd. <title>.md` (illegal characters replaced, the video id when the title is empty, the date never in the raw `yyyymmdd` form; ` (<video_id>)` is appended when a file of that name holds another video's article, judged by its frontmatter `url`, so a rerun of the same video replaces its own article and nothing else is overwritten), YAML frontmatter with quoted values (`title`, `source`, `url`, `channel`, `author`, `date`, `created`, `type`, `bilingual`, `duration`, `transcript_source`, `tags`, `via`), a header with the title, the channel link, the language mode and the duration, and a one-line footer naming the transcript source. The bilingual layout itself (each English paragraph followed by its Chinese translation) comes from `translate_only`. The name is chosen and the file written under a machine-wide lock (`articles.lock` next to the YouTube lock), so two videos with the same title finishing at once cannot both take the free name; the file goes to a dot-prefixed temp file in the same folder and is then renamed, so a notes app never reads half an article.
 - `cleanup` runs only after the article exists. A failed or interrupted run keeps its whole directory so it can be resumed or inspected.
 
 ### 6.10 Public commands
@@ -396,7 +407,8 @@ kernel/
   cli.py                  argument parsing, the five commands, JSON output and exit codes
   pipeline.py             stage list, state.json, the two locks, resume, overrides, results;
                           download.sh calls; the agent handoff; status and cleanup
-  locks.py                the flock primitive: bounded waits, holder info, never-deleted lock files
+  locks.py                the flock primitive: bounded waits, holder info, never-deleted lock files;
+                          the machine-wide lock directory
   sources/
     youtube.py            the machine-wide YouTube lock path, the yt-dlp error classifier, the refusal record
     subtitle_language.py  spoken language, trusted tracks, subtitle candidates
@@ -424,7 +436,7 @@ scripts/update_yt_dlp.sh  the hourly `brew upgrade yt-dlp`
 prompts/*.md              task prompts: cleanup_zh, structure_only, translate_only
 ```
 
-Dependencies point one way. `config`, `files` and `locks` import nothing else from the kernel; `llm` uses only `config`, `sources` only `config` and `files`; `text` uses `config`, `files` and `llm`; `quality` uses `text`; `pipeline` uses all of them; `cli` uses `pipeline`, plus `sources` and `quality` for the debug commands. Nothing in `kernel/` imports `yt_transcript_utils.py`. The only loop runs across processes: `pipeline` starts `download.sh`, which pipes metadata through the `subtitle-info` command.
+Dependencies point one way. `config`, `files` and `locks` import nothing else from the kernel; `llm` uses only `config`, `sources` only `config`, `files` and `locks`; `text` uses `config`, `files` and `llm`; `quality` uses `text`; `pipeline` uses all of them; `cli` uses `pipeline`, plus `sources` and `quality` for the debug commands. Nothing in `kernel/` imports `yt_transcript_utils.py`. The only loop runs across processes: `pipeline` starts `download.sh`, which pipes metadata through the `subtitle-info` command.
 
 The module plan written before the split (stage 0 of the refactor) differs from the result in four places, for these reasons:
 
@@ -574,7 +586,7 @@ A response cut off before `<!--END-->` only loses its last paragraph: the cursor
 |---|---|
 | Chunks | `kernel/text/chunking.py` (`chunk_document`), called once by the `text` stage |
 | Units, rounds, sizing, validation, fallback, coverage | `kernel/text/window.py` (`process_window`, `run_window_rounds`, `parse_window_output`, `plan_round`, `update_sizing`) |
-| Backend choice per task and the mid-run switch to the API | the request function in `process_window`, over `kernel/llm/agent_cli.py` and `kernel/llm/api.py` |
+| Backend choice per task; what an unusable CLI does (`llm_api_fallback`) | the request function in `process_window`, over `kernel/llm/agent_cli.py` and `kernel/llm/api.py`; the question and its answers in `_Run.llm_api_question` and `_Run.answer_llm_api_question` |
 | Outline, chapter hints, terms per round | `kernel/text/outline.py` |
 | Headings and paragraph ends at sentence boundaries | `kernel/text/structure.py` (`structure_paragraphs`), called by `raw_stage_text` in `window.py` |
 | Transcript glossary and drift check | `kernel/text/glossary.py` |
@@ -684,7 +696,7 @@ Because the project still has to find the source text, decide how to acquire it,
 | Long-text subsystem (section 7) | see 7.5 |
 | LLM backends (6.8) | `kernel/llm/agent_cli.py`, `kernel/llm/api.py`; the choice in `kernel/text/window.py`; the handoff in `kernel/pipeline.py` (`AgentHandoff`) |
 | Quality check (6.9) | `kernel/quality/verify.py`, `kernel/quality/semantic.py` |
-| Article assembly (6.9) | `kernel/text/assemble.py`, `_Run.stage_assemble` |
+| Article assembly (6.9) | `kernel/text/assemble.py` (`assemble_final`, `frontmatter_url`), `_Run.stage_assemble`, `article_path` in `kernel/pipeline.py` |
 | Config and defaults | `kernel/config.py`, documented key by key in `config.example.yaml` |
 | Host contract (6.13) | `SKILL.md` |
 | Tests (6.12) | `tests/`, `scripts/run_regression.py` |
@@ -886,7 +898,7 @@ agent 从不编辑状态文件，也从不手动执行内部阶段。需要不�
 | `source` | 判断口语语言并选出可信的字幕轨（6.3）；下载并解析成纯文本和带时间的片段；给字幕质量打分，评分规则要求时改用 Deepgram；或者直接用 Deepgram 转写 | `source/`、`raw_text.txt`、`segments.json`、`state.json` 里的路由 | `unsupported`、`needs_user`（首选字幕轨被拒、缺少 Deepgram 密钥，或上面的 yt-dlp 情况）、`failed` |
 | `normalize` | 生成规范化文档：清理后的文字、带时间的片段，以及分块时按文字切还是按片段切 | `normalized_document.json` | `failed` |
 | `plan` | 按模式选择文字任务（中文：`cleanup_zh`；双语：先 `structure_only` 再 `translate_only`），把文字标为 `short` 或 `long`，并估算规模（输入 token、每个任务预计轮数）。中文的 Deepgram 文字会多一条修复识别错误的说明 | `plan.json` | `failed` |
-| `text` | 先把规范化文档切成分块，再用窗口执行器（第 7 节）逐个执行规划好的任务；每个任务单独记账 | `text/` | `needs_agent_text`、`in_progress`、`failed` |
+| `text` | 先把规范化文档切成分块，再用窗口执行器（第 7 节）逐个执行规划好的任务；每个任务单独记账 | `text/` | `needs_agent_text`、`needs_user`（`llm_api_fallback`，6.8）、`in_progress`、`failed` |
 | `merge` | 按顺序拼接最后一个任务的段落（第一个任务的段落带上大纲的标题、句子完整，见 7.5 B），再去掉在轮次接缝处重复的标题、段落和段首 | `optimized.md` | `failed` |
 | `verify` | 对照原始文字做质量检查 | `quality.json` | `failed`（只有硬失败才停；警告只记录） |
 | `assemble` | 写出文章：frontmatter、头部、正文和结尾，文件名为 `yyyy-mm-dd. <标题>.md` | `output_dir` 里的文章 | `needs_user`（`output_dir_missing`）、`failed` |
@@ -938,7 +950,7 @@ agent 从不编辑状态文件，也从不手动执行内部阶段。需要不�
   optimized.md  quality.json
 ```
 
-各视频目录旁边，`/tmp/yt-transcript/.locks/` 放锁文件（每个视频一个 `video-<video_id>.lock`，以及 `youtube.lock`）和两份小记录：`youtube_rate_limit.json`（YouTube 最近一次拒绝这台机器）和 `yt-dlp-update.stamp`（最近一次问 Homebrew 的时间）。这些文件都从不删除。
+各视频目录旁边，`/tmp/yt-transcript/.locks/` 放锁文件（每个视频一个 `video-<video_id>.lock`，以及 `youtube.lock`、`articles.lock`）和两份小记录：`youtube_rate_limit.json`（YouTube 最近一次拒绝这台机器）和 `yt-dlp-update.stamp`（最近一次问 Homebrew 的时间）。这些文件都从不删除。
 
 `YT_TRANSCRIPT_WORK_ROOT` 可以代替 `/tmp/yt-transcript`，`YT_TRANSCRIPT_OUTPUT_DIR` 可以代替配置里的 `output_dir`；回归脚本两个都用，所以不会碰到真实的运行目录和笔记库。视频锁跟着工作根目录走。YouTube 锁和那两份记录关系到整台机器，所以不管工作根目录在哪里，都留在 `/tmp/yt-transcript/.locks/`；只有 `YT_TRANSCRIPT_LOCK_DIR` 能改它们的位置，离线测试就是这样做的。
 
@@ -1025,7 +1037,7 @@ agent 从不编辑状态文件，也从不手动执行内部阶段。需要不�
 |---|---|---|---|
 | `done` | 0 | 文章已写出：`output_file`、`title`、`route`、`warnings`、`llm`。`--stage plan` 之后：`stage`、`route`、`plan`，路由需要 Deepgram 时还有 `message` | 汇报结果 |
 | `failed` | 1 | 某个阶段失败：`stage`、`reason`、`message`、`retryable`（质量检查失败时还有 `hard_failures`） | `retryable` 时重跑一次 `next_command`，否则汇报；可以建议某个覆盖参数 |
-| `needs_user` | 3 | 只有用户能解决。`reason` 是 `cookies_required`、`login_required`、`rate_limited`、`deepgram_key_missing`、`tool_missing` 或 `output_dir_missing`；`message` 说明该怎么做。首选字幕轨被拒时还有 `preferred_track`、`fallback_track` 和 `accept_command` | 告诉用户；用户处理后重跑，用户接受备用字幕轨时执行 `accept_command` |
+| `needs_user` | 3 | 只有用户能解决。`reason` 是 `cookies_required`、`login_required`、`rate_limited`、`deepgram_key_missing`、`tool_missing`、`output_dir_missing` 或 `llm_api_fallback`；`message` 说明该怎么做。首选字幕轨被拒时还有 `preferred_track`、`fallback_track` 和 `accept_command`。`llm_api_fallback`（6.8）还有 `choices`，每项带 `answer`、`label` 和 `command` | 告诉用户；用户处理后重跑，用户接受备用字幕轨时执行 `accept_command`，或执行用户所选那一项的 `command` |
 | `unsupported` | 4 | 口语语言不受支持：`reason` 为 `unsupported_language`，还有 `language` | 汇报；不重试。`message` 建议了 `--mode`（语言是从标题推测的或由 Deepgram 自己识别的），而用户说视频其实是中文或英文时，用对应的 `--mode` 重跑 |
 | `needs_agent_text` | 5 | 没有可用的 LLM 后端，交出一次请求：`task.name`、`task.prompt_file`、`task.output_file` | 完成请求，把答案写进输出文件，重跑 `next_command` |
 | `in_progress` | 6 | `--max-seconds` 时间用完，在安全点停下：`stage`、`progress`（`stages_done`、`text_tasks`）。等同一视频的另一个运行或等 YouTube 时预算用完，也返回它（6.4），`message` 说明谁在占用 | 重跑 `next_command`，直到状态改变 |
@@ -1071,7 +1083,7 @@ agent 从不编辑状态文件，也从不手动执行内部阶段。需要不�
 }
 ```
 
-这个任务恰好是一次 LLM 请求：一次大纲请求、一轮窗口或一个兜底分块，prompt、编号单元和结束标记都和 LLM 后端收到的一样。重跑时，`run` 把答案移到 `agent_task/answers/<prompt 的 sha256>.txt`，遇到同一个 prompt 时交回这个答案，并用校验任何响应的同一套规则（第 7 节）校验它；答案一直保留到 `text` 阶段结束。短视频大约每个文字任务交一次；长视频要交好几次。所以 agent 就是最慢的一种 LLM 后端，不需要单独维护一条文字处理路径。它只是兜底：正常情况下 `auto` 会用上宿主 CLI 或 API。
+这个任务恰好是一次 LLM 请求：一次大纲请求、一轮窗口或一个兜底分块，prompt、编号单元和结束标记都和 LLM 后端收到的一样。重跑时，`run` 把答案移到 `agent_task/answers/<prompt 的 sha256>.txt`，遇到同一个 prompt 时交回这个答案，并用校验任何响应的同一套规则（第 7 节）校验它；答案一直保留到 `text` 阶段结束。短视频大约每个文字任务交一次；长视频要交好几次。所以 agent 就是最慢的一种 LLM 后端，不需要单独维护一条文字处理路径。它只是兜底：正常情况下 `auto` 会用上宿主 CLI，`llm_backend: api` 则用 API。
 
 ### 6.6 覆盖参数
 
@@ -1082,6 +1094,7 @@ agent 从不编辑状态文件，也从不手动执行内部阶段。需要不�
 | `--from <阶段>` | 否 | 把该阶段及之后的阶段标为未完成，然后运行。用于恢复和调试。 |
 | `--stage plan` | 写进 `next_command` | 做完 `plan` 就停：免费的路由检查。 |
 | `--max-seconds <n>` | 写进 `next_command` | n 秒后、且本次调用至少完成了一个阶段或一轮窗口时，不再开始新的阶段或新一轮窗口，返回 `in_progress`。 |
+| `--llm-api once\|always\|no\|never` | 是 | 回答这个视频的 `llm_api_fallback` 问题（6.8）；`always` 和 `never` 还会把回答记进 `config.yaml`。不重做任何阶段。 |
 | `--restart` | 否 | 删除工作目录（包括保存的覆盖参数），从头开始。 |
 | `--config-path <文件>` | 写进 `next_command` | 读取另一个 `config.yaml`，而不是 skill 根目录下的那个。 |
 
@@ -1104,14 +1117,24 @@ agent 从不编辑状态文件，也从不手动执行内部阶段。需要不�
 - **API**：配置里的 OpenAI 兼容接口或 Anthropic Messages 接口（`llm_api_format`、`llm_base_url`、`llm_model`、`llm_api_key`），带重试、退避和可选的流式响应。
 - **交给 agent**：上面的 `needs_agent_text` 结果。
 
-`llm_backend: auto`（默认）时，每个任务在它的窗口运行开始时选后端：先看明确指定的命令（先环境变量，再 `llm_agent_cli`），再看同一任务之前的调用用过的 CLI，最后根据环境变量识别宿主。CLI 要在 `llm_cli_probe_timeout_sec` 内答出一次一行的试调才会被使用；否则配置了 API 就用 API，没配置就交给 agent。CLI 在运行中途失败、`llm_cli_max_retries` 次重试后仍不行时，如果配置了 API，剩下的轮次改走 API。`llm_backend: api` 跳过 CLI。`state.json` 里把后端记为 `<agent>-cli`、`api` 或 `agent-handoff`。
+`llm_backend: auto`（默认）时，每个任务在它的窗口运行开始时选后端：先看明确指定的命令（先环境变量，再 `llm_agent_cli`），再看同一任务之前的调用用过的 CLI，最后根据环境变量识别宿主。CLI 要在 `llm_cli_probe_timeout_sec` 内答出一次一行的试调才会被使用。CLI 请求失败时，按 API 那条路同样的指数退避（`llm_backoff_sec`）重试 `llm_cli_max_retries` 次。`llm_backend: api` 用 API，并跳过 CLI。`state.json` 里把后端记为 `<agent>-cli`、`api` 或 `agent-handoff`。
+
+`auto` 模式下 CLI 仍可能用不了：没找到、试调失败，或者某个请求重试后仍然失败。配了 API 时，这时怎么办由 `llm_api_fallback` 决定。API 按请求收费，而且并行的几个视频会一起切过去，所以默认是问用户，而不是替用户选：
+
+| `llm_api_fallback` | 没有可用的 CLI | CLI 请求一直失败 |
+|---|---|---|
+| `ask`（默认） | `needs_user`，原因 `llm_api_fallback`，带四个 `choices`（见下） | 同样，停在那个请求（大纲或某一轮） |
+| `auto` | 所有请求交给 API | 剩下的部分交给 API，并给出警告 |
+| `never` | 交给 agent | 可重试的 `llm_error`，重跑时从那一轮继续 |
+
+没配 API 时，行为和 `never` 一样。问题列出四个回答，每个都带着自己的命令（`next_command` 加上 `--llm-api <回答>`）：`once`（这个视频用 API）、`always`（用 API，并把 `llm_api_fallback: auto` 记进 `config.yaml`）、`no`（这个视频不用）和 `never`（这个视频不用，并记下 `llm_api_fallback: never`）。这个视频的回答像覆盖参数一样存进 `state.json`，直到 `--restart`。记进 `config.yaml` 时只改这一行，并保留文件权限，因为这个文件里有 API 密钥。问一次最多让每个视频停一次，批量时只问一次（SKILL.md）；另一种做法是悄悄切换，以前付费 API 的费用就是这样在没人决定的情况下涨上去的。
 
 不依赖任何提供方的特殊请求字段。`max_tokens` 只作为宽松的上限发送；截断通过窗口协议的结束行检测，没有 `finish_reason` 的命令行输出也适用。报告了 `finish_reason` 为 `length`（或提供方的同义值）时，只会让后面的轮次少写一些。
 
 ### 6.9 质量检查与组装
 
 - `verify` 检查结构、截断迹象、相对原文的长度比、重复短语和接缝重复、中文可读性、双语配对、术语漂移、semantic anchors（日期、数字、版本号、URL）以及窗口运行的覆盖率。只有硬失败会让运行停下（`failed`，阶段 `verify`，原因 `quality_hard_failure`），这时不写文章：文件不存在或为空、超过 1200 个字符却没有一个 `##` 标题、双语正文里没有一组"英文段后接中文段"的配对。其余都是警告，存进 `state.json`，随 `done` 一起返回，由 agent 提及。另外它只记录、不警告：最长段落的长度、超过 prompt 分段点的段落数（中文 500 字；双语输出按英文段落，250 词）、段内含单个换行的段落数，以及有多少个 `##` 标题前面那段没有说完（标题把一句话切开了，也就是 7.5 B 的放置没能处理的情况，比如前一段以破折号结尾）。
-- `assemble` 计算以前要从状态里手工拼出来的所有东西：文件名 `yyyy-mm-dd. <标题>.md`（替换非法字符，标题为空时用视频 id，日期从不使用原始的 `yyyymmdd`）、值都加引号的 YAML frontmatter（`title`、`source`、`url`、`channel`、`author`、`date`、`created`、`type`、`bilingual`、`duration`、`transcript_source`、`tags`、`via`）、包含标题、频道链接、语言模式和时长的头部，以及注明转录来源的一行结尾。双语排版本身（每个英文段后面跟它的中文译文）由 `translate_only` 产生。
+- `assemble` 计算以前要从状态里手工拼出来的所有东西：文件名 `yyyy-mm-dd. <标题>.md`（替换非法字符，标题为空时用视频 id，日期从不使用原始的 `yyyymmdd`；同名文件里是别的视频的文章时，按它 frontmatter 的 `url` 判断，在名字后加 ` (<video_id>)`，所以同一视频重跑覆盖自己的旧文章，别的文件都不会被覆盖）、值都加引号的 YAML frontmatter（`title`、`source`、`url`、`channel`、`author`、`date`、`created`、`type`、`bilingual`、`duration`、`transcript_source`、`tags`、`via`）、包含标题、频道链接、语言模式和时长的头部，以及注明转录来源的一行结尾。双语排版本身（每个英文段后面跟它的中文译文）由 `translate_only` 产生。选文件名和写文件在一把整台机器共用的锁（YouTube 锁旁边的 `articles.lock`）里完成，所以两个同名视频同时写完时不会都占用那个空名字；文件先写到同目录下以点开头的临时文件，再改名，笔记软件不会读到半篇文章。
 - `cleanup` 只在文章存在之后运行。失败或中断的运行保留整个目录，便于续跑或检查。
 
 ### 6.10 对外命令
@@ -1136,7 +1159,7 @@ kernel/
   cli.py                  参数解析、五个命令、JSON 输出和退出码
   pipeline.py             阶段列表、state.json、两把锁、续跑、覆盖参数、结果；
                           调用 download.sh；交给 agent；status 和 cleanup
-  locks.py                flock 原语：有上限的等待、持有者信息、从不删除的锁文件
+  locks.py                flock 原语：有上限的等待、持有者信息、从不删除的锁文件；整台机器共用的锁目录
   sources/
     youtube.py            整台机器共用的 YouTube 锁路径、yt-dlp 错误分类器、拒绝记录
     subtitle_language.py  口语语言、可信字幕轨、候选字幕轨
@@ -1164,7 +1187,7 @@ scripts/update_yt_dlp.sh  每小时最多一次的 `brew upgrade yt-dlp`
 prompts/*.md              任务 prompt：cleanup_zh、structure_only、translate_only
 ```
 
-依赖只朝一个方向。`config`、`files` 和 `locks` 不引用 kernel 里的其他模块；`llm` 只用 `config`，`sources` 只用 `config` 和 `files`；`text` 用 `config`、`files` 和 `llm`；`quality` 用 `text`；`pipeline` 用上面所有模块；`cli` 用 `pipeline`，调试命令另外用 `sources` 和 `quality`。`kernel/` 里没有任何模块引用 `yt_transcript_utils.py`。唯一的回路跨越进程：`pipeline` 启动 `download.sh`，`download.sh` 再把元数据交给 `subtitle-info` 命令。
+依赖只朝一个方向。`config`、`files` 和 `locks` 不引用 kernel 里的其他模块；`llm` 只用 `config`，`sources` 只用 `config`、`files` 和 `locks`；`text` 用 `config`、`files` 和 `llm`；`quality` 用 `text`；`pipeline` 用上面所有模块；`cli` 用 `pipeline`，调试命令另外用 `sources` 和 `quality`。`kernel/` 里没有任何模块引用 `yt_transcript_utils.py`。唯一的回路跨越进程：`pipeline` 启动 `download.sh`，`download.sh` 再把元数据交给 `subtitle-info` 命令。
 
 拆分之前（重构第 0 阶段）写下的模块计划和结果有四处不同，原因如下：
 
@@ -1314,7 +1337,7 @@ merge 阶段 -> verify 阶段 -> assemble 阶段
 |---|---|
 | 分块 | `kernel/text/chunking.py`（`chunk_document`），由 `text` 阶段调用一次 |
 | 单元、轮次、大小调整、校验、兜底、覆盖率 | `kernel/text/window.py`（`process_window`、`run_window_rounds`、`parse_window_output`、`plan_round`、`update_sizing`） |
-| 每个任务的后端选择，以及运行中途改走 API | `process_window` 里的请求函数，底层是 `kernel/llm/agent_cli.py` 和 `kernel/llm/api.py` |
+| 每个任务的后端选择；CLI 用不了时怎么办（`llm_api_fallback`） | `process_window` 里的请求函数，底层是 `kernel/llm/agent_cli.py` 和 `kernel/llm/api.py`；问题和回答在 `_Run.llm_api_question` 和 `_Run.answer_llm_api_question` |
 | 大纲、章节提示、每轮的术语 | `kernel/text/outline.py` |
 | 按句子边界放标题、收段落 | `kernel/text/structure.py`（`structure_paragraphs`），由 `window.py` 的 `raw_stage_text` 调用 |
 | 转录术语表和漂移检查 | `kernel/text/glossary.py` |
@@ -1424,7 +1447,7 @@ merge 阶段 -> verify 阶段 -> assemble 阶段
 | 长文本子系统（第 7 节） | 见 7.5 |
 | LLM 后端（6.8） | `kernel/llm/agent_cli.py`、`kernel/llm/api.py`；选择在 `kernel/text/window.py`；交给 agent 在 `kernel/pipeline.py`（`AgentHandoff`） |
 | 质量检查（6.9） | `kernel/quality/verify.py`、`kernel/quality/semantic.py` |
-| 组装文章（6.9） | `kernel/text/assemble.py`、`_Run.stage_assemble` |
+| 组装文章（6.9） | `kernel/text/assemble.py`（`assemble_final`、`frontmatter_url`）、`_Run.stage_assemble`、`kernel/pipeline.py` 里的 `article_path` |
 | 配置和默认值 | `kernel/config.py`，每一项在 `config.example.yaml` 里有说明 |
 | 与宿主的约定（6.13） | `SKILL.md` |
 | 测试（6.12） | `tests/`、`scripts/run_regression.py` |

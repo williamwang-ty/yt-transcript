@@ -37,6 +37,7 @@ from pathlib import Path
 from kernel import config as kernel_config
 from kernel import locks
 from kernel.files import atomic_write_text
+from kernel.llm import agent_cli as kernel_agent_cli
 from kernel.quality import verify as kernel_verify
 from kernel.sources import deepgram as kernel_deepgram
 from kernel.sources import subtitle_language as kernel_subtitle_language
@@ -71,6 +72,8 @@ USAGE_EXIT_CODE = 2
 STATE_FILE = "state.json"
 # Video locks live outside the work dirs, which `cleanup` and `--restart` delete.
 LOCKS_DIR = ".locks"
+# Machine-wide, in kernel.locks.machine_dir(): held while an article's name is chosen and written.
+ARTICLES_LOCK = "articles.lock"
 METADATA_FILE = "metadata.json"
 CHAPTERS_FILE = "chapters.json"
 SOURCE_DIR = "source"
@@ -117,6 +120,10 @@ YT_DLP_CONFIG_ENV = {
     "YT_DLP_COOKIES_FILE": "yt_dlp_cookies_file",
 }
 DEEPGRAM_KEY_PLACEHOLDERS = {"", "your_api_key_here", "your_deepgram_api_key_here"}
+# The answers to a `llm_api_fallback` question (`run --llm-api`): what this video
+# does, and the ones the user wants remembered in config.yaml.
+LLM_API_ANSWERS = {"once": "auto", "always": "auto", "no": "never", "never": "never"}
+REMEMBERED_LLM_API_ANSWERS = ("always", "never")
 # The needs_user reason for each problem kernel/sources/youtube.py finds in yt-dlp's output.
 NEEDS_USER_REASONS = {"rate_limited": "rate_limited", "bot_check": "cookies_required",
                       "login_required": "login_required"}
@@ -222,6 +229,19 @@ def canonical_url(video_id: str) -> str:
     return f"https://www.youtube.com/watch?v={video_id}"
 
 
+def article_path(folder: Path, name: str, video_id: str) -> Path:
+    """`<name>.md`, unless that file is another video's article: then `<name> (<video_id>).md`.
+
+    The frontmatter `url:` says whose article an existing file is; a file that
+    names no video counts as someone else's. A rerun of the same video
+    overwrites its own article.
+    """
+    path = folder / f"{name}.md"
+    if path.exists() and parse_video_id(kernel_assemble.frontmatter_url(path)) != video_id:
+        return folder / f"{name} ({video_id}).md"
+    return path
+
+
 def iso_date(upload_date: str) -> str:
     """yyyymmdd -> yyyy-mm-dd, the date format for output filenames."""
     text = str(upload_date or "")
@@ -292,11 +312,12 @@ class _Run:
     def __init__(self, *, video_id: str, url: str, work_dir: Path, source: str | None, mode: str | None,
                  from_stage: str | None, stop_after: str | None, max_seconds: float | None,
                  restart: bool, config_path: str | None, stderr_tail: _StderrTail | None,
-                 video_lock: locks.FileLock, started: float, started_at: float):
+                 video_lock: locks.FileLock, started: float, started_at: float, llm_api: str | None = None):
         self.video_id = video_id
         self.url = url
         self.work_dir = work_dir
         self.requested_overrides = {"source": source, "mode": mode}
+        self.llm_api = llm_api
         self.from_stage = from_stage
         self.stop_after = stop_after
         self.max_seconds = max_seconds
@@ -382,6 +403,8 @@ class _Run:
             return self.finish("failed", stage="", reason="config_error", retryable=False,
                                message=(self.stderr_tail.last(1) if self.stderr_tail else "")
                                or f"Cannot read the config file {self.config_path}")
+        if self.llm_api:
+            self.answer_llm_api_question(self.llm_api)
 
         changed = [key for key, value in self.requested_overrides.items()
                    if value is not None and value != self.overrides.get(key)]
@@ -446,6 +469,41 @@ class _Run:
         if name == "assemble":
             # The article itself stays; the next assemble overwrites it.
             self.state["output_file"] = None
+
+    def answer_llm_api_question(self, answer: str) -> None:
+        """Keep the user's `--llm-api` answer for this video, and in config.yaml when it is for good."""
+        policy = LLM_API_ANSWERS[answer]
+        self.state["llm_api"] = policy
+        if answer in REMEMBERED_LLM_API_ANSWERS:
+            written = kernel_config.set_config_value(self.config_path, "llm_api_fallback", policy)
+            self.config["llm_api_fallback"] = policy
+            _log(f"ℹ️ Saved llm_api_fallback: {policy} in {written}.")
+
+    def llm_api_question(self, needed: kernel_agent_cli.ApiFallbackNeeded) -> Stop:
+        """The needs_user result that asks whether this video may use the paid API."""
+        agent = needed.agent or "agent"
+        if needed.case == "cli_failed":
+            what = f"The {agent} CLI still failed after its retries ({needed.detail})."
+            without = "Without the API, the run tries the CLI again."
+            no_label = "Don't use the API; try the CLI again (ask again next time)"
+        else:
+            what = f"No agent CLI can be used ({needed.detail})."
+            without = "Without the API, the text requests are handed to you (needs_agent_text)."
+            no_label = "Don't use the API; hand the text to the agent (ask again next time)"
+        labels = {
+            "once": "Use the API for this video (ask again next time)",
+            "always": "Use the API, now and every later time the CLI cannot be used (don't ask again)",
+            "no": no_label,
+            "never": "Never use the API when the CLI cannot be used (don't ask again)",
+        }
+        return Stop(
+            "needs_user", "llm_api_fallback",
+            f"{what} The configured API ({self.config.get('llm_model', '')}) could take over, but it is billed "
+            f"per request. {without} "
+            "Ask the user which of `choices` to take, then run that choice's command.",
+            choices=[{"answer": answer, "label": label, "command": f"{self.next_command()} --llm-api {answer}"}
+                     for answer, label in labels.items()],
+        )
 
     def run_stage(self, name: str) -> None:
         record = self.state["stages"].setdefault(name, {})
@@ -956,16 +1014,22 @@ class _Run:
                     input_key=task["input_key"],
                     stop_check=stop_check,
                     agent_handoff=handoff.request,
+                    api_fallback=self.state.get("llm_api"),
                 )
+            except kernel_agent_cli.ApiFallbackNeeded as needed:
+                task_record["status"] = "running"
+                self.update_task_progress(task_record, task["input_key"])
+                self.update_llm_usage()
+                raise self.llm_api_question(needed) from None
             except AgentTextNeeded as needed:
                 task_record["status"] = "needs_agent_text"
                 self.update_task_progress(task_record, task["input_key"])
                 self.update_llm_usage()
                 raise Stop(
                     "needs_agent_text", "no_llm_backend",
-                    "No LLM backend is reachable (no host agent CLI answered and no API is configured). Answer "
-                    "the request in task.prompt_file exactly as the model would, write only the answer to "
-                    "task.output_file, then run next_command.",
+                    "No LLM backend is reachable (no host agent CLI answered, and the API is not configured or "
+                    "the user declined it). Answer the request in task.prompt_file exactly as the model would, "
+                    "write only the answer to task.output_file, then run next_command.",
                     task={**needed.task, "name": prompt},
                 ) from None
             task_record.update({key: result.get(key) for key in (
@@ -987,7 +1051,8 @@ class _Run:
             error_type = str(result.get("error") or "")
             message = str(result.get("message") or "text processing failed")
             reason = "llm_timeout" if "timeout" in error_type.lower() else "llm_error"
-            raise Stop("failed", reason, message, retryable=True)
+            raise Stop("failed", reason, f"{message} (rerun next_command to continue where it stopped)",
+                       retryable=True)
         handoff.clear()
         record["outputs"] = [TEXT_DIR]
 
@@ -1030,20 +1095,28 @@ class _Run:
         meta = self.state["metadata"]
         date = iso_date(meta.get("upload_date", ""))
         title = kernel_assemble.sanitize_filename(str(meta.get("title") or "")).strip() or self.video_id
-        output_file = Path(output_dir).expanduser() / (f"{date}. {title}.md" if date else f"{title}.md")
         mode = self.state["route"]["mode"]
-        kernel_assemble.assemble_final(
-            str(self.path(OPTIMIZED_FILE)),
-            str(output_file),
-            title=str(meta.get("title") or ""),
-            source=self.url,
-            channel=str(meta.get("channel") or ""),
-            date=str(meta.get("upload_date") or ""),
-            created=date,
-            duration=int(meta.get("duration") or 0),
-            transcript_source=SOURCE_LABELS[self.state["route"]["source"]],
-            bilingual=mode == "bilingual",
-        )
+        # Choosing the name and writing under one machine-wide lock: two videos with the
+        # same title finishing at once cannot both take the free name.
+        lock = locks.FileLock(locks.machine_dir() / ARTICLES_LOCK)
+        lock.acquire(video_id=self.video_id)
+        try:
+            output_file = article_path(Path(output_dir).expanduser(), f"{date}. {title}" if date else title,
+                                       self.video_id)
+            kernel_assemble.assemble_final(
+                str(self.path(OPTIMIZED_FILE)),
+                str(output_file),
+                title=str(meta.get("title") or ""),
+                source=self.url,
+                channel=str(meta.get("channel") or ""),
+                date=str(meta.get("upload_date") or ""),
+                created=date,
+                duration=int(meta.get("duration") or 0),
+                transcript_source=SOURCE_LABELS[self.state["route"]["source"]],
+                bilingual=mode == "bilingual",
+            )
+        finally:
+            lock.release()
         self.state["output_file"] = str(output_file.absolute())
         record["outputs"] = [self.state["output_file"]]
 
@@ -1133,7 +1206,8 @@ def llm_usage(text_dir: Path) -> dict:
 
 def run(url: str, *, source: str | None = None, mode: str | None = None, from_stage: str | None = None,
         stage: str | None = None, max_seconds: float | None = None, restart: bool = False,
-        config_path: str | None = None, stderr_tail: _StderrTail | None = None) -> tuple[dict, int]:
+        config_path: str | None = None, stderr_tail: _StderrTail | None = None,
+        llm_api: str | None = None) -> tuple[dict, int]:
     """Run (or continue) the pipeline for one video; return (result, exit code).
 
     A second call for a video that is already running waits for the first one
@@ -1154,7 +1228,7 @@ def run(url: str, *, source: str | None = None, mode: str | None = None, from_st
         # This call did nothing, so the next one repeats every flag it was given.
         flags = [*(["--source", source] if source else []), *(["--mode", mode] if mode else []),
                  *(["--from", from_stage] if from_stage else []), *(["--stage", stage] if stage else []),
-                 *(["--restart"] if restart else [])]
+                 *(["--restart"] if restart else []), *(["--llm-api", llm_api] if llm_api else [])]
         return {
             "status": "in_progress",
             "video_id": video_id,
@@ -1171,7 +1245,7 @@ def run(url: str, *, source: str | None = None, mode: str | None = None, from_st
         job = _Run(video_id=video_id, url=canonical_url(video_id), work_dir=work_dir, source=source, mode=mode,
                    from_stage=from_stage, stop_after=stage, max_seconds=max_seconds, restart=restart,
                    config_path=config_path, stderr_tail=stderr_tail, video_lock=lock, started=started,
-                   started_at=started_at)
+                   started_at=started_at, llm_api=llm_api)
         result = job.execute()
     finally:
         lock.release()

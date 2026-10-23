@@ -211,6 +211,122 @@ class RunCommandTests(RunFixture):
         self.assertEqual(2, new_calls.count("window"))
         self.assertEqual(expected, Path(resumed["output_file"]).read_text(encoding="utf-8"))
 
+    def api_config(self, name: str = "api.yaml", **fields) -> str:
+        """A config with the paid API configured and a CLI that retries once."""
+        return self.write_config(name, llm_cli_max_retries="1", llm_backoff_sec="0.1", llm_api_key='"key"',
+                                 llm_base_url='"https://api.example.com"', llm_model='"some-model"', **fields)
+
+    @staticmethod
+    def fake_api(**kwargs) -> dict:
+        """The paid API, answered by the fake LLM without its simulated outage."""
+        env = {key: value for key, value in os.environ.items() if key != "FAKE_LLM_FAIL_FROM_UNIT"}
+        answer = subprocess.run([sys.executable, str(FAKE_LLM)], input=kwargs["messages"][0]["content"],
+                                capture_output=True, text=True, env=env, check=True)
+        return {"text": answer.stdout.strip(), "latency_ms": 1,
+                "request_url": "https://api.example.com/chat/completions", "streaming_used": False,
+                "finish_reason": "stop", "usage": {}, "attempts": 1}
+
+    def test_cli_failure_with_llm_api_fallback_never_stops_with_llm_error(self):
+        config = self.api_config(llm_api_fallback="never")
+        os.environ["FAKE_LLM_FAIL_FROM_UNIT"] = "1"
+        with mock.patch("kernel.llm.api.call_llm_api") as api_call:
+            failed = self.run_video(ENGLISH, config=config)
+            self.assertEqual(("failed", "text", "llm_error", True),
+                             (failed["status"], failed["stage"], failed["reason"], failed["retryable"]))
+            self.assertIn("rerun next_command", failed["message"])
+            # The first round and one retry after the backoff, nothing more.
+            self.assertEqual(["failed", "failed"], self.llm_calls())
+
+            del os.environ["FAKE_LLM_FAIL_FROM_UNIT"]
+            self.assert_finished(ENGLISH, self.run_video(ENGLISH, config=config))
+        api_call.assert_not_called()
+        self.assertEqual("cli", self.state(ENGLISH)["llm"]["backend"].split("-")[-1])
+
+    def test_cli_failure_with_the_api_configured_asks_the_user(self):
+        config = self.api_config()
+        before = Path(config).read_text(encoding="utf-8")
+        os.environ["FAKE_LLM_FAIL_FROM_UNIT"] = "1"
+        with mock.patch("kernel.llm.api.call_llm_api", side_effect=self.fake_api) as api_call:
+            asked = self.run_video(ENGLISH, config=config)
+            self.assertEqual(("needs_user", "text", "llm_api_fallback"),
+                             (asked["status"], asked["stage"], asked["reason"]))
+            self.assertIn("billed per request", asked["message"])
+            self.assertEqual(["once", "always", "no", "never"], [c["answer"] for c in asked["choices"]])
+            for choice in asked["choices"]:
+                self.assertEqual(f"{asked['next_command']} --llm-api {choice['answer']}", choice["command"])
+            self.assertEqual(["failed", "failed"], self.llm_calls())
+            api_call.assert_not_called()
+
+            # "no": this video tries the CLI again and stops with a retryable error; nothing is saved.
+            failed = self.run_video(ENGLISH, config=config, llm_api="no")
+            self.assertEqual(("failed", "llm_error", True), (failed["status"], failed["reason"], failed["retryable"]))
+            self.assertEqual("never", self.state(ENGLISH)["llm_api"])
+            api_call.assert_not_called()
+
+            # "once": the rest of this video goes to the API; later reruns keep that answer.
+            self.assert_finished(ENGLISH, self.run_video(ENGLISH, config=config, llm_api="once"))
+            self.assertEqual("auto", self.state(ENGLISH)["llm_api"])
+            self.assertEqual("api", self.state(ENGLISH)["llm"]["backend"])
+            self.assertGreater(api_call.call_count, 0)
+            # Another video still asks.
+            self.assertEqual("needs_user", self.run_video(LONG, config=config)["status"])
+        self.assertEqual(before, Path(config).read_text(encoding="utf-8"))
+
+    def test_an_answer_for_good_is_saved_in_config(self):
+        config = self.api_config()
+        os.chmod(config, 0o600)
+        os.environ["FAKE_LLM_FAIL_FROM_UNIT"] = "1"
+        with mock.patch("kernel.llm.api.call_llm_api", side_effect=self.fake_api) as api_call:
+            self.assertEqual("needs_user", self.run_video(ENGLISH, config=config)["status"])
+            self.assert_finished(ENGLISH, self.run_video(ENGLISH, config=config, llm_api="always"))
+            self.assertIn("llm_api_fallback: auto\n", Path(config).read_text(encoding="utf-8"))
+            self.assertEqual(0o600, Path(config).stat().st_mode & 0o777)
+            # The next video uses the API without asking.
+            self.assert_finished(LONG, self.run_video(LONG, config=config))
+            calls = api_call.call_count
+
+            # "never": this video and every later one stop with a retryable llm_error, without a question.
+            for options in ({"llm_api": "never"}, {}):
+                failed = self.run_video(ENGLISH, config=config, restart=True, **options)
+                self.assertEqual(("failed", "llm_error"), (failed["status"], failed["reason"]))
+        self.assertIn("llm_api_fallback: never\n", Path(config).read_text(encoding="utf-8"))
+        self.assertNotIn("llm_api_fallback: auto", Path(config).read_text(encoding="utf-8"))
+        self.assertEqual(calls, api_call.call_count)
+
+    def test_without_a_usable_cli_the_api_question_offers_the_agent(self):
+        config = self.api_config(llm_agent_cli='"no-such-agent-cli-xyz"')
+        with mock.patch("kernel.llm.api.call_llm_api") as api_call:
+            asked = self.run_video(ENGLISH, config=config)
+            self.assertEqual(("needs_user", "llm_api_fallback"), (asked["status"], asked["reason"]))
+            self.assertIn("handed to you", asked["message"])
+            self.assertIn("hand the text to the agent", asked["choices"][2]["label"])
+            handed = self.run_video(ENGLISH, config=config, llm_api="no")
+            self.assertEqual("needs_agent_text", handed["status"])
+        api_call.assert_not_called()
+
+    def test_article_name_is_shared_only_with_the_same_video(self):
+        out = self.root / "out"
+        first = self.run_video(ENGLISH)
+        self.assert_finished(ENGLISH, first)
+        name = Path(first["output_file"])
+        # The same video again overwrites its own article.
+        again = self.run_video(ENGLISH, restart=True)
+        self.assertEqual(str(name), again["output_file"])
+        self.assertEqual([name.name], sorted(p.name for p in out.iterdir()))
+
+        # Another video's article (or a note that names no video) under that name stays as it is.
+        for other in ('---\nurl: "https://www.youtube.com/watch?v=Other_video"\n---\n\nsomeone else\n',
+                      "a hand-written note\n"):
+            name.write_text(other, encoding="utf-8")
+            result = self.run_video(ENGLISH, restart=True)
+            suffixed = name.with_name(f"{name.stem} ({ENGLISH}).md")
+            self.assertEqual(str(suffixed), result["output_file"])
+            self.assertEqual(other, name.read_text(encoding="utf-8"))
+            self.assertIn(f"url: \"https://www.youtube.com/watch?v={ENGLISH}\"", suffixed.read_text(encoding="utf-8"))
+            self.assertEqual(sorted([name.name, suffixed.name]), sorted(p.name for p in out.iterdir()))
+            # A finished rerun keeps pointing at that file.
+            self.assertEqual(str(suffixed), self.run_video(ENGLISH)["output_file"])
+
     def test_max_seconds_returns_in_progress_at_safe_points(self):
         expected = self.reference_article(LONG)
         results, cursors = [], []
@@ -384,8 +500,8 @@ class RunCommandTests(RunFixture):
             self.assertEqual(1, calls.count("update"))
             # The update and the metadata fetch share one hold of the YouTube lock; the subtitles get their own.
             self.assertTrue(all(youtube_held[:3]))
-            self.assertEqual([f"video-{ENGLISH}.lock", kernel_youtube.LOCK_FILE, kernel_youtube.LOCK_FILE],
-                             acquired)
+            self.assertEqual([f"video-{ENGLISH}.lock", kernel_youtube.LOCK_FILE, kernel_youtube.LOCK_FILE,
+                              pipeline.ARTICLES_LOCK], acquired)
             self.assertEqual("done", self.run_video(ENGLISH)["status"])
             self.assertEqual(1, calls.count("update"))
             os.environ[pipeline.YT_DLP_UPDATE_ENV] = "0"

@@ -8,6 +8,9 @@ that inherited the descriptor keeps the lock until it exits too. The holder
 writes who it is into the file, so a waiter can say whom it waits for.
 
 The wait is bounded with SIGALRM, so `acquire` must run in the main thread.
+
+Locks about the whole machine (YouTube, the articles folder) live in one fixed
+directory, whatever the work root: `machine_dir()`.
 """
 
 from __future__ import annotations
@@ -18,6 +21,14 @@ import os
 import signal
 from datetime import datetime
 from pathlib import Path
+
+# The machine-wide lock directory; tests point it elsewhere.
+LOCK_DIR_ENV = "YT_TRANSCRIPT_LOCK_DIR"
+DEFAULT_LOCK_DIR = "/tmp/yt-transcript/.locks"
+
+
+def machine_dir() -> Path:
+    return Path(os.environ.get(LOCK_DIR_ENV) or DEFAULT_LOCK_DIR).expanduser()
 
 
 class Busy(Exception):

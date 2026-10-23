@@ -1,16 +1,22 @@
 """config.yaml loading, the defaults of every setting, and the small value parsers the kernel shares.
 
-This is the bottom layer of the kernel: it imports nothing from the rest of it.
+This is the bottom layer of the kernel: it imports only the file helpers.
 """
 
 from __future__ import annotations
 
 import os
+import re
 import sys
 from pathlib import Path
 
+from kernel.files import atomic_write_text
+
 LLM_BACKEND_MODES = ("auto", "api")
 DEFAULT_LLM_BACKEND = "auto"
+# What auto mode does when the agent CLI cannot be used and the API is configured.
+LLM_API_FALLBACK_MODES = ("ask", "auto", "never")
+DEFAULT_LLM_API_FALLBACK = "ask"
 DEFAULT_CLI_TIMEOUT_SEC = 600
 DEFAULT_CLI_MAX_RETRIES = 1
 DEFAULT_CLI_PROBE_TIMEOUT_SEC = 120
@@ -166,6 +172,12 @@ def normalize_backend_mode(value) -> str:
     return text if text in LLM_BACKEND_MODES else DEFAULT_LLM_BACKEND
 
 
+def normalize_api_fallback(value) -> str:
+    """Normalize `llm_api_fallback` to `ask`, `auto` or `never`."""
+    text = str(value or "").strip().lower()
+    return text if text in LLM_API_FALLBACK_MODES else DEFAULT_LLM_API_FALLBACK
+
+
 def _is_disabled_deepgram_model(model: str = "") -> bool:
     """Return whether a Deepgram model is disabled for this workflow."""
     normalized = str(model or "").strip().lower().replace("_", "-")
@@ -210,6 +222,7 @@ def default_config_values(config_path: str = "") -> dict:
         "llm_backoff_sec": 1.5,
         "llm_stream": "auto",
         "llm_backend": DEFAULT_LLM_BACKEND,
+        "llm_api_fallback": DEFAULT_LLM_API_FALLBACK,
         "llm_agent_cli": "",
         "llm_cli_timeout_sec": DEFAULT_CLI_TIMEOUT_SEC,
         "llm_cli_max_retries": DEFAULT_CLI_MAX_RETRIES,
@@ -274,6 +287,28 @@ def coerce_float_or_none(value) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def set_config_value(config_path: str | None, key: str, value: str) -> Path:
+    """Set one `key: value` line in config.yaml and return the file's path.
+
+    Every other line stays as it is, and so does the file's mode (config.yaml
+    holds API keys). A missing key is appended; a missing file is created.
+    """
+    path = (Path(config_path) if config_path else _default_config_path()).resolve()
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+        mode = path.stat().st_mode & 0o777
+    except FileNotFoundError:
+        lines, mode = [], 0o600
+    pattern = re.compile(rf"^\s*{re.escape(key)}\s*:")
+    new_line = f"{key}: {value}"
+    if any(pattern.match(line) for line in lines):
+        lines = [new_line if pattern.match(line) else line for line in lines]
+    else:
+        lines.append(new_line)
+    atomic_write_text(path, "\n".join(lines) + "\n", mode=mode)
+    return path
 
 
 def load_config(config_path: str = None, allow_missing: bool = False) -> dict:
@@ -438,6 +473,7 @@ def load_config(config_path: str = None, allow_missing: bool = False) -> dict:
         "llm_backoff_sec": llm_backoff_sec,
         "llm_stream": normalize_stream_mode(config.get('llm_stream', 'auto')),
         "llm_backend": normalize_backend_mode(config.get('llm_backend', DEFAULT_LLM_BACKEND)),
+        "llm_api_fallback": normalize_api_fallback(config.get('llm_api_fallback', DEFAULT_LLM_API_FALLBACK)),
         "llm_agent_cli": str(config.get('llm_agent_cli', '') or '').strip(),
         "llm_cli_timeout_sec": parse_int_field('llm_cli_timeout_sec', DEFAULT_CLI_TIMEOUT_SEC, minimum=1),
         "llm_cli_max_retries": parse_int_field('llm_cli_max_retries', DEFAULT_CLI_MAX_RETRIES, minimum=0),

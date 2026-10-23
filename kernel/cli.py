@@ -54,6 +54,9 @@ def main():
     run_parser.add_argument('--max-seconds', type=float, default=None,
                             help='Return in_progress at the next safe point after this many seconds')
     run_parser.add_argument('--restart', action='store_true', help="Discard this video's work directory first")
+    run_parser.add_argument('--llm-api', choices=list(kernel_pipeline.LLM_API_ANSWERS), default=None,
+                            help='Answer an llm_api_fallback question: use the paid API for this video (once) '
+                                 'or from now on (always), or not for this video (no) or ever (never)')
     run_parser.add_argument('--config-path', default=None, help='Path to config.yaml')
 
     status_parser = subparsers.add_parser(
@@ -107,6 +110,7 @@ def main():
                 restart=args.restart,
                 config_path=args.config_path,
                 stderr_tail=stderr_tail,
+                llm_api=args.llm_api,
             )
         print(json.dumps(result, ensure_ascii=False))
         sys.exit(code)

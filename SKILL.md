@@ -22,7 +22,7 @@ python3 <skill-root>/yt_transcript_utils.py run "<youtube-url>" --max-seconds 30
 | `done` (0) | Report it (see Reporting below). |
 | `in_progress` (6) | Not an error: the time budget ran out at a safe point, or while this call waited for another run of the same video or for YouTube (`message` says which). Run `next_command` again at once, and keep going until the status changes. |
 | `needs_agent_text` (5) | No LLM backend was reachable, so one text request is handed to you. Read `task.prompt_file` and do exactly what it asks (keep every `[S<n>]` tag, end with the `<!--END-->` line it describes). Write only your answer to `task.output_file`, then run `next_command`. A video can need several such requests; repeat until the status changes. |
-| `needs_user` (3) | Only the user can fix this. Tell them what `message` says and stop. If the result has an `accept_command` (YouTube refused the preferred subtitle track; reason `rate_limited` or `cookies_required`): ask whether to retry later (after setting cookies for `cookies_required`), or accept the `fallback_track` now; run `accept_command` only if they accept. |
+| `needs_user` (3) | Only the user can fix this. Tell them what `message` says and stop. If the result has an `accept_command` (YouTube refused the preferred subtitle track; reason `rate_limited` or `cookies_required`): ask whether to retry later (after setting cookies for `cookies_required`), or accept the `fallback_track` now; run `accept_command` only if they accept. If it has `choices` (reason `llm_api_fallback`: the agent CLI cannot be used and the paid API could take over): show the user every choice's `label` in their language and run the `command` of the one they pick; never pick one yourself. |
 | `unsupported` (4) | Tell the user the video's spoken language is not supported (only Chinese and English are). Do not retry or force another source on your own. If `message` suggests `--mode` (the language was only guessed) and the user says the video is actually Chinese or English, rerun with `--mode chinese` or `--mode bilingual`. |
 | `failed` (1) | If `retryable` is true, run `next_command` once more. Otherwise, or if it fails again, report `stage`, `reason` and `message`. `override_not_applicable`: the flag the user asked for cannot apply to this video; say why. |
 
@@ -49,7 +49,7 @@ Add a flag only when the user asked for that outcome. `--source` and `--mode` ar
 
 ## Several videos
 
-Process the URLs one at a time, in order, each with its own `run`, and finish handling one video's result before starting the next. A `needs_user` result with reason `cookies_required`, `rate_limited`, `tool_missing` or `output_dir_missing` would hit the remaining videos too: stop there and tell the user. Every other result concerns only that video (for example `deepgram_key_missing` matters only for videos without usable subtitles): note it and go on with the next URL. End with a table: title (or the URL when the result has none), status, and the output file or the reason.
+Process the URLs one at a time, in order, each with its own `run`, and finish handling one video's result before starting the next. A `needs_user` result with reason `cookies_required`, `rate_limited`, `tool_missing` or `output_dir_missing` would hit the remaining videos too: stop there and tell the user. For `llm_api_fallback`, ask once: run the command of the user's pick, and when a later video of the same request stops with `llm_api_fallback`, run its command for the same `answer` without asking again. Every other result concerns only that video (for example `deepgram_key_missing` matters only for videos without usable subtitles): note it and go on with the next URL. End with a table: title (or the URL when the result has none), status, and the output file or the reason.
 
 ## Unfinished runs
 
@@ -67,7 +67,7 @@ Reply in the user's language. For `done`, give the title, `output_file`, the rou
    Output file: <output_file>
 ```
 
-If you answered `needs_agent_text` requests, say so: setting up an LLM backend (`llm_*` in `config.yaml`) lets later runs finish without you.
+If you answered `needs_agent_text` requests, say so: a working agent CLI (`llm_agent_cli` in `config.yaml`), or the paid API (`llm_backend: api` with `llm_api_key`, `llm_base_url` and `llm_model`), lets later runs finish without you.
 
 Product decisions you may need to explain:
 
