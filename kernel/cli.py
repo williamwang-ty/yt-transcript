@@ -75,8 +75,6 @@ def main():
         help='Detect the spoken language and pick subtitle candidates from yt-dlp metadata on stdin'
     )
     subtitle_info_parser.add_argument('--video-id', default='', help='Video id to report when metadata lacks one')
-    subtitle_info_parser.add_argument('--from-list-subs', action='store_true',
-                                      help='Read `yt-dlp --list-subs` output instead of `yt-dlp -J` JSON')
     subtitle_info_parser.add_argument('--yt-dlp-runtime-json', default='',
                                       help='yt-dlp runtime JSON to echo back in the result')
 
@@ -124,15 +122,11 @@ def main():
         sys.exit(code)
 
     elif args.command == 'subtitle-info':
-        raw = sys.stdin.read()
-        if args.from_list_subs:
-            payload = kernel_subtitle_language.metadata_from_list_subs(raw, video_id=args.video_id)
-        else:
-            try:
-                payload = json.loads(raw)
-            except json.JSONDecodeError as error:
-                print(f"Error: subtitle-info expects yt-dlp -J metadata on stdin: {error}", file=sys.stderr)
-                sys.exit(1)
+        try:
+            payload = json.loads(sys.stdin.read())
+        except json.JSONDecodeError as error:
+            print(f"Error: subtitle-info expects yt-dlp -J metadata on stdin: {error}", file=sys.stderr)
+            sys.exit(1)
         try:
             runtime = json.loads(args.yt_dlp_runtime_json) if args.yt_dlp_runtime_json else {}
         except json.JSONDecodeError:

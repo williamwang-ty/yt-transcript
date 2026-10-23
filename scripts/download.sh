@@ -1,13 +1,24 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# download.sh - Unified download wrapper for yt-transcript skill
+# download.sh - the yt-dlp calls of `yt_transcript_utils.py run`
 # Usage: ./download.sh <VIDEO_URL> <MODE>
 # MODE: metadata | subtitle-info | subtitles | audio
+#
+# Each yt-dlp call runs once: no retries here and no reading of yt-dlp's error
+# text. `run` holds the machine-wide YouTube lock around this script, reads
+# yt-dlp's errors (kernel/sources/youtube.py) and decides whether one retry with
+# browser cookies makes sense. yt-dlp's own `-t sleep` preset paces the requests.
+#
+# One page extraction per video: `yt-dlp -J` runs once and its output is saved
+# to $YT_TRANSCRIPT_INFO_JSON; every mode reads that file, and subtitles are
+# downloaded from it (`--load-info-json`, no new page fetch; yt-dlp itself falls
+# back to the URL when the saved info no longer works). Audio still downloads by
+# URL, so the Deepgram route fetches the page a second time.
 
 if [ $# -lt 2 ]; then
-    echo "Usage: $0 <VIDEO_URL> <MODE>"
-    echo "MODE: metadata | subtitle-info | subtitles | audio"
+    echo "Usage: $0 <VIDEO_URL> <MODE>" >&2
+    echo "MODE: metadata | subtitle-info | subtitles | audio" >&2
     exit 1
 fi
 
@@ -22,21 +33,22 @@ YT_DLP_RETRIES="${YT_DLP_RETRIES:-}"
 YT_DLP_EXTRACTOR_RETRIES="${YT_DLP_EXTRACTOR_RETRIES:-}"
 YT_DLP_COOKIES_FROM_BROWSER="${YT_DLP_COOKIES_FROM_BROWSER:-}"
 YT_DLP_COOKIES_FILE="${YT_DLP_COOKIES_FILE:-}"
-YTDLP_SESSION_BROWSER_COOKIES=""
-YTDLP_SESSION_STATE_FILE="/tmp/yt_transcript_${$}_browser_session"
-trap 'rm -f "$YTDLP_SESSION_STATE_FILE"' EXIT
-YTDLP_CHROME_COOKIES_RETRY_MAX=3
 YTDLP_DEFAULT_SOCKET_TIMEOUT_SEC=15
 YTDLP_DEFAULT_RETRIES=1
 YTDLP_DEFAULT_EXTRACTOR_RETRIES=1
-METADATA_JSON_CACHE=""
-METADATA_JSON_LOADED=false
-# Set by `yt_transcript_utils.py run`: cache file for the `yt-dlp -J` metadata,
-# the folder that holds subtitles/ and audio/, and the output mode whose
-# subtitle tracks may be used (chinese | bilingual; empty means any).
+# Set by `run`: the saved `yt-dlp -J` output, the folder that holds subtitles/
+# and audio/, and the output mode whose subtitle tracks may be used
+# (chinese | bilingual; empty means any).
 YT_TRANSCRIPT_INFO_JSON="${YT_TRANSCRIPT_INFO_JSON:-}"
 YT_TRANSCRIPT_DOWNLOAD_DIR="${YT_TRANSCRIPT_DOWNLOAD_DIR:-}"
 YT_TRANSCRIPT_SUBTITLE_MODE="${YT_TRANSCRIPT_SUBTITLE_MODE:-}"
+
+TEMP_INFO_JSON=""
+if [ -z "$YT_TRANSCRIPT_INFO_JSON" ]; then
+    TEMP_INFO_JSON=$(mktemp)
+    YT_TRANSCRIPT_INFO_JSON="$TEMP_INFO_JSON"
+fi
+trap 'rm -f ${TEMP_INFO_JSON:+"$TEMP_INFO_JSON"} "${YT_TRANSCRIPT_INFO_JSON}.tmp"' EXIT
 
 resolve_positive_int() {
     local raw_value="$1"
@@ -74,367 +86,106 @@ elif [ -n "$YT_DLP_COOKIES_FROM_BROWSER" ]; then
     YTDLP_ARGS+=(--cookies-from-browser "$YT_DLP_COOKIES_FROM_BROWSER")
 fi
 
-current_session_browser() {
-    if [ -s "$YTDLP_SESSION_STATE_FILE" ]; then
-        cat "$YTDLP_SESSION_STATE_FILE" 2>/dev/null || true
-    elif [ -n "$YTDLP_SESSION_BROWSER_COOKIES" ]; then
-        printf '%s' "$YTDLP_SESSION_BROWSER_COOKIES"
-    fi
-}
+# yt-dlp's pacing preset (2026.10: --sleep-requests 0.75 --sleep-subtitles 5
+# --sleep-interval 10 --max-sleep-interval 20). Releases before mid-2025 lack it;
+# `--list-extractors` makes yt-dlp parse the option and exit without a request.
+SLEEP_PRESET=false
+if yt-dlp -t sleep --list-extractors >/dev/null 2>&1; then
+    YTDLP_ARGS+=(-t sleep)
+    SLEEP_PRESET=true
+else
+    echo "ℹ️  This yt-dlp ($(yt-dlp --version 2>/dev/null || echo 'unknown version')) has no '-t sleep' preset; running without its request pacing." >&2
+fi
 
-current_auth_strategy() {
-    if [ -n "$YT_DLP_COOKIES_FILE" ]; then
-        printf 'cookies_file'
-    elif [ -n "$YT_DLP_COOKIES_FROM_BROWSER" ]; then
-        printf 'configured_browser'
-    elif [ -n "$(current_session_browser)" ]; then
-        printf 'chrome_retry_session'
-    else
-        printf 'anonymous'
-    fi
-}
-
-current_ytdlp_runtime_json() {
-    local session_browser=""
-    session_browser=$(current_session_browser)
-
-    env \
-        YT_DLP_SOCKET_TIMEOUT_SEC="$YT_DLP_SOCKET_TIMEOUT_SEC" \
-        YT_DLP_RETRIES="$YT_DLP_RETRIES" \
-        YT_DLP_EXTRACTOR_RETRIES="$YT_DLP_EXTRACTOR_RETRIES" \
-        YT_DLP_COOKIES_FROM_BROWSER="$YT_DLP_COOKIES_FROM_BROWSER" \
-        YT_DLP_COOKIES_FILE="$YT_DLP_COOKIES_FILE" \
-        YTDLP_SESSION_BROWSER_COOKIES="$session_browser" \
-        YTDLP_CHROME_COOKIES_RETRY_MAX="$YTDLP_CHROME_COOKIES_RETRY_MAX" \
-        YTDLP_AUTH_STRATEGY="$(current_auth_strategy)" \
+# The settings above, reported in every result.
+runtime_json() {
+    YT_DLP_SOCKET_TIMEOUT_SEC="$YT_DLP_SOCKET_TIMEOUT_SEC" YT_DLP_RETRIES="$YT_DLP_RETRIES" \
+        YT_DLP_EXTRACTOR_RETRIES="$YT_DLP_EXTRACTOR_RETRIES" YT_DLP_COOKIES_FILE="$YT_DLP_COOKIES_FILE" \
+        YT_DLP_COOKIES_FROM_BROWSER="$YT_DLP_COOKIES_FROM_BROWSER" SLEEP_PRESET="$SLEEP_PRESET" \
         python3 - <<'PY'
 import json
 import os
 
+cookies_file = os.environ.get('YT_DLP_COOKIES_FILE', '')
+browser = os.environ.get('YT_DLP_COOKIES_FROM_BROWSER', '')
 print(json.dumps({
-    'socket_timeout_sec': int(os.environ.get('YT_DLP_SOCKET_TIMEOUT_SEC', '0') or 0),
-    'retries': int(os.environ.get('YT_DLP_RETRIES', '0') or 0),
-    'extractor_retries': int(os.environ.get('YT_DLP_EXTRACTOR_RETRIES', '0') or 0),
-    'auth_strategy': os.environ.get('YTDLP_AUTH_STRATEGY', 'anonymous'),
-    'cookies_from_browser': os.environ.get('YT_DLP_COOKIES_FROM_BROWSER', ''),
-    'cookies_file': os.environ.get('YT_DLP_COOKIES_FILE', ''),
-    'session_browser_cookies': os.environ.get('YTDLP_SESSION_BROWSER_COOKIES', ''),
-    'chrome_retry_max': int(os.environ.get('YTDLP_CHROME_COOKIES_RETRY_MAX', '3') or 3),
+    'socket_timeout_sec': int(os.environ['YT_DLP_SOCKET_TIMEOUT_SEC']),
+    'retries': int(os.environ['YT_DLP_RETRIES']),
+    'extractor_retries': int(os.environ['YT_DLP_EXTRACTOR_RETRIES']),
+    'auth_strategy': 'cookies_file' if cookies_file else 'browser_cookies' if browser else 'anonymous',
+    'cookies_file': cookies_file,
+    'cookies_from_browser': browser,
+    'sleep_preset': os.environ.get('SLEEP_PRESET') == 'true',
 }, ensure_ascii=False))
 PY
 }
 
-is_impersonation_warning_line() {
-    local text="$1"
-    case "$text" in
-        *"extractor specified to use impersonation for this download, but no impersonate target is available"*)
-            return 0
-            ;;
-    esac
-    return 1
-}
-
+# Pass yt-dlp's stderr on, except one harmless warning about impersonation.
 emit_filtered_stderr() {
-    local stderr_text="$1"
+    local stderr_file="$1"
     local saw_impersonation=false
-    [ -z "$stderr_text" ] && return 0
-    while IFS= read -r line; do
-        if is_impersonation_warning_line "$line"; then
-            saw_impersonation=true
-            continue
-        fi
+    local line
+    [ -s "$stderr_file" ] || return 0
+    while IFS= read -r line || [ -n "$line" ]; do
+        case "$line" in
+            *"extractor specified to use impersonation for this download, but no impersonate target is available"*)
+                saw_impersonation=true
+                continue
+                ;;
+        esac
         printf '%s\n' "$line" >&2
-    done <<< "$stderr_text"
+    done < "$stderr_file"
     if [ "$saw_impersonation" = true ]; then
         echo "ℹ️  yt-dlp extractor impersonation is unavailable in this build; continuing without it." >&2
     fi
 }
 
-# Detect the common YouTube bot-verification failure strings returned by `yt-dlp`.
-is_not_a_bot_error() {
-    local text="$1"
-    case "$text" in
-        *"Sign in to confirm you're not a bot"*|*"Sign in to confirm you’re not a bot"*|*"LOGIN_REQUIRED"*)
-            return 0
-            ;;
-    esac
-    return 1
-}
-
-is_rate_limited_error() {
-    local text="$1"
-    case "$text" in
-        *"HTTP Error 429"*|*"Too Many Requests"*)
-            return 0
-            ;;
-    esac
-    return 1
-}
-
-auth_retry_reason_for_error() {
-    local text="$1"
-    if is_not_a_bot_error "$text"; then
-        printf 'bot_verification'
-        return 0
-    fi
-    if is_rate_limited_error "$text"; then
-        printf 'rate_limit'
-        return 0
-    fi
-    return 1
-}
-
-emit_auth_retry_message() {
-    local reason="$1"
-    local attempt="$2"
-    case "$reason" in
-        bot_verification)
-            echo "ℹ️  yt-dlp hit YouTube bot verification; retrying with Chrome cookies (attempt ${attempt}/${YTDLP_CHROME_COOKIES_RETRY_MAX})..." >&2
-            ;;
-        rate_limit)
-            echo "ℹ️  yt-dlp request was rate limited; retrying with Chrome cookies (attempt ${attempt}/${YTDLP_CHROME_COOKIES_RETRY_MAX})..." >&2
-            ;;
-        *)
-            echo "ℹ️  yt-dlp request may require authenticated cookies; retrying with Chrome cookies (attempt ${attempt}/${YTDLP_CHROME_COOKIES_RETRY_MAX})..." >&2
-            ;;
-    esac
-}
-
-classify_subtitle_download_failure() {
-    local text="$1"
-    if is_rate_limited_error "$text"; then
-        printf 'rate_limited'
-    elif is_not_a_bot_error "$text"; then
-        printf 'bot_verification'
-    elif [ -n "$text" ]; then
-        printf 'download_failed'
-    else
-        printf 'unknown_error'
-    fi
-}
-
-# Explain how to provide browser cookies when automatic retries still fail.
-emit_cookies_import_guidance() {
-    local attempts="${1:-}"
-    local suffix=""
-    if [[ "$attempts" =~ ^[0-9]+$ ]] && [ "$attempts" -gt 0 ]; then
-        suffix=" after ${attempts} attempt(s)"
-    fi
-
-    echo "ℹ️  Automatic Chrome cookies retry failed${suffix}." >&2
-    cat >&2 <<'EOF'
-   Common causes:
-   - Chrome is not installed in this environment
-   - Chrome is installed but not logged into YouTube
-   - This is a remote or container environment without browser profile access
-
-   To continue, export a Netscape-format cookies.txt from a logged-in browser and configure one of:
-   - config.yaml: yt_dlp_cookies_file: "/path/to/youtube_cookies.txt"
-   - env var: YT_DLP_COOKIES_FILE=/path/to/youtube_cookies.txt
-
-   Recommended import flow:
-   1. Open YouTube in a logged-in browser on your local machine
-   2. Export youtube.com cookies in Netscape cookies.txt format
-   3. Copy the file to this machine/container
-   4. Point yt-transcript to that file and retry
-EOF
-}
-
-# Run `yt-dlp` with the currently resolved retry, timeout, and cookie flags.
-run_yt_dlp_command() {
-    local stdout_file="$1"
-    local stderr_file="$2"
-    shift 2
-
-    local -a args=()
-    if (( ${#YTDLP_ARGS[@]} )); then
-        args+=("${YTDLP_ARGS[@]}")
-    fi
-
-    local session_browser=""
-    session_browser=$(current_session_browser)
-    if [ -n "$session_browser" ] && [ -z "$YT_DLP_COOKIES_FILE" ] && [ -z "$YT_DLP_COOKIES_FROM_BROWSER" ]; then
-        args+=(--cookies-from-browser "$session_browser")
-    fi
-
-    local -a passthrough=("$@")
-    local passthrough_count=${#passthrough[@]}
-    local url="${passthrough[$((passthrough_count - 1))]}"
-    unset 'passthrough[$((passthrough_count - 1))]'
-
-    command yt-dlp ${passthrough[@]+"${passthrough[@]}"} ${args[@]+"${args[@]}"} "$url" >"$stdout_file" 2>"$stderr_file"
-}
-
-# Wrap `yt-dlp` with auth-related failure detection and a best-effort Chrome-cookies retry.
+# Run yt-dlp once with the settings above; stdout passes through.
 yt_dlp() {
-    local stdout_file stderr_file status stderr_text retry_reason
-    stdout_file=$(mktemp)
+    local stderr_file status=0
     stderr_file=$(mktemp)
-
-    if run_yt_dlp_command "$stdout_file" "$stderr_file" "$@"; then
-        cat "$stdout_file"
-        if [ -s "$stderr_file" ]; then
-            emit_filtered_stderr "$(cat "$stderr_file")"
-        fi
-        rm -f "$stdout_file" "$stderr_file"
-        return 0
-    else
-        status=$?
-    fi
-
-    stderr_text=$(cat "$stderr_file")
-    rm -f "$stdout_file" "$stderr_file"
-
-    retry_reason=""
-    if [ -z "$YT_DLP_COOKIES_FILE" ] && [ -z "$YT_DLP_COOKIES_FROM_BROWSER" ] && [ -z "$YTDLP_SESSION_BROWSER_COOKIES" ] && [ ! -s "$YTDLP_SESSION_STATE_FILE" ]; then
-        retry_reason=$(auth_retry_reason_for_error "$stderr_text" || true)
-    fi
-
-    if [ -n "$retry_reason" ]; then
-        local attempt retry_stdout retry_stderr retry_status retry_stderr_text
-
-        emit_filtered_stderr "$stderr_text"
-
-        attempt=0
-        retry_status="$status"
-        while [ "$attempt" -lt "$YTDLP_CHROME_COOKIES_RETRY_MAX" ]; do
-            attempt=$((attempt + 1))
-            emit_auth_retry_message "$retry_reason" "$attempt"
-
-            retry_stdout=$(mktemp)
-            retry_stderr=$(mktemp)
-
-            local -a retry_passthrough=("$@")
-            local retry_count=${#retry_passthrough[@]}
-            local retry_url="${retry_passthrough[$((retry_count - 1))]}"
-            unset 'retry_passthrough[$((retry_count - 1))]'
-
-            if command yt-dlp ${retry_passthrough[@]+"${retry_passthrough[@]}"} ${YTDLP_ARGS[@]+"${YTDLP_ARGS[@]}"} --cookies-from-browser chrome "$retry_url" >"$retry_stdout" 2>"$retry_stderr"; then
-                YTDLP_SESSION_BROWSER_COOKIES="chrome"
-                printf '%s' "$YTDLP_SESSION_BROWSER_COOKIES" > "$YTDLP_SESSION_STATE_FILE"
-                cat "$retry_stdout"
-                if [ -s "$retry_stderr" ]; then
-                    emit_filtered_stderr "$(cat "$retry_stderr")"
-                fi
-                rm -f "$retry_stdout" "$retry_stderr"
-                return 0
-            else
-                retry_status=$?
-            fi
-
-            retry_stderr_text=$(cat "$retry_stderr")
-            rm -f "$retry_stdout" "$retry_stderr"
-
-            if [ -n "$retry_stderr_text" ]; then
-                emit_filtered_stderr "$retry_stderr_text"
-            fi
-
-            retry_reason=$(auth_retry_reason_for_error "$retry_stderr_text" || true)
-            if [ -z "$retry_reason" ]; then
-                break
-            fi
-        done
-
-        emit_cookies_import_guidance "$attempt"
-        return "$retry_status"
-    fi
-
-    if [ -n "$stderr_text" ]; then
-        emit_filtered_stderr "$stderr_text"
-    fi
+    command yt-dlp "$@" "${YTDLP_ARGS[@]}" 2>"$stderr_file" || status=$?
+    emit_filtered_stderr "$stderr_file"
+    rm -f "$stderr_file"
     return "$status"
 }
 
-# Extract the normalized YouTube video ID from a URL.
-video_id_for_url() {
-    yt_dlp --print "%(id)s" "$VIDEO_URL"
-}
-
-# Fetch `yt-dlp -J` metadata once per invocation and reuse it inside the script.
-# With YT_TRANSCRIPT_INFO_JSON set, the metadata is read from that file when it
-# exists, and saved there after a fetch, so one run calls `yt-dlp -J` once.
-metadata_json_for_url() {
-    if [ "$METADATA_JSON_LOADED" != true ]; then
-        if [ -n "$YT_TRANSCRIPT_INFO_JSON" ] && [ -s "$YT_TRANSCRIPT_INFO_JSON" ]; then
-            METADATA_JSON_CACHE=$(cat "$YT_TRANSCRIPT_INFO_JSON")
-        else
-            METADATA_JSON_CACHE=$(yt_dlp -J "$VIDEO_URL" 2>/dev/null || true)
-            if [ -n "$YT_TRANSCRIPT_INFO_JSON" ] && [ -n "$METADATA_JSON_CACHE" ]; then
-                printf '%s' "$METADATA_JSON_CACHE" > "${YT_TRANSCRIPT_INFO_JSON}.tmp"
-                mv "${YT_TRANSCRIPT_INFO_JSON}.tmp" "$YT_TRANSCRIPT_INFO_JSON"
-            fi
-        fi
-        METADATA_JSON_LOADED=true
+# Make sure $YT_TRANSCRIPT_INFO_JSON holds the video's `yt-dlp -J` metadata,
+# fetching it only when the file is missing or empty.
+ensure_metadata_json() {
+    if [ ! -s "$YT_TRANSCRIPT_INFO_JSON" ]; then
+        yt_dlp -J "$VIDEO_URL" > "${YT_TRANSCRIPT_INFO_JSON}.tmp"
+        mv "${YT_TRANSCRIPT_INFO_JSON}.tmp" "$YT_TRANSCRIPT_INFO_JSON"
     fi
-    printf '%s' "$METADATA_JSON_CACHE"
 }
 
-# Extract the normalized video ID from a metadata JSON document.
-video_id_from_metadata_json() {
-    local metadata_json
-    metadata_json=$(cat)
-    METADATA_JSON="$metadata_json" python3 - <<'PY'
+# The video id from the saved metadata; fails unless it is a safe path component.
+video_id_from_metadata() {
+    python3 - "$YT_TRANSCRIPT_INFO_JSON" <<'PY'
 import json
-import os
+import re
+import sys
 
-payload = json.loads(os.environ['METADATA_JSON'])
-video_id = str(payload.get('id') or '').strip()
-if not video_id:
+try:
+    payload = json.load(open(sys.argv[1], encoding='utf-8'))
+except ValueError:
+    payload = {}
+video_id = str((payload if isinstance(payload, dict) else {}).get('id') or '').strip()
+if not re.fullmatch(r'[A-Za-z0-9_-]+', video_id):
+    print(f'❌ Error: Could not resolve a video ID from the yt-dlp metadata (got {video_id!r})', file=sys.stderr)
     raise SystemExit(1)
 print(video_id)
 PY
 }
 
-# Emit metadata payload from `yt-dlp -J` output.
-emit_metadata_from_metadata_json() {
-    local metadata_json ytdlp_runtime_json
-    metadata_json=$(cat)
-    ytdlp_runtime_json=$(current_ytdlp_runtime_json)
-    METADATA_JSON="$metadata_json" YTDLP_RUNTIME_JSON="$ytdlp_runtime_json" python3 - <<'PY'
-import json
-import os
-
-payload = json.loads(os.environ['METADATA_JSON'])
-video_id = str(payload.get('id') or '').strip()
-if not video_id:
-    raise SystemExit(1)
-
-duration = payload.get('duration')
-if duration in (None, '', 'NA'):
-    duration = 0
-else:
-    try:
-        duration = int(float(duration))
-    except (TypeError, ValueError):
-        duration = 0
-
-print(json.dumps({
-    'video_id': video_id,
-    'title': str(payload.get('title') or ''),
-    'duration': duration,
-    'upload_date': str(payload.get('upload_date') or ''),
-    'channel': str(payload.get('channel') or ''),
-    'yt_dlp_runtime': json.loads(os.environ.get('YTDLP_RUNTIME_JSON', '{}') or '{}'),
-}, ensure_ascii=False))
-PY
+# Language detection and subtitle candidates for the saved metadata.
+subtitle_info_json() {
+    python3 "$ROOT_DIR/yt_transcript_utils.py" subtitle-info \
+        --video-id "$1" \
+        --yt-dlp-runtime-json "$(runtime_json)" < "$YT_TRANSCRIPT_INFO_JSON"
 }
 
-# Fail fast when a URL does not resolve to a plausible video ID.
-require_valid_video_id() {
-    local video_id="$1"
-    if [ -z "$video_id" ]; then
-        echo "❌ Error: Could not resolve a video ID for: $VIDEO_URL" >&2
-        exit 1
-    fi
-    case "$video_id" in
-        *[!A-Za-z0-9_-]*)
-            echo "❌ Error: Resolved video ID contains unsafe characters: $video_id" >&2
-            exit 1
-            ;;
-    esac
-}
-
-# Compute the work directory used for one video download/transcription job.
+# The folder that holds one video's downloads.
 download_root_for_video() {
     local video_id="$1"
     if [ -n "$YT_TRANSCRIPT_DOWNLOAD_DIR" ]; then
@@ -451,300 +202,101 @@ reset_download_dir() {
     mkdir -p "$dir"
 }
 
-# Derive structured subtitle availability information from `yt-dlp --dump-json` output.
-emit_subtitle_info_from_metadata_json() {
-    local video_id="$1"
-    local ytdlp_runtime_json
-    ytdlp_runtime_json=$(current_ytdlp_runtime_json)
-    python3 "$ROOT_DIR/yt_transcript_utils.py" subtitle-info \
-        --video-id "$video_id" \
-        --yt-dlp-runtime-json "$ytdlp_runtime_json"
-}
-
-# Fallback parser for subtitle listings when full metadata JSON is unavailable.
-emit_subtitle_info_from_list_output() {
-    local video_id="$1"
-    local ytdlp_runtime_json
-    ytdlp_runtime_json=$(current_ytdlp_runtime_json)
-    python3 "$ROOT_DIR/yt_transcript_utils.py" subtitle-info \
-        --from-list-subs \
-        --video-id "$video_id" \
-        --yt-dlp-runtime-json "$ytdlp_runtime_json"
-}
-
-# Choose the best available audio-only format from `yt-dlp` metadata JSON.
-select_audio_format_from_metadata_json() {
-    local metadata_json
-    metadata_json=$(cat)
-    METADATA_JSON="$metadata_json" python3 - <<'PY'
-import json
-import os
-
-payload = json.loads(os.environ['METADATA_JSON'])
-formats = payload.get('formats') if isinstance(payload.get('formats'), list) else []
-audio_only = []
-for entry in formats:
-    if not isinstance(entry, dict):
-        continue
-    acodec = str(entry.get('acodec') or '')
-    vcodec = str(entry.get('vcodec') or '')
-    if not acodec or acodec == 'none':
-        continue
-    if vcodec and vcodec != 'none':
-        continue
-    audio_only.append(entry)
-
-if not audio_only:
-    raise SystemExit(1)
-
-
-def is_chinese(entry):
-    language = str(entry.get('language') or '').lower()
-    format_note = str(entry.get('format_note') or '').lower()
-    name = str(entry.get('name') or '').lower()
-    return language.startswith('zh') or ' chinese' in format_note or ' chinese' in name
-
-preferred = next((entry for entry in audio_only if is_chinese(entry)), None)
-if preferred is None:
-    preferred = next((entry for entry in audio_only if str(entry.get('format_id') or '') == '140'), None)
-if preferred is None:
-    preferred = audio_only[0]
-
-format_id = str(preferred.get('format_id') or '').strip()
-if not format_id:
-    raise SystemExit(1)
-print(format_id)
-PY
-}
-
 case "$MODE" in
     metadata)
         echo "📋 Fetching video metadata..." >&2
-        METADATA_JSON=$(metadata_json_for_url)
-        if [ -n "$METADATA_JSON" ]; then
-            VIDEO_ID=$(printf '%s' "$METADATA_JSON" | video_id_from_metadata_json 2>/dev/null || true)
-            if [ -n "$VIDEO_ID" ]; then
-                require_valid_video_id "$VIDEO_ID"
-                if METADATA_PAYLOAD=$(printf '%s' "$METADATA_JSON" | emit_metadata_from_metadata_json 2>/dev/null); then
-                    printf '%s\n' "$METADATA_PAYLOAD"
-                    exit 0
-                fi
-            fi
-        fi
-
-        VIDEO_ID=$(video_id_for_url)
-        require_valid_video_id "$VIDEO_ID"
-        if ! TITLE=$(yt_dlp --print "%(title)s" "$VIDEO_URL"); then
-            exit 1
-        fi
-        DURATION=$(yt_dlp --print "%(duration)s" "$VIDEO_URL" 2>/dev/null || echo "0")
-        [ -z "$DURATION" ] || [ "$DURATION" = "NA" ] && DURATION=0
-        if ! UPLOAD_DATE=$(yt_dlp --print "%(upload_date)s" "$VIDEO_URL"); then
-            exit 1
-        fi
-        if ! CHANNEL=$(yt_dlp --print "%(channel)s" "$VIDEO_URL"); then
-            exit 1
-        fi
-
-        YTDLP_RUNTIME_JSON=$(current_ytdlp_runtime_json)
-        VIDEO_ID="$VIDEO_ID" TITLE="$TITLE" DURATION="$DURATION" UPLOAD_DATE="$UPLOAD_DATE" CHANNEL="$CHANNEL" YTDLP_RUNTIME_JSON="$YTDLP_RUNTIME_JSON" \
-            python3 - <<'PY'
+        ensure_metadata_json
+        video_id_from_metadata >/dev/null
+        YTDLP_RUNTIME_JSON="$(runtime_json)" python3 - "$YT_TRANSCRIPT_INFO_JSON" <<'PY'
 import json
 import os
+import sys
 
+payload = json.load(open(sys.argv[1], encoding='utf-8'))
+try:
+    duration = int(float(payload.get('duration') or 0))
+except (TypeError, ValueError):
+    duration = 0
 print(json.dumps({
-    'video_id': os.environ.get('VIDEO_ID', ''),
-    'title': os.environ.get('TITLE', ''),
-    'duration': int(os.environ.get('DURATION', '0') or 0),
-    'upload_date': os.environ.get('UPLOAD_DATE', ''),
-    'channel': os.environ.get('CHANNEL', ''),
-    'yt_dlp_runtime': json.loads(os.environ.get('YTDLP_RUNTIME_JSON', '{}') or '{}'),
+    'video_id': str(payload.get('id') or '').strip(),
+    'title': str(payload.get('title') or ''),
+    'duration': duration,
+    'upload_date': str(payload.get('upload_date') or ''),
+    'channel': str(payload.get('channel') or ''),
+    'yt_dlp_runtime': json.loads(os.environ['YTDLP_RUNTIME_JSON']),
 }, ensure_ascii=False))
 PY
         ;;
 
     subtitle-info)
         echo "🔎 Inspecting subtitle availability..." >&2
-        METADATA_JSON=$(metadata_json_for_url)
-        if [ -n "$METADATA_JSON" ]; then
-            VIDEO_ID=$(printf '%s' "$METADATA_JSON" | video_id_from_metadata_json 2>/dev/null || true)
-            if [ -n "$VIDEO_ID" ]; then
-                require_valid_video_id "$VIDEO_ID"
-                if SUB_INFO_JSON=$(printf '%s' "$METADATA_JSON" | emit_subtitle_info_from_metadata_json "$VIDEO_ID" 2>/dev/null); then
-                    printf '%s\n' "$SUB_INFO_JSON"
-                    exit 0
-                fi
-            fi
-        fi
-
-        VIDEO_ID=$(video_id_for_url)
-        require_valid_video_id "$VIDEO_ID"
-        if ! LIST_OUTPUT=$(yt_dlp --list-subs "$VIDEO_URL" 2>&1); then
-            printf '%s\n' "$LIST_OUTPUT" >&2
-            exit 1
-        fi
-
-        printf '%s' "$LIST_OUTPUT" | emit_subtitle_info_from_list_output "$VIDEO_ID"
+        ensure_metadata_json
+        VIDEO_ID=$(video_id_from_metadata)
+        subtitle_info_json "$VIDEO_ID"
         ;;
 
     subtitles)
         echo "📥 Downloading subtitles..." >&2
-        SUB_INFO_JSON=""
-        SUBTITLE_WARNINGS_JSON="[]"
-        SUBTITLE_WARNING_LINES=""
-        ATTEMPTED_CANDIDATE_LINES=""
-        METADATA_JSON=$(metadata_json_for_url)
-        if [ -n "$METADATA_JSON" ]; then
-            VIDEO_ID=$(printf '%s' "$METADATA_JSON" | video_id_from_metadata_json 2>/dev/null || true)
-            if [ -n "$VIDEO_ID" ]; then
-                require_valid_video_id "$VIDEO_ID"
-                SUB_INFO_JSON=$(printf '%s' "$METADATA_JSON" | emit_subtitle_info_from_metadata_json "$VIDEO_ID" 2>/dev/null || true)
-            fi
-        fi
-        if [ -z "$SUB_INFO_JSON" ]; then
-            SUB_INFO_JSON=$(bash "$SCRIPT_DIR/download.sh" "$VIDEO_URL" subtitle-info)
-            VIDEO_ID=$(SUB_INFO_JSON="$SUB_INFO_JSON" python3 - <<'PY'
-import json
-import os
-
-payload = json.loads(os.environ['SUB_INFO_JSON'])
-video_id = str(payload.get('video_id') or '').strip()
-if not video_id:
-    raise SystemExit(1)
-print(video_id)
-PY
-)
-            require_valid_video_id "$VIDEO_ID"
-        fi
+        ensure_metadata_json
+        VIDEO_ID=$(video_id_from_metadata)
+        SUB_INFO_JSON=$(subtitle_info_json "$VIDEO_ID")
         SUBTITLE_DIR="$(download_root_for_video "$VIDEO_ID")/subtitles"
         reset_download_dir "$SUBTITLE_DIR"
 
-        if ! SUBTITLE_PLAN_JSON=$(SUB_INFO_JSON="$SUB_INFO_JSON" python3 - <<'PY'
+        # One "language<TAB>mode<TAB>kind" row per trusted candidate, best first.
+        if ! CANDIDATE_ROWS=$(SUB_INFO_JSON="$SUB_INFO_JSON" python3 - <<'PY'
 import json
 import os
 import sys
 
 sub_info = json.loads(os.environ['SUB_INFO_JSON'])
 wanted_mode = os.environ.get('YT_TRANSCRIPT_SUBTITLE_MODE', '').strip()
-candidates = []
+rows = []
 for candidate in sub_info.get('listed_candidates', []):
-    language = str(candidate.get('language', '') or '').strip()
-    mode = str(candidate.get('mode', '') or '').strip()
-    source_kind = str(candidate.get('source_kind', '') or '').strip()
-    if wanted_mode and mode != wanted_mode:
-        continue
-    if language and mode and source_kind:
-        candidates.append({
-            "language": language,
-            "mode": mode,
-            "source_kind": source_kind,
-        })
-
-if not candidates:
+    fields = [str(candidate.get(key, '') or '').strip() for key in ('language', 'mode', 'source_kind')]
+    if all(fields) and (not wanted_mode or fields[1] == wanted_mode):
+        rows.append('\t'.join(fields))
+if not rows:
     reason = str(sub_info.get('unsupported_reason', '') or '').strip()
     if reason:
-        print(f"❌ Error: {reason}", file=sys.stderr)
+        print(f'❌ Error: {reason}', file=sys.stderr)
     raise SystemExit(1)
-
-print(json.dumps({
-    "candidates": candidates,
-}, ensure_ascii=False))
+print('\n'.join(rows))
 PY
 ); then
             echo "❌ Error: No trusted Chinese or English subtitle track for this video" >&2
             exit 1
         fi
 
-        CANDIDATE_ROWS=$(SUBTITLE_PLAN_JSON="$SUBTITLE_PLAN_JSON" python3 - <<'PY'
-import json
-import os
-
-payload = json.loads(os.environ['SUBTITLE_PLAN_JSON'])
-for candidate in payload.get('candidates', []):
-    language = str(candidate.get('language', '') or '').strip()
-    mode = str(candidate.get('mode', '') or '').strip()
-    source_kind = str(candidate.get('source_kind', '') or '').strip()
-    if language:
-        print('\t'.join((language, mode, source_kind)))
-PY
-)
         RESOLVED_MODE=""
         RESOLVED_SOURCE_LANGUAGE=""
         RESOLVED_SOURCE_KIND=""
-
+        ATTEMPT_ROWS=""
+        WARNING_LINES=""
         while IFS=$'\t' read -r CANDIDATE_LANG CANDIDATE_MODE CANDIDATE_KIND; do
             [ -z "$CANDIDATE_LANG" ] && continue
             find "$SUBTITLE_DIR" -maxdepth 1 -type f -name "${VIDEO_ID}.*" -delete 2>/dev/null || true
-            ATTEMPT_AUTH_RETRY_USED="false"
-            if DOWNLOAD_LOG=$(yt_dlp --write-sub --write-auto-sub \
+            if DOWNLOAD_LOG=$(yt_dlp --load-info-json "$YT_TRANSCRIPT_INFO_JSON" \
+                                     --write-sub --write-auto-sub \
                                      --sub-lang "$CANDIDATE_LANG" \
                                      --sub-format "vtt" \
                                      --skip-download \
-                                     -o "$SUBTITLE_DIR/${VIDEO_ID}" \
-                                     "$VIDEO_URL" 2>&1); then
-                case "$DOWNLOAD_LOG" in
-                    *"retrying with Chrome cookies"*)
-                        ATTEMPT_AUTH_RETRY_USED="true"
-                        ;;
-                esac
+                                     -o "$SUBTITLE_DIR/${VIDEO_ID}" 2>&1); then
+                if [ -n "$DOWNLOAD_LOG" ]; then printf '%s\n' "$DOWNLOAD_LOG" >&2; fi
                 RESOLVED_MODE="$CANDIDATE_MODE"
                 RESOLVED_SOURCE_LANGUAGE="$CANDIDATE_LANG"
                 RESOLVED_SOURCE_KIND="$CANDIDATE_KIND"
-                ATTEMPT_ROW=$(printf '%s\t%s\t%s\t%s\t%s\t%s\t%s' \
-                    "$CANDIDATE_LANG" \
-                    "$CANDIDATE_MODE" \
-                    "$CANDIDATE_KIND" \
-                    "selected" \
-                    "" \
-                    "$ATTEMPT_AUTH_RETRY_USED" \
-                    "$(current_auth_strategy)")
-                if [ -n "$ATTEMPTED_CANDIDATE_LINES" ]; then
-                    ATTEMPTED_CANDIDATE_LINES="${ATTEMPTED_CANDIDATE_LINES}
-${ATTEMPT_ROW}"
-                else
-                    ATTEMPTED_CANDIDATE_LINES="$ATTEMPT_ROW"
-                fi
-                if [ -n "$DOWNLOAD_LOG" ]; then
-                    printf '%s\n' "$DOWNLOAD_LOG" >&2
-                fi
+                ATTEMPT_ROWS="${ATTEMPT_ROWS}${CANDIDATE_LANG}"$'\t'"${CANDIDATE_MODE}"$'\t'"${CANDIDATE_KIND}"$'\t'"selected"$'\t'$'\n'
                 break
             fi
-
-            case "$DOWNLOAD_LOG" in
-                *"retrying with Chrome cookies"*)
-                    ATTEMPT_AUTH_RETRY_USED="true"
-                    ;;
-                esac
-            FAILURE_REASON=$(classify_subtitle_download_failure "$DOWNLOAD_LOG")
-            ATTEMPT_ROW=$(printf '%s\t%s\t%s\t%s\t%s\t%s\t%s' \
-                "$CANDIDATE_LANG" \
-                "$CANDIDATE_MODE" \
-                "$CANDIDATE_KIND" \
-                "blocked" \
-                "$FAILURE_REASON" \
-                "$ATTEMPT_AUTH_RETRY_USED" \
-                "$(current_auth_strategy)")
-            if [ -n "$ATTEMPTED_CANDIDATE_LINES" ]; then
-                ATTEMPTED_CANDIDATE_LINES="${ATTEMPTED_CANDIDATE_LINES}
-${ATTEMPT_ROW}"
-            else
-                ATTEMPTED_CANDIDATE_LINES="$ATTEMPT_ROW"
-            fi
-            if [ "$FAILURE_REASON" = "rate_limited" ]; then
-                WARNING_MESSAGE="subtitle download failed for preferred candidate '$CANDIDATE_LANG' due to rate limiting; trying next available source track"
-            else
-                WARNING_MESSAGE="subtitle download failed for preferred candidate '$CANDIDATE_LANG'; trying next available source track"
-            fi
+            if [ -n "$DOWNLOAD_LOG" ]; then printf '%s\n' "$DOWNLOAD_LOG" >&2; fi
+            # yt-dlp's last ERROR line (else its last line); `run` reads what it means.
+            ERROR_LINE=$(printf '%s\n' "$DOWNLOAD_LOG" | tr '\t' ' ' \
+                | awk 'NF { last = $0 } /^ERROR/ { error = $0 } END { print (error != "" ? error : last) }')
+            ATTEMPT_ROWS="${ATTEMPT_ROWS}${CANDIDATE_LANG}"$'\t'"${CANDIDATE_MODE}"$'\t'"${CANDIDATE_KIND}"$'\t'"blocked"$'\t'"${ERROR_LINE}"$'\n'
+            WARNING_MESSAGE="subtitle download failed for preferred candidate '$CANDIDATE_LANG'; trying next available source track"
             echo "⚠️  $WARNING_MESSAGE" >&2
-            if [ -n "$DOWNLOAD_LOG" ]; then
-                printf '%s\n' "$DOWNLOAD_LOG" >&2
-            fi
-            if [ -n "$SUBTITLE_WARNING_LINES" ]; then
-                SUBTITLE_WARNING_LINES="${SUBTITLE_WARNING_LINES}
-${WARNING_MESSAGE}"
-            else
-                SUBTITLE_WARNING_LINES="$WARNING_MESSAGE"
-            fi
+            WARNING_LINES="${WARNING_LINES}${WARNING_MESSAGE}"$'\n'
         done <<< "$CANDIDATE_ROWS"
 
         if [ -z "$RESOLVED_SOURCE_LANGUAGE" ]; then
@@ -752,17 +304,10 @@ ${WARNING_MESSAGE}"
             exit 1
         fi
 
-        SUBTITLE_WARNINGS_JSON=$(SUBTITLE_WARNING_LINES="$SUBTITLE_WARNING_LINES" python3 - <<'PY'
-import json
-import os
-
-lines = [line.strip() for line in os.environ.get('SUBTITLE_WARNING_LINES', '').splitlines() if line.strip()]
-print(json.dumps(lines, ensure_ascii=False))
-PY
-)
-
-        YTDLP_RUNTIME_JSON=$(current_ytdlp_runtime_json)
-        VIDEO_ID="$VIDEO_ID" SUB_INFO_JSON="$SUB_INFO_JSON" SUBTITLE_DIR="$SUBTITLE_DIR" YTDLP_RUNTIME_JSON="$YTDLP_RUNTIME_JSON" SUBTITLE_WARNINGS_JSON="$SUBTITLE_WARNINGS_JSON" RESOLVED_MODE="$RESOLVED_MODE" RESOLVED_SOURCE_LANGUAGE="$RESOLVED_SOURCE_LANGUAGE" RESOLVED_SOURCE_KIND="$RESOLVED_SOURCE_KIND" ATTEMPTED_CANDIDATE_LINES="$ATTEMPTED_CANDIDATE_LINES" python3 - <<'PY'
+        VIDEO_ID="$VIDEO_ID" SUB_INFO_JSON="$SUB_INFO_JSON" SUBTITLE_DIR="$SUBTITLE_DIR" \
+            YTDLP_RUNTIME_JSON="$(runtime_json)" WARNING_LINES="$WARNING_LINES" RESOLVED_MODE="$RESOLVED_MODE" \
+            RESOLVED_SOURCE_LANGUAGE="$RESOLVED_SOURCE_LANGUAGE" RESOLVED_SOURCE_KIND="$RESOLVED_SOURCE_KIND" \
+            ATTEMPT_ROWS="$ATTEMPT_ROWS" python3 - <<'PY'
 import json
 import os
 from pathlib import Path
@@ -770,159 +315,79 @@ from pathlib import Path
 video_id = os.environ['VIDEO_ID']
 sub_info = json.loads(os.environ['SUB_INFO_JSON'])
 subtitle_dir = Path(os.environ['SUBTITLE_DIR'])
-warnings = json.loads(os.environ.get('SUBTITLE_WARNINGS_JSON', '[]') or '[]')
 files = sorted(str(path) for path in subtitle_dir.glob(f'{video_id}.*.vtt'))
-manual_languages = sub_info.get('manual_languages', [])
-automatic_languages = sub_info.get('automatic_languages', [])
-mode = str(os.environ.get('RESOLVED_MODE', '') or sub_info.get('mode', '')).strip()
-preferred_source_language = sub_info.get('preferred_source_language', '')
-preferred_source_kind = sub_info.get('preferred_source_kind', '')
-preferred_mode = str(sub_info.get('mode', '') or '').strip()
-listed_candidates = sub_info.get('listed_candidates', [])
-resolved_source_language = str(os.environ.get('RESOLVED_SOURCE_LANGUAGE', '') or '').strip()
-resolved_source_kind = str(os.environ.get('RESOLVED_SOURCE_KIND', '') or '').strip()
-
 if not files:
     raise SystemExit('❌ Error: Subtitle download completed but no VTT files were found')
 
+resolved_language = os.environ['RESOLVED_SOURCE_LANGUAGE']
+wanted = str(subtitle_dir / f'{video_id}.{resolved_language}.vtt')
+selected_vtt = wanted if wanted in files else files[0]
+selected_language = Path(selected_vtt).name[len(video_id) + 1:-len('.vtt')]
 
-def subtitle_lang(path):
-    name = Path(path).name
-    prefix = f'{video_id}.'
-    if not name.startswith(prefix) or not name.endswith('.vtt'):
-        return ''
-    return name[len(prefix):-4]
-
-
-lang_to_files = {}
-for path in files:
-    lang = subtitle_lang(path)
-    if not lang:
+attempted, blocked = [], []
+for row in os.environ.get('ATTEMPT_ROWS', '').splitlines():
+    parts = row.split('\t')
+    if len(parts) != 5:
         continue
-    lang_to_files.setdefault(lang, []).append(path)
-
-
-def family_candidates(languages, family):
-    return [lang for lang in languages if lang == family or lang.startswith(f'{family}-')]
-
-
-def choose_file():
-    if resolved_source_language:
-        candidates = lang_to_files.get(resolved_source_language, [])
-        if candidates:
-            return candidates[0], resolved_source_language, (resolved_source_kind or preferred_source_kind or '')
-
-    if mode == 'bilingual':
-        family = 'en'
-    elif mode == 'chinese':
-        family = 'zh'
-    else:
-        family = preferred_source_language.split('-', 1)[0] if preferred_source_language else ''
-
-    for source_kind, languages in (('manual', manual_languages), ('auto', automatic_languages)):
-        for lang in family_candidates(languages, family):
-            candidates = lang_to_files.get(lang, [])
-            if candidates:
-                return candidates[0], lang, source_kind
-
-    if preferred_source_language:
-        for source_kind, languages in (('manual', manual_languages), ('auto', automatic_languages)):
-            if preferred_source_language in languages:
-                candidates = lang_to_files.get(preferred_source_language, [])
-                if candidates:
-                    return candidates[0], preferred_source_language, source_kind
-
-    fallback_lang = subtitle_lang(files[0])
-    fallback_kind = preferred_source_kind or ''
-    return files[0], fallback_lang, fallback_kind
-
-
-selected_source_vtt, selected_source_language, selected_source_kind = choose_file()
-english = [
-    path for path in files
-    if subtitle_lang(path) == 'en' or subtitle_lang(path).startswith('en-')
-]
-chinese = [
-    path for path in files
-    if subtitle_lang(path) == 'zh' or subtitle_lang(path).startswith('zh-')
-]
-attempted_candidates = []
-blocked_candidates = []
-for raw_line in os.environ.get('ATTEMPTED_CANDIDATE_LINES', '').splitlines():
-    if not raw_line.strip():
-        continue
-    parts = raw_line.split('\t')
-    if len(parts) != 7:
-        continue
-    language, candidate_mode, source_kind, status, failure_reason, auth_retry_used, auth_strategy = parts
-    candidate = {
-        'language': language,
-        'mode': candidate_mode,
-        'source_kind': source_kind,
-        'status': status,
-        'auth_retry_used': auth_retry_used == 'true',
-        'auth_strategy_after_attempt': auth_strategy,
-    }
-    if failure_reason:
-        candidate['failure_reason'] = failure_reason
-    attempted_candidates.append(candidate)
+    language, mode, source_kind, status, error = parts
+    candidate = {'language': language, 'mode': mode, 'source_kind': source_kind, 'status': status}
     if status == 'blocked':
-        blocked_candidates.append(candidate)
+        candidate['error'] = error
+        blocked.append(candidate)
+    attempted.append(candidate)
 
-fallback_used = bool(
-    preferred_source_language
-    and selected_source_language
-    and preferred_source_language != selected_source_language
-)
-
+preferred_language = sub_info.get('preferred_source_language', '')
 print(json.dumps({
     'video_id': video_id,
     'download_dir': str(subtitle_dir),
-    'listed_candidates': listed_candidates,
+    'listed_candidates': sub_info.get('listed_candidates', []),
     'downloaded_files': files,
-    'english_files': english,
-    'chinese_files': chinese,
-    'preferred_source_language': preferred_source_language,
-    'preferred_source_kind': preferred_source_kind,
-    'preferred_mode': preferred_mode,
-    'attempted_candidates': attempted_candidates,
-    'blocked_candidates': blocked_candidates,
-    'selected_source_vtt': selected_source_vtt,
-    'selected_source_language': selected_source_language,
-    'selected_source_kind': selected_source_kind,
-    'final_source_vtt': selected_source_vtt,
-    'final_source_language': selected_source_language,
-    'final_source_kind': selected_source_kind,
-    'resolved_mode': mode,
-    'fallback_used': fallback_used,
-    'warnings': warnings,
-    'yt_dlp_runtime': json.loads(os.environ.get('YTDLP_RUNTIME_JSON', '{}') or '{}'),
+    'preferred_source_language': preferred_language,
+    'preferred_source_kind': sub_info.get('preferred_source_kind', ''),
+    'preferred_mode': str(sub_info.get('mode', '') or '').strip(),
+    'attempted_candidates': attempted,
+    'blocked_candidates': blocked,
+    'selected_source_vtt': selected_vtt,
+    'selected_source_language': selected_language,
+    'selected_source_kind': os.environ['RESOLVED_SOURCE_KIND'] or sub_info.get('preferred_source_kind', ''),
+    'resolved_mode': os.environ['RESOLVED_MODE'] or str(sub_info.get('mode', '') or '').strip(),
+    'fallback_used': bool(preferred_language and selected_language and preferred_language != selected_language),
+    'warnings': [line for line in os.environ.get('WARNING_LINES', '').splitlines() if line.strip()],
+    'yt_dlp_runtime': json.loads(os.environ['YTDLP_RUNTIME_JSON']),
 }, ensure_ascii=False))
 PY
         ;;
 
     audio)
         echo "🎵 Downloading audio..." >&2
-        VIDEO_ID=""
-        METADATA_JSON=$(metadata_json_for_url)
-        if [ -n "$METADATA_JSON" ]; then
-            VIDEO_ID=$(printf '%s' "$METADATA_JSON" | video_id_from_metadata_json 2>/dev/null || true)
-        fi
-        if [ -z "$VIDEO_ID" ]; then
-            VIDEO_ID=$(video_id_for_url)
-        fi
-        require_valid_video_id "$VIDEO_ID"
+        ensure_metadata_json
+        VIDEO_ID=$(video_id_from_metadata)
         AUDIO_DIR="$(download_root_for_video "$VIDEO_ID")/audio"
         reset_download_dir "$AUDIO_DIR"
 
-        AUDIO_FORMAT=""
-        if [ -n "$METADATA_JSON" ]; then
-            AUDIO_FORMAT=$(printf '%s' "$METADATA_JSON" | select_audio_format_from_metadata_json 2>/dev/null || true)
-        fi
+        # An audio-only format: one in Chinese if there is one, else 140 (m4a), else the first.
+        AUDIO_FORMAT=$(python3 - "$YT_TRANSCRIPT_INFO_JSON" <<'PY'
+import json
+import sys
 
-        if [ -z "$AUDIO_FORMAT" ]; then
-            AUDIO_FORMAT="bestaudio"
-        fi
+payload = json.load(open(sys.argv[1], encoding='utf-8'))
+formats = payload.get('formats') if isinstance(payload.get('formats'), list) else []
+audio_only = [entry for entry in formats if isinstance(entry, dict)
+              and str(entry.get('acodec') or 'none') != 'none' and str(entry.get('vcodec') or 'none') == 'none']
+
+
+def is_chinese(entry):
+    language = str(entry.get('language') or '').lower()
+    return language.startswith('zh') or ' chinese' in str(entry.get('format_note') or '').lower() \
+        or ' chinese' in str(entry.get('name') or '').lower()
+
+
+preferred = next((entry for entry in audio_only if is_chinese(entry)), None) \
+    or next((entry for entry in audio_only if str(entry.get('format_id') or '') == '140'), None) \
+    or (audio_only[0] if audio_only else {})
+print(str(preferred.get('format_id') or '').strip() or 'bestaudio')
+PY
+)
 
         echo "Using audio format: $AUDIO_FORMAT" >&2
         yt_dlp -f "$AUDIO_FORMAT" -o "$AUDIO_DIR/${VIDEO_ID}.%(ext)s" "$VIDEO_URL" >&2
@@ -933,8 +398,8 @@ PY
             exit 1
         fi
 
-        YTDLP_RUNTIME_JSON=$(current_ytdlp_runtime_json)
-        AUDIO_FILE="$AUDIO_FILE" VIDEO_ID="$VIDEO_ID" AUDIO_FORMAT="$AUDIO_FORMAT" AUDIO_DIR="$AUDIO_DIR" YTDLP_RUNTIME_JSON="$YTDLP_RUNTIME_JSON" python3 - <<'PY'
+        AUDIO_FILE="$AUDIO_FILE" VIDEO_ID="$VIDEO_ID" AUDIO_FORMAT="$AUDIO_FORMAT" AUDIO_DIR="$AUDIO_DIR" \
+            YTDLP_RUNTIME_JSON="$(runtime_json)" python3 - <<'PY'
 import json
 import os
 from pathlib import Path
@@ -947,14 +412,14 @@ print(json.dumps({
     'audio_format': os.environ['AUDIO_FORMAT'],
     'extension': audio_file.suffix.lstrip('.'),
     'size_bytes': audio_file.stat().st_size,
-    'yt_dlp_runtime': json.loads(os.environ.get('YTDLP_RUNTIME_JSON', '{}') or '{}'),
+    'yt_dlp_runtime': json.loads(os.environ['YTDLP_RUNTIME_JSON']),
 }, ensure_ascii=False))
 PY
         ;;
 
     *)
-        echo "❌ Error: Invalid MODE '$MODE'"
-        echo "Valid modes: metadata | subtitle-info | subtitles | audio"
+        echo "❌ Error: Invalid MODE '$MODE'" >&2
+        echo "Valid modes: metadata | subtitle-info | subtitles | audio" >&2
         exit 1
         ;;
 esac

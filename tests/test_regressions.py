@@ -2,6 +2,7 @@
 
 from tests.regression_agent_cli import AgentCliRegressionTests
 from tests.regression_chunking import ChunkingTests, PostMergeCleanupTests
+from tests.regression_concurrency import ConcurrentRunTests, FileLockTests, YouTubeProblemTests
 from tests.regression_core import CoreRegressionTests
 from tests.regression_e2e import EndToEndFixtureTests
 from tests.regression_language import LanguageRegressionTests
@@ -22,9 +23,11 @@ __all__ = [
     "AgentCliRegressionTests",
     "AtomicWriteTests",
     "ChunkingTests",
+    "ConcurrentRunTests",
     "CoreRegressionTests",
     "DownloadScriptTests",
     "EndToEndFixtureTests",
+    "FileLockTests",
     "GlossaryTests",
     "LanguageRegressionTests",
     "NormalizedDocumentTests",
@@ -38,4 +41,5 @@ __all__ = [
     "WindowOutlineTests",
     "WindowProtocolTests",
     "WindowSizingTests",
+    "YouTubeProblemTests",
 ]

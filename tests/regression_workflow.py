@@ -2,1078 +2,318 @@
 
 from tests._support import *
 
+# A yt-dlp stand-in driven by spec.json next to it; every call is logged to calls.jsonl.
+FAKE_YT_DLP = r'''#!/usr/bin/env python3
+import json
+import sys
+from pathlib import Path
+
+here = Path(__file__).resolve().parent
+spec = json.loads((here / "spec.json").read_text(encoding="utf-8"))
+args = sys.argv[1:]
+with open(here / "calls.jsonl", "a", encoding="utf-8") as log:
+    log.write(json.dumps(args) + "\n")
+
+
+def value(name):
+    return args[args.index(name) + 1] if name in args else ""
+
+
+if "--list-extractors" in args:
+    if not spec.get("preset", True):
+        print("yt-dlp: error: no such option: -t", file=sys.stderr)
+        sys.exit(2)
+    print("youtube")
+    sys.exit(0)
+if "--version" in args:
+    print(spec.get("version", "2026.10.21"))
+    sys.exit(0)
+for line in spec.get("stderr", []):
+    print(line, file=sys.stderr)
+if "-J" in args:
+    if spec.get("j_error"):
+        print(spec["j_error"], file=sys.stderr)
+        sys.exit(1)
+    print(json.dumps(spec["info"]))
+    sys.exit(0)
+if "--write-sub" in args:
+    lang = value("--sub-lang")
+    answer = spec.get("subs", {}).get(lang)
+    if answer != "ok":
+        print(answer or f"ERROR: Unable to download video subtitles for '{lang}': HTTP Error 404: Not Found",
+              file=sys.stderr)
+        sys.exit(1)
+    target = Path(value("-o") + f".{lang}.vtt")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("WEBVTT\n", encoding="utf-8")
+    print(f"[info] Writing video subtitles to: {target}")
+    sys.exit(0)
+if "-f" in args:
+    target = Path(value("-o").replace("%(ext)s", "m4a"))
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(b"audio")
+    sys.exit(0)
+sys.exit(3)
+'''
+
+URL = "https://www.youtube.com/watch?v=vid001"
+
 
 class DownloadScriptTests(unittest.TestCase):
     """download.sh metadata, subtitle-info, subtitles and audio modes, and update_yt_dlp.sh."""
-    def test_download_metadata_returns_valid_json(self):
-        """Test download metadata returns valid json."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            fake_bin = Path(tmpdir) / "yt-dlp"
-            fake_bin.write_text(
-                "#!/usr/bin/env bash\n"
-                "if [ \"$1\" = \"--print\" ]; then\n"
-                "  case \"$2\" in\n"
-                "    '%(id)s') echo 'abc123' ;;\n"
-                "    '%(title)s') echo 'He said \"hi\"' ;;\n"
-                "    '%(duration)s') echo '42' ;;\n"
-                "    '%(upload_date)s') echo '20260307' ;;\n"
-                "    '%(channel)s') echo 'A \"B\"' ;;\n"
-                "  esac\n"
-                "  exit 0\n"
-                "fi\n"
-                "exit 1\n",
-                encoding="utf-8",
-            )
-            fake_bin.chmod(0o755)
 
-            env = os.environ.copy()
-            env["PATH"] = f"{tmpdir}:{env['PATH']}"
-            result = subprocess.run(
-                ["bash", str(PROJECT_ROOT / "scripts/download.sh"), "https://example.com/video", "metadata"],
-                cwd=PROJECT_ROOT,
-                env=env,
-                check=True,
-                capture_output=True,
-                text=True,
-            )
-            payload = json.loads(result.stdout)
-            self.assertEqual(payload["video_id"], "abc123")
-            self.assertEqual(payload["title"], 'He said "hi"')
-            self.assertEqual(payload["channel"], 'A "B"')
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory(prefix="yt-download-")
+        self.addCleanup(tmp.cleanup)
+        self.dir = Path(tmp.name)
+        self.bin = self.dir / "bin"
+        self.bin.mkdir()
+        fake = self.bin / "yt-dlp"
+        fake.write_text(FAKE_YT_DLP, encoding="utf-8")
+        fake.chmod(0o755)
+        self.info_file = self.dir / "metadata.json"
+        self.env = os.environ.copy()
+        self.env.update({
+            "PATH": f"{self.bin}{os.pathsep}{self.env['PATH']}",
+            "YT_TRANSCRIPT_INFO_JSON": str(self.info_file),
+            "YT_TRANSCRIPT_DOWNLOAD_DIR": str(self.dir / "downloads"),
+        })
+        for var in ("YT_DLP_SOCKET_TIMEOUT_SEC", "YT_DLP_RETRIES", "YT_DLP_EXTRACTOR_RETRIES",
+                    "YT_DLP_COOKIES_FROM_BROWSER", "YT_DLP_COOKIES_FILE", "YT_TRANSCRIPT_SUBTITLE_MODE"):
+            self.env.pop(var, None)
 
-    def test_download_metadata_fails_when_video_id_is_missing(self):
-        """Test download metadata fails when video id is missing."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            fake_bin = Path(tmpdir) / "yt-dlp"
-            fake_bin.write_text(
-                "#!/usr/bin/env bash\n"
-                "if [ \"$1\" = \"--print\" ] && [ \"$2\" = '%(id)s' ]; then\n"
-                "  exit 0\n"
-                "fi\n"
-                "exit 1\n",
-                encoding="utf-8",
-            )
-            fake_bin.chmod(0o755)
+    def spec(self, **spec) -> None:
+        (self.bin / "spec.json").write_text(json.dumps(spec), encoding="utf-8")
 
-            env = os.environ.copy()
-            env["PATH"] = f"{tmpdir}:{env['PATH']}"
-            result = subprocess.run(
-                ["bash", str(PROJECT_ROOT / "scripts/download.sh"), "https://example.com/video", "metadata"],
-                cwd=PROJECT_ROOT,
-                env=env,
-                capture_output=True,
-                text=True,
-            )
-            self.assertNotEqual(result.returncode, 0)
-            self.assertIn("Could not resolve a video ID", result.stderr)
+    def download(self, mode: str, check: bool = True) -> subprocess.CompletedProcess:
+        result = subprocess.run(["bash", str(PROJECT_ROOT / "scripts/download.sh"), URL, mode], cwd=PROJECT_ROOT,
+                                env=self.env, capture_output=True, text=True, timeout=60)
+        if check:
+            self.assertEqual(0, result.returncode, result.stderr)
+        return result
 
-    def test_download_metadata_prefers_single_json_fetch_when_available(self):
-        """Test download metadata prefers a single -J fetch when available."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            log_path = Path(tmpdir) / "yt-dlp.log"
-            fake_bin = Path(tmpdir) / "yt-dlp"
-            fake_bin.write_text(
-                f"""#!/usr/bin/env bash
-printf '%s\n' "$*" >> '{log_path}'
-for arg in "$@"; do
-  if [ "$arg" = "-J" ]; then
-    cat <<'EOF'
-{{"id":"json123","title":"JSON title","duration":42,"upload_date":"20260324","channel":"JSON channel"}}
-EOF
-    exit 0
-  fi
-done
-exit 1
-""",
-                encoding="utf-8",
-            )
-            fake_bin.chmod(0o755)
+    def calls(self) -> list:
+        """yt-dlp calls apart from the `-t sleep` probe."""
+        path = self.bin / "calls.jsonl"
+        calls = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()] if path.exists() else []
+        return [args for args in calls if "--list-extractors" not in args and "--version" not in args]
 
-            env = os.environ.copy()
-            env["PATH"] = f"{tmpdir}:{env['PATH']}"
-            result = subprocess.run(
-                ["bash", str(PROJECT_ROOT / "scripts/download.sh"), "https://example.com/video", "metadata"],
-                cwd=PROJECT_ROOT,
-                env=env,
-                check=True,
-                capture_output=True,
-                text=True,
-            )
+    # -- metadata -------------------------------------------------------------
 
-            payload = json.loads(result.stdout)
-            log_text = log_path.read_text(encoding="utf-8")
-            self.assertEqual(payload["video_id"], "json123")
-            self.assertEqual(payload["title"], "JSON title")
-            self.assertEqual(payload["channel"], "JSON channel")
-            self.assertIn("-J", log_text)
-            self.assertIn("https://example.com/video", log_text)
-            self.assertNotIn("%(title)s", log_text)
+    def test_metadata_fetches_the_page_once(self):
+        self.spec(info={"id": "vid001", "title": 'He said "hi"', "duration": 42.0, "upload_date": "20260307",
+                        "channel": 'A "B"'})
+        payload = json.loads(self.download("metadata").stdout)
+        self.assertEqual(("vid001", 'He said "hi"', 42, "20260307", 'A "B"'),
+                         (payload["video_id"], payload["title"], payload["duration"], payload["upload_date"],
+                          payload["channel"]))
+        self.assertEqual(1, len(self.calls()))
+        self.assertIn("-J", self.calls()[0])
+        self.assertEqual("vid001", json.loads(self.info_file.read_text(encoding="utf-8"))["id"])
 
-    def test_download_metadata_retries_with_chrome_after_not_a_bot(self):
-        """Test download metadata retries with chrome after not a bot."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            fake_bin = Path(tmpdir) / "yt-dlp"
-            fake_bin.write_text(
-                """#!/usr/bin/env bash
-has_chrome=false
-print_field=''
-while [ $# -gt 0 ]; do
-  if [ "$1" = "--cookies-from-browser" ] && [ $# -ge 2 ] && [ "$2" = "chrome" ]; then
-    has_chrome=true
-    shift 2
-    continue
-  fi
-  if [ "$1" = "--print" ] && [ $# -ge 2 ]; then
-    print_field="$2"
-    shift 2
-    continue
-  fi
-  shift
-done
+    def test_metadata_failure_passes_yt_dlp_errors_on_without_asking_again(self):
+        error = ("ERROR: [youtube] vid001: This content isn't available, try again later. The current session "
+                 "has been rate-limited by YouTube for up to an hour.")
+        self.spec(j_error=error)
+        result = self.download("metadata", check=False)
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn(error, result.stderr)
+        # One request: no field-by-field fallbacks and no cookie retries in the script.
+        self.assertEqual(1, len(self.calls()))
+        self.assertFalse(self.info_file.exists() and self.info_file.read_text(encoding="utf-8"))
 
-if [ "$has_chrome" != true ]; then
-  echo "ERROR: [youtube] abc123: Sign in to confirm you're not a bot" >&2
-  exit 1
-fi
+    def test_metadata_fails_when_the_video_id_is_missing(self):
+        self.spec(info={"title": "no id"})
+        result = self.download("metadata", check=False)
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn("Could not resolve a video ID", result.stderr)
 
-case "$print_field" in
-  '%(id)s') echo 'abc123' ;;
-  '%(title)s') echo 'Recovered title' ;;
-  '%(duration)s') echo '42' ;;
-  '%(upload_date)s') echo '20260316' ;;
-  '%(channel)s') echo 'Recovered channel' ;;
-  *) exit 1 ;;
-esac
-""",
-                encoding="utf-8",
-            )
-            fake_bin.chmod(0o755)
+    def test_saved_metadata_is_used_without_a_request(self):
+        self.info_file.write_text(json.dumps({"id": "vid001", "title": "Saved"}), encoding="utf-8")
+        self.spec(info={"id": "vid001", "title": "Fetched"})
+        self.assertEqual("Saved", json.loads(self.download("metadata").stdout)["title"])
+        self.assertEqual([], self.calls())
 
-            env = os.environ.copy()
-            env["PATH"] = f"{tmpdir}:{env['PATH']}"
-            result = subprocess.run(
-                ["bash", str(PROJECT_ROOT / "scripts/download.sh"), "https://example.com/video", "metadata"],
-                cwd=PROJECT_ROOT,
-                env=env,
-                check=True,
-                capture_output=True,
-                text=True,
-            )
+    def test_metadata_applies_safe_defaults_and_the_sleep_preset(self):
+        self.spec(info={"id": "vid001"})
+        self.env.update({"YT_DLP_SOCKET_TIMEOUT_SEC": "-1", "YT_DLP_RETRIES": "-1", "YT_DLP_EXTRACTOR_RETRIES": "x"})
+        payload = json.loads(self.download("metadata").stdout)
+        self.assertEqual({"socket_timeout_sec": 15, "retries": 1, "extractor_retries": 1, "auth_strategy": "anonymous",
+                          "cookies_file": "", "cookies_from_browser": "", "sleep_preset": True},
+                         payload["yt_dlp_runtime"])
+        args = " ".join(self.calls()[0])
+        for expected in ("--socket-timeout 15", "--retries 1", "--extractor-retries 1", "-t sleep"):
+            self.assertIn(expected, args)
 
-            payload = json.loads(result.stdout)
-            self.assertEqual(payload["video_id"], "abc123")
-            self.assertEqual(payload["title"], "Recovered title")
-            self.assertEqual(payload["channel"], "Recovered channel")
-            self.assertEqual(payload["yt_dlp_runtime"]["auth_strategy"], "chrome_retry_session")
-            self.assertEqual(payload["yt_dlp_runtime"]["session_browser_cookies"], "chrome")
-            self.assertIn("retrying with Chrome cookies", result.stderr)
-            self.assertIn("attempt 1/3", result.stderr)
+    def test_yt_dlp_without_the_sleep_preset_runs_without_it(self):
+        self.spec(info={"id": "vid001"}, preset=False, version="2025.03.31")
+        result = self.download("metadata")
+        self.assertFalse(json.loads(result.stdout)["yt_dlp_runtime"]["sleep_preset"])
+        self.assertNotIn("-t", self.calls()[0])
+        self.assertIn("This yt-dlp (2025.03.31) has no '-t sleep' preset", result.stderr)
 
-    def test_download_metadata_guides_cookie_file_when_chrome_retry_fails(self):
-        """Test download metadata guides cookie file when chrome retry fails."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            fake_bin = Path(tmpdir) / "yt-dlp"
-            fake_bin.write_text(
-                """#!/usr/bin/env bash
-has_chrome=false
-while [ $# -gt 0 ]; do
-  if [ "$1" = "--cookies-from-browser" ] && [ $# -ge 2 ] && [ "$2" = "chrome" ]; then
-    has_chrome=true
-    shift 2
-    continue
-  fi
-  shift
-done
+    def test_configured_cookies_reach_yt_dlp(self):
+        self.spec(info={"id": "vid001"})
+        self.env["YT_DLP_COOKIES_FROM_BROWSER"] = "firefox"
+        payload = json.loads(self.download("metadata").stdout)
+        self.assertEqual("browser_cookies", payload["yt_dlp_runtime"]["auth_strategy"])
+        self.assertIn("--cookies-from-browser firefox", " ".join(self.calls()[0]))
 
-if [ "$has_chrome" = true ]; then
-  echo "ERROR: could not find chrome cookies database" >&2
-  exit 1
-fi
+    def test_impersonation_warning_is_filtered(self):
+        self.spec(info={"id": "vid001"}, stderr=[
+            "WARNING: [youtube] The extractor specified to use impersonation for this download, but no "
+            "impersonate target is available"])
+        result = self.download("metadata")
+        self.assertNotIn("no impersonate target is available", result.stderr)
+        self.assertIn("impersonation is unavailable in this build", result.stderr)
 
-echo "ERROR: [youtube] abc123: Sign in to confirm you're not a bot" >&2
-exit 1
-""",
-                encoding="utf-8",
-            )
-            fake_bin.chmod(0o755)
+    # -- subtitle-info and subtitles ------------------------------------------
 
-            env = os.environ.copy()
-            env["PATH"] = f"{tmpdir}:{env['PATH']}"
-            result = subprocess.run(
-                ["bash", str(PROJECT_ROOT / "scripts/download.sh"), "https://example.com/video", "metadata"],
-                cwd=PROJECT_ROOT,
-                env=env,
-                capture_output=True,
-                text=True,
-            )
-
-            self.assertNotEqual(result.returncode, 0)
-            self.assertIn("retrying with Chrome cookies", result.stderr)
-            self.assertIn("attempt 1/3", result.stderr)
-            self.assertIn("Automatic Chrome cookies retry failed", result.stderr)
-            self.assertIn("yt_dlp_cookies_file", result.stderr)
-            self.assertIn("Netscape-format cookies.txt", result.stderr)
-
-    def test_subtitle_info_prefers_chinese_when_both_languages_exist(self):
-        """Test subtitle info prefers Chinese when both Chinese and English exist."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            fake_bin = Path(tmpdir) / "yt-dlp"
-            fake_bin.write_text(
-                "#!/usr/bin/env bash\n"
-                "if [ \"$1\" = \"--print\" ] && [ \"$2\" = '%(id)s' ]; then\n"
-                "  echo 'vid001'\n"
-                "  exit 0\n"
-                "fi\n"
-                "if [ \"$1\" = \"--list-subs\" ]; then\n"
-                "  cat <<'EOF'\n"
-                "[info] Available subtitles for vid001:\n"
-                "Language Name                  Formats\n"
-                "zh-Hans  Chinese (Simplified)  vtt, ttml\n"
-                "en       English              vtt, ttml\n"
-                "[info] Available automatic captions for vid001:\n"
-                "Language Name                  Formats\n"
-                "en-US    English (US)         vtt, ttml\n"
-                "EOF\n"
-                "  exit 0\n"
-                "fi\n"
-                "exit 1\n",
-                encoding="utf-8",
-            )
-            fake_bin.chmod(0o755)
-
-            env = os.environ.copy()
-            env["PATH"] = f"{tmpdir}:{env['PATH']}"
-            result = subprocess.run(
-                ["bash", str(PROJECT_ROOT / "scripts/download.sh"), "https://example.com/video", "subtitle-info"],
-                cwd=PROJECT_ROOT,
-                env=env,
-                check=True,
-                capture_output=True,
-                text=True,
-            )
-            payload = json.loads(result.stdout)
-            self.assertTrue(payload["has_manual"])
-            self.assertTrue(payload["english_available"])
-            self.assertTrue(payload["chinese_available"])
-            self.assertEqual(payload["preferred_source_language"], "zh-Hans")
-            self.assertEqual(payload["preferred_source_kind"], "manual")
-            self.assertEqual(payload["mode"], "chinese")
-            self.assertEqual(
-                payload["listed_candidates"],
-                [
-                    {"language": "zh-Hans", "mode": "chinese", "source_kind": "manual"},
-                    {"language": "en", "mode": "bilingual", "source_kind": "manual"},
-                    {"language": "en-US", "mode": "bilingual", "source_kind": "auto"},
-                ],
-            )
+    def test_subtitle_info_prefers_human_chinese(self):
+        self.spec(info={"id": "vid001", "subtitles": {"en": [{"ext": "vtt"}], "zh-Hans": [{"ext": "vtt"}]},
+                        "automatic_captions": {"en-US": [{"ext": "vtt"}]}})
+        payload = json.loads(self.download("subtitle-info").stdout)
+        self.assertEqual(("zh-Hans", "manual", "chinese"),
+                         (payload["preferred_source_language"], payload["preferred_source_kind"], payload["mode"]))
+        self.assertEqual([{"language": "zh-Hans", "mode": "chinese", "source_kind": "manual"},
+                          {"language": "en", "mode": "bilingual", "source_kind": "manual"},
+                          {"language": "en-US", "mode": "bilingual", "source_kind": "auto"}],
+                         payload["listed_candidates"])
 
     def test_subtitle_info_marks_unsupported_languages_as_no_usable_subtitles(self):
-        """Test subtitle info treats non-Chinese/non-English tracks as no usable subtitles."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            fake_bin = Path(tmpdir) / "yt-dlp"
-            fake_bin.write_text(
-                """#!/usr/bin/env bash
-if [ "$1" = "--print" ] && [ "$2" = '%(id)s' ]; then
-  echo 'vides'
-  exit 0
-fi
-if [ "$1" = "-J" ]; then
-  cat <<'EOF'
-{"id":"vides","subtitles":{"es":[{"ext":"vtt"}]}}
-EOF
-  exit 0
-fi
-exit 1
-""",
-                encoding="utf-8",
-            )
-            fake_bin.chmod(0o755)
+        self.spec(info={"id": "vid001", "subtitles": {"es": [{"ext": "vtt"}]}})
+        payload = json.loads(self.download("subtitle-info").stdout)
+        self.assertFalse(payload["has_any"])
+        self.assertEqual(("", "", ""),
+                         (payload["preferred_source_language"], payload["preferred_source_kind"], payload["mode"]))
 
-            env = os.environ.copy()
-            env["PATH"] = f"{tmpdir}:{env['PATH']}"
-            result = subprocess.run(
-                ["bash", str(PROJECT_ROOT / "scripts/download.sh"), "https://example.com/video", "subtitle-info"],
-                cwd=PROJECT_ROOT,
-                env=env,
-                check=True,
-                capture_output=True,
-                text=True,
-            )
-            payload = json.loads(result.stdout)
-            self.assertFalse(payload["has_any"])
-            self.assertFalse(payload["english_available"])
-            self.assertFalse(payload["chinese_available"])
-            self.assertEqual(payload["preferred_source_language"], "")
-            self.assertEqual(payload["preferred_source_kind"], "")
-            self.assertEqual(payload["mode"], "")
+    def test_subtitles_download_from_the_saved_metadata(self):
+        self.spec(info={"id": "vid001", "subtitles": {"en": [{"ext": "vtt"}], "zh-Hans": [{"ext": "vtt"}]}},
+                  subs={"zh-Hans": "ok", "en": "ok"})
+        payload = json.loads(self.download("subtitles").stdout)
+        subtitle_dir = self.dir / "downloads" / "subtitles"
+        self.assertEqual(str(subtitle_dir / "vid001.zh-Hans.vtt"), payload["selected_source_vtt"])
+        self.assertEqual(("zh-Hans", "manual", "chinese", False),
+                         (payload["selected_source_language"], payload["selected_source_kind"],
+                          payload["resolved_mode"], payload["fallback_used"]))
+        self.assertEqual([{"language": "zh-Hans", "mode": "chinese", "source_kind": "manual", "status": "selected"}],
+                         payload["attempted_candidates"])
+        # One page fetch (-J); the subtitle comes from the saved metadata, not the URL.
+        first, second = self.calls()
+        self.assertIn("-J", first)
+        self.assertEqual(str(self.info_file), second[second.index("--load-info-json") + 1])
+        self.assertNotIn(URL, second)
 
-    def test_subtitle_info_propagates_yt_dlp_failure(self):
-        """Test subtitle info propagates yt dlp failure."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            fake_bin = Path(tmpdir) / "yt-dlp"
-            fake_bin.write_text(
-                "#!/usr/bin/env bash\n"
-                "if [ \"$1\" = \"--print\" ] && [ \"$2\" = '%(id)s' ]; then\n"
-                "  echo 'vid001'\n"
-                "  exit 0\n"
-                "fi\n"
-                "if [ \"$1\" = \"--list-subs\" ]; then\n"
-                "  echo 'ERROR: network failed' >&2\n"
-                "  exit 1\n"
-                "fi\n"
-                "exit 1\n",
-                encoding="utf-8",
-            )
-            fake_bin.chmod(0o755)
+    def test_a_refused_track_reports_yt_dlp_error_and_the_next_one_is_tried(self):
+        error = "ERROR: Unable to download video subtitles for 'zh-Hans': HTTP Error 429: Too Many Requests"
+        self.spec(info={"id": "vid001", "subtitles": {"en": [{"ext": "vtt"}], "zh-Hans": [{"ext": "vtt"}]}},
+                  subs={"zh-Hans": error, "en": "ok"})
+        result = self.download("subtitles")
+        payload = json.loads(result.stdout)
+        self.assertEqual(("en", "bilingual", True),
+                         (payload["selected_source_language"], payload["resolved_mode"], payload["fallback_used"]))
+        self.assertEqual([{"language": "zh-Hans", "mode": "chinese", "source_kind": "manual", "status": "blocked",
+                           "error": error}], payload["blocked_candidates"])
+        self.assertEqual(["zh-Hans", "en"], [c["language"] for c in payload["attempted_candidates"]])
+        self.assertEqual(1, len(payload["warnings"]))
+        self.assertIn(error, result.stderr)
 
-            env = os.environ.copy()
-            env["PATH"] = f"{tmpdir}:{env['PATH']}"
-            result = subprocess.run(
-                ["bash", str(PROJECT_ROOT / "scripts/download.sh"), "https://example.com/video", "subtitle-info"],
-                cwd=PROJECT_ROOT,
-                env=env,
-                capture_output=True,
-                text=True,
-            )
-            self.assertNotEqual(result.returncode, 0)
-            self.assertIn("network failed", result.stderr)
+    def test_subtitles_fail_when_no_track_downloads(self):
+        self.spec(info={"id": "vid001", "subtitles": {"en": [{"ext": "vtt"}]}})
+        result = self.download("subtitles", check=False)
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn("HTTP Error 404", result.stderr)
+        self.assertIn("No usable English or Chinese subtitle track could be downloaded", result.stderr)
 
-    def test_subtitle_info_reads_structured_metadata_when_json_available(self):
-        """Test subtitle info reads structured metadata when json available."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            fake_bin = Path(tmpdir) / "yt-dlp"
-            fake_bin.write_text(
-                """#!/usr/bin/env bash
-if [ "$1" = "--print" ] && [ "$2" = '%(id)s' ]; then
-  echo 'vidjson'
-  exit 0
-fi
-if [ "$1" = "-J" ]; then
-  cat <<'EOF'
-{"id":"vidjson","subtitles":{"en":[{"ext":"vtt"}],"zh-Hans":[{"ext":"vtt"}]},"automatic_captions":{"en-US":[{"ext":"vtt"}]}}
-EOF
-  exit 0
-fi
-if [ "$1" = "--list-subs" ]; then
-  echo 'should not be used' >&2
-  exit 99
-fi
-exit 1
-""",
-                encoding="utf-8",
-            )
-            fake_bin.chmod(0o755)
+    def test_subtitles_download_a_regional_english_variant(self):
+        self.spec(info={"id": "vid001", "subtitles": {"en-GB": [{"ext": "vtt"}]}}, subs={"en-GB": "ok"})
+        payload = json.loads(self.download("subtitles").stdout)
+        self.assertEqual(("en-GB", "manual"), (payload["selected_source_language"], payload["selected_source_kind"]))
 
-            env = os.environ.copy()
-            env["PATH"] = f"{tmpdir}:{env['PATH']}"
-            result = subprocess.run(
-                ["bash", str(PROJECT_ROOT / "scripts/download.sh"), "https://example.com/video", "subtitle-info"],
-                cwd=PROJECT_ROOT,
-                env=env,
-                check=True,
-                capture_output=True,
-                text=True,
-            )
-            payload = json.loads(result.stdout)
-            self.assertEqual(payload["video_id"], "vidjson")
-            self.assertTrue(payload["english_available"])
-            self.assertTrue(payload["chinese_available"])
-            self.assertEqual(payload["preferred_source_language"], "zh-Hans")
-            self.assertEqual(payload["preferred_source_kind"], "manual")
-            self.assertEqual(payload["mode"], "chinese")
-            self.assertEqual(
-                payload["listed_candidates"],
-                [
-                    {"language": "zh-Hans", "mode": "chinese", "source_kind": "manual"},
-                    {"language": "en", "mode": "bilingual", "source_kind": "manual"},
-                    {"language": "en-US", "mode": "bilingual", "source_kind": "auto"},
-                ],
-            )
+    def test_subtitles_reject_unsupported_languages_before_download(self):
+        self.spec(info={"id": "vid001", "subtitles": {"es": [{"ext": "vtt"}]}}, subs={"es": "ok"})
+        result = self.download("subtitles", check=False)
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn("Spoken language 'es' is not supported yet", result.stderr)
+        self.assertFalse(any("--write-sub" in args for args in self.calls()))
 
-    def test_subtitles_selects_manual_chinese_source_file_when_available(self):
-        """Test subtitles selects a Chinese source file when Chinese subtitles are available."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            fake_bin = Path(tmpdir) / "yt-dlp"
-            fake_bin.write_text(
-                """#!/usr/bin/env bash
-if [ "$1" = "--print" ] && [ "$2" = '%(id)s' ]; then
-  echo 'vid001'
-  exit 0
-fi
-if [ "$1" = "--list-subs" ]; then
-  cat <<'EOF'
-[info] Available subtitles for vid001:
-Language Name                  Formats
-zh-Hans  Chinese (Simplified)  vtt, ttml
-en       English              vtt, ttml
-[info] Available automatic captions for vid001:
-Language Name                  Formats
-en-US    English (US)         vtt, ttml
-EOF
-  exit 0
-fi
-if [ "$1" = "--write-sub" ]; then
-  out=''
-  langs=''
-  while [ $# -gt 0 ]; do
-    if [ "$1" = "-o" ]; then
-      out="$2"
-      shift 2
-      continue
-    fi
-    if [ "$1" = "--sub-lang" ]; then
-      langs="$2"
-      shift 2
-      continue
-    fi
-    shift
-  done
-  mkdir -p "$(dirname "$out")"
-  case "$langs" in
-    zh-Hans) : > "${out}.zh-Hans.vtt" ;;
-    en) : > "${out}.en.vtt" ;;
-    en-US) : > "${out}.en-US.vtt" ;;
-  esac
-  exit 0
-fi
-exit 1
-""",
-                encoding="utf-8",
-            )
-            fake_bin.chmod(0o755)
+    def test_subtitle_mode_limits_the_candidates(self):
+        self.spec(info={"id": "vid001", "subtitles": {"en": [{"ext": "vtt"}], "zh-Hans": [{"ext": "vtt"}]}},
+                  subs={"zh-Hans": "ok", "en": "ok"})
+        self.env["YT_TRANSCRIPT_SUBTITLE_MODE"] = "bilingual"
+        payload = json.loads(self.download("subtitles").stdout)
+        self.assertEqual(("en", "bilingual"), (payload["selected_source_language"], payload["resolved_mode"]))
 
-            env = os.environ.copy()
-            env["PATH"] = f"{tmpdir}:{env['PATH']}"
-            result = subprocess.run(
-                ["bash", str(PROJECT_ROOT / "scripts/download.sh"), "https://example.com/video", "subtitles"],
-                cwd=PROJECT_ROOT,
-                env=env,
-                check=True,
-                capture_output=True,
-                text=True,
-            )
-            payload = json.loads(result.stdout)
-            self.assertEqual(payload["selected_source_vtt"], "/tmp/vid001_downloads/subtitles/vid001.zh-Hans.vtt")
-            self.assertEqual(payload["selected_source_language"], "zh-Hans")
-            self.assertEqual(payload["selected_source_kind"], "manual")
-            self.assertEqual(payload["resolved_mode"], "chinese")
-            self.assertEqual(payload["preferred_source_language"], "zh-Hans")
-            self.assertFalse(payload["fallback_used"])
-            self.assertEqual(
-                payload["attempted_candidates"],
-                [
-                    {
-                        "language": "zh-Hans",
-                        "mode": "chinese",
-                        "source_kind": "manual",
-                        "status": "selected",
-                        "auth_retry_used": False,
-                        "auth_strategy_after_attempt": "anonymous",
-                    }
-                ],
-            )
-            shutil.rmtree("/tmp/vid001_downloads", ignore_errors=True)
+    # -- audio ----------------------------------------------------------------
 
-    def test_subtitles_selects_manual_chinese_source_file_from_isolated_dir(self):
-        """Test subtitles selects a Chinese source file from the isolated subtitle dir."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            fake_bin = Path(tmpdir) / "yt-dlp"
-            fake_bin.write_text(
-                """#!/usr/bin/env bash
-if [ "$1" = "--print" ] && [ "$2" = '%(id)s' ]; then
-  echo 'vid001'
-  exit 0
-fi
-if [ "$1" = "-J" ]; then
-  cat <<'EOF'
-{"id":"vid001","subtitles":{"en":[{"ext":"vtt"}],"zh-Hans":[{"ext":"vtt"}]},"automatic_captions":{"en-US":[{"ext":"vtt"}]}}
-EOF
-  exit 0
-fi
-if [ "$1" = "--write-sub" ]; then
-  out=''
-  langs=''
-  while [ $# -gt 0 ]; do
-    if [ "$1" = "-o" ]; then
-      out="$2"
-      shift 2
-      continue
-    fi
-    if [ "$1" = "--sub-lang" ]; then
-      langs="$2"
-      shift 2
-      continue
-    fi
-    shift
-  done
-  mkdir -p "$(dirname "$out")"
-  case "$langs" in
-    zh-Hans) : > "${out}.zh-Hans.vtt" ;;
-    en) : > "${out}.en.vtt" ;;
-    en-US) : > "${out}.en-US.vtt" ;;
-  esac
-  exit 0
-fi
-exit 1
-""",
-                encoding="utf-8",
-            )
-            fake_bin.chmod(0o755)
+    def test_audio_picks_a_chinese_audio_only_format_and_downloads_by_url(self):
+        self.spec(info={"id": "vid001", "formats": [
+            {"format_id": "18", "vcodec": "avc1", "acodec": "mp4a"},
+            {"format_id": "251", "language": "zh", "vcodec": "none", "acodec": "opus"},
+            {"format_id": "140", "language": "en", "vcodec": "none", "acodec": "mp4a.40.2"}]})
+        payload = json.loads(self.download("audio").stdout)
+        self.assertEqual(str(self.dir / "downloads" / "audio" / "vid001.m4a"), payload["audio_file"])
+        self.assertEqual("251", payload["audio_format"])
+        self.assertTrue(Path(payload["audio_file"]).is_file())
+        download = self.calls()[-1]
+        self.assertEqual("251", download[download.index("-f") + 1])
+        self.assertIn(URL, download)
 
-            stale = Path("/tmp/vid001.en.vtt")
-            stale.write_text("stale", encoding="utf-8")
-            try:
-                env = os.environ.copy()
-                env["PATH"] = f"{tmpdir}:{env['PATH']}"
-                result = subprocess.run(
-                    ["bash", str(PROJECT_ROOT / "scripts/download.sh"), "https://example.com/video", "subtitles"],
-                    cwd=PROJECT_ROOT,
-                    env=env,
-                    check=True,
-                    capture_output=True,
-                    text=True,
-                )
-                payload = json.loads(result.stdout)
-                self.assertEqual(payload["selected_source_vtt"], "/tmp/vid001_downloads/subtitles/vid001.zh-Hans.vtt")
-                self.assertNotEqual(payload["selected_source_vtt"], str(stale))
-                self.assertTrue(Path(payload["selected_source_vtt"]).exists())
-            finally:
-                stale.unlink(missing_ok=True)
-                shutil.rmtree("/tmp/vid001_downloads", ignore_errors=True)
+    def test_audio_falls_back_to_bestaudio(self):
+        self.spec(info={"id": "vid001", "formats": []})
+        self.assertEqual("bestaudio", json.loads(self.download("audio").stdout)["audio_format"])
 
-    def test_subtitles_downloads_supported_english_variant(self):
-        """Test subtitles downloads supported english variant."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            fake_bin = Path(tmpdir) / "yt-dlp"
-            fake_bin.write_text(
-                """#!/usr/bin/env bash
-if [ "$1" = "--print" ] && [ "$2" = '%(id)s' ]; then
-  echo 'vidgb'
-  exit 0
-fi
-if [ "$1" = "-J" ]; then
-  cat <<'EOF'
-{"id":"vidgb","subtitles":{"en-GB":[{"ext":"vtt"}]}}
-EOF
-  exit 0
-fi
-if [ "$1" = "--write-sub" ]; then
-  out=''
-  langs=''
-  while [ $# -gt 0 ]; do
-    if [ "$1" = "-o" ]; then
-      out="$2"
-      shift 2
-      continue
-    fi
-    if [ "$1" = "--sub-lang" ]; then
-      langs="$2"
-      shift 2
-      continue
-    fi
-    shift
-  done
-  mkdir -p "$(dirname "$out")"
-  case ",$langs," in
-    *,en-GB,*) : > "${out}.en-GB.vtt" ;;
-  esac
-  exit 0
-fi
-exit 1
-""",
-                encoding="utf-8",
-            )
-            fake_bin.chmod(0o755)
+    # -- update_yt_dlp.sh -----------------------------------------------------
 
-            env = os.environ.copy()
-            env["PATH"] = f"{tmpdir}:{env['PATH']}"
-            result = subprocess.run(
-                ["bash", str(PROJECT_ROOT / "scripts/download.sh"), "https://example.com/video", "subtitles"],
-                cwd=PROJECT_ROOT,
-                env=env,
-                check=True,
-                capture_output=True,
-                text=True,
-            )
-            payload = json.loads(result.stdout)
-            self.assertEqual(payload["selected_source_vtt"], "/tmp/vidgb_downloads/subtitles/vidgb.en-GB.vtt")
-            self.assertEqual(payload["selected_source_language"], "en-GB")
-            self.assertEqual(payload["selected_source_kind"], "manual")
-            shutil.rmtree("/tmp/vidgb_downloads", ignore_errors=True)
+    def run_update(self, brew_script: str | None) -> subprocess.CompletedProcess:
+        if brew_script is not None:
+            brew = self.bin / "brew"
+            brew.write_text("#!/usr/bin/env bash\n"
+                            f"printf '%s\\n' \"$*\" >> '{self.dir / 'brew.log'}'\n" + brew_script, encoding="utf-8")
+            brew.chmod(0o755)
+        for name in ("pip", "pip3"):
+            trap = self.bin / name
+            trap.write_text(f"#!/usr/bin/env bash\necho pip >> '{self.dir / 'pip.log'}'\n", encoding="utf-8")
+            trap.chmod(0o755)
+        env = dict(self.env, YT_TRANSCRIPT_LOCK_DIR=str(self.dir / "locks"))
+        env.pop("YT_TRANSCRIPT_YT_DLP_UPDATE", None)
+        env["PATH"] = f"{self.bin}{os.pathsep}/usr/bin{os.pathsep}/bin"
+        result = subprocess.run(["bash", str(PROJECT_ROOT / "scripts/update_yt_dlp.sh")], env=env,
+                                capture_output=True, text=True, timeout=30)
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertFalse((self.dir / "pip.log").exists())
+        return result
 
-    def test_subtitles_retries_rate_limited_chinese_candidate_with_chrome(self):
-        """Test subtitles retry a rate-limited Chinese candidate with Chrome cookies before falling back."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            fake_bin = Path(tmpdir) / "yt-dlp"
-            fake_bin.write_text(
-                """#!/usr/bin/env bash
-has_chrome=false
-if [ "$1" = "-J" ]; then
-  cat <<'EOF'
-{"id":"vidretry","automatic_captions":{"zh-Hans":[{"ext":"vtt"}],"en":[{"ext":"vtt"}]}}
-EOF
-  exit 0
-fi
-if [ "$1" = "--write-sub" ]; then
-  out=''
-  langs=''
-  while [ $# -gt 0 ]; do
-    if [ "$1" = "--cookies-from-browser" ] && [ $# -ge 2 ] && [ "$2" = "chrome" ]; then
-      has_chrome=true
-      shift 2
-      continue
-    fi
-    if [ "$1" = "-o" ]; then
-      out="$2"
-      shift 2
-      continue
-    fi
-    if [ "$1" = "--sub-lang" ]; then
-      langs="$2"
-      shift 2
-      continue
-    fi
-    shift
-  done
-  mkdir -p "$(dirname "$out")"
-  if [ "$langs" = "zh-Hans" ] && [ "$has_chrome" != true ]; then
-    echo "ERROR: Unable to download video subtitles for 'zh-Hans': HTTP Error 429: Too Many Requests" >&2
-    exit 1
-  fi
-  if [ "$langs" = "zh-Hans" ] && [ "$has_chrome" = true ]; then
-    : > "${out}.zh-Hans.vtt"
-    exit 0
-  fi
-  if [ "$langs" = "en" ]; then
-    : > "${out}.en.vtt"
-    exit 0
-  fi
-fi
-exit 1
-""",
-                encoding="utf-8",
-            )
-            fake_bin.chmod(0o755)
+    def brew_calls(self) -> list:
+        log = self.dir / "brew.log"
+        return log.read_text(encoding="utf-8").splitlines() if log.exists() else []
 
-            env = os.environ.copy()
-            env["PATH"] = f"{tmpdir}:{env['PATH']}"
-            try:
-                result = subprocess.run(
-                    ["bash", str(PROJECT_ROOT / "scripts/download.sh"), "https://example.com/video", "subtitles"],
-                    cwd=PROJECT_ROOT,
-                    env=env,
-                    check=True,
-                    capture_output=True,
-                    text=True,
-                )
-                payload = json.loads(result.stdout)
-                self.assertEqual(payload["selected_source_vtt"], "/tmp/vidretry_downloads/subtitles/vidretry.zh-Hans.vtt")
-                self.assertEqual(payload["selected_source_language"], "zh-Hans")
-                self.assertEqual(payload["resolved_mode"], "chinese")
-                self.assertFalse(payload["fallback_used"])
-                self.assertEqual(payload["blocked_candidates"], [])
-                self.assertEqual(len(payload["attempted_candidates"]), 1)
-                self.assertTrue(payload["attempted_candidates"][0]["auth_retry_used"])
-                self.assertEqual(payload["attempted_candidates"][0]["status"], "selected")
-                self.assertEqual(payload["yt_dlp_runtime"]["auth_strategy"], "chrome_retry_session")
-                self.assertEqual(payload["yt_dlp_runtime"]["session_browser_cookies"], "chrome")
-                self.assertIn("rate limited; retrying with Chrome cookies", result.stderr)
-            finally:
-                shutil.rmtree("/tmp/vidretry_downloads", ignore_errors=True)
+    def test_update_script_does_nothing_when_disabled(self):
+        result = subprocess.run(["bash", str(PROJECT_ROOT / "scripts/update_yt_dlp.sh")], capture_output=True,
+                                text=True, env={**self.env, "YT_TRANSCRIPT_YT_DLP_UPDATE": "0"})
+        self.assertEqual((0, "", ""), (result.returncode, result.stdout, result.stderr))
 
-    def test_subtitles_fall_back_to_english_when_chinese_candidates_fail(self):
-        """Test subtitles fall back to English when advertised Chinese tracks cannot be downloaded."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            fake_bin = Path(tmpdir) / "yt-dlp"
-            fake_bin.write_text(
-                """#!/usr/bin/env bash
-if [ "$1" = "-J" ]; then
-  cat <<'EOF'
-{"id":"vidopt","subtitles":{"en":[{"ext":"vtt"}],"zh-Hans":[{"ext":"vtt"}]}}
-EOF
-  exit 0
-fi
-if [ "$1" = "--write-sub" ]; then
-  out=''
-  langs=''
-  while [ $# -gt 0 ]; do
-    if [ "$1" = "-o" ]; then
-      out="$2"
-      shift 2
-      continue
-    fi
-    if [ "$1" = "--sub-lang" ]; then
-      langs="$2"
-      shift 2
-      continue
-    fi
-    shift
-  done
-  mkdir -p "$(dirname "$out")"
-  if [ "$langs" = "zh-Hans" ]; then
-    echo "ERROR: Unable to download video subtitles for 'zh-Hans': HTTP Error 429: Too Many Requests" >&2
-    exit 1
-  fi
-  if [ "$langs" = "en" ]; then
-    : > "${out}.en.vtt"
-    exit 0
-  fi
-fi
-exit 1
-""",
-                encoding="utf-8",
-            )
-            fake_bin.chmod(0o755)
+    def test_update_asks_homebrew_at_most_hourly(self):
+        self.spec(info={})
+        # Homebrew's prefix is the folder that holds bin/yt-dlp.
+        result = self.run_update(f'if [ "$1" = "--prefix" ]; then echo "{self.dir}"; exit 0; fi\nexit 0\n')
+        self.assertIn("Asking Homebrew", result.stdout)
+        self.assertIn("is the newest Homebrew has", result.stdout)
+        self.assertEqual(["--prefix", "upgrade yt-dlp"], self.brew_calls())
+        self.assertTrue((self.dir / "locks" / "yt-dlp-update.stamp").is_file())
+        # Within the hour nothing runs, whatever the first result was.
+        self.assertEqual("", self.run_update(None).stdout)
+        self.assertEqual(["--prefix", "upgrade yt-dlp"], self.brew_calls())
 
-            env = os.environ.copy()
-            env["PATH"] = f"{tmpdir}:{env['PATH']}"
-            try:
-                result = subprocess.run(
-                    ["bash", str(PROJECT_ROOT / "scripts/download.sh"), "https://example.com/video", "subtitles"],
-                    cwd=PROJECT_ROOT,
-                    env=env,
-                    check=True,
-                    capture_output=True,
-                    text=True,
-                )
-                payload = json.loads(result.stdout)
-                self.assertEqual(payload["selected_source_vtt"], "/tmp/vidopt_downloads/subtitles/vidopt.en.vtt")
-                self.assertEqual(payload["selected_source_language"], "en")
-                self.assertEqual(payload["selected_source_kind"], "manual")
-                self.assertEqual(payload["resolved_mode"], "bilingual")
-                self.assertEqual(payload["preferred_source_language"], "zh-Hans")
-                self.assertTrue(payload["fallback_used"])
-                self.assertEqual(payload["chinese_files"], [])
-                self.assertEqual(len(payload["warnings"]), 1)
-                self.assertIn("trying next available source track", payload["warnings"][0])
-                self.assertIn("rate limiting", payload["warnings"][0])
-                self.assertEqual(
-                    payload["blocked_candidates"],
-                    [
-                        {
-                            "language": "zh-Hans",
-                            "mode": "chinese",
-                            "source_kind": "manual",
-                            "status": "blocked",
-                            "failure_reason": "rate_limited",
-                            "auth_retry_used": True,
-                            "auth_strategy_after_attempt": "anonymous",
-                        }
-                    ],
-                )
-                self.assertEqual(len(payload["attempted_candidates"]), 2)
-                self.assertEqual(payload["attempted_candidates"][1]["language"], "en")
-                self.assertEqual(payload["attempted_candidates"][1]["status"], "selected")
-                self.assertIn("zh-Hans", result.stderr)
-                self.assertIn("rate limited; retrying with Chrome cookies", result.stderr)
-            finally:
-                shutil.rmtree("/tmp/vidopt_downloads", ignore_errors=True)
+    def test_failed_brew_upgrade_is_reported_and_has_no_pip_fallback(self):
+        self.spec(info={})
+        result = self.run_update(f'if [ "$1" = "--prefix" ]; then echo "{self.dir}"; exit 0; fi\n'
+                                 'echo "Error: Another active Homebrew process is already in progress." >&2\nexit 1\n')
+        self.assertIn("brew upgrade yt-dlp failed", result.stdout)
+        self.assertIn("Another active Homebrew process", result.stdout)
 
-    def test_subtitles_rejects_unsupported_languages_before_download(self):
-        """Test subtitles rejects unsupported languages before download."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            fake_bin = Path(tmpdir) / "yt-dlp"
-            fake_bin.write_text(
-                """#!/usr/bin/env bash
-if [ "$1" = "--print" ] && [ "$2" = '%(id)s' ]; then
-  echo 'vides'
-  exit 0
-fi
-if [ "$1" = "-J" ]; then
-  cat <<'EOF'
-{"id":"vides","subtitles":{"es":[{"ext":"vtt"}]}}
-EOF
-  exit 0
-fi
-if [ "$1" = "--write-sub" ]; then
-  echo 'unexpected subtitle download' >&2
-  exit 99
-fi
-exit 1
-""",
-                encoding="utf-8",
-            )
-            fake_bin.chmod(0o755)
-
-            env = os.environ.copy()
-            env["PATH"] = f"{tmpdir}:{env['PATH']}"
-            result = subprocess.run(
-                ["bash", str(PROJECT_ROOT / "scripts/download.sh"), "https://example.com/video", "subtitles"],
-                cwd=PROJECT_ROOT,
-                env=env,
-                capture_output=True,
-                text=True,
-            )
-            self.assertNotEqual(result.returncode, 0)
-            self.assertIn("Spoken language 'es' is not supported yet", result.stderr)
-            self.assertNotIn("unexpected subtitle download", result.stderr)
-
-    def test_yt_dlp_update_check_is_best_effort(self):
-        """A failed update check is reported and never fails the caller."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            fake_yt_dlp = Path(tmpdir) / "yt-dlp"
-            fake_yt_dlp.write_text("#!/usr/bin/env bash\necho '2025.01.01'\n", encoding="utf-8")
-            fake_yt_dlp.chmod(0o755)
-            fake_curl = Path(tmpdir) / "curl"
-            fake_curl.write_text("#!/usr/bin/env bash\nexit 127\n", encoding="utf-8")
-            fake_curl.chmod(0o755)
-            version_cache = Path("/tmp/yt-dlp-version-cache")
-            previous_cache = version_cache.read_text(encoding="utf-8") if version_cache.exists() else None
-            version_cache.unlink(missing_ok=True)
-            try:
-                env = os.environ.copy()
-                env["PATH"] = f"{tmpdir}:{env['PATH']}"
-                env.pop("YT_TRANSCRIPT_YT_DLP_UPDATE", None)
-                result = subprocess.run(["bash", str(PROJECT_ROOT / "scripts/update_yt_dlp.sh")],
-                                        env=env, capture_output=True, text=True)
-            finally:
-                if previous_cache is not None:
-                    version_cache.write_text(previous_cache, encoding="utf-8")
-
-            self.assertEqual(result.returncode, 0)
-            self.assertIn("Could not check for updates", result.stdout)
-
-    def test_yt_dlp_update_check_supports_gnu_stat_for_cache_age(self):
-        """The hourly version cache works with GNU `stat -c`."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            fake_yt_dlp = Path(tmpdir) / "yt-dlp"
-            fake_yt_dlp.write_text("#!/usr/bin/env bash\necho '2025.01.01'\n", encoding="utf-8")
-            fake_yt_dlp.chmod(0o755)
-            fake_stat = Path(tmpdir) / "stat"
-            fake_stat.write_text(
-                """#!/usr/bin/env bash
-if [ "$1" = "-f" ]; then
-  exit 1
-fi
-if [ "$1" = "-c" ] && [ "$2" = "%Y" ]; then
-  date +%s
-  exit 0
-fi
-exit 1
-""",
-                encoding="utf-8",
-            )
-            fake_stat.chmod(0o755)
-            version_cache = Path("/tmp/yt-dlp-version-cache")
-            previous_cache = version_cache.read_text(encoding="utf-8") if version_cache.exists() else None
-            version_cache.write_text("2025.01.01", encoding="utf-8")
-            try:
-                env = os.environ.copy()
-                env["PATH"] = f"{tmpdir}:{env['PATH']}"
-                env.pop("YT_TRANSCRIPT_YT_DLP_UPDATE", None)
-                result = subprocess.run(["bash", str(PROJECT_ROOT / "scripts/update_yt_dlp.sh")],
-                                        env=env, capture_output=True, text=True)
-            finally:
-                if previous_cache is None:
-                    version_cache.unlink(missing_ok=True)
-                else:
-                    version_cache.write_text(previous_cache, encoding="utf-8")
-
-            self.assertEqual(result.returncode, 0)
-            self.assertIn("yt-dlp is up to date (cached)", result.stdout)
-
-    def test_audio_download_uses_isolated_dir(self):
-        """Test audio download uses isolated dir."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            fake_bin = Path(tmpdir) / "yt-dlp"
-            fake_bin.write_text(
-                """#!/usr/bin/env bash
-if [ "$1" = "--print" ] && [ "$2" = '%(id)s' ]; then
-  echo 'vidaudio'
-  exit 0
-fi
-if [ "$1" = "-J" ]; then
-  cat <<'EOF'
-{"id":"vidaudio","formats":[{"format_id":"251","language":"zh","vcodec":"none","acodec":"opus"},{"format_id":"140","language":"en","vcodec":"none","acodec":"mp4a.40.2"}]}
-EOF
-  exit 0
-fi
-if [ "$1" = "-f" ]; then
-  out=''
-  while [ $# -gt 0 ]; do
-    if [ "$1" = "-o" ]; then
-      out="$2"
-      shift 2
-      continue
-    fi
-    shift
-  done
-  mkdir -p "$(dirname "$out")"
-  : > "${out//%(ext)s/mp3}"
-  exit 0
-fi
-exit 1
-""",
-                encoding="utf-8",
-            )
-            fake_bin.chmod(0o755)
-
-            stale = Path("/tmp/vidaudio.mp3")
-            stale.write_text("stale", encoding="utf-8")
-            try:
-                env = os.environ.copy()
-                env["PATH"] = f"{tmpdir}:{env['PATH']}"
-                result = subprocess.run(
-                    ["bash", str(PROJECT_ROOT / "scripts/download.sh"), "https://example.com/video", "audio"],
-                    cwd=PROJECT_ROOT,
-                    env=env,
-                    check=True,
-                    capture_output=True,
-                    text=True,
-                )
-                payload = json.loads(result.stdout)
-                self.assertEqual(payload["audio_file"], "/tmp/vidaudio_downloads/audio/vidaudio.mp3")
-                self.assertNotEqual(payload["audio_file"], str(stale))
-                self.assertEqual(payload["audio_format"], "251")
-                self.assertTrue(Path(payload["audio_file"]).exists())
-            finally:
-                stale.unlink(missing_ok=True)
-                shutil.rmtree("/tmp/vidaudio_downloads", ignore_errors=True)
-
-    def test_audio_download_can_resolve_video_id_from_metadata_json_only(self):
-        """Test audio download can resolve video id from metadata json without --print."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            fake_bin = Path(tmpdir) / "yt-dlp"
-            fake_bin.write_text(
-                """#!/usr/bin/env bash
-if [ "$1" = "-J" ]; then
-  cat <<'EOF'
-{"id":"vidjsononly","formats":[{"format_id":"251","language":"zh","vcodec":"none","acodec":"opus"}]}
-EOF
-  exit 0
-fi
-if [ "$1" = "-f" ]; then
-  out=''
-  while [ $# -gt 0 ]; do
-    if [ "$1" = "-o" ]; then
-      out="$2"
-      shift 2
-      continue
-    fi
-    shift
-  done
-  mkdir -p "$(dirname "$out")"
-  : > "${out//%(ext)s/mp3}"
-  exit 0
-fi
-exit 1
-""",
-                encoding="utf-8",
-            )
-            fake_bin.chmod(0o755)
-
-            env = os.environ.copy()
-            env["PATH"] = f"{tmpdir}:{env['PATH']}"
-            try:
-                result = subprocess.run(
-                    ["bash", str(PROJECT_ROOT / "scripts/download.sh"), "https://example.com/video", "audio"],
-                    cwd=PROJECT_ROOT,
-                    env=env,
-                    check=True,
-                    capture_output=True,
-                    text=True,
-                )
-                payload = json.loads(result.stdout)
-                self.assertEqual(payload["video_id"], "vidjsononly")
-                self.assertEqual(payload["audio_format"], "251")
-                self.assertEqual(payload["audio_file"], "/tmp/vidjsononly_downloads/audio/vidjsononly.mp3")
-            finally:
-                shutil.rmtree("/tmp/vidjsononly_downloads", ignore_errors=True)
-
-
-    def test_download_metadata_applies_safe_ytdlp_defaults_and_reports_runtime(self):
-        """Test download metadata applies safe ytdlp defaults and reports runtime."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            log_path = Path(tmpdir) / "yt-dlp.log"
-            fake_bin = Path(tmpdir) / "yt-dlp"
-            fake_bin.write_text(
-                f"""#!/usr/bin/env bash
-printf '%s
-' "$*" >> '{log_path}'
-print_field=''
-while [ $# -gt 0 ]; do
-  if [ "$1" = "--print" ] && [ $# -ge 2 ]; then
-    print_field="$2"
-    shift 2
-    continue
-  fi
-  shift
-done
-case "$print_field" in
-  '%(id)s') echo 'safe123' ;;
-  '%(title)s') echo 'Safe title' ;;
-  '%(duration)s') echo '42' ;;
-  '%(upload_date)s') echo '20260316' ;;
-  '%(channel)s') echo 'Safe channel' ;;
-  *) exit 1 ;;
-esac
-""",
-                encoding="utf-8",
-            )
-            fake_bin.chmod(0o755)
-
-            env = os.environ.copy()
-            env["PATH"] = f"{tmpdir}:{env['PATH']}"
-            env["YT_DLP_SOCKET_TIMEOUT_SEC"] = "-1"
-            env["YT_DLP_RETRIES"] = "-1"
-            env["YT_DLP_EXTRACTOR_RETRIES"] = "-1"
-            result = subprocess.run(
-                ["bash", str(PROJECT_ROOT / "scripts/download.sh"), "https://example.com/video", "metadata"],
-                cwd=PROJECT_ROOT,
-                env=env,
-                check=True,
-                capture_output=True,
-                text=True,
-            )
-
-            payload = json.loads(result.stdout)
-            log_text = log_path.read_text(encoding="utf-8")
-            self.assertEqual(payload["yt_dlp_runtime"]["socket_timeout_sec"], 15)
-            self.assertEqual(payload["yt_dlp_runtime"]["retries"], 1)
-            self.assertEqual(payload["yt_dlp_runtime"]["extractor_retries"], 1)
-            self.assertIn("--socket-timeout 15", log_text)
-            self.assertIn("--retries 1", log_text)
-            self.assertIn("--extractor-retries 1", log_text)
-
-    def test_download_metadata_filters_impersonation_warning(self):
-        """Test download metadata filters impersonation warning."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            fake_bin = Path(tmpdir) / "yt-dlp"
-            fake_bin.write_text(
-                """#!/usr/bin/env bash
-print_field=''
-while [ $# -gt 0 ]; do
-  if [ "$1" = "--print" ] && [ $# -ge 2 ]; then
-    print_field="$2"
-    shift 2
-    continue
-  fi
-  shift
-done
-echo 'WARNING: [youtube] The extractor specified to use impersonation for this download, but no impersonate target is available' >&2
-case "$print_field" in
-  '%(id)s') echo 'imp123' ;;
-  '%(title)s') echo 'Impersonation title' ;;
-  '%(duration)s') echo '12' ;;
-  '%(upload_date)s') echo '20260316' ;;
-  '%(channel)s') echo 'Channel' ;;
-  *) exit 1 ;;
-esac
-""",
-                encoding="utf-8",
-            )
-            fake_bin.chmod(0o755)
-
-            env = os.environ.copy()
-            env["PATH"] = f"{tmpdir}:{env['PATH']}"
-            result = subprocess.run(
-                ["bash", str(PROJECT_ROOT / "scripts/download.sh"), "https://example.com/video", "metadata"],
-                cwd=PROJECT_ROOT,
-                env=env,
-                check=True,
-                capture_output=True,
-                text=True,
-            )
-
-            self.assertNotIn("no impersonate target is available", result.stderr)
-            self.assertIn("impersonation is unavailable in this build", result.stderr)
+    def test_yt_dlp_outside_homebrew_is_only_reported(self):
+        self.spec(info={})
+        result = self.run_update('if [ "$1" = "--prefix" ]; then echo /opt/homebrew; exit 0; fi\nexit 0\n')
+        self.assertIn("is not managed by Homebrew", result.stdout)
+        self.assertEqual(["--prefix"], self.brew_calls())

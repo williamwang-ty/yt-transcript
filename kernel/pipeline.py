@@ -10,10 +10,16 @@ on it. SYSTEM_DESIGN.md section 6 describes the design.
 
 Work directory: `/tmp/yt-transcript/<video_id>/`, or `$YT_TRANSCRIPT_WORK_ROOT/<video_id>/`.
 `$YT_TRANSCRIPT_OUTPUT_DIR` replaces the configured `output_dir` (regression runs).
+
+Two file locks keep concurrent calls apart (kernel/locks.py): a call holds its
+video's lock (`<work root>/.locks/video-<id>.lock`) from start to end, and the
+machine-wide YouTube lock (kernel/sources/youtube.py) around each yt-dlp call.
+Waiting for either counts against `--max-seconds`.
 """
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import math
@@ -29,10 +35,12 @@ from datetime import datetime
 from pathlib import Path
 
 from kernel import config as kernel_config
+from kernel import locks
 from kernel.files import atomic_write_text
 from kernel.quality import verify as kernel_verify
 from kernel.sources import deepgram as kernel_deepgram
 from kernel.sources import subtitle_language as kernel_subtitle_language
+from kernel.sources import youtube as kernel_youtube
 from kernel.text import assemble as kernel_assemble
 from kernel.text import chunking as kernel_chunking
 from kernel.text import merge as kernel_merge
@@ -61,8 +69,8 @@ EXIT_CODES = {
 USAGE_EXIT_CODE = 2
 
 STATE_FILE = "state.json"
-# Held while a run of the video is active; records the owning process.
-LOCK_FILE = ".runtime_owner.json"
+# Video locks live outside the work dirs, which `cleanup` and `--restart` delete.
+LOCKS_DIR = ".locks"
 METADATA_FILE = "metadata.json"
 CHAPTERS_FILE = "chapters.json"
 SOURCE_DIR = "source"
@@ -109,18 +117,14 @@ YT_DLP_CONFIG_ENV = {
     "YT_DLP_COOKIES_FILE": "yt_dlp_cookies_file",
 }
 DEEPGRAM_KEY_PLACEHOLDERS = {"", "your_api_key_here", "your_deepgram_api_key_here"}
-# yt-dlp messages that only the user can resolve, checked in this order.
-NEEDS_USER_PATTERNS = (
-    ("cookies_required", ("confirm you're not a bot", "confirm you’re not a bot")),
-    ("rate_limited", ("http error 429", "too many requests")),
-    ("login_required", ("login_required", "sign in to confirm your age", "private video",
-                        "members-only", "join this channel")),
-)
+# The needs_user reason for each problem kernel/sources/youtube.py finds in yt-dlp's output.
+NEEDS_USER_REASONS = {"rate_limited": "rate_limited", "bot_check": "cookies_required",
+                      "login_required": "login_required"}
 NEEDS_USER_MESSAGES = {
     "cookies_required": (
-        "YouTube asked to sign in to confirm this is not a bot, and the automatic Chrome-cookies retry did not "
-        "help. Export youtube.com cookies (Netscape cookies.txt) from a logged-in browser, set "
-        "yt_dlp_cookies_file in config.yaml, then rerun."
+        "YouTube asked to sign in to confirm this is not a bot, and browser cookies did not help. Export "
+        "youtube.com cookies (Netscape cookies.txt) from a logged-in browser, set yt_dlp_cookies_file in "
+        "config.yaml, then rerun."
     ),
     "login_required": (
         "This video needs a signed-in YouTube account (private, members-only or age-restricted). Set "
@@ -128,7 +132,7 @@ NEEDS_USER_MESSAGES = {
         "then rerun."
     ),
     "rate_limited": "YouTube is rate-limiting requests from this machine. Wait a while, then rerun.",
-    "tool_missing": "yt-dlp is not installed or not on PATH. Install it (pip install -U yt-dlp), then rerun.",
+    "tool_missing": "yt-dlp is not installed or not on PATH. Install it (on macOS: brew install yt-dlp), then rerun.",
     "deepgram_key_missing": (
         "This video needs audio transcription (no usable subtitles), but no Deepgram API key is configured. "
         "Set deepgram_api_key in config.yaml, then rerun."
@@ -224,15 +228,6 @@ def iso_date(upload_date: str) -> str:
     return f"{text[:4]}-{text[4:6]}-{text[6:8]}" if len(text) == 8 and text.isdigit() else text
 
 
-def classify_download_error(text: str) -> str:
-    """Name the needs_user reason a yt-dlp failure calls for, or ''."""
-    lowered = str(text or "").lower()
-    for reason, needles in NEEDS_USER_PATTERNS:
-        if any(needle in lowered for needle in needles):
-            return reason
-    return ""
-
-
 def _remove(path: Path) -> None:
     if path.is_dir() and not path.is_symlink():
         shutil.rmtree(path, ignore_errors=True)
@@ -240,47 +235,8 @@ def _remove(path: Path) -> None:
         path.unlink()
 
 
-def _process_alive(pid: int) -> bool:
-    if pid == os.getpid():
-        return True
-    try:
-        os.kill(pid, 0)
-    except PermissionError:
-        return True
-    except OSError:
-        return False
-    return True
-
-
-def lock_holder(work_dir: Path) -> dict:
-    """The lock record of the live process running this video, or {} when nobody holds the lock."""
-    try:
-        record = json.loads((work_dir / LOCK_FILE).read_text(encoding="utf-8"))
-        pid = int(record.get("pid") or 0)
-    except (OSError, ValueError, TypeError, AttributeError):
-        return {}
-    return record if pid > 0 and _process_alive(pid) else {}
-
-
-def acquire_lock(work_dir: Path) -> bool:
-    """Take the video's lock; a lock left by a dead process (or unreadable) is replaced."""
-    path = work_dir / LOCK_FILE
-    for _ in range(3):
-        try:
-            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
-        except FileExistsError:
-            if lock_holder(work_dir):
-                return False
-            _remove(path)
-            continue
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump({"pid": os.getpid(), "acquired_at": _now()}, handle)
-        return True
-    return False
-
-
-def release_lock(work_dir: Path) -> None:
-    _remove(work_dir / LOCK_FILE)
+def video_lock_path(video_id: str) -> Path:
+    return work_root() / LOCKS_DIR / f"video-{video_id}.lock"
 
 
 def read_state(work_dir: Path) -> dict:
@@ -321,12 +277,22 @@ def _skill_command() -> str:
     return f"python3 {shlex.quote(str(kernel_config.skill_root() / 'yt_transcript_utils.py'))}"
 
 
+def _run_command(url: str, *flags: str, max_seconds: float | None = None, config_path: str | None = None) -> str:
+    parts = [_skill_command(), "run", shlex.quote(url), *flags]
+    if max_seconds:
+        parts += ["--max-seconds", f"{max_seconds:g}"]
+    if config_path:
+        parts += ["--config-path", shlex.quote(str(config_path))]
+    return " ".join(parts)
+
+
 class _Run:
-    """One call of `run` for one video, holding the work dir lock."""
+    """One call of `run` for one video, holding the video's lock."""
 
     def __init__(self, *, video_id: str, url: str, work_dir: Path, source: str | None, mode: str | None,
                  from_stage: str | None, stop_after: str | None, max_seconds: float | None,
-                 restart: bool, config_path: str | None, stderr_tail: _StderrTail | None):
+                 restart: bool, config_path: str | None, stderr_tail: _StderrTail | None,
+                 video_lock: locks.FileLock, started: float, started_at: float):
         self.video_id = video_id
         self.url = url
         self.work_dir = work_dir
@@ -337,7 +303,11 @@ class _Run:
         self.restart = restart
         self.config_path = config_path
         self.stderr_tail = stderr_tail
-        self.started = time.monotonic()
+        # When the call began (monotonic, and epoch seconds for the YouTube refusal rule).
+        self.started = started
+        self.started_at = started_at
+        self.video_lock = video_lock
+        self.youtube_lock = locks.FileLock(kernel_youtube.lock_path())
         self.progress_made = False
         self.state: dict = {}
         self.config: dict = {}
@@ -360,18 +330,18 @@ class _Run:
         atomic_write_text(self.path(STATE_FILE), json.dumps(self.state, ensure_ascii=False, indent=2) + "\n")
 
     def next_command(self) -> str:
-        parts = [_skill_command(), "run", shlex.quote(self.url)]
-        if self.plan_only:
-            parts += ["--stage", PLAN_STAGE]
-        if self.max_seconds:
-            parts += ["--max-seconds", f"{self.max_seconds:g}"]
-        if self.config_path:
-            parts += ["--config-path", shlex.quote(str(self.config_path))]
-        return " ".join(parts)
+        return _run_command(self.url, *(["--stage", PLAN_STAGE] if self.plan_only else []),
+                            max_seconds=self.max_seconds, config_path=self.config_path)
 
     def deadline_passed(self) -> bool:
         return bool(self.max_seconds) and self.progress_made and \
             time.monotonic() - self.started >= float(self.max_seconds)
+
+    def seconds_left(self) -> float | None:
+        """What is left of `--max-seconds` (None without one): the longest this call may wait for a lock."""
+        if not self.max_seconds:
+            return None
+        return max(0.0, float(self.max_seconds) - (time.monotonic() - self.started))
 
     def finish(self, status: str, **fields) -> dict:
         result = {"status": status, "video_id": self.video_id, **fields}
@@ -403,8 +373,7 @@ class _Run:
     def execute(self) -> dict:
         if self.restart:
             for child in self.work_dir.iterdir():
-                if child.name != LOCK_FILE:
-                    _remove(child)
+                _remove(child)
         self.state = read_state(self.work_dir) or _new_state(self.video_id, self.url)
         self.state["url"] = self.url
         try:
@@ -525,10 +494,76 @@ class _Run:
 
     # -- downloads --------------------------------------------------------------
 
+    def lock_fds(self) -> tuple:
+        """The held lock descriptors, passed to child processes so a killed parent does not free them early."""
+        return tuple(lock.fd for lock in (self.video_lock, self.youtube_lock) if lock.held)
+
+    @contextlib.contextmanager
+    def youtube(self):
+        """Hold the machine-wide YouTube lock: one yt-dlp at a time on this machine.
+
+        After taking it, stop if YouTube refused this machine since this call
+        began: that refusal holds for every run already going. Reentrant.
+        """
+        if self.youtube_lock.held:
+            yield
+            return
+        try:
+            self.youtube_lock.acquire(
+                timeout=self.seconds_left(), video_id=self.video_id,
+                on_wait=lambda holder: _log(f"⏳ Waiting for YouTube, which {locks.describe(holder)} is using."))
+        except locks.Busy as busy:
+            raise Stop("in_progress", "", f"YouTube was still in use by {locks.describe(busy.holder)} when this "
+                       "call's time ran out; run next_command to keep waiting.", progress=self.progress()) from None
+        try:
+            refusal = kernel_youtube.refusal_since(self.started_at)
+            if refusal:
+                reason = NEEDS_USER_REASONS.get(refusal.get("problem"), "rate_limited")
+                raise Stop("needs_user", reason, (
+                    f"{NEEDS_USER_MESSAGES[reason]} YouTube refused this machine at {refusal.get('at')} (while "
+                    f"fetching {refusal.get('video_id')}), so runs that began before then do not call it again. "
+                    f"yt-dlp said: {refusal.get('message')}"))
+            yield
+        finally:
+            self.youtube_lock.release()
+
     def download(self, mode: str, *, subtitle_mode: str = "") -> dict:
-        """Run `download.sh <url> <mode>` and return its JSON; Stop on failure."""
+        """Run `download.sh <url> <mode>` under the YouTube lock and return its JSON; Stop on failure.
+
+        yt-dlp runs once. A bot check gets one retry with Chrome cookies when no
+        cookies are configured. When YouTube refuses the machine as a whole (rate
+        limit, or a bot check that cookies did not pass), the refusal is recorded
+        for every other run (kernel/sources/youtube.py).
+        """
         if not shutil.which("yt-dlp"):
             raise Stop("needs_user", "tool_missing", NEEDS_USER_MESSAGES["tool_missing"])
+        env = self.download_env(subtitle_mode)
+        with self.youtube():
+            proc = self.run_download_sh(mode, env)
+            problem = kernel_youtube.classify(proc.stderr) if proc.returncode else ""
+            cookies = env.get("YT_DLP_COOKIES_FILE") or env.get("YT_DLP_COOKIES_FROM_BROWSER")
+            if problem == "bot_check" and not cookies:
+                _log("ℹ️ YouTube asked to confirm this is not a bot; retrying once with Chrome cookies.")
+                proc = self.run_download_sh(mode, {**env, "YT_DLP_COOKIES_FROM_BROWSER": "chrome"})
+                problem = (kernel_youtube.classify(proc.stderr) or "bot_check") if proc.returncode else ""
+            if proc.returncode != 0:
+                said = kernel_youtube.said(proc.stderr)
+                if problem in kernel_youtube.SESSION_PROBLEMS:
+                    kernel_youtube.record_refusal(problem, said, self.video_id)
+                if problem:
+                    reason = NEEDS_USER_REASONS[problem]
+                    raise Stop("needs_user", reason, f"{NEEDS_USER_MESSAGES[reason]} yt-dlp said: {said}")
+                tail = [line.strip() for line in (proc.stderr or proc.stdout).splitlines() if line.strip()][-3:]
+                raise Stop("failed", "download_error", f"download.sh {mode} exited {proc.returncode}: "
+                           + " | ".join(tail), retryable=True)
+        out = proc.stdout.strip()
+        try:
+            return json.loads(out[out.index("{"):])
+        except ValueError:
+            raise Stop("failed", "download_error", f"download.sh {mode} printed no JSON", retryable=True)
+
+    def download_env(self, subtitle_mode: str) -> dict:
+        """The environment download.sh reads: paths, the subtitle mode and the yt-dlp settings."""
         env = dict(os.environ)
         env.update({
             "YT_TRANSCRIPT_INFO_JSON": str(self.path(METADATA_FILE)),
@@ -540,41 +575,34 @@ class _Run:
             value = self.config.get(key)
             if value not in (None, "") and not env.get(env_name):
                 env[env_name] = str(value)
+        return env
+
+    def run_download_sh(self, mode: str, env: dict):
         self.path(SOURCE_DIR).mkdir(parents=True, exist_ok=True)
         script = kernel_config.skill_root() / "scripts" / "download.sh"
         try:
             proc = subprocess.run(["bash", str(script), self.url, mode], capture_output=True, text=True,
-                                  timeout=DOWNLOAD_TIMEOUT_SEC, env=env)
+                                  timeout=DOWNLOAD_TIMEOUT_SEC, env=env, pass_fds=self.lock_fds())
         except subprocess.TimeoutExpired:
             raise Stop("failed", "download_error", f"download.sh {mode} timed out after {DOWNLOAD_TIMEOUT_SEC}s",
                        retryable=True)
         if proc.stderr:
             sys.stderr.write(proc.stderr if proc.stderr.endswith("\n") else proc.stderr + "\n")
-        if proc.returncode != 0:
-            reason = classify_download_error(proc.stderr)
-            if reason:
-                raise Stop("needs_user", reason, NEEDS_USER_MESSAGES[reason])
-            tail = [line.strip() for line in (proc.stderr or proc.stdout).splitlines() if line.strip()][-3:]
-            raise Stop("failed", "download_error", f"download.sh {mode} exited {proc.returncode}: "
-                       + " | ".join(tail), retryable=True)
-        out = proc.stdout.strip()
-        try:
-            return json.loads(out[out.index("{"):])
-        except ValueError:
-            raise Stop("failed", "download_error", f"download.sh {mode} printed no JSON", retryable=True)
+        return proc
 
     def update_yt_dlp(self) -> None:
-        """Update yt-dlp when a newer release exists; YouTube keeps breaking old ones.
+        """Let Homebrew update yt-dlp; YouTube keeps breaking old releases.
 
-        Best effort (the script checks GitHub at most hourly and never fails),
-        run once per video before its metadata is fetched.
+        Best effort (the script asks Homebrew at most hourly and never fails).
+        Call it inside `youtube()`, so no yt-dlp runs while Homebrew replaces it.
         """
         if os.environ.get(YT_DLP_UPDATE_ENV) == "0" or not shutil.which("yt-dlp"):
             return
         script = kernel_config.skill_root() / "scripts" / "update_yt_dlp.sh"
+        env = {**os.environ, kernel_youtube.LOCK_DIR_ENV: str(kernel_youtube.lock_dir())}
         try:
             proc = subprocess.run(["bash", str(script)], capture_output=True, text=True,
-                                  timeout=YT_DLP_UPDATE_TIMEOUT_SEC)
+                                  timeout=YT_DLP_UPDATE_TIMEOUT_SEC, env=env, pass_fds=self.lock_fds())
         except (OSError, subprocess.TimeoutExpired):
             _log("⚠️ The yt-dlp update check did not finish; continuing with the installed version.")
             return
@@ -593,8 +621,9 @@ class _Run:
 
     def stage_metadata(self, record: dict) -> None:
         _remove(self.path(METADATA_FILE))
-        self.update_yt_dlp()
-        summary = self.download("metadata")
+        with self.youtube():
+            self.update_yt_dlp()
+            summary = self.download("metadata")
         if summary.get("video_id") and summary["video_id"] != self.video_id:
             raise Stop("failed", "download_error",
                        f"yt-dlp resolved video id {summary['video_id']!r}, expected {self.video_id!r}")
@@ -691,16 +720,18 @@ class _Run:
     def subtitle_route(self, route: dict, sub_info: dict, want_mode: str | None) -> bool:
         """Take the subtitle track; return False when its quality calls for Deepgram instead."""
         subs = self.download("subtitles", subtitle_mode=want_mode or "")
-        refused = [c for c in subs.get("blocked_candidates", []) or []
-                   if c.get("failure_reason") in {"rate_limited", "bot_verification"}]
-        route["blocked_tracks"] = [f"{c.get('language', '')}:{c.get('failure_reason', 'blocked')}"
-                                   for c in subs.get("blocked_candidates", []) or []]
+        blocked = [c for c in subs.get("blocked_candidates", []) or [] if isinstance(c, dict)]
+        for candidate in blocked:
+            candidate["failure_reason"] = kernel_youtube.classify(candidate.get("error", "")) or "download_failed"
+        # A track YouTube refused while another one downloaded: this video only, the user decides.
+        refused = [c for c in blocked if c["failure_reason"] in kernel_youtube.SESSION_PROBLEMS]
+        route["blocked_tracks"] = [f"{c.get('language', '')}:{c['failure_reason']}" for c in blocked]
         language = str(subs.get("selected_source_language") or "")
         kind = str(subs.get("selected_source_kind") or "")
         mode = str(subs.get("resolved_mode") or sub_info.get("mode") or "")
         if refused and not want_mode:
             first = refused[0]
-            reason = "rate_limited" if first.get("failure_reason") == "rate_limited" else "cookies_required"
+            reason = NEEDS_USER_REASONS[first["failure_reason"]]
             raise Stop(
                 "needs_user", reason,
                 f"YouTube refused the preferred subtitle track {first.get('language')} "
@@ -1103,33 +1134,47 @@ def llm_usage(text_dir: Path) -> dict:
 def run(url: str, *, source: str | None = None, mode: str | None = None, from_stage: str | None = None,
         stage: str | None = None, max_seconds: float | None = None, restart: bool = False,
         config_path: str | None = None, stderr_tail: _StderrTail | None = None) -> tuple[dict, int]:
-    """Run (or continue) the pipeline for one video; return (result, exit code)."""
+    """Run (or continue) the pipeline for one video; return (result, exit code).
+
+    A second call for a video that is already running waits for the first one
+    (within `max_seconds`), then continues from its state: usually `done` at once.
+    """
+    started, started_at = time.monotonic(), time.time()
     video_id = parse_video_id(url)
     if not video_id:
         return {"status": "usage_error", "message": f"Not a YouTube video URL: {url!r}"}, USAGE_EXIT_CODE
     if max_seconds is not None and max_seconds <= 0:
         return {"status": "usage_error", "message": "--max-seconds must be positive"}, USAGE_EXIT_CODE
     work_dir = work_root() / video_id
-    work_dir.mkdir(parents=True, exist_ok=True)
-    if not acquire_lock(work_dir):
-        active = lock_holder(work_dir)
-        result = {
-            "status": "failed",
+    lock = locks.FileLock(video_lock_path(video_id))
+    try:
+        lock.acquire(timeout=max_seconds, video_id=video_id, on_wait=lambda holder: _log(
+            f"⏳ Another run of this video is active ({locks.describe(holder)}); waiting for it."))
+    except locks.Busy as busy:
+        # This call did nothing, so the next one repeats every flag it was given.
+        flags = [*(["--source", source] if source else []), *(["--mode", mode] if mode else []),
+                 *(["--from", from_stage] if from_stage else []), *(["--stage", stage] if stage else []),
+                 *(["--restart"] if restart else [])]
+        return {
+            "status": "in_progress",
             "video_id": video_id,
             "stage": "",
-            "reason": "locked",
-            "message": f"Another run of this video is active (pid {active.get('pid', '?')}); wait for it to finish.",
-            "retryable": True,
+            "message": f"Another run of this video ({locks.describe(busy.holder)}) was still active when this "
+                       "call's time ran out; run next_command to keep waiting.",
+            "next_command": _run_command(canonical_url(video_id), *flags, max_seconds=max_seconds,
+                                         config_path=config_path),
             "work_dir": str(work_dir),
-        }
-        return result, EXIT_CODES["failed"]
+            "seconds": round(time.monotonic() - started, 1),
+        }, EXIT_CODES["in_progress"]
     try:
+        work_dir.mkdir(parents=True, exist_ok=True)
         job = _Run(video_id=video_id, url=canonical_url(video_id), work_dir=work_dir, source=source, mode=mode,
                    from_stage=from_stage, stop_after=stage, max_seconds=max_seconds, restart=restart,
-                   config_path=config_path, stderr_tail=stderr_tail)
+                   config_path=config_path, stderr_tail=stderr_tail, video_lock=lock, started=started,
+                   started_at=started_at)
         result = job.execute()
     finally:
-        release_lock(work_dir)
+        lock.release()
     return result, EXIT_CODES.get(result["status"], EXIT_CODES["failed"])
 
 
@@ -1147,7 +1192,7 @@ def _status_entry(work_dir: Path, state: dict) -> dict:
         "output_file": state.get("output_file"),
         "updated_at": state.get("updated_at", ""),
         "work_dir": str(work_dir),
-        "active": bool(lock_holder(work_dir)),
+        "active": locks.is_held(video_lock_path(work_dir.name)),
     }
 
 
@@ -1189,11 +1234,18 @@ def cleanup(video_id: str, force: bool = False) -> tuple[dict, int]:
     work_dir = work_root() / video_id
     if not work_dir.exists():
         return {"success": True, "removed": False, "video_id": video_id, "message": "no work directory"}, 0
-    if lock_holder(work_dir):
+    # Deleting under the video's lock: no run can be writing the directory meanwhile.
+    lock = locks.FileLock(video_lock_path(video_id))
+    try:
+        lock.acquire(timeout=0, video_id=video_id, command="cleanup")
+    except locks.Busy as busy:
         return {"success": False, "removed": False, "video_id": video_id, "reason": "locked",
-                "message": "A run of this video is active; stop it first."}, 1
-    if not run_finished(read_state(work_dir)) and not force:
-        return {"success": False, "removed": False, "video_id": video_id, "reason": "unfinished",
-                "message": "The run is unfinished; rerun it to continue, or pass --force to discard it."}, 1
-    shutil.rmtree(work_dir)
+                "message": f"A run of this video is active ({locks.describe(busy.holder)}); stop it first."}, 1
+    try:
+        if not run_finished(read_state(work_dir)) and not force:
+            return {"success": False, "removed": False, "video_id": video_id, "reason": "unfinished",
+                    "message": "The run is unfinished; rerun it to continue, or pass --force to discard it."}, 1
+        shutil.rmtree(work_dir)
+    finally:
+        lock.release()
     return {"success": True, "removed": True, "video_id": video_id, "work_dir": str(work_dir)}, 0
