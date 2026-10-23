@@ -371,7 +371,7 @@ In `auto` mode the CLI can still be unusable: none was found, its probe failed, 
 
 | `llm_api_fallback` | No usable CLI | A CLI request still failing |
 |---|---|---|
-| `ask` (default) | `needs_user`, reason `llm_api_fallback`, with four `choices` (below) | the same, at that round |
+| `ask` (default) | `needs_user`, reason `llm_api_fallback`, with four `choices` (below) | the same, at that request (the outline or a round) |
 | `auto` | the API takes every request | the API takes the rest of the run, with a warning |
 | `never` | agent handoff | a retryable `llm_error`; the rerun continues at that round |
 
@@ -1123,7 +1123,7 @@ agent 从不编辑状态文件，也从不手动执行内部阶段。需要不�
 
 | `llm_api_fallback` | 没有可用的 CLI | CLI 请求一直失败 |
 |---|---|---|
-| `ask`（默认） | `needs_user`，原因 `llm_api_fallback`，带四个 `choices`（见下） | 同样，停在那一轮 |
+| `ask`（默认） | `needs_user`，原因 `llm_api_fallback`，带四个 `choices`（见下） | 同样，停在那个请求（大纲或某一轮） |
 | `auto` | 所有请求交给 API | 剩下的部分交给 API，并给出警告 |
 | `never` | 交给 agent | 可重试的 `llm_error`，重跑时从那一轮继续 |
 
