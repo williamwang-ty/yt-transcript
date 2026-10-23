@@ -2,16 +2,23 @@
 
 Before the first window round, the whole numbered source goes to the model
 once (or in a few parts when it is too long for one request), and the model
-returns a short JSON object: the section list (title + first source unit) and
-a list of names and terms with the spellings that should be used. The window
-rounds then get the relevant part of the outline and the terms that occur in
-their window; section headings are inserted by the program at the outline's
-section starts instead of being chosen by each round.
+returns a short JSON object: the section list (title, first source unit and
+the words the section begins with) and a list of names and terms with the
+spellings that should be used. The window rounds then get the relevant part
+of the outline and the terms that occur in their window; section headings
+come from the outline instead of being chosen by each round, and the program
+adds them to the written text (`kernel/text/structure.py`).
+
+A section's position is its anchor: the words it begins with, copied from the
+source, plus the unit holding them. Unit numbers alone are too coarse, since
+a unit of unpunctuated subtitles is a cut at a cue pause and often starts in
+the middle of a sentence; the heading goes before the written sentence that
+holds the anchor.
 
 YouTube chapters, when the video has them, are mapped to source units and
-given to the model as hints. If the outline cannot be produced or fails
-validation, the run continues without it and the rounds place their own
-headings, as before.
+given to the model as hints, anchored at the chapter's first subtitle cue.
+If the outline cannot be produced or fails validation, the run continues
+without it and the rounds place their own headings, as before.
 """
 
 from __future__ import annotations
@@ -39,23 +46,35 @@ MAX_TERM_CHARS = 60
 MAX_ROUND_TERMS = 20
 TERM_KINDS = ("person", "organization", "product", "term")
 HEADER_LINE = re.compile(r"^[ \t]*#{1,6}[ \t]+.*$\n?", re.MULTILINE)
-# A heading the model writes for a section is accepted when its paragraph
-# covers units within this distance of the section's first unit.
+# A section's first words are looked for this far from the unit the model
+# gave, in the source and again in the written text, and a chapter takes over
+# the section starting this close to it.
 HEADING_TOLERANCE_UNITS = 2
+# Length of an anchor, weighing an English word 2 and a Chinese character 1:
+# about as long as the words it is made from (a cue, the model's first
+# words), kept within MIN..MAX, or DEFAULT when there is nothing to go by.
+ANCHOR_MIN_WEIGHT = 8
+ANCHOR_MAX_WEIGHT = 16
+ANCHOR_DEFAULT_WEIGHT = 12
+# First words shorter than this (letters and digits only) are not searched for.
+MIN_ANCHOR_KEY = 4
+# When the whole of the model's first words is not found, their start is.
+ANCHOR_PROBE_KEY = 6
+ANCHOR_WORD = re.compile(r"[A-Za-z0-9]+(?:['’][A-Za-z]+)?|[^\W_]")
 
 OUTLINE_PROMPT = """# Transcript Outline
 
 **Task**: Read the transcript below and plan its section headings and a list of names and terms. Do not rewrite or summarize the transcript.
 
-Every source unit starts with a number tag like [S12].{part_note}
+Every source unit starts with a number tag like [S12]. A unit may start or end in the middle of a sentence.{part_note}
 
 ## Output
 
 Return only one JSON object and nothing else:
 
-{{"sections": [{{"start": {first}, "title": "..."{title_zh_example}}}], "terms": [{{"term": "...", "variants": ["..."], "kind": "person"{zh_example}}}]}}
+{{"sections": [{{"start": {first}, "first_words": "...", "title": "..."{title_zh_example}}}], "terms": [{{"term": "...", "variants": ["..."], "kind": "person"{zh_example}}}]}}
 
-- `sections`: the major topics in order. `start` is the number of the unit where the topic begins, and the numbers must increase.{first_note} Aim for {low} to {high} sections; start a section only at a real topic shift, not for a single remark. `title` is a short heading in {title_language} (at most about 20 Chinese characters or 8 English words), without numbering or `#`.{title_zh_note}
+- `sections`: the major topics in order. `first_words` are the first words of the sentence that begins the topic (about 6 to 12 Chinese characters, or 4 to 8 English words), copied exactly from the transcript without the tag; `start` is the number of the unit that contains them, and the numbers must increase.{first_note} Aim for {low} to {high} sections; start a section only at a real topic shift, not for a single remark. `title` is a short heading in {title_language} (at most about 20 Chinese characters or 8 English words), without numbering or `#`.{title_zh_note}
 - `terms`: at most {max_terms} names of people, organizations and products, and technical terms, that recur or matter. `term` is the name as the speaker uses it, spelled correctly: keep a Chinese name in Chinese when that is what is said, and do not expand it to a full name or swap in a translation. `variants` lists only misrecognized or misspelled forms of that same word that actually appear in the transcript (speech-recognition errors, typos); never a translation, an abbreviation, a short form or a full name, since the speaker's wording is kept. Leave it empty unless you are confident. `kind` is one of person, organization, product, term.{zh_note}{hints}
 
 ## Transcript
@@ -67,7 +86,7 @@ HINTS_BLOCK = """
 
 ## Video Chapters
 
-The video has its own chapters, listed below at the unit where each one starts. Keep every chapter as its own section starting at or near that unit (move the start a few units if the topic clearly begins elsewhere); do not merge chapters. You may split a long chapter into several sections where the topic changes. Keep each chapter's title as written, including its numbers; only translate it into {title_language} if it is in another language, and replace placeholder titles such as "<Untitled Chapter 1>".
+The video has its own chapters, listed below with the unit and the words where each one starts. Keep every chapter as its own section starting there, with those words as its `first_words`; do not merge chapters. You may split a long chapter into several sections where the topic changes. Keep each chapter's title as written, including its numbers; only translate it into {title_language} if it is in another language, and replace placeholder titles such as "<Untitled Chapter 1>".
 
 {lines}"""
 
@@ -135,8 +154,9 @@ def build_outline_prompt(units: list[str], start: int, end: int, *, prompt_name:
                       " list a section only where a new topic begins.")
     else:
         first_note = f" The first section starts at [S{start + 1}]."
-    hint_lines = [f"- [S{hint['start']}] {hint['title']}" for hint in hints or []
-                  if start < int(hint["start"]) <= end]
+    hint_lines = [f"- [S{hint['start']}] {hint['title']}"
+                  + (f" (begins with “{hint['anchor']}”)" if hint.get("anchor") else "")
+                  for hint in hints or [] if start < int(hint["start"]) <= end]
     hints_text = HINTS_BLOCK.format(title_language=title_language, lines="\n".join(hint_lines)) if hint_lines else ""
     unit_separator = "\n"
     numbered = unit_separator.join(f"[S{index + 1}] {units[index]}" for index in range(start, end))
@@ -231,6 +251,9 @@ def parse_outline(text: str, first: int, last: int, *, max_terms: int = DEFAULT_
         title_zh = clean_title(entry.get("title_zh"))
         if title_zh and title_zh != title:
             section["title_zh"] = title_zh
+        first_words = re.sub(r"\[S\d+\]|\s+", " ", str(entry.get("first_words", "") or "")).strip(" \"'“”‘’「」")
+        if first_words:
+            section["first_words"] = first_words[:MAX_TITLE_CHARS]
         sections.append(section)
         previous = start
     if not sections:
@@ -365,62 +388,191 @@ def generate_outline(units: list[str], *, prompt_name: str, call_llm, max_output
         if len(parts) > 1:
             log(f"ℹ️ Outline part {number}/{len(parts)}: {len(parsed['sections'])} sections")
     merged = merge_parts(parsed_parts, max_terms)
-    merged["sections"] = restore_chapter_titles(merged["sections"], hints, prompt_name)
+    merged["sections"] = apply_chapters(anchor_sections(merged["sections"], units), hints, prompt_name)
     record.update({"status": "ok", **merged})
     return record
+
+
+# ---------------------------------------------------------------------------
+# Anchors: the words a section begins with
+# ---------------------------------------------------------------------------
+
+def key_chars(text: str) -> tuple[str, list[int]]:
+    """Lower-cased letters and digits of `text`, and the index in `text` of each."""
+    chars, positions = [], []
+    for index, char in enumerate(text):
+        if char.isalnum():
+            lowered = char.lower()
+            chars.append(lowered)
+            positions.extend([index] * len(lowered))
+    return "".join(chars), positions
+
+
+def _join_units(left: str, right: str) -> str:
+    return left + (" " if (left[-1:] + right[:1]).isascii() else "") + right
+
+
+def text_weight(text: str) -> int:
+    return sum(2 if word.isascii() else 1 for word in ANCHOR_WORD.findall(text))
+
+
+def anchor_text(units: list[str], index: int, position: int, weight: int = ANCHOR_DEFAULT_WEIGHT) -> str:
+    """The source text from `position` in units[index], about `weight` long (see ANCHOR_*_WEIGHT).
+
+    It runs into the next units only when the rest of this one is shorter
+    than the minimum.
+    """
+    text = units[index][position:]
+    for following in units[index + 1:index + 3]:
+        if text_weight(text) >= ANCHOR_MIN_WEIGHT:
+            break
+        text = _join_units(text, following)
+    target = max(ANCHOR_MIN_WEIGHT, min(ANCHOR_MAX_WEIGHT, weight))
+    words, total = [], 0
+    for word in ANCHOR_WORD.finditer(text):
+        words.append(word)
+        total += 2 if word.group().isascii() else 1
+        if total >= target:
+            break
+    return text[words[0].start():words[-1].end()] if words else ""
+
+
+def locate_words(units: list[str], words: str, start: int) -> tuple[int, int] | None:
+    """Find a section's first words in the source near its start unit (1-based).
+
+    Only letters and digits are compared, so punctuation and spacing do not
+    matter. Returns (unit index, position in that unit) of the occurrence
+    nearest the start unit within HEADING_TOLERANCE_UNITS, or None. When the
+    whole of the words is not there, their first ANCHOR_PROBE_KEY characters
+    are tried, since models sometimes fix a word while copying.
+    """
+    key, _ = key_chars(words)
+    if len(key) < MIN_ANCHOR_KEY:
+        return None
+    probes = [key, key[:ANCHOR_PROBE_KEY]] if len(key) > ANCHOR_PROBE_KEY else [key]
+    first = max(0, start - 1 - HEADING_TOLERANCE_UNITS)
+    last = min(len(units), start + HEADING_TOLERANCE_UNITS)
+    for probe in probes:
+        best = None
+        for index in range(first, last):
+            # The words may run over the end of the unit into the next one.
+            text = _join_units(units[index], units[index + 1]) if index + 1 < len(units) else units[index]
+            compact, positions = key_chars(text)
+            found = compact.find(probe)
+            while found >= 0 and positions[found] < len(units[index]):
+                candidate = (abs(index - (start - 1)), index, positions[found])
+                best = candidate if best is None else min(best, candidate)
+                found = compact.find(probe, found + 1)
+        if best is not None:
+            return best[1], best[2]
+    return None
+
+
+def anchor_sections(sections: list[dict], units: list[str]) -> list[dict]:
+    """Turn the model's `first_words` into anchors copied from the source.
+
+    A section whose words are found moves to the unit holding them and gets
+    `anchor`, the source text from there; one whose words are missing keeps
+    its unit and has no anchor. A section that would no longer start after
+    the one before it is dropped.
+    """
+    anchored = []
+    for section in sections:
+        section = dict(section)
+        words = section.pop("first_words", "")
+        found = locate_words(units, words, section["start"]) if words else None
+        if found:
+            index, position = found
+            section["start"] = index + 1
+            section["anchor"] = anchor_text(units, index, position, text_weight(words))
+        if anchored and section["start"] <= anchored[-1]["start"]:
+            continue
+        anchored.append(section)
+    return anchored
 
 
 # ---------------------------------------------------------------------------
 # Chapter hints
 # ---------------------------------------------------------------------------
 
-def restore_chapter_titles(sections: list[dict], hints: list[dict] | None, prompt_name: str) -> list[dict]:
-    """Put the video's own chapter titles back on the sections that start at those chapters.
+def apply_chapters(sections: list[dict], hints: list[dict] | None, prompt_name: str) -> list[dict]:
+    """Put the video's own chapters back on the sections that start at them.
 
     Models tend to reword chapter titles and drop numbers from them even when
-    told not to. A section within HEADING_TOLERANCE_UNITS of a chapter start
-    (the nearest one) takes the chapter's title, unless that title is not in
-    the output language (an English chapter title in a Chinese cleanup run),
-    where the model's translation is kept.
+    told not to, and to move a start to the beginning of a unit. The section
+    nearest a chapter start, within HEADING_TOLERANCE_UNITS, takes the
+    chapter's position (unit and anchor) and title, unless that title is a
+    placeholder or not in the output language (an English chapter title in a
+    Chinese cleanup run), where the model's title is kept.
     """
     if not hints:
         return sections
     sections = [dict(section) for section in sections]
     taken = set()
     for hint in hints:
-        title = clean_title(hint.get("title"))
-        placeholder = "untitled chapter" in title.lower() or title.lower().startswith("<untitled")
-        if not title or placeholder or (OUTLINE_PROMPTS.get(prompt_name) == "zh" and not _has_cjk(title)):
-            continue
-        nearby = [(abs(section["start"] - int(hint["start"])), index) for index, section in enumerate(sections)
-                  if index not in taken and abs(section["start"] - int(hint["start"])) <= HEADING_TOLERANCE_UNITS]
+        start = int(hint["start"])
+        nearby = [(abs(section["start"] - start), index) for index, section in enumerate(sections)
+                  if index not in taken and abs(section["start"] - start) <= HEADING_TOLERANCE_UNITS]
         if not nearby:
             continue
         index = min(nearby)[1]
         taken.add(index)
-        if sections[index]["title"] != title:
-            sections[index]["title"] = title
-            if sections[index].get("title_zh") == title:
-                sections[index].pop("title_zh")
-    return sections
+        section = sections[index]
+        if hint.get("anchor"):
+            section["anchor"] = hint["anchor"]
+        elif section["start"] != start:
+            section.pop("anchor", None)
+        section["start"] = start
+        title = clean_title(hint.get("title"))
+        placeholder = "untitled chapter" in title.lower() or title.lower().startswith("<untitled")
+        if not title or placeholder or (OUTLINE_PROMPTS.get(prompt_name) == "zh" and not _has_cjk(title)):
+            continue
+        if section["title"] != title:
+            section["title"] = title
+            if section.get("title_zh") == title:
+                section.pop("title_zh")
+    # A chapter that moved onto or past a neighbouring section wins over it.
+    ordered = sorted(range(len(sections)), key=lambda index: (sections[index]["start"], index not in taken))
+    kept = []
+    for index in ordered:
+        if kept and sections[index]["start"] <= kept[-1]["start"]:
+            continue
+        kept.append(sections[index])
+    return kept
+
+
+def _visible_index(text: str, count: int) -> int:
+    """Index in `text` of its non-whitespace character number `count` (0-based)."""
+    seen = 0
+    for index, char in enumerate(text):
+        if char.isspace():
+            continue
+        if seen == count:
+            return index
+        seen += 1
+    return len(text)
 
 
 def hints_from_times(chapters: list[dict], cue_starts: list[tuple[int, float]],
-                     unit_offsets: list[int | None]) -> list[dict]:
+                     unit_offsets: list[int | None], units: list[str] | None = None) -> list[dict]:
     """Map YouTube chapter start times to source units through the subtitle cues.
 
     `cue_starts` is (offset in the whitespace-free cue text, start time) per
     cue; `unit_offsets` the offset where each unit starts in that text, or
-    None for units that could not be located.
+    None for units that could not be located. With `units`, each hint also
+    gets `anchor`: the source text from the chapter's first cue on. A
+    chapter that starts after the last cue has no text and is left out.
     """
     located = [(offset, index) for index, offset in enumerate(unit_offsets) if offset is not None]
     if not located or not cue_starts:
         return []
+    last_cue = max(time for _, time in cue_starts)
+    cue_ends = {offset: following for (offset, _), (following, _) in zip(cue_starts, cue_starts[1:])}
     hints = []
     for chapter in chapters:
         title = clean_title(chapter.get("title"))
         start_time = chapter.get("start_time")
-        if not title or not isinstance(start_time, (int, float)):
+        if not title or not isinstance(start_time, (int, float)) or float(start_time) > last_cue:
             continue
         # The cue starting closest to the chapter time (the later one on a tie).
         offset = min(cue_starts, key=lambda cue: (abs(cue[1] - float(start_time)), -cue[1]))[0]
@@ -434,7 +586,18 @@ def hints_from_times(chapters: list[dict], cue_starts: list[tuple[int, float]],
             unit_index = located[0][1]
         if hints and hints[-1]["start"] >= unit_index + 1:
             continue
-        hints.append({"start": unit_index + 1, "title": title})
+        hint = {"start": unit_index + 1, "title": title}
+        if units:
+            unit = units[unit_index]
+            within = max(0, offset - unit_offsets[unit_index])
+            position = _visible_index(unit, within)
+            # As long as the chapter's first cue (the part of it in this unit).
+            weight = text_weight(unit[position:_visible_index(unit, within + cue_ends[offset] - offset)]) \
+                if offset in cue_ends else ANCHOR_DEFAULT_WEIGHT
+            anchor = anchor_text(units, unit_index, position, weight)
+            if anchor:
+                hint["anchor"] = anchor
+        hints.append(hint)
     return hints
 
 
@@ -442,29 +605,30 @@ def hints_from_times(chapters: list[dict], cue_starts: list[tuple[int, float]],
 # Use in window rounds
 # ---------------------------------------------------------------------------
 
-def round_outline_text(sections: list[dict], cursor: int, window_end: int, next_section: int = 0) -> str:
+def round_outline_text(sections: list[dict], cursor: int, window_end: int) -> str:
     """The outline lines a round needs: the section it starts in, those starting in its window, and the next.
 
-    Sections from `next_section` on have no heading yet; the model is asked
-    to write the heading of those that begin in its window.
+    The model is asked to start a new paragraph at the beginning of the
+    sentence each section in its window begins with, so that the heading the
+    program adds there later falls between two paragraphs.
     """
     lines = []
-    current = None
-    for index, section in enumerate(sections):
-        if section["start"] <= cursor + 1:
-            current = index
     following = None
     for index, section in enumerate(sections):
-        start = section["start"]
-        if index == current and index < next_section:
-            lines.append(f"- [S{start}] {section['title']} (the section [S{cursor + 1}] is in; already headed)")
-        elif index >= next_section and (index == current or cursor + 1 < start <= window_end):
-            lines.append(f"- [S{start}] {section['title']} (starts in this window: where this topic begins, at or "
-                         f"right around [S{start}], start a new paragraph and put the line `## {section['title']}` "
-                         "before it)")
+        start, title = section["start"], section["title"]
+        if start <= cursor and (index + 1 == len(sections) or sections[index + 1]["start"] > cursor):
+            lines.append(f"- {title} (the section [S{cursor + 1}] is in)")
+        elif cursor < start <= window_end:
+            if section.get("anchor"):
+                spot = (f"it begins in [S{start}] at the words “{section['anchor']}”; start a new paragraph at the "
+                        "beginning of the sentence that contains these words")
+            else:
+                spot = (f"it begins in or right after [S{start}], where this topic starts; start a new paragraph at "
+                        "the beginning of that sentence")
+            lines.append(f"- {title} (starts in this window: {spot})")
         elif start > window_end and following is None:
             following = index
-            lines.append(f"- [S{start}] {section['title']} (next section, after this window)")
+            lines.append(f"- {title} (next section, after this window)")
     return OUTLINE_ROUND_BLOCK.format(lines="\n".join(lines)) if lines else ""
 
 
@@ -511,59 +675,3 @@ def heading_block(section: dict) -> str:
     if section.get("title_zh") and section["title_zh"] != section["title"]:
         lines.append(f"## {section['title_zh']}")
     return "\n".join(lines)
-
-
-def place_headings(sections: list[dict], next_section: int, text: str, start: int, end: int) -> tuple[str, list, int]:
-    """Put the outline's headings into one committed paragraph group (units start..end, 1-based).
-
-    The model is asked to write a section's title, as given, where the topic
-    really begins near the section's first unit. Such a heading is kept (in
-    the canonical form); any other header line is removed. A section the
-    model did not head gets its heading from the program, before the first
-    paragraph whose midpoint reaches the section start. Returns the text, the
-    starts of the sections placed here, and the next unplaced section index.
-    """
-    placed: list[int] = []
-    out_lines: list[str] = []
-    model_placed = False
-    for line in (text or "").split("\n"):
-        if not re.match(r"^[ \t]*#{1,6}[ \t]+", line):
-            out_lines.append(line)
-            continue
-        key = _title_key(clean_title(line))
-        match = None
-        for index in range(next_section, len(sections)):
-            section = sections[index]
-            near = start - HEADING_TOLERANCE_UNITS <= section["start"] <= end + HEADING_TOLERANCE_UNITS
-            if near and key and key in {_title_key(section["title"]), _title_key(section.get("title_zh", ""))}:
-                match = index
-                break
-        if match is None:
-            continue
-        # Sections skipped before this one get their headings here too, in order.
-        out_lines.append("\n\n".join(heading_block(section) for section in sections[next_section:match + 1]))
-        placed.extend(section["start"] for section in sections[next_section:match + 1])
-        next_section = match + 1
-        model_placed = True
-    body = re.sub(r"\n{3,}", "\n\n", "\n".join(out_lines)).strip()
-    if not model_placed:
-        last = sections_before(sections, next_section, start, end)
-        if last > next_section:
-            body = "\n\n".join([heading_block(section) for section in sections[next_section:last]] + [body])
-            placed.extend(section["start"] for section in sections[next_section:last])
-            next_section = last
-    return body, placed, next_section
-
-
-def sections_before(sections: list[dict], next_section: int, start: int, end: int) -> int:
-    """Return the index past the sections whose heading goes before the paragraph covering units start..end (1-based).
-
-    A section heading goes before the first paragraph whose midpoint is at or
-    after the section's first unit, so a section start that falls late in a
-    paragraph moves to the next paragraph instead of splitting it.
-    """
-    midpoint = (start + end) / 2
-    index = next_section
-    while index < len(sections) and sections[index]["start"] <= midpoint:
-        index += 1
-    return index

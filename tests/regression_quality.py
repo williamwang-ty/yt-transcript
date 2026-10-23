@@ -436,6 +436,25 @@ class VerifyQualityTests(unittest.TestCase):
             self.assertFalse(any("paragraph" in warning.lower() and "long" in warning.lower()
                                  for warning in result["warnings"]))
 
+    def test_verify_quality_counts_headings_that_split_a_sentence_without_failing(self):
+        """Test a heading after a paragraph that stops mid-sentence is counted, and only recorded."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            optimized = Path(tmpdir) / "opt.md"
+            optimized.write_text(
+                "---\ntitle: 测试\n---\n\n# 测试\n\n## 开场\n\n"
+                "这一段说完了。\n\n## 第二部分\n\n## 紧接着的小节\n\n"
+                "这一段说到一半就被\n\n## 第三部分\n\n切断了，标题插在了句子中间。\n\n"
+                "他说：“这句以引号结束。”\n\n## Fourth\n\nIt ends with a word\n\n## Fifth\n\nDone.\n",
+                encoding="utf-8",
+            )
+
+            result = kernel_verify.verify_quality(str(optimized), bilingual=False)
+
+            # Only 第三部分 and Fifth follow an unfinished sentence; two headings in a row count once.
+            self.assertEqual(result["checks"]["heading_mid_sentence_count"], 2)
+            self.assertTrue(result["passed"], result)
+            self.assertFalse(any("heading" in warning.lower() for warning in result["warnings"]))
+
     def test_verify_quality_measures_bilingual_paragraphs_in_english_words(self):
         """Test bilingual output is measured by its English paragraphs, in words."""
         with tempfile.TemporaryDirectory() as tmpdir:

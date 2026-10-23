@@ -10,6 +10,7 @@ from pathlib import Path
 from kernel.quality import semantic as kernel_semantic
 from kernel.text import glossary as kernel_glossary
 from kernel.text import window as kernel_window
+from kernel.text.structure import SENTENCE_END
 from kernel.text.cleanup import overlap as kernel_overlap
 from kernel.text.cleanup.cjk import is_cjk_family_char
 from kernel.text.measure import (
@@ -213,6 +214,23 @@ def _compute_paragraph_length_metrics(body_paragraphs: list[str], *, bilingual: 
     }
 
 
+def _count_headings_mid_sentence(blocks: list[str]) -> int:
+    """Count `##` headings right after a paragraph that stops in the middle of a sentence (advisory only).
+
+    Such a heading usually splits one sentence in two. The program puts
+    headings at sentence starts of the written text (`kernel/text/structure.py`),
+    so this counts what it let through: a paragraph ending on a dash or a
+    colon, a sentence piece too long to move, or text without punctuation.
+    """
+    count = 0
+    previous = None
+    for block in blocks:
+        if block.startswith("## ") and previous is not None and not SENTENCE_END.search(previous):
+            count += 1
+        previous = None if block.startswith(("#", ">", "---")) else block
+    return count
+
+
 def _count_bilingual_paragraph_pairs(paragraphs: list[str]) -> int:
     """Count adjacent English-to-Chinese body paragraph pairs."""
     normalized_blocks = [str(block or "").strip() for block in paragraphs if str(block or "").strip()]
@@ -307,6 +325,7 @@ def verify_quality(optimized_text_path: str, raw_text_path: str = None,
     ]
     checks["paragraph_count"] = len(body_paragraphs)
     checks.update(_compute_paragraph_length_metrics(body_paragraphs, bilingual=bilingual))
+    checks["heading_mid_sentence_count"] = _count_headings_mid_sentence(paragraphs)
 
     # Check 1: Non-empty
     checks["non_empty"] = total_chars > 0
