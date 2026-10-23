@@ -34,9 +34,8 @@ How the source and the output language are chosen:
 |---|---|
 | `python3` (3.10 or newer) | Everything; only the standard library is used |
 | `bash` | `scripts/download.sh` and `scripts/update_yt_dlp.sh` |
-| `yt-dlp` | Metadata, subtitles and audio. `run` updates it (via `brew` or `pip`) at most once an hour, because YouTube keeps breaking old releases |
+| `yt-dlp` | Metadata, subtitles and audio. Because YouTube keeps breaking old releases, `run` asks Homebrew for a newer one at most once an hour; a yt-dlp installed some other way is only reported, never updated |
 | `ffmpeg` and `ffprobe` | Only for Deepgram audio over 10 MB, which is split at silences |
-| `curl` | Optional: the yt-dlp update check. Without it the check is skipped |
 | A [Deepgram](https://console.deepgram.com/) API key | Only for videos without usable subtitles |
 | An LLM backend | The text of every video: the host agent's own CLI, an OpenAI-compatible or Anthropic API, or, as a last resort, the host agent itself (see below) |
 
@@ -80,6 +79,7 @@ Environment variables:
 | `YT_TRANSCRIPT_WORK_ROOT` | Work root instead of `/tmp/yt-transcript` |
 | `YT_TRANSCRIPT_AGENT_CLI` | The agent CLI for the text; wins over `llm_agent_cli` |
 | `YT_TRANSCRIPT_YT_DLP_UPDATE=0` | Skips the yt-dlp update check |
+| `YT_TRANSCRIPT_LOCK_DIR` | Directory of the machine-wide YouTube lock and records instead of `/tmp/yt-transcript/.locks` (for tests) |
 | `YT_DLP_SOCKET_TIMEOUT_SEC`, `YT_DLP_RETRIES`, `YT_DLP_EXTRACTOR_RETRIES`, `YT_DLP_COOKIES_FILE`, `YT_DLP_COOKIES_FROM_BROWSER` | Win over the matching `yt_dlp_*` keys |
 
 #### LLM backend
@@ -90,7 +90,7 @@ If no CLI is found or the probe fails, the LLM API is used when `llm_api_key`, `
 
 #### YouTube cookies and bot checks
 
-`run` starts without cookies. When YouTube asks to confirm you are not a bot, rate-limits the request, or asks for a sign-in, `download.sh` retries up to three times with `--cookies-from-browser chrome`. If that does not help, `run` stops with `needs_user` (`cookies_required`, `rate_limited` or `login_required`). The portable fix is a Netscape-format `cookies.txt` exported from a browser that is signed in to YouTube:
+`run` starts without cookies. When YouTube asks to confirm you are not a bot, `run` retries once with `--cookies-from-browser chrome`; if that does not help, it stops with `needs_user` `cookies_required`. A rate limit gets no retry (more requests only make it last longer) and stops with `rate_limited`; a video that needs a sign-in stops with `login_required`. Each message quotes what yt-dlp said. The portable fix is a Netscape-format `cookies.txt` exported from a browser that is signed in to YouTube:
 
 ```yaml
 yt_dlp_cookies_file: "~/.config/yt-transcript/youtube_cookies.txt"
@@ -146,11 +146,11 @@ The URL can also be an 11-character video id.
 | `status` | Exit code | Meaning and main fields |
 |---|---|---|
 | `done` | 0 | The article was written: `output_file`, `title`, `route` (source, language, track, mode), `warnings` (advisory), `llm` (backend, requests, estimated tokens). A `--stage plan` call also ends with `done` |
-| `failed` | 1 | A stage failed: `stage`, `reason`, `message`, `retryable`. `locked` means another run of the same video is active |
+| `failed` | 1 | A stage failed: `stage`, `reason`, `message`, `retryable` |
 | `needs_user` | 3 | Only the user can fix it: `cookies_required`, `login_required`, `rate_limited`, `deepgram_key_missing`, `tool_missing` or `output_dir_missing` |
 | `unsupported` | 4 | The spoken language is neither Chinese nor English |
 | `needs_agent_text` | 5 | No LLM backend was reachable: `task.prompt_file` is the request, the answer goes to `task.output_file` |
-| `in_progress` | 6 | The `--max-seconds` budget ran out at a safe point; run `next_command` to continue |
+| `in_progress` | 6 | The `--max-seconds` budget ran out at a safe point, or while waiting for another run of the same video or for YouTube (`message` names it); run `next_command` to continue |
 
 Every result has `video_id`, `work_dir` and `seconds`. Results that can be continued (all but a finished article and `unsupported`) also have `next_command`, the exact command to run next. Exit code 2 means the command line was wrong.
 
@@ -158,7 +158,11 @@ When YouTube refuses the preferred subtitle track (rate limit or bot check) and 
 
 ### Work directory and resume
 
-Each video has one work directory, `/tmp/yt-transcript/<video_id>/`, holding `state.json` (stage records, route, overrides, warnings, LLM usage, last result) and the files of each stage. Rerunning `run` skips finished stages and continues an interrupted text stage paragraph by paragraph. A second `run` of a video that is still running gets `failed` with reason `locked`. Once the article is written, the `cleanup` stage removes the intermediate files; `state.json` stays, so a rerun returns `done` at once with the existing article.
+Each video has one work directory, `/tmp/yt-transcript/<video_id>/`, holding `state.json` (stage records, route, overrides, warnings, LLM usage, last result) and the files of each stage. Rerunning `run` skips finished stages and continues an interrupted text stage paragraph by paragraph. A second `run` of a video that is still running waits for the first one (within its `--max-seconds`), then returns what the first one left, usually `done`. Once the article is written, the `cleanup` stage removes the intermediate files; `state.json` stays, so a rerun returns `done` at once with the existing article.
+
+### Several runs at once
+
+Different videos can run at the same time, from one agent or several. They share no files; only their YouTube requests take turns. One yt-dlp call runs at a time on the machine, with yt-dlp's `-t sleep` request pacing, and each video's page is fetched once (the subtitle download reuses the saved metadata). When YouTube rate-limits the machine, the refusal is recorded in `/tmp/yt-transcript/.locks/`, and every run that began before it stops with `needs_user` `rate_limited` instead of asking YouTube again; a run started later tries once. SYSTEM_DESIGN.md 6.4 has the details.
 
 Known limitation: macOS (and many Linux systems) empties `/tmp` on restart, so an interrupted run starts over after a reboot unless `YT_TRANSCRIPT_WORK_ROOT` points somewhere persistent. An unfinished Deepgram run also keeps its audio in the work directory (it can take hundreds of MB) until it finishes or is discarded with `cleanup <video_id> --force`.
 
@@ -204,18 +208,19 @@ yt-transcript/
 ├── yt_transcript_utils.py   # Entry script
 ├── kernel/
 │   ├── cli.py               # Commands: run, status, cleanup, subtitle-info, verify-quality
-│   ├── pipeline.py          # `run`: stages, state.json, lock, results, agent handoff
+│   ├── pipeline.py          # `run`: stages, state.json, locks, results, agent handoff
 │   ├── config.py            # config.yaml loading and every default
 │   ├── files.py             # Small file helpers
+│   ├── locks.py             # File locks (flock) with bounded waits
 │   ├── llm/                 # Agent CLI and LLM API calls
-│   ├── sources/             # Subtitle language and track choice; Deepgram
+│   ├── sources/             # YouTube lock and yt-dlp errors; subtitle language and track choice; Deepgram
 │   ├── text/                # Subtitle cleanup, normalization, plan, chunking, window executor,
 │   │                        # outline, glossary, prompts, merge, article assembly
 │   └── quality/             # The quality check
 ├── prompts/                 # cleanup_zh, structure_only, translate_only
 ├── scripts/
-│   ├── download.sh          # yt-dlp: metadata, subtitles, audio, cookie retries
-│   ├── update_yt_dlp.sh     # Hourly yt-dlp update check
+│   ├── download.sh          # yt-dlp: metadata, subtitles, audio; one call each, no retries
+│   ├── update_yt_dlp.sh     # Hourly `brew upgrade yt-dlp`
 │   └── run_regression.py    # Live and offline regression runner
 └── tests/                   # Unit tests, offline end-to-end fixtures, live regression video set
 ```
@@ -261,9 +266,8 @@ python3 yt_transcript_utils.py run "<youtube-url>"
 |---|---|
 | `python3`（3.10 或更新） | 全部功能；只用标准库 |
 | `bash` | `scripts/download.sh` 和 `scripts/update_yt_dlp.sh` |
-| `yt-dlp` | 元数据、字幕和音频。因为 YouTube 经常让旧版失效，`run` 最多每小时检查一次并（通过 `brew` 或 `pip`）更新它 |
+| `yt-dlp` | 元数据、字幕和音频。因为 YouTube 经常让旧版失效，`run` 最多每小时问一次 Homebrew 有没有新版；用其他方式装的 yt-dlp 只报告，不更新 |
 | `ffmpeg` 和 `ffprobe` | 只在 Deepgram 的音频超过 10 MB、需要在静音处切开时使用 |
-| `curl` | 可选：yt-dlp 更新检查用，没有就跳过检查 |
 | [Deepgram](https://console.deepgram.com/) API key | 只在视频没有可用字幕时需要 |
 | LLM 后端 | 每个视频的文字处理：宿主 agent 自己的命令行、OpenAI 兼容或 Anthropic API，最后还可以交给宿主 agent 本身（见下文） |
 
@@ -307,6 +311,7 @@ cp config.example.yaml config.yaml
 | `YT_TRANSCRIPT_WORK_ROOT` | 工作根目录，默认 `/tmp/yt-transcript` |
 | `YT_TRANSCRIPT_AGENT_CLI` | 处理文字的 agent 命令行，优先于 `llm_agent_cli` |
 | `YT_TRANSCRIPT_YT_DLP_UPDATE=0` | 跳过 yt-dlp 更新检查 |
+| `YT_TRANSCRIPT_LOCK_DIR` | 整台机器共用的 YouTube 锁和记录所在的目录，默认 `/tmp/yt-transcript/.locks`（测试用） |
 | `YT_DLP_SOCKET_TIMEOUT_SEC`、`YT_DLP_RETRIES`、`YT_DLP_EXTRACTOR_RETRIES`、`YT_DLP_COOKIES_FILE`、`YT_DLP_COOKIES_FROM_BROWSER` | 优先于对应的 `yt_dlp_*` 配置项 |
 
 #### LLM 后端
@@ -317,7 +322,7 @@ cp config.example.yaml config.yaml
 
 #### YouTube cookies 和机器人验证
 
-`run` 一开始不带 cookies。YouTube 要求确认不是机器人、限流或要求登录时，`download.sh` 会带上 `--cookies-from-browser chrome` 最多重试三次。仍然不行，`run` 就以 `needs_user`（`cookies_required`、`rate_limited` 或 `login_required`）停下。最通用的办法是从已登录 YouTube 的浏览器导出 Netscape 格式的 `cookies.txt`：
+`run` 一开始不带 cookies。YouTube 要求确认不是机器人时，`run` 带上 `--cookies-from-browser chrome` 重试一次；仍然不行，就以 `needs_user` `cookies_required` 停下。限流不重试（再发请求只会让限流更久），以 `rate_limited` 停下；视频需要登录时以 `login_required` 停下。每条提示都引用 yt-dlp 的原话。最通用的办法是从已登录 YouTube 的浏览器导出 Netscape 格式的 `cookies.txt`：
 
 ```yaml
 yt_dlp_cookies_file: "~/.config/yt-transcript/youtube_cookies.txt"
@@ -373,11 +378,11 @@ URL 也可以是 11 位的视频 id。
 | `status` | 退出码 | 含义和主要字段 |
 |---|---|---|
 | `done` | 0 | 文章已写出：`output_file`、`title`、`route`（来源、语言、字幕轨、模式）、`warnings`（仅供参考）、`llm`（后端、请求数、估算的 token 数）。`--stage plan` 调用也以 `done` 结束 |
-| `failed` | 1 | 某个阶段失败：`stage`、`reason`、`message`、`retryable`。`locked` 表示这个视频的另一次运行还在进行 |
+| `failed` | 1 | 某个阶段失败：`stage`、`reason`、`message`、`retryable` |
 | `needs_user` | 3 | 只有用户能解决：`cookies_required`、`login_required`、`rate_limited`、`deepgram_key_missing`、`tool_missing` 或 `output_dir_missing` |
 | `unsupported` | 4 | 口语语言既不是中文也不是英文 |
 | `needs_agent_text` | 5 | 没有可用的 LLM 后端：`task.prompt_file` 是请求，答案写到 `task.output_file` |
-| `in_progress` | 6 | `--max-seconds` 的时间用完，停在了安全点；运行 `next_command` 继续 |
+| `in_progress` | 6 | `--max-seconds` 的时间用完，停在了安全点，或者是在等同一视频的另一次运行、等 YouTube 时用完的（`message` 会说明）；运行 `next_command` 继续 |
 
 每个结果都有 `video_id`、`work_dir` 和 `seconds`。可以继续的结果（除了已写出文章的 `done` 和 `unsupported`）还有 `next_command`，即下一步要运行的准确命令。退出码 2 表示命令行写错了。
 
@@ -385,7 +390,11 @@ URL 也可以是 11 位的视频 id。
 
 ### 工作目录和续跑
 
-每个视频有一个工作目录 `/tmp/yt-transcript/<video_id>/`，里面是 `state.json`（各阶段记录、路由、覆盖参数、警告、LLM 用量、上一次结果）和各阶段的文件。重跑 `run` 会跳过已完成的阶段，中断的文字阶段按段落继续。同一个视频还在运行时再启动一次 `run`，会得到原因为 `locked` 的 `failed`。文章写出后，`cleanup` 阶段删掉中间文件，只留下 `state.json`，所以重跑会立刻返回 `done` 和已有的文章。
+每个视频有一个工作目录 `/tmp/yt-transcript/<video_id>/`，里面是 `state.json`（各阶段记录、路由、覆盖参数、警告、LLM 用量、上一次结果）和各阶段的文件。重跑 `run` 会跳过已完成的阶段，中断的文字阶段按段落继续。同一个视频还在运行时再启动一次 `run`，它会等第一次结束（在自己的 `--max-seconds` 之内），然后返回第一次留下的结果，通常是 `done`。文章写出后，`cleanup` 阶段删掉中间文件，只留下 `state.json`，所以重跑会立刻返回 `done` 和已有的文章。
+
+### 多个运行同时进行
+
+不同视频可以同时运行，不管是一个 agent 还是几个 agent 发起的。它们不共享文件，只有对 YouTube 的请求要排队：整台机器同一时间只跑一个 yt-dlp，并使用 yt-dlp 的 `-t sleep` 请求节奏；每个视频的页面只取一次（下载字幕时复用保存下来的元数据）。YouTube 限流这台机器时，这次拒绝会记在 `/tmp/yt-transcript/.locks/` 里，在它之前开始的运行都以 `needs_user` `rate_limited` 停下，不再请求 YouTube；之后才开始的运行会试一次。细节见 SYSTEM_DESIGN.md 的 6.4 节。
 
 已知限制：macOS（以及很多 Linux 系统）重启时会清空 `/tmp`，所以除非 `YT_TRANSCRIPT_WORK_ROOT` 指向一个持久的位置，中断的运行在重启后要从头开始。未完成的 Deepgram 运行也会把音频留在工作目录里（可能有几百 MB），直到运行完成或用 `cleanup <video_id> --force` 放弃。
 
@@ -431,18 +440,19 @@ yt-transcript/
 ├── yt_transcript_utils.py   # 入口脚本
 ├── kernel/
 │   ├── cli.py               # 命令：run、status、cleanup、subtitle-info、verify-quality
-│   ├── pipeline.py          # `run`：阶段、state.json、运行锁、结果、交给 agent
+│   ├── pipeline.py          # `run`：阶段、state.json、锁、结果、交给 agent
 │   ├── config.py            # 读取 config.yaml，以及所有默认值
 │   ├── files.py             # 小的文件工具函数
+│   ├── locks.py             # 有等待上限的文件锁（flock）
 │   ├── llm/                 # agent 命令行和 LLM API 调用
-│   ├── sources/             # 字幕语言和字幕轨选择；Deepgram
+│   ├── sources/             # YouTube 锁和 yt-dlp 错误；字幕语言和字幕轨选择；Deepgram
 │   ├── text/                # 字幕清理、规范化、计划、分块、窗口执行器、
 │   │                        # 大纲、术语表、prompt、合并、组装文章
 │   └── quality/             # 质量检查
 ├── prompts/                 # cleanup_zh、structure_only、translate_only
 ├── scripts/
-│   ├── download.sh          # yt-dlp：元数据、字幕、音频、cookies 重试
-│   ├── update_yt_dlp.sh     # 每小时一次的 yt-dlp 更新检查
+│   ├── download.sh          # yt-dlp：元数据、字幕、音频；每样调用一次，不重试
+│   ├── update_yt_dlp.sh     # 每小时一次的 `brew upgrade yt-dlp`
 │   └── run_regression.py    # 真实视频和离线回归的运行脚本
 └── tests/                   # 单元测试、离线端到端 fixtures、真实视频回归的视频列表
 ```

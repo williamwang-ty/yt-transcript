@@ -4,7 +4,8 @@ Each case runs `scripts/run_regression.py --fixtures tests/fixtures/e2e`
 (which calls `yt_transcript_utils.py run`) in a copy of the skill with an
 empty config, so a local config.yaml cannot change routing or the LLM
 backend. The fakes are in tests/e2e/ and tests/fake_llm.py; fixtures are
-recorded with tests/e2e/record_fixtures.py.
+recorded with tests/e2e/record_fixtures.py. All cases run at once and share
+one YouTube lock, as parallel calls on one machine would.
 
 The observed behaviour of every case is compared with
 tests/fixtures/e2e/baseline.json. After an intended change, regenerate it with
@@ -53,7 +54,7 @@ def _copy_skill(target: Path) -> None:
             shutil.copy2(source, destination)
 
 
-def _child_env(llm_log: Path) -> dict:
+def _child_env(llm_log: Path, root: Path) -> dict:
     env = {key: value for key, value in os.environ.items()}
     # Detected host agents must not matter; the fake CLI comes from the run.
     for agent in _agent_cli.KNOWN_AGENTS:
@@ -62,6 +63,10 @@ def _child_env(llm_log: Path) -> dict:
     for var in ("AGENT", "AI_AGENT", _agent_cli.AGENT_CLI_ENV_VAR):
         env.pop(var, None)
     env["FAKE_LLM_LOG"] = str(llm_log)
+    env["YT_TRANSCRIPT_LOCK_DIR"] = str(root / "locks")
+    # Every yt-dlp call is logged and takes a moment, so overlapping calls would show.
+    env["FAKE_YT_DLP_LOG"] = str(root / "yt-dlp.jsonl")
+    env["FAKE_YT_DLP_DELAY"] = "0.1"
     return env
 
 
@@ -126,15 +131,21 @@ class EndToEndFixtureTests(unittest.TestCase):
         root = Path(cls._tmp.name)
         _copy_skill(root / "skill")
         cls.results = {}
+        procs = {}
         for video in cls.videos:
             vid = video["id"]
+            procs[vid] = subprocess.Popen(
+                [sys.executable, str(root / "skill" / "scripts" / "run_regression.py"),
+                 "--fixtures", str(FIXTURES), "--only", vid, "--out-dir", str(root / "out" / vid),
+                 "--timeout", "300"],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                env=_child_env(root / f"{vid}_llm.jsonl", root),
+            )
+        log = root / "yt-dlp.jsonl"
+        for vid, proc in procs.items():
             out_dir = root / "out" / vid
             llm_log = root / f"{vid}_llm.jsonl"
-            proc = subprocess.run(
-                [sys.executable, str(root / "skill" / "scripts" / "run_regression.py"),
-                 "--fixtures", str(FIXTURES), "--only", vid, "--out-dir", str(out_dir), "--timeout", "120"],
-                capture_output=True, text=True, env=_child_env(llm_log), timeout=900,
-            )
+            _, stderr = proc.communicate(timeout=900)
             report = json.loads((out_dir / "report.json").read_text(encoding="utf-8"))
             calls = [json.loads(line) for line in llm_log.read_text(encoding="utf-8").splitlines()] \
                 if llm_log.exists() else []
@@ -142,8 +153,10 @@ class EndToEndFixtureTests(unittest.TestCase):
                 "report": report["videos"][0],
                 "observed": observe(report["videos"][0], out_dir / vid, calls),
                 "vdir": out_dir / vid,
-                "stderr": proc.stderr,
+                "stderr": stderr,
             }
+        cls.yt_dlp_calls = [call for call in map(json.loads, log.read_text(encoding="utf-8").splitlines())
+                            if call["kind"] != "probe"] if log.exists() else []
 
     @classmethod
     def tearDownClass(cls):
@@ -215,6 +228,19 @@ class EndToEndFixtureTests(unittest.TestCase):
                 calls = self.results[video["id"]]["observed"]["llm_calls"]
                 self.assertIn("outline", calls)
                 self.assertGreaterEqual(calls.count("window"), 2)
+
+    def test_yt_dlp_ran_one_at_a_time_with_one_page_fetch_per_video(self):
+        self.assertTrue(self.yt_dlp_calls)
+        self.assertEqual([], [call for call in self.yt_dlp_calls if call["overlap"]])
+        for video in self.videos:
+            with self.subTest(video=video["id"]):
+                calls = [call for call in self.yt_dlp_calls if call["video_id"] == video["id"]]
+                extracts = [call for call in calls if call["kind"] == "extract"]
+                # The metadata, plus the audio download for the Deepgram route; subtitles read the saved metadata.
+                self.assertEqual(2 if video["expected_case"] == "deepgram" else 1, len(extracts))
+                self.assertIn("-J", extracts[0]["args"])
+                self.assertTrue(all(call["kind"] == "load_info" for call in calls
+                                    if "--write-sub" in call["args"]))
 
     def test_matches_baseline(self):
         observed = {vid: result["observed"] for vid, result in sorted(self.results.items())}

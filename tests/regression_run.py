@@ -20,9 +20,11 @@ from pathlib import Path
 from unittest import mock
 
 from kernel import config as kernel_config
+from kernel import locks
 from kernel import pipeline
 from kernel.quality import verify as kernel_verify
 from kernel.sources import deepgram as kernel_deepgram
+from kernel.sources import youtube as kernel_youtube
 from kernel.text import subtitle_quality as kernel_subtitle_quality
 from kernel.llm import agent_cli as _agent_cli
 from tests.e2e import fake_deepgram
@@ -39,8 +41,8 @@ JAPANESE = "tGVSOK3PNUI"  # unsupported language
 EARLY_STAGES = ("metadata", "source", "normalize", "plan")
 
 
-class RunCommandTests(unittest.TestCase):
-    """`run` statuses, resume points and overrides, in process."""
+class RunFixture(unittest.TestCase):
+    """A work root, output dir, lock dir and config of its own per test; the fakes on PATH."""
 
     def setUp(self):
         tmp = tempfile.TemporaryDirectory(prefix="yt-run-")
@@ -52,6 +54,7 @@ class RunCommandTests(unittest.TestCase):
             fake_deepgram.FIXTURES_ENV: str(FIXTURES),
             pipeline.WORK_ROOT_ENV: str(self.root / "work"),
             pipeline.OUTPUT_DIR_ENV: str(self.root / "out"),
+            kernel_youtube.LOCK_DIR_ENV: str(self.root / "locks"),
             pipeline.YT_DLP_UPDATE_ENV: "0",
             "FAKE_LLM_LOG": str(self.llm_log),
         })
@@ -62,7 +65,8 @@ class RunCommandTests(unittest.TestCase):
             for var in agent["env"]:
                 os.environ.pop(var, None)
         for var in ("AGENT", "AI_AGENT", _agent_cli.AGENT_CLI_ENV_VAR, "FAKE_YT_DLP_RATE_LIMITED",
-                    "FAKE_LLM_FAIL_FROM_UNIT"):
+                    "FAKE_YT_DLP_SESSION_LIMITED", "FAKE_YT_DLP_BOT_CHECK", "FAKE_YT_DLP_NO_PRESET",
+                    "FAKE_YT_DLP_LOG", "FAKE_YT_DLP_DELAY", "FAKE_LLM_FAIL_FROM_UNIT"):
             os.environ.pop(var, None)
         deepgram = mock.patch.object(kernel_deepgram, "_call_deepgram_api", fake_deepgram.recorded_response)
         deepgram.start()
@@ -122,6 +126,15 @@ class RunCommandTests(unittest.TestCase):
         self.assertTrue(all(state["stages"][name]["status"] == "done" for name in pipeline.STAGES))
         self.assertEqual([pipeline.STATE_FILE], sorted(p.name for p in self.work_dir(video).iterdir()))
 
+    def cli(self, *args: str) -> list:
+        """The argv of `run` through the CLI, with Deepgram answered from the fixture."""
+        return [sys.executable, str(PROJECT_ROOT / "tests" / "e2e" / "fake_deepgram.py"), "run", *args,
+                "--config-path", self.config]
+
+
+class RunCommandTests(RunFixture):
+    """`run` statuses, resume points and overrides, in process."""
+
     # -- inputs and the CLI ---------------------------------------------------
 
     def test_parse_video_id_accepts_youtube_url_forms(self):
@@ -145,11 +158,7 @@ class RunCommandTests(unittest.TestCase):
         for args, code, status in (([ENGLISH], 0, "done"), (["https://example.com/x"], 2, "usage_error"),
                                    ([JAPANESE], 4, "unsupported")):
             with self.subTest(args=args):
-                proc = subprocess.run(
-                    [sys.executable, str(PROJECT_ROOT / "tests" / "e2e" / "fake_deepgram.py"), "run", *args,
-                     "--config-path", self.config],
-                    capture_output=True, text=True, env=env, timeout=300,
-                )
+                proc = subprocess.run(self.cli(*args), capture_output=True, text=True, env=env, timeout=300)
                 self.assertEqual(code, proc.returncode, proc.stderr[-2000:])
                 lines = proc.stdout.strip().splitlines()
                 self.assertEqual(1, len(lines), proc.stdout)
@@ -332,6 +341,8 @@ class RunCommandTests(unittest.TestCase):
         self.assertEqual({"track": "en", "track_kind": "manual", "mode": "bilingual"}, result["fallback_track"])
         self.assertTrue(result["accept_command"].endswith("--mode bilingual"))
         self.assertEqual([], self.llm_calls())
+        # Another track downloaded, so YouTube did not refuse the machine: other runs go on.
+        self.assertEqual({}, kernel_youtube.last_refusal())
 
         # Accepting the English track; the choice sticks for later reruns.
         accepted = self.run_video(ENGLISH, mode="bilingual")
@@ -348,21 +359,33 @@ class RunCommandTests(unittest.TestCase):
 
     def test_yt_dlp_update_check_runs_once_before_the_metadata_fetch(self):
         real_run = subprocess.run
-        calls = []
+        calls, youtube_held = [], []
+        real_acquire = locks.FileLock.acquire
+        acquired = []
 
         def fake_run(args, *rest, **kwargs):
             command = " ".join(str(arg) for arg in args)
             calls.append("update" if command.endswith("update_yt_dlp.sh") else
                          "download" if "download.sh" in command else "other")
+            youtube_held.append(locks.is_held(kernel_youtube.lock_path()))
             if calls[-1] == "update":
                 return subprocess.CompletedProcess(args, 0, stdout="✅ yt-dlp is up to date\n", stderr="")
             return real_run(args, *rest, **kwargs)
 
+        def spy_acquire(lock, *args, **kwargs):
+            acquired.append(lock.path.name)
+            return real_acquire(lock, *args, **kwargs)
+
         os.environ[pipeline.YT_DLP_UPDATE_ENV] = "1"
-        with mock.patch("kernel.pipeline.subprocess.run", side_effect=fake_run):
+        with mock.patch("kernel.pipeline.subprocess.run", side_effect=fake_run), \
+                mock.patch.object(locks.FileLock, "acquire", spy_acquire):
             self.assert_finished(ENGLISH, self.run_video(ENGLISH))
             self.assertEqual(["update", "download"], calls[:2])
             self.assertEqual(1, calls.count("update"))
+            # The update and the metadata fetch share one hold of the YouTube lock; the subtitles get their own.
+            self.assertTrue(all(youtube_held[:3]))
+            self.assertEqual([f"video-{ENGLISH}.lock", kernel_youtube.LOCK_FILE, kernel_youtube.LOCK_FILE],
+                             acquired)
             self.assertEqual("done", self.run_video(ENGLISH)["status"])
             self.assertEqual(1, calls.count("update"))
             os.environ[pipeline.YT_DLP_UPDATE_ENV] = "0"
@@ -419,18 +442,6 @@ class RunCommandTests(unittest.TestCase):
         self.assertEqual(["cleanup_zh"] * 4, tasks)
         self.assertEqual("agent-handoff", result["llm"]["backend"])
         self.assertEqual(expected, Path(result["output_file"]).read_text(encoding="utf-8"))
-
-    def test_active_lock_fails_with_locked(self):
-        work_dir = self.work_dir(ENGLISH)
-        work_dir.mkdir(parents=True)
-        self.assertTrue(pipeline.acquire_lock(work_dir))
-        try:
-            result = self.run_video(ENGLISH)
-        finally:
-            pipeline.release_lock(work_dir)
-        self.assertEqual(("failed", "locked"), (result["status"], result["reason"]))
-        self.assertTrue(result["retryable"])
-        self.assertEqual("done", self.run_video(ENGLISH)["status"])
 
     def test_override_that_cannot_be_honored_fails(self):
         for video, options in ((ENGLISH, {"mode": "chinese"}), (DEEPGRAM, {"source": "subtitles"})):

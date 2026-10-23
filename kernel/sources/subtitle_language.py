@@ -21,7 +21,7 @@ FAMILY_BY_MODE = {mode: family for family, mode in MODE_BY_FAMILY.items()}
 # explicit ``--mode`` names the spoken language instead of them.
 GUESSED_SIGNALS = ("video_text", "unknown")
 
-# Without caption URLs (``--list-subs`` output, old fixtures) a translation list
+# Without caption URLs (trimmed or old metadata) a translation list
 # can only be recognised by its size: YouTube offers 100+ targets at once.
 _UNLABELLED_AUTO_TRACK_LIMIT = 10
 
@@ -294,36 +294,3 @@ def build_subtitle_info(payload: dict, video_id: str = "", yt_dlp_runtime: dict 
         "unsupported_reason": unsupported_reason,
         "yt_dlp_runtime": yt_dlp_runtime or {},
     }
-
-
-_LIST_SUBS_ROW = re.compile(r"^([A-Za-z0-9_-]+)\s+")
-
-
-def metadata_from_list_subs(text: str, video_id: str = "") -> dict:
-    """Turn ``yt-dlp --list-subs`` output into a minimal metadata payload.
-
-    The listing has no caption URLs, so translated tracks are recognised by the
-    ``-orig`` marker or by the size of the automatic list.
-    """
-    section = None
-    manual: dict[str, list] = {}
-    automatic: dict[str, list] = {}
-    for raw_line in str(text or "").splitlines():
-        line = raw_line.strip()
-        if not line:
-            continue
-        lower = line.lower()
-        if "available subtitles" in lower and "automatic" not in lower:
-            section = manual
-            continue
-        if "available automatic captions" in lower:
-            section = automatic
-            continue
-        if line.startswith("Language") or line.startswith("[") or section is None:
-            continue
-        if " has no subtitles" in lower or " has no automatic captions" in lower:
-            continue
-        match = _LIST_SUBS_ROW.match(line)
-        if match:
-            section.setdefault(match.group(1), [{"ext": "vtt"}])
-    return {"id": video_id, "subtitles": manual, "automatic_captions": automatic}

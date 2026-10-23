@@ -15,7 +15,9 @@ Stages (pick with --stage):
 
 Every run uses its own work root (<out-dir>/work) and writes the article to
 <out-dir>/<video_id>/output, so it never touches /tmp/yt-transcript or the
-configured output_dir.
+configured output_dir. Real-video runs share the machine-wide YouTube lock and
+rate-limit record with every other `run` (YouTube sees one machine); fixture
+runs get their own in <out-dir>/locks unless $YT_TRANSCRIPT_LOCK_DIR is set.
 
 Usage:
     python3 scripts/run_regression.py
@@ -54,9 +56,10 @@ DEFAULT_VIDEOS = ROOT_DIR / "tests" / "live_regression" / "videos.json"
 E2E_DIR = ROOT_DIR / "tests" / "e2e"
 FAKE_LLM = ROOT_DIR / "tests" / "fake_llm.py"
 STAGES = ("plan", "full")
-# Same names as kernel/pipeline.py; this script only talks to the CLI.
+# Same names as kernel/pipeline.py and kernel/sources/youtube.py; this script only talks to the CLI.
 WORK_ROOT_ENV = "YT_TRANSCRIPT_WORK_ROOT"
 OUTPUT_DIR_ENV = "YT_TRANSCRIPT_OUTPUT_DIR"
+LOCK_DIR_ENV = "YT_TRANSCRIPT_LOCK_DIR"
 
 # verify-quality checks worth tracking across runs.
 TRACKED_CHECKS = (
@@ -452,6 +455,7 @@ def main() -> int:
     out_dir = Path(args.out_dir or f"/tmp/yt_regression/{started.strftime('%Y%m%dT%H%M%SZ')}")
     out_dir.mkdir(parents=True, exist_ok=True)
     if FIXTURE_MODE:
+        CMD_ENV.setdefault(LOCK_DIR_ENV, str(out_dir / "locks"))
         write_fixture_config(out_dir / "fixture_config.yaml")
         CONFIG_ARGS[:] = ["--config-path", str(out_dir / "fixture_config.yaml")]
     elif args.config_path:

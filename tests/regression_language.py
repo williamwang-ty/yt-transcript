@@ -182,25 +182,6 @@ class LanguageRegressionTests(unittest.TestCase):
         self.assertEqual(info["preferred_source_language"], "en")
         self.assertEqual(info["mode"], "bilingual")
 
-    def test_list_subs_fallback_drops_translations(self):
-        """Test the --list-subs fallback keeps only the -orig language when translations are listed."""
-        rows = "\n".join(
-            f"{code:<8} Name   vtt, srt"
-            for code in ["ab", "af", "zh-Hans", "zh-Hant", "en-orig", "en", "eo", "fr", "de", "ja", "ko"]
-        )
-        listing = (
-            "[youtube] vid: Downloading webpage\n"
-            "[info] Available automatic captions for vid:\n"
-            "Language Name                  Formats\n"
-            f"{rows}\n"
-            "vid has no subtitles\n"
-        )
-        payload = subtitle_language.metadata_from_list_subs(listing, video_id="vid")
-        info = subtitle_language.build_subtitle_info(payload, video_id="vid")
-        self.assertEqual(info["source_language"], "en")
-        self.assertEqual(info["listed_candidates"], [{"language": "en", "mode": "bilingual", "source_kind": "auto"}])
-        self.assertEqual(info["ignored_translated_count"], 9)
-
     def test_subtitle_info_cli_reads_metadata_from_stdin(self):
         """Test the subtitle-info command used by download.sh."""
         result = subprocess.run(

@@ -102,7 +102,7 @@ User ──> Host agent (reads SKILL.md, a few dozen lines)
         │ metadata -> source -> normalize -> plan -> text       │
         │   -> merge -> verify -> assemble -> cleanup           │
         │                                                       │
-        │ /tmp/yt-transcript/<video_id>/state.json  (+ lock)    │
+        │ /tmp/yt-transcript/<video_id>/state.json  (+ locks)   │
         │ text stage -> LLM backend: host CLI | API | agent     │
         └───────────────────────────┬───────────────────────────┘
                                     │ one JSON result + exit code
@@ -142,7 +142,7 @@ The agent never edits the state file and never runs internal stages by hand. If 
 
 | Stage | What it does | Main outputs | Can stop with |
 |---|---|---|---|
-| `metadata` | Run the yt-dlp update check, then fetch the video's yt-dlp info once (title, channel, date, duration, chapters, track list, audio-track languages); later stages read this file instead of asking yt-dlp again | `metadata.json`, `chapters.json` | `needs_user` (`cookies_required` after the automatic browser-cookie retries, `login_required`, `rate_limited`, `tool_missing`), `failed` |
+| `metadata` | Inside the YouTube lock (6.4): let Homebrew update yt-dlp (at most hourly), then fetch the video's yt-dlp info once with `yt-dlp -J` (title, channel, date, duration, chapters, track list, audio-track languages); later stages read this file instead of asking YouTube again | `metadata.json`, `chapters.json` | `needs_user` (`cookies_required` after one retry with Chrome cookies, `login_required`, `rate_limited`, `tool_missing`), `in_progress` (the wait for YouTube used up `--max-seconds`), `failed` |
 | `source` | Detect the spoken language and pick the trusted track (6.3); download it and parse it into raw text and timed segments; score the subtitle quality and switch to Deepgram when the scoring rule calls for it; or transcribe with Deepgram directly | `source/`, `raw_text.txt`, `segments.json`, the route in `state.json` | `unsupported`, `needs_user` (preferred track refused, Deepgram key missing, or a yt-dlp case above), `failed` |
 | `normalize` | Build the normalized document: the cleaned text, the timed segments, and whether chunking follows the text or the segments | `normalized_document.json` | `failed` |
 | `plan` | Choose the text tasks for the mode (Chinese: `cleanup_zh`; bilingual: `structure_only`, then `translate_only`), mark the text `short` or `long`, and estimate its size (input tokens, expected rounds per task). Chinese Deepgram text gets an extra instruction to repair recognition artifacts | `plan.json` | `failed` |
@@ -155,7 +155,7 @@ The agent never edits the state file and never runs internal stages by hand. If 
 Notes:
 
 - **Idempotent stages.** Rerunning an unfinished stage starts that stage over, except that expensive sub-steps keep their results inside the stage (the downloaded audio, the Deepgram result of each audio piece, the outline, finished window rounds), so an interrupted stage never pays twice.
-- **No separate preflight.** Each stage checks what it needs right before it needs it: yt-dlp before `metadata` (including the update check, at most hourly, because YouTube keeps breaking older yt-dlp releases), the Deepgram key only when `source` chooses Deepgram, an LLM backend only at `text`, `output_dir` only at `assemble`. Cheap paths stay cheap.
+- **No separate preflight.** Each stage checks what it needs right before it needs it: yt-dlp at `metadata` (including the Homebrew update, at most hourly, because YouTube keeps breaking older yt-dlp releases), the Deepgram key only when `source` chooses Deepgram, an LLM backend only at `text`, `output_dir` only at `assemble`. Cheap paths stay cheap.
 - **The source is final before any LLM call.** The subtitle quality reroute happens inside `source`, so `normalize` and everything after it work on accepted text.
 - **One path for every length.** Short and long videos go through the same stages. `plan` marks the text `long` when the video runs 30 minutes or more, or when a shorter video's text is above the single-request limit (about 4,100 to 4,800 estimated tokens, depending on the route). For a `long` text, YouTube chapter starts also cut the chunks and become outline hints; a `short` text uses neither. The outline pass is skipped whenever one round can process the whole text (7.4), so a short video usually takes one request per task.
 - **Free routing check.** `--stage plan` runs `metadata` through `plan` without spending money. If the route needs Deepgram, it records that decision and stops inside `source`, without transcribing.
@@ -174,7 +174,7 @@ The `source` stage applies these rules (`kernel/sources/subtitle_language.py` pi
 
 A language that comes only from the video's text, or from nothing, is not firm: `--mode` names the spoken language instead (`chinese` = Chinese audio, `bilingual` = English audio), Deepgram is asked for that language, and the route records `language_signal: mode_override`. The `unsupported` result for such a guess, and for a language Deepgram detected itself, says so in its message. The text signal exists because a video with no caption track and no metadata language otherwise depends on Deepgram's detection alone, and that detection heard a Mandarin video (DQGrPstFRVI, whose title and description are Chinese) as Indonesian. Deepgram-specific options (restricting detection to Chinese and English, confidence thresholds) were not used.
 
-When YouTube refuses the preferred track (rate limit or bot check) even after the automatic retries with browser cookies, `source` does not quietly take the next track. The old agent-driven flow did, which turned a Chinese article into a bilingual one and made results differ between runs. `source` returns `needs_user` with reason `rate_limited` (`cookies_required` for a bot check), names `preferred_track` and `fallback_track`, and gives an `accept_command`: the same command with `--mode <fallback mode>`. The agent asks the user whether to wait and rerun, or to accept the fallback.
+When YouTube refuses the preferred track (rate limit or bot check) while a later track still downloads, `source` does not quietly take the next track. The old agent-driven flow did, which turned a Chinese article into a bilingual one and made results differ between runs. `source` returns `needs_user` with reason `rate_limited` (`cookies_required` for a bot check), names `preferred_track` and `fallback_track`, and gives an `accept_command`: the same command with `--mode <fallback mode>`. The agent asks the user whether to wait and rerun, or to accept the fallback. Such a refusal concerns this video only. When YouTube refuses every track, or the page itself, it is refusing the machine, and every run on it stops ("Several runs at once" in 6.4).
 
 `yt-dlp` stays the acquisition dependency. Direct YouTube InnerTube fetching was evaluated: it is lighter for subtitle-only runs but is an unofficial, interface-sensitive surface, does not remove the need for the Deepgram fallback, and would move extraction maintenance into this project. It remains a possible future fast path, not the default.
 
@@ -185,7 +185,6 @@ Each video has one work directory:
 ```text
 /tmp/yt-transcript/<video_id>/
   state.json                 the only state file; kept after cleanup
-  .runtime_owner.json        the lock: pid of the active run
   metadata.json  chapters.json
   source/                    subtitles/ or audio/ from download.sh (plus audio pieces when split),
                              subtitle_document.json (the subtitle quality check),
@@ -199,7 +198,9 @@ Each video has one work directory:
   optimized.md  quality.json
 ```
 
-`YT_TRANSCRIPT_WORK_ROOT` replaces `/tmp/yt-transcript` and `YT_TRANSCRIPT_OUTPUT_DIR` replaces the configured `output_dir`; the regression runner uses both so it never touches real runs or the notes folder.
+Beside the video directories, `/tmp/yt-transcript/.locks/` holds the lock files (`video-<video_id>.lock` per video, `youtube.lock`) and two small records: `youtube_rate_limit.json` (YouTube's last refusal of this machine) and `yt-dlp-update.stamp` (the last Homebrew check). None of them is ever deleted.
+
+`YT_TRANSCRIPT_WORK_ROOT` replaces `/tmp/yt-transcript` and `YT_TRANSCRIPT_OUTPUT_DIR` replaces the configured `output_dir`; the regression runner uses both so it never touches real runs or the notes folder. The video locks move with the work root. The YouTube lock and the two records stay in `/tmp/yt-transcript/.locks/` whatever the work root, because they are about the machine; only `YT_TRANSCRIPT_LOCK_DIR` moves them, which the offline tests do.
 
 `state.json` is written atomically whenever a stage starts or ends and before every window round. Its shape, from a finished bilingual run (shortened):
 
@@ -256,9 +257,25 @@ Rules:
 - **Finished runs stay finished.** `cleanup` keeps `state.json`, so rerunning `run` on a finished video returns `done` with the existing article at once, as long as that file still exists (if it was deleted, the run starts over). Rerunning a whole batch therefore only does the unfinished videos. `--restart` produces the article again.
 - **Overrides are sticky.** `--source` and `--mode` are saved in `state.json` and stay in effect on reruns of that video until `--restart`, so a resume never silently flips the route. An override that cannot be honored (`override_not_applicable`) is not saved, so a plain rerun goes back to the earlier route.
 - **Config is read on every call**, but finished stages are not redone when it changes. `--from <stage>` redoes them. After `cleanup` the intermediate files are gone, so `--from` on a finished run redoes every stage; it is meant for unfinished runs (for example `--from text` after a quality failure).
-- **The lock** keeps two processes from writing one work directory. A second `run` on a locked video returns `failed` with reason `locked`; a lock whose process has exited is taken over. Different videos can run in parallel because they share no files.
+- **The video lock** keeps two processes from writing one work directory: a call holds it from start to end, and a second call on the same video waits for the first (within its `--max-seconds`), then continues from the state the first one left, usually returning `done` at once. Different videos share no files and run in parallel; only their YouTube requests take turns (below).
 - **Hygiene**: `video_id` must match `[A-Za-z0-9_-]+` before it becomes a path. `state.json` never holds API keys; it records the backend's name, not its credentials.
 - **Lifetime**: the directory lives under `/tmp`, so a reboot loses unfinished runs. This is an accepted limitation.
+
+#### Several runs at once
+
+Several `run` calls can be going at once: a batch started in parallel, or two agents on one machine. Two file locks (`flock`, `kernel/locks.py`) keep them apart. There is no queue, scheduler or extra state; a call that has to wait simply waits.
+
+- **Two locks, one order.** The video lock (`<work root>/.locks/video-<id>.lock`) is held for the whole call. The YouTube lock (`/tmp/yt-transcript/.locks/youtube.lock`) is held around each yt-dlp step: the update check with the metadata fetch, the subtitle download, the audio download. A call always takes its video lock first, so two calls cannot deadlock. Deepgram, the LLM and every other stage run outside the YouTube lock, so one video's text stage overlaps another's download.
+- **One yt-dlp at a time.** YouTube meters requests per machine (its IP, or the account in the cookies), not per process; parallel extractions are what got this machine "rate-limited by YouTube for up to an hour". Under the lock, every yt-dlp call also uses yt-dlp's `-t sleep` preset, its own pause between requests, so parallel runs ask YouTube no faster than one run does, with no pacing numbers of ours. A yt-dlp too old for `-t sleep` (before mid-2025) runs without it, with a log line. Each video's page is extracted once by `metadata` (`yt-dlp -J`, stderr kept, no per-field fallbacks); the subtitle download loads that file with `--load-info-json`. The audio download still passes the URL, so the Deepgram route makes a second page request.
+- **Children hold the locks too.** The lock descriptors are passed to `download.sh` and the update script, so a killed `run` whose yt-dlp is still going keeps YouTube locked until that yt-dlp ends.
+- **No stale locks.** The operating system frees a process's locks when it dies, so nothing has to detect or take over a dead holder. Lock files are never deleted (deleting one while another call waits on it would let two holders in); each records its holder's pid, start time and video id for the messages.
+- **Waiting counts against `--max-seconds`.** When the budget runs out before a lock is free, the call returns `in_progress` naming the holder, and its `next_command` keeps waiting. Without `--max-seconds` the call waits as long as it takes. A same-video call therefore never fails with `locked`.
+- **One refusal stops the runs already going.** When YouTube refuses the machine as a whole, the call writes the time and yt-dlp's message to `/tmp/yt-transcript/.locks/youtube_rate_limit.json`. Every call checks that record right after taking the YouTube lock: a call that began before the refusal returns `needs_user` (`rate_limited`, or `cookies_required` for a bot check) quoting yt-dlp, without asking YouTube again; a call that begins later tries once. A batch thus stops at the first refusal instead of feeding YouTube more requests, and a rerun after the user's go-ahead tries again. There is nothing to clear and no cooldown of ours: yt-dlp recognises the limit, YouTube decides when it ends.
+- **What counts as a refusal of the machine**: yt-dlp's rate-limit message (HTTP 429, "try again later", "rate-limited by YouTube"), and a bot check that Chrome cookies did not pass. A track refused while another track downloads (6.3), and a video that needs a signed-in account (`login_required`), concern that video only and are not recorded.
+- **One classifier.** `kernel/sources/youtube.py` is the only code that reads yt-dlp's error text; it names `rate_limited`, `bot_check` or `login_required`, and anything else stays a retryable `download_error`. `download.sh` runs each yt-dlp call once and passes the error on: no retries, no error reading.
+- **Cookies only for the bot check.** A bot check with no cookies configured gets one retry with Chrome's cookies. A rate limit gets no retry, because more requests only extend it.
+- **The yt-dlp update** runs inside the YouTube lock, so no yt-dlp runs while Homebrew replaces it. Homebrew is asked at most hourly per machine, and the time is recorded whatever the result. Only a yt-dlp that Homebrew manages is upgraded; any other is only reported, and nothing installs through pip.
+- **`cleanup`** takes the video lock before it deletes, so it never removes a running video's directory.
 
 ### 6.5 Results handed back to the agent
 
@@ -271,11 +288,11 @@ Every `run` call prints exactly one JSON object on stdout and exits with a fixed
 | `needs_user` | 3 | Only the user can fix it. `reason` is `cookies_required`, `login_required`, `rate_limited`, `deepgram_key_missing`, `tool_missing` or `output_dir_missing`; `message` says what to do. A refused preferred track adds `preferred_track`, `fallback_track` and `accept_command` | Tell the user; rerun after they act, or run `accept_command` if they accept the fallback |
 | `unsupported` | 4 | The spoken language is not supported: `reason` `unsupported_language`, `language` | Report; do not retry. When `message` suggests `--mode` (the language was guessed from the title or detected by Deepgram) and the user says the video is Chinese or English, rerun with that `--mode` |
 | `needs_agent_text` | 5 | No LLM backend is reachable; one request is handed over: `task.name`, `task.prompt_file`, `task.output_file` | Answer it, write the answer to the output file, rerun `next_command` |
-| `in_progress` | 6 | The `--max-seconds` budget ran out at a safe point: `stage`, `progress` (`stages_done`, `text_tasks`) | Rerun `next_command` until the status changes |
+| `in_progress` | 6 | The `--max-seconds` budget ran out at a safe point: `stage`, `progress` (`stages_done`, `text_tasks`). Also when the budget ran out while waiting for another run of the same video or for YouTube (6.4); `message` names the holder | Rerun `next_command` until the status changes |
 
 Every result also has `video_id`, `work_dir` and `seconds`. Every result except `done` and `unsupported`, and every result of a `--stage plan` call, has `next_command`: the command that continues the run. Exit code 2 is reserved for command-line usage errors (`{"status": "usage_error", "message": …}`), such as an argument that is not a YouTube URL.
 
-`failed` reasons: `download_error`, `deepgram_error`, `llm_error`, `llm_timeout` and `locked` are retryable. `source_error`, `normalize_error`, `plan_error`, `merge_error`, `quality_hard_failure`, `override_not_applicable` and `config_error` are not, and neither is `<stage>_error`, which wraps an unexpected exception in that stage.
+`failed` reasons: `download_error`, `deepgram_error`, `llm_error` and `llm_timeout` are retryable. `source_error`, `normalize_error`, `plan_error`, `merge_error`, `quality_hard_failure`, `override_not_applicable` and `config_error` are not, and neither is `<stage>_error`, which wraps an unexpected exception in that stage.
 
 A `done` result:
 
@@ -334,7 +351,7 @@ These are the agent's escape hatches. A user request like "use Deepgram for this
 
 A long video can take a quarter of an hour or more, while many hosts kill shell commands after a few minutes. Two properties make that safe on any host:
 
-- `run` can be killed at any moment. Every finished stage and window round is already on disk, the lock of a dead process is taken over, and rerunning loses at most the request that was in flight.
+- `run` can be killed at any moment. Every finished stage and window round is already on disk, the operating system frees a killed process's locks, and rerunning loses at most the request that was in flight.
 - `--max-seconds <n>` lets the agent avoid the kill: `run` stops at the first stage or round boundary after n seconds and returns `in_progress` with the progress so far. SKILL.md has the agent pass `--max-seconds 300` with a 10-minute shell timeout (about half of the limit when its shell limit is shorter), and rerun until the status changes.
 
 This needs nothing host-specific such as background jobs.
@@ -366,7 +383,7 @@ Every command runs as `python3 <skill-root>/yt_transcript_utils.py <command>`.
 | `run <url> [flags]` | The whole flow (sections 6.2 to 6.9); `<url>` may also be a bare 11-character video id |
 | `status [<video_id>]` | Without an id: every run under the work root, split into `unfinished` (each with `next_stage`, `last_result` and `next_command`) and `finished`. With an id: that video's entry plus its whole `state.json` |
 | `cleanup <video_id> [--force]` | Remove a work directory; refuses an active run, and an unfinished run without `--force` |
-| `subtitle-info` | Debug: read `yt-dlp -J` metadata on stdin and print the language detection and the track candidates (`--from-list-subs` reads `yt-dlp --list-subs` output instead); `download.sh` uses it too |
+| `subtitle-info` | Debug: read `yt-dlp -J` metadata on stdin and print the language detection and the track candidates; `download.sh` uses it too |
 | `verify-quality <file> [--raw-text <file>] [--bilingual] [--work-dir <dir>]` | Debug: rerun the quality check on any file |
 
 Everything else is internal. Pause, cancel, telemetry queries and the external runtime API were removed: interrupting the process stops a run, rerunning resumes it, and `state.json` holds the timings and usage.
@@ -377,9 +394,11 @@ Everything else is internal. Pause, cancel, telemetry queries and the external r
 yt_transcript_utils.py    entry script at the skill root; calls kernel.cli.main()
 kernel/
   cli.py                  argument parsing, the five commands, JSON output and exit codes
-  pipeline.py             stage list, state.json, lock, resume, overrides, results;
+  pipeline.py             stage list, state.json, the two locks, resume, overrides, results;
                           download.sh calls; the agent handoff; status and cleanup
+  locks.py                the flock primitive: bounded waits, holder info, never-deleted lock files
   sources/
+    youtube.py            the machine-wide YouTube lock path, the yt-dlp error classifier, the refusal record
     subtitle_language.py  spoken language, trusted tracks, subtitle candidates
     deepgram.py           audio splitting, the Deepgram API with retries and a per-piece cache, parsing
   text/
@@ -399,24 +418,24 @@ kernel/
     verify.py  semantic.py   the checks of the verify stage
   config.py               config.yaml parsing and the default of every setting
   files.py                atomic writes, timestamps
-scripts/download.sh       yt-dlp: metadata, subtitle-info, subtitles, audio (run as a subprocess)
-scripts/update_yt_dlp.sh  the hourly yt-dlp update check
+scripts/download.sh       yt-dlp: metadata, subtitle-info, subtitles, audio (run as a subprocess; one call each)
+scripts/update_yt_dlp.sh  the hourly `brew upgrade yt-dlp`
 prompts/*.md              task prompts: cleanup_zh, structure_only, translate_only
 ```
 
-Dependencies point one way. `config` and `files` import nothing else from the kernel; `llm` and `sources` use only `config`; `text` uses `config`, `files` and `llm`; `quality` uses `text`; `pipeline` uses all of them; `cli` uses `pipeline`, plus `sources` and `quality` for the debug commands. Nothing in `kernel/` imports `yt_transcript_utils.py`. The only loop runs across processes: `pipeline` starts `download.sh`, which pipes metadata through the `subtitle-info` command.
+Dependencies point one way. `config`, `files` and `locks` import nothing else from the kernel; `llm` uses only `config`, `sources` only `config` and `files`; `text` uses `config`, `files` and `llm`; `quality` uses `text`; `pipeline` uses all of them; `cli` uses `pipeline`, plus `sources` and `quality` for the debug commands. Nothing in `kernel/` imports `yt_transcript_utils.py`. The only loop runs across processes: `pipeline` starts `download.sh`, which pipes metadata through the `subtitle-info` command.
 
 The module plan written before the split (stage 0 of the refactor) differs from the result in four places, for these reasons:
 
 - **Subtitle quality lives in `text/subtitle_quality.py`, not in `sources`.** It scores cleaned subtitle text, and `normalize` uses it as well as the `source` stage; in `sources` it would make `text` depend on `sources`. The `source` stage reaches it through `pipeline`.
-- **`download.sh` stays a subprocess** instead of moving into `sources`. Its yt-dlp handling (cookie retries, per-track refusal detection, audio format choice) is about 950 lines of shell that works and is covered by tests and the real-video regression; porting it would risk behavior for no user-visible gain. `pipeline` passes it paths and yt-dlp settings through environment variables and reads the JSON it prints.
+- **`download.sh` stays a subprocess** instead of moving into `sources`. It is about 420 lines of shell that build the yt-dlp commands (settings, cookies, `-t sleep`, the subtitle candidates in order, the audio format choice), run each once and print JSON; the retry and error policy lives in Python (`sources/youtube.py`, `_Run.download`). Porting the rest would risk behavior for no user-visible gain. `pipeline` passes it paths and yt-dlp settings through environment variables, and the held lock descriptors.
 - **The agent handoff stays in `pipeline`** (`AgentHandoff`), not in `llm`. It belongs to the run rather than to a backend: it writes into the work directory and ends the call with a `needs_agent_text` result. The window executor receives it as a callback and treats it like any other backend.
 - **`config.py` owns the defaults.** It defines the default of every setting, and `load_config` always returns every key filled in, so the modules that read a setting get a complete value instead of keeping defaults of their own.
 
 ### 6.12 Testing
 
 - **Unit tests** per area in `tests/regression_*.py`, all run by `python3 -m unittest tests.test_regressions` (offline, well under a minute). Tests of deleted code were deleted with it.
-- **End-to-end tests** (`tests/regression_e2e.py`) run the whole flow offline through `scripts/run_regression.py --fixtures tests/fixtures/e2e`: a fake `yt-dlp` on `PATH` (`tests/e2e/`) serves recorded metadata and subtitles, a fake Deepgram answers from a recorded response, and a fake LLM CLI (`tests/fake_llm.py`, plugged in through `llm_agent_cli`) implements the window protocol and the outline JSON. Cases: Chinese human subtitles (long, several rounds with an outline), English subtitles (bilingual), no subtitles (Deepgram), and an unsupported language. Routes and outputs are compared with `tests/fixtures/e2e/baseline.json`; `UPDATE_E2E_BASELINE=1` rewrites it after an intended change. `tests/regression_run.py` covers resume inside `text`, sticky and rejected overrides, the lock, `--max-seconds`, `--from`, `--restart`, `--stage plan`, the quality reroute, and every result status.
+- **End-to-end tests** (`tests/regression_e2e.py`) run the whole flow offline through `scripts/run_regression.py --fixtures tests/fixtures/e2e`: a fake `yt-dlp` on `PATH` (`tests/e2e/`) serves recorded metadata and subtitles, a fake Deepgram answers from a recorded response, and a fake LLM CLI (`tests/fake_llm.py`, plugged in through `llm_agent_cli`) implements the window protocol and the outline JSON. Cases: Chinese human subtitles (long, several rounds with an outline), English subtitles (bilingual), no subtitles (Deepgram), and an unsupported language. Routes and outputs are compared with `tests/fixtures/e2e/baseline.json`; `UPDATE_E2E_BASELINE=1` rewrites it after an intended change. The four cases run at the same time, and the fake `yt-dlp` logs every call, so the test also checks that yt-dlp never ran twice at once and that each video's page was fetched once (twice on the Deepgram route). `tests/regression_run.py` covers resume inside `text`, sticky and rejected overrides, `--max-seconds`, `--from`, `--restart`, `--stage plan`, the quality reroute, and every result status. `tests/regression_concurrency.py` covers the locks with real processes: eight processes racing for one lock never overlap, a killed holder frees it, a bounded wait returns `in_progress` with the holder, `cleanup` refuses a running video, and a rate limit stops the queued runs without another yt-dlp call while a later run tries once.
 - **Real-video regression** on a machine that can reach YouTube (`scripts/run_regression.py`, which calls `run`; see `tests/live_regression/README.md`) before merging any change to the main path. `--stage plan` and `--no-deepgram` keep it free or cheap.
 
 ### 6.13 What SKILL.md contains
@@ -492,7 +511,7 @@ Paragraphs are written only by `cleanup_zh` and `structure_only`; `translate_onl
 - **fallback**
   - after more than `window_marker_retries` invalid rounds in a row at the same cursor, the stretch is processed once as one plain fixed chunk of about `chunk_tokens_<task>` tokens, so the run still advances
 - **ownership**
-  - the `run` lock on the video's work directory; the executor has no lock of its own
+  - the video lock that `run` holds for the whole call (6.4); the executor has no lock of its own
 
 ##### Layer 4: verification, merge, and final outputs
 
@@ -584,7 +603,7 @@ Each task's window state lives in the video's work directory: `text/window/` for
 
 ### 7.6 Why this subsystem design fits the whole project
 
-The long-text subsystem is the `text` stage, not a separate product. It consumes the normalized document from `normalize`, follows the tasks chosen by `plan`, uses the same lock and state file as every other stage, and hands its paragraphs to `merge`. Short videos use it too, as the one-round case, so there is one text path to test and improve.
+The long-text subsystem is the `text` stage, not a separate product. It consumes the normalized document from `normalize`, follows the tasks chosen by `plan`, uses the same video lock and state file as every other stage, and hands its paragraphs to `merge`. Short videos use it too, as the one-round case, so there is one text path to test and improve.
 
 ---
 
@@ -639,9 +658,10 @@ Because the project still has to find the source text, decide how to acquire it,
 | Design | Code |
 |---|---|
 | Entry script and commands (6.10) | `yt_transcript_utils.py` → `kernel/cli.py` |
-| Stage list, `state.json`, lock, resume, overrides, results and exit codes (6.2, 6.4 to 6.6) | `kernel/pipeline.py`: `STAGES`, `EXIT_CODES`, `_Run.execute`, `_Run.run_stage`, `_Run.invalidate`, `acquire_lock`, `run`, `status`, `cleanup` |
+| Stage list, `state.json`, resume, overrides, results and exit codes (6.2, 6.4 to 6.6) | `kernel/pipeline.py`: `STAGES`, `EXIT_CODES`, `_Run.execute`, `_Run.run_stage`, `_Run.invalidate`, `run`, `status`, `cleanup` |
+| Locks and several runs at once (6.4) | `kernel/locks.py` (`FileLock`); `video_lock_path` and `run` in `kernel/pipeline.py`; `_Run.youtube`; `kernel/sources/youtube.py` (`lock_path`, `refusal_since`, `record_refusal`) |
 | `--max-seconds` and `in_progress` (6.7) | `_Run.deadline_passed` and the `stop_check` that `stage_text` passes to the window executor |
-| yt-dlp calls, the update check, `needs_user` reasons (6.2) | `_Run.download`, `_Run.update_yt_dlp`, `classify_download_error`; `scripts/download.sh`, `scripts/update_yt_dlp.sh` |
+| yt-dlp calls, the update check, `needs_user` reasons (6.2) | `_Run.download`, `_Run.update_yt_dlp`, `kernel/sources/youtube.py` (`classify`); `scripts/download.sh`, `scripts/update_yt_dlp.sh` |
 | Language detection and track choice (6.3) | `kernel/sources/subtitle_language.py` (`select_subtitle_candidates`), `_Run.stage_source`, `_Run.subtitle_route` |
 | Subtitle quality score and reroute (6.3) | `kernel/text/subtitle_quality.py`, applied in `_Run.subtitle_route` |
 | Deepgram (6.3) | `kernel/sources/deepgram.py` (`transcribe_deepgram`), `_Run.transcribe` |
@@ -809,7 +829,7 @@ LLM 只用来处理文字，从不决定下一步做什么。
         │ metadata -> source -> normalize -> plan -> text       │
         │   -> merge -> verify -> assemble -> cleanup           │
         │                                                       │
-        │ /tmp/yt-transcript/<video_id>/state.json（+ 运行锁）  │
+        │ /tmp/yt-transcript/<video_id>/state.json（+ 锁）      │
         │ text 阶段 -> LLM 后端：宿主 CLI | API | agent         │
         └───────────────────────────┬───────────────────────────┘
                                     │ 一个 JSON 结果 + 退出码
@@ -849,7 +869,7 @@ agent 从不编辑状态文件，也从不手动执行内部阶段。需要不�
 
 | 阶段 | 做什么 | 主要产物 | 可能的停止状态 |
 |---|---|---|---|
-| `metadata` | 先做 yt-dlp 更新检查，再用 yt-dlp 取一次视频信息（标题、频道、日期、时长、章节、字幕轨列表、音轨语言）；后面的阶段读这个文件，不再向 yt-dlp 要这些信息 | `metadata.json`、`chapters.json` | `needs_user`（自动用浏览器 cookies 重试后仍要求机器人验证 `cookies_required`、`login_required`、`rate_limited`、`tool_missing`）、`failed` |
+| `metadata` | 在 YouTube 锁里（6.4）：先让 Homebrew 更新 yt-dlp（最多每小时一次），再用 `yt-dlp -J` 取一次视频信息（标题、频道、日期、时长、章节、字幕轨列表、音轨语言）；后面的阶段读这个文件，不再向 YouTube 要这些信息 | `metadata.json`、`chapters.json` | `needs_user`（用 Chrome cookies 重试一次后仍要求机器人验证 `cookies_required`、`login_required`、`rate_limited`、`tool_missing`）、`in_progress`（等 YouTube 用完了 `--max-seconds`）、`failed` |
 | `source` | 判断口语语言并选出可信的字幕轨（6.3）；下载并解析成纯文本和带时间的片段；给字幕质量打分，评分规则要求时改用 Deepgram；或者直接用 Deepgram 转写 | `source/`、`raw_text.txt`、`segments.json`、`state.json` 里的路由 | `unsupported`、`needs_user`（首选字幕轨被拒、缺少 Deepgram 密钥，或上面的 yt-dlp 情况）、`failed` |
 | `normalize` | 生成规范化文档：清理后的文字、带时间的片段，以及分块时按文字切还是按片段切 | `normalized_document.json` | `failed` |
 | `plan` | 按模式选择文字任务（中文：`cleanup_zh`；双语：先 `structure_only` 再 `translate_only`），把文字标为 `short` 或 `long`，并估算规模（输入 token、每个任务预计轮数）。中文的 Deepgram 文字会多一条修复识别错误的说明 | `plan.json` | `failed` |
@@ -862,7 +882,7 @@ agent 从不编辑状态文件，也从不手动执行内部阶段。需要不�
 说明：
 
 - **阶段幂等。** 重跑一个未完成的阶段，会把这个阶段从头做一遍；但昂贵的子步骤在阶段内部保留结果（下载好的音频、每段音频的 Deepgram 结果、大纲、已完成的窗口轮次），所以中断的阶段不会重复花钱。
-- **没有单独的 preflight。** 每个阶段在真正需要之前才检查它需要的东西：`metadata` 之前检查 yt-dlp（包括更新检查，最多每小时一次，因为 YouTube 经常让旧版 yt-dlp 失效），`source` 选了 Deepgram 才检查 Deepgram 密钥，到 `text` 才检查 LLM 后端，到 `assemble` 才检查 `output_dir`。便宜的路径保持便宜。
+- **没有单独的 preflight。** 每个阶段在真正需要之前才检查它需要的东西：到 `metadata` 才检查 yt-dlp（包括 Homebrew 更新，最多每小时一次，因为 YouTube 经常让旧版 yt-dlp 失效），`source` 选了 Deepgram 才检查 Deepgram 密钥，到 `text` 才检查 LLM 后端，到 `assemble` 才检查 `output_dir`。便宜的路径保持便宜。
 - **第一次调用 LLM 之前来源已经定下来。** 字幕质量改道在 `source` 内部完成，所以 `normalize` 及之后的阶段处理的都是已经认可的文字。
 - **长短视频一条路径。** 短视频和长视频走同样的阶段。视频时长 30 分钟以上，或者较短视频的文字超过单次请求的上限（按路线不同，约 4100 到 4800 个估算 token），`plan` 就把文字标为 `long`。`long` 的文字会在 YouTube 章节开始处切分块，章节也作为大纲的提示；`short` 的文字两者都不用。只要一轮能处理完全文就跳过大纲调用（7.4），所以短视频通常每个任务只需要一次请求。
 - **免费的路由检查。** `--stage plan` 执行 `metadata` 到 `plan`，不花钱。如果路由需要 Deepgram，就记下这个决定，在 `source` 内部停下，不做转写。
@@ -881,7 +901,7 @@ agent 从不编辑状态文件，也从不手动执行内部阶段。需要不�
 
 只来自视频文字的语言、或者完全没有信号时，语言都不算确定：这时 `--mode` 直接指定口语语言（`chinese` 为中文音频，`bilingual` 为英文音频），Deepgram 按这个语言转写，路由里记为 `language_signal: mode_override`。这种推测出的语言、以及 Deepgram 自己识别出的语言不受支持时，`unsupported` 的 `message` 会说明可以这样重跑。加视频文字这个信号，是因为没有任何字幕轨、元数据也没写语言的视频，原来只能靠 Deepgram 自己识别，而它把一个普通话视频（DQGrPstFRVI，标题和简介都是中文）识别成了印尼语。没有使用 Deepgram 专有的做法（把识别范围限定在中英文、按置信度定阈值）。
 
-首选字幕轨在自动用浏览器 cookies 重试后仍被 YouTube 拒绝（限流或机器人验证）时，`source` 不会悄悄换用下一条字幕轨。旧的 agent 驱动流程会这样做，结果中文文章变成了双语文章，而且每次运行结果可能不一样。现在 `source` 返回 `needs_user`，原因是 `rate_limited`（机器人验证时是 `cookies_required`），列出 `preferred_track` 和 `fallback_track`，并给出 `accept_command`：同一条命令加上 `--mode <备用字幕轨的模式>`。agent 问用户是等一会儿再重跑，还是接受备用字幕轨。
+首选字幕轨被 YouTube 拒绝（限流或机器人验证）、后面的字幕轨却下载成功时，`source` 不会悄悄换用下一条字幕轨。旧的 agent 驱动流程会这样做，结果中文文章变成了双语文章，而且每次运行结果可能不一样。现在 `source` 返回 `needs_user`，原因是 `rate_limited`（机器人验证时是 `cookies_required`），列出 `preferred_track` 和 `fallback_track`，并给出 `accept_command`：同一条命令加上 `--mode <备用字幕轨的模式>`。agent 问用户是等一会儿再重跑，还是接受备用字幕轨。这种拒绝只关系到这一个视频。YouTube 拒绝所有字幕轨，或者连页面都拒绝时，它拒绝的是整台机器，这台机器上的所有运行都会停下（6.4 的“多个运行同时进行”）。
 
 `yt-dlp` 仍然是获取来源的依赖。直接调用 YouTube InnerTube 获取字幕评估过：对只需要字幕的场景更轻，但它是非官方、接口敏感的入口，不能取代 Deepgram 兜底，还会把维护提取逻辑的负担转到本项目。它可以作为将来的快速路径，但不是默认方案。
 
@@ -892,7 +912,6 @@ agent 从不编辑状态文件，也从不手动执行内部阶段。需要不�
 ```text
 /tmp/yt-transcript/<video_id>/
   state.json                 唯一的状态文件；cleanup 后保留
-  .runtime_owner.json        运行锁：当前运行的进程号
   metadata.json  chapters.json
   source/                    download.sh 下载的 subtitles/ 或 audio/（音频被切开时还有各段音频），
                              subtitle_document.json（字幕质量检查），
@@ -906,7 +925,9 @@ agent 从不编辑状态文件，也从不手动执行内部阶段。需要不�
   optimized.md  quality.json
 ```
 
-`YT_TRANSCRIPT_WORK_ROOT` 可以代替 `/tmp/yt-transcript`，`YT_TRANSCRIPT_OUTPUT_DIR` 可以代替配置里的 `output_dir`；回归脚本两个都用，所以不会碰到真实的运行目录和笔记库。
+各视频目录旁边，`/tmp/yt-transcript/.locks/` 放锁文件（每个视频一个 `video-<video_id>.lock`，以及 `youtube.lock`）和两份小记录：`youtube_rate_limit.json`（YouTube 最近一次拒绝这台机器）和 `yt-dlp-update.stamp`（最近一次问 Homebrew 的时间）。这些文件都从不删除。
+
+`YT_TRANSCRIPT_WORK_ROOT` 可以代替 `/tmp/yt-transcript`，`YT_TRANSCRIPT_OUTPUT_DIR` 可以代替配置里的 `output_dir`；回归脚本两个都用，所以不会碰到真实的运行目录和笔记库。视频锁跟着工作根目录走。YouTube 锁和那两份记录关系到整台机器，所以不管工作根目录在哪里，都留在 `/tmp/yt-transcript/.locks/`；只有 `YT_TRANSCRIPT_LOCK_DIR` 能改它们的位置，离线测试就是这样做的。
 
 每个阶段开始和结束时、每轮窗口之前，都原子地写一次 `state.json`。下面是一次已完成的双语运行的 `state.json`（有删节）：
 
@@ -963,9 +984,25 @@ agent 从不编辑状态文件，也从不手动执行内部阶段。需要不�
 - **完成的就保持完成。** `cleanup` 保留 `state.json`，所以对已完成的视频重跑 `run`，会立即返回 `done` 和已有的文章，前提是这篇文章还在（被删掉了就从头再做）。因此整批重跑时只会处理没完成的视频。要重新生成文章就用 `--restart`。
 - **覆盖参数会保留。** `--source` 和 `--mode` 存进 `state.json`，在这个视频之后的重跑里一直有效，直到 `--restart`，所以续跑不会悄悄改变路由。无法满足的覆盖参数（`override_not_applicable`）不会保存，所以直接重跑会回到原来的路由。
 - **每次调用都会读配置**，但配置改了，已完成的阶段也不会重做；要重做就用 `--from <阶段>`。`cleanup` 之后中间文件已经删掉，所以对已完成的运行用 `--from` 会重做所有阶段；它是给未完成的运行用的（比如质量检查失败后 `--from text`）。
-- **运行锁**防止两个进程同时写一个工作目录。对一个被锁住的视频再执行 `run`，返回 `failed`，原因是 `locked`；进程已退出的锁会被接管。不同视频之间不共享文件，可以并行运行。
+- **视频锁**防止两个进程同时写一个工作目录：一次调用从开始到结束都持有它，同一个视频的第二次调用会等第一次结束（在自己的 `--max-seconds` 之内），然后从第一次留下的状态继续，通常立即返回 `done`。不同视频之间不共享文件，可以并行运行；只有它们对 YouTube 的请求要排队（见下）。
 - **安全**：`video_id` 必须匹配 `[A-Za-z0-9_-]+` 才能用作路径。`state.json` 不存 API 密钥，只记后端名字，不记凭据。
 - **寿命**：目录在 `/tmp` 下，重启后未完成的任务会丢失。这是接受的限制。
+
+#### 多个运行同时进行
+
+同一台机器上可以同时有几个 `run` 调用：并行启动的一批视频，或者两个 agent 各跑各的。两把文件锁（`flock`，`kernel/locks.py`）把它们隔开。没有队列、调度器或额外的状态；要等的调用就等着。
+
+- **两把锁，固定顺序。** 视频锁（`<工作根目录>/.locks/video-<id>.lock`）在整个调用期间持有。YouTube 锁（`/tmp/yt-transcript/.locks/youtube.lock`）只在每一步 yt-dlp 期间持有：更新检查连同取元数据、下载字幕、下载音频。调用总是先拿视频锁，所以两个调用不会互相死锁。Deepgram、LLM 和其他阶段都在 YouTube 锁之外运行，所以一个视频的文字处理可以和另一个视频的下载同时进行。
+- **同一时间只有一个 yt-dlp。** YouTube 按机器（IP，或 cookies 里的账号）计量请求，而不是按进程；这台机器被“rate-limited by YouTube for up to an hour”，就是因为并行提取。在锁里，每次 yt-dlp 调用还都加上 yt-dlp 自带的 `-t sleep` 预设（它自己在请求之间停顿），所以并行的运行向 YouTube 请求的速度不会超过一个运行，我们也不用自己定节流参数。太旧、没有 `-t sleep` 的 yt-dlp（2025 年年中之前）就不加，并记一行日志。每个视频的页面只在 `metadata` 提取一次（`yt-dlp -J`，保留 stderr，不再逐字段兜底）；下载字幕时用 `--load-info-json` 读这个文件。下载音频仍然传链接，所以 Deepgram 路线会第二次请求页面。
+- **子进程也持有锁。** 锁的文件描述符会传给 `download.sh` 和更新脚本，所以 `run` 被杀掉而它的 yt-dlp 还在跑时，YouTube 锁会一直保持到那个 yt-dlp 结束。
+- **没有残留的锁。** 进程死掉时操作系统会释放它的锁，所以不需要检测或接管死掉的持有者。锁文件从不删除（有调用在等一个锁文件时把它删掉，会让两个持有者同时进去）；每个锁文件里记着持有者的进程号、开始时间和视频 id，用在提示信息里。
+- **等锁算进 `--max-seconds`。** 锁还没空出来预算就用完时，调用返回 `in_progress`，说明谁在占用，它的 `next_command` 会接着等。没有 `--max-seconds` 时一直等下去。所以同一视频的调用再也不会以 `locked` 失败。
+- **一次拒绝让已经在跑的运行都停下。** YouTube 拒绝整台机器时，这次调用把时间和 yt-dlp 的原话写进 `/tmp/yt-transcript/.locks/youtube_rate_limit.json`。每个调用拿到 YouTube 锁后马上检查这份记录：在拒绝之前就开始的调用返回 `needs_user`（`rate_limited`，机器人验证时是 `cookies_required`），并引用 yt-dlp 的原话，不再请求 YouTube；在拒绝之后才开始的调用会试一次。所以一批视频会在第一次被拒时停下，而不是继续给 YouTube 发请求；用户同意后重跑，就会再试。没有需要清除的东西，也没有我们自己定的冷却时间：限流长什么样由 yt-dlp 识别，什么时候结束由 YouTube 决定。
+- **什么算拒绝整台机器**：yt-dlp 的限流消息（HTTP 429、“try again later”、“rate-limited by YouTube”），以及用了 Chrome cookies 仍没通过的机器人验证。另一条字幕轨能下载时某条字幕轨被拒（6.3），以及视频需要登录账号（`login_required`），都只关系到这个视频，不会记录。
+- **只有一个分类器。** 只有 `kernel/sources/youtube.py` 读 yt-dlp 的错误文字；它识别出 `rate_limited`、`bot_check` 或 `login_required`，其他情况都是可重试的 `download_error`。`download.sh` 每个 yt-dlp 调用只执行一次，把错误原样交出来：不重试，也不读错误。
+- **cookies 只用于机器人验证。** 没配 cookies 时遇到机器人验证，用 Chrome 的 cookies 重试一次。限流不重试，因为再发请求只会让限流更久。
+- **yt-dlp 更新**在 YouTube 锁里进行，所以 Homebrew 替换 yt-dlp 时不会有 yt-dlp 在跑。整台机器最多每小时问一次 Homebrew，不管结果如何都记下时间。只升级 Homebrew 管理的 yt-dlp；其他方式装的只报告，也不会用 pip 安装。
+- **`cleanup`** 删除前先拿视频锁，所以绝不会删掉正在运行的视频目录。
 
 ### 6.5 交回给 agent 的结果
 
@@ -978,11 +1015,11 @@ agent 从不编辑状态文件，也从不手动执行内部阶段。需要不�
 | `needs_user` | 3 | 只有用户能解决。`reason` 是 `cookies_required`、`login_required`、`rate_limited`、`deepgram_key_missing`、`tool_missing` 或 `output_dir_missing`；`message` 说明该怎么做。首选字幕轨被拒时还有 `preferred_track`、`fallback_track` 和 `accept_command` | 告诉用户；用户处理后重跑，用户接受备用字幕轨时执行 `accept_command` |
 | `unsupported` | 4 | 口语语言不受支持：`reason` 为 `unsupported_language`，还有 `language` | 汇报；不重试。`message` 建议了 `--mode`（语言是从标题推测的或由 Deepgram 自己识别的），而用户说视频其实是中文或英文时，用对应的 `--mode` 重跑 |
 | `needs_agent_text` | 5 | 没有可用的 LLM 后端，交出一次请求：`task.name`、`task.prompt_file`、`task.output_file` | 完成请求，把答案写进输出文件，重跑 `next_command` |
-| `in_progress` | 6 | `--max-seconds` 时间用完，在安全点停下：`stage`、`progress`（`stages_done`、`text_tasks`） | 重跑 `next_command`，直到状态改变 |
+| `in_progress` | 6 | `--max-seconds` 时间用完，在安全点停下：`stage`、`progress`（`stages_done`、`text_tasks`）。等同一视频的另一个运行或等 YouTube 时预算用完，也返回它（6.4），`message` 说明谁在占用 | 重跑 `next_command`，直到状态改变 |
 
 每个结果还有 `video_id`、`work_dir` 和 `seconds`。除了 `done` 和 `unsupported`，每个结果都有 `next_command`，也就是继续这次运行的命令；`--stage plan` 调用的结果也都有。退出码 2 留给命令行用法错误（`{"status": "usage_error", "message": …}`），比如参数不是 YouTube 链接。
 
-`failed` 的原因：`download_error`、`deepgram_error`、`llm_error`、`llm_timeout` 和 `locked` 可以重试；`source_error`、`normalize_error`、`plan_error`、`merge_error`、`quality_hard_failure`、`override_not_applicable` 和 `config_error` 不能重试，`<阶段>_error`（某个阶段里出现意外异常）也不能重试。
+`failed` 的原因：`download_error`、`deepgram_error`、`llm_error` 和 `llm_timeout` 可以重试；`source_error`、`normalize_error`、`plan_error`、`merge_error`、`quality_hard_failure`、`override_not_applicable` 和 `config_error` 不能重试，`<阶段>_error`（某个阶段里出现意外异常）也不能重试。
 
 一个 `done` 结果：
 
@@ -1041,7 +1078,7 @@ agent 从不编辑状态文件，也从不手动执行内部阶段。需要不�
 
 长视频可能要跑一刻钟甚至更久，而很多宿主几分钟后就会结束 shell 命令。下面两点让任何宿主都能安全运行：
 
-- `run` 随时可以被杀掉。每个完成的阶段和每轮窗口都已经落盘，已退出进程的锁会被接管，重跑最多损失正在进行的那一次请求。
+- `run` 随时可以被杀掉。每个完成的阶段和每轮窗口都已经落盘，被杀掉的进程的锁由操作系统释放，重跑最多损失正在进行的那一次请求。
 - `--max-seconds <n>` 让 agent 不必被动挨杀：`run` 在 n 秒后的第一个阶段或轮次边界停下，返回 `in_progress` 和目前的进度。SKILL.md 让 agent 带上 `--max-seconds 300`，并把 shell 超时设为 10 分钟（shell 上限更短时传大约一半的上限值），然后一直重跑到状态改变。
 
 这不需要后台任务之类宿主特有的能力。
@@ -1073,7 +1110,7 @@ agent 从不编辑状态文件，也从不手动执行内部阶段。需要不�
 | `run <url> [参数]` | 整个流程（6.2 到 6.9 节）；`<url>` 也可以是 11 个字符的视频 id |
 | `status [<video_id>]` | 不带 id：列出工作根目录下的所有运行，分为 `unfinished`（各带 `next_stage`、`last_result` 和 `next_command`）和 `finished`。带 id：该视频的条目加上完整的 `state.json` |
 | `cleanup <video_id> [--force]` | 删除一个工作目录；正在运行的拒绝，未完成的运行不带 `--force` 也拒绝 |
-| `subtitle-info` | 调试用：从 stdin 读 `yt-dlp -J` 的元数据，输出语言判断和候选字幕轨（`--from-list-subs` 改为读 `yt-dlp --list-subs` 的输出）；`download.sh` 也用它 |
+| `subtitle-info` | 调试用：从 stdin 读 `yt-dlp -J` 的元数据，输出语言判断和候选字幕轨；`download.sh` 也用它 |
 | `verify-quality <文件> [--raw-text <文件>] [--bilingual] [--work-dir <目录>]` | 调试用：对任意文件重跑质量检查 |
 
 其余都是内部函数。暂停、取消、telemetry 查询和对外 runtime API 已经删除：中断进程就停下，重跑就续跑，耗时和用量记在 `state.json` 里。
@@ -1084,9 +1121,11 @@ agent 从不编辑状态文件，也从不手动执行内部阶段。需要不�
 yt_transcript_utils.py    skill 根目录下的入口脚本；调用 kernel.cli.main()
 kernel/
   cli.py                  参数解析、五个命令、JSON 输出和退出码
-  pipeline.py             阶段列表、state.json、运行锁、续跑、覆盖参数、结果；
+  pipeline.py             阶段列表、state.json、两把锁、续跑、覆盖参数、结果；
                           调用 download.sh；交给 agent；status 和 cleanup
+  locks.py                flock 原语：有上限的等待、持有者信息、从不删除的锁文件
   sources/
+    youtube.py            整台机器共用的 YouTube 锁路径、yt-dlp 错误分类器、拒绝记录
     subtitle_language.py  口语语言、可信字幕轨、候选字幕轨
     deepgram.py           切分音频、带重试和分段缓存的 Deepgram API 调用、解析结果
   text/
@@ -1106,24 +1145,24 @@ kernel/
     verify.py  semantic.py   verify 阶段的各项检查
   config.py               解析 config.yaml，定义每个配置项的默认值
   files.py                原子写入、时间戳
-scripts/download.sh       yt-dlp：metadata、subtitle-info、subtitles、audio（作为子进程运行）
-scripts/update_yt_dlp.sh  每小时最多一次的 yt-dlp 更新检查
+scripts/download.sh       yt-dlp：metadata、subtitle-info、subtitles、audio（作为子进程运行；每样只调用一次）
+scripts/update_yt_dlp.sh  每小时最多一次的 `brew upgrade yt-dlp`
 prompts/*.md              任务 prompt：cleanup_zh、structure_only、translate_only
 ```
 
-依赖只朝一个方向。`config` 和 `files` 不引用 kernel 里的其他模块；`llm` 和 `sources` 只用 `config`；`text` 用 `config`、`files` 和 `llm`；`quality` 用 `text`；`pipeline` 用上面所有模块；`cli` 用 `pipeline`，调试命令另外用 `sources` 和 `quality`。`kernel/` 里没有任何模块引用 `yt_transcript_utils.py`。唯一的回路跨越进程：`pipeline` 启动 `download.sh`，`download.sh` 再把元数据交给 `subtitle-info` 命令。
+依赖只朝一个方向。`config`、`files` 和 `locks` 不引用 kernel 里的其他模块；`llm` 只用 `config`，`sources` 只用 `config` 和 `files`；`text` 用 `config`、`files` 和 `llm`；`quality` 用 `text`；`pipeline` 用上面所有模块；`cli` 用 `pipeline`，调试命令另外用 `sources` 和 `quality`。`kernel/` 里没有任何模块引用 `yt_transcript_utils.py`。唯一的回路跨越进程：`pipeline` 启动 `download.sh`，`download.sh` 再把元数据交给 `subtitle-info` 命令。
 
 拆分之前（重构第 0 阶段）写下的模块计划和结果有四处不同，原因如下：
 
 - **字幕质量放在 `text/subtitle_quality.py`，不在 `sources`。** 它给清理后的字幕文字打分，`normalize` 和 `source` 阶段都要用；放在 `sources` 会让 `text` 依赖 `sources`。`source` 阶段通过 `pipeline` 调用它。
-- **`download.sh` 仍然作为子进程运行**，没有并入 `sources`。它处理 yt-dlp 的部分（cookies 重试、逐条字幕轨识别被拒、选择音频格式）是约 950 行能正常工作的 shell，有测试和真实视频回归覆盖；移植它有改变行为的风险，用户却得不到任何好处。`pipeline` 通过环境变量把路径和 yt-dlp 设置传给它，并读取它输出的 JSON。
+- **`download.sh` 仍然作为子进程运行**，没有并入 `sources`。它是约 420 行的 shell，负责拼 yt-dlp 命令（设置、cookies、`-t sleep`、按顺序的候选字幕轨、选择音频格式），每个命令只执行一次，再输出 JSON；重试和错误处理的策略在 Python 里（`sources/youtube.py`、`_Run.download`）。把剩下的部分也移植过来有改变行为的风险，用户却得不到任何好处。`pipeline` 通过环境变量把路径和 yt-dlp 设置传给它，并把持有的锁描述符一起传过去。
 - **交给 agent 的逻辑留在 `pipeline`**（`AgentHandoff`），不在 `llm`。它属于这次运行，而不是某个后端：它往工作目录里写文件，并以 `needs_agent_text` 结果结束本次调用。窗口执行器把它作为回调接收，和其他后端一样对待。
 - **默认值都归 `config.py`。** 它定义每个配置项的默认值，`load_config` 返回的结果里每个键都已填好，所以读取配置的模块拿到的总是完整的值，不再各自保留默认值。
 
 ### 6.12 测试
 
 - **单元测试**按领域放在 `tests/regression_*.py`，用 `python3 -m unittest tests.test_regressions` 全部运行（离线，不到一分钟）。被删除代码的测试已随代码一起删除。
-- **端到端测试**（`tests/regression_e2e.py`）通过 `scripts/run_regression.py --fixtures tests/fixtures/e2e` 离线跑整个流程：`PATH` 上的假 `yt-dlp`（`tests/e2e/`）提供录好的元数据和字幕，假 Deepgram 用录好的响应回答，假 LLM 命令行（`tests/fake_llm.py`，通过 `llm_agent_cli` 接入）实现窗口协议和大纲 JSON。用例：中文人工字幕（长视频，带大纲的多轮窗口）、英文字幕（双语）、无字幕（Deepgram）、不支持的语言。路由和产物与 `tests/fixtures/e2e/baseline.json` 对比；有意的改动之后用 `UPDATE_E2E_BASELINE=1` 重新生成。`tests/regression_run.py` 覆盖 `text` 阶段内的续跑、覆盖参数的保留和拒绝、运行锁、`--max-seconds`、`--from`、`--restart`、`--stage plan`、质量改道，以及每一种结果状态。
+- **端到端测试**（`tests/regression_e2e.py`）通过 `scripts/run_regression.py --fixtures tests/fixtures/e2e` 离线跑整个流程：`PATH` 上的假 `yt-dlp`（`tests/e2e/`）提供录好的元数据和字幕，假 Deepgram 用录好的响应回答，假 LLM 命令行（`tests/fake_llm.py`，通过 `llm_agent_cli` 接入）实现窗口协议和大纲 JSON。用例：中文人工字幕（长视频，带大纲的多轮窗口）、英文字幕（双语）、无字幕（Deepgram）、不支持的语言。路由和产物与 `tests/fixtures/e2e/baseline.json` 对比；有意的改动之后用 `UPDATE_E2E_BASELINE=1` 重新生成。四个用例同时运行，假 `yt-dlp` 记下每次调用，所以这个测试还检查 yt-dlp 从没有两个同时在跑，以及每个视频的页面只取了一次（Deepgram 路线两次）。`tests/regression_run.py` 覆盖 `text` 阶段内的续跑、覆盖参数的保留和拒绝、`--max-seconds`、`--from`、`--restart`、`--stage plan`、质量改道，以及每一种结果状态。`tests/regression_concurrency.py` 用真实的进程测锁：八个进程抢一把锁从不重叠，持有者被杀掉后锁被释放，有上限的等待返回带持有者的 `in_progress`，`cleanup` 拒绝删除正在运行的视频，限流让排队的运行不再调用 yt-dlp，而之后开始的运行会试一次。
 - **真实视频回归**：任何动到主路径的改动合并前，在能访问 YouTube 的机器上跑 `scripts/run_regression.py`（它调用 `run`；见 `tests/live_regression/README.md`）。`--stage plan` 和 `--no-deepgram` 可以让它免费或很便宜。
 
 ### 6.13 SKILL.md 的内容
@@ -1199,7 +1238,7 @@ prompts/*.md              任务 prompt：cleanup_zh、structure_only、translat
 - **兜底（fallback）**
   - 同一个游标处连续无效的轮次超过 `window_marker_retries` 次后，把这一段按一个约 `chunk_tokens_<task>` token 的普通固定分块处理一次，保证任务继续推进
 - **占有（ownership）**
-  - 就是 `run` 对视频工作目录的运行锁；执行器自己没有锁
+  - 就是 `run` 在整个调用期间持有的视频锁（6.4）；执行器自己没有锁
 
 ##### 第 4 层：校验、合并与最终输出
 
@@ -1291,7 +1330,7 @@ merge 阶段 -> verify 阶段 -> assemble 阶段
 
 ### 7.6 为什么这个子系统设计适合整个项目
 
-长文本子系统就是 `text` 阶段，不是另一个独立产品。它消费 `normalize` 生成的规范化文档，按 `plan` 选定的任务执行，和其他阶段共用同一个运行锁和状态文件，把段落交给 `merge`。短视频也用它，是只跑一轮的情况，所以只有一条文字处理路径需要测试和改进。
+长文本子系统就是 `text` 阶段，不是另一个独立产品。它消费 `normalize` 生成的规范化文档，按 `plan` 选定的任务执行，和其他阶段共用同一个视频锁和状态文件，把段落交给 `merge`。短视频也用它，是只跑一轮的情况，所以只有一条文字处理路径需要测试和改进。
 
 ---
 
@@ -1346,9 +1385,10 @@ merge 阶段 -> verify 阶段 -> assemble 阶段
 | 设计 | 代码 |
 |---|---|
 | 入口脚本和命令（6.10） | `yt_transcript_utils.py` → `kernel/cli.py` |
-| 阶段列表、`state.json`、运行锁、续跑、覆盖参数、结果和退出码（6.2、6.4 到 6.6） | `kernel/pipeline.py`：`STAGES`、`EXIT_CODES`、`_Run.execute`、`_Run.run_stage`、`_Run.invalidate`、`acquire_lock`、`run`、`status`、`cleanup` |
+| 阶段列表、`state.json`、续跑、覆盖参数、结果和退出码（6.2、6.4 到 6.6） | `kernel/pipeline.py`：`STAGES`、`EXIT_CODES`、`_Run.execute`、`_Run.run_stage`、`_Run.invalidate`、`run`、`status`、`cleanup` |
+| 锁和多个运行同时进行（6.4） | `kernel/locks.py`（`FileLock`）；`kernel/pipeline.py` 里的 `video_lock_path` 和 `run`；`_Run.youtube`；`kernel/sources/youtube.py`（`lock_path`、`refusal_since`、`record_refusal`） |
 | `--max-seconds` 和 `in_progress`（6.7） | `_Run.deadline_passed`，以及 `stage_text` 交给窗口执行器的 `stop_check` |
-| 调用 yt-dlp、更新检查、`needs_user` 的原因（6.2） | `_Run.download`、`_Run.update_yt_dlp`、`classify_download_error`；`scripts/download.sh`、`scripts/update_yt_dlp.sh` |
+| 调用 yt-dlp、更新检查、`needs_user` 的原因（6.2） | `_Run.download`、`_Run.update_yt_dlp`、`kernel/sources/youtube.py`（`classify`）；`scripts/download.sh`、`scripts/update_yt_dlp.sh` |
 | 语言判断和字幕轨选择（6.3） | `kernel/sources/subtitle_language.py`（`select_subtitle_candidates`）、`_Run.stage_source`、`_Run.subtitle_route` |
 | 字幕质量分和改道（6.3） | `kernel/text/subtitle_quality.py`，在 `_Run.subtitle_route` 里使用 |
 | Deepgram（6.3） | `kernel/sources/deepgram.py`（`transcribe_deepgram`）、`_Run.transcribe` |
