@@ -58,13 +58,18 @@ class AgentCliRegressionTests(unittest.TestCase):
         self.assertTrue(decision["probe"]["ok"])
         self.assertEqual(runner.call_args.kwargs["input"], agent_cli.CLI_PROBE_PROMPT)
 
-    def test_auto_falls_back_to_api_when_probe_fails(self):
-        """A CLI that errors on the probe leaves the API as the backend."""
+    def test_auto_never_picks_the_paid_api(self):
+        """A failed probe, or no CLI at all, leaves no backend even with the API configured."""
         config = {"llm_backend": "auto", "llm_api_key": "k", "llm_base_url": "https://x", "llm_model": "m"}
         runner = mock.Mock(return_value=_completed("", returncode=1, stderr="not logged in"))
         decision = agent_cli.resolve_llm_backend(config, env={"GEMINI_CLI": "1"}, which=_which_all, runner=runner)
-        self.assertEqual(decision["backend"], "api")
+        self.assertEqual(decision["backend"], "none")
+        self.assertTrue(decision["api_configured"])
         self.assertIn("not logged in", decision["fallback_reason"])
+
+        undetected = agent_cli.resolve_llm_backend(config, env={}, which=_which_all)
+        self.assertEqual(undetected["backend"], "none")
+        self.assertIn("llm_agent_cli", undetected["fallback_reason"])
 
     def test_auto_without_agent_or_api_has_no_backend(self):
         """No detected agent and no API configured resolves to none."""
@@ -104,13 +109,19 @@ class AgentCliRegressionTests(unittest.TestCase):
         self.assertEqual(resumed["command"], ["mytool", "--ask", "{prompt}"])
 
     def test_call_cli_llm_strips_nesting_variables_and_retries(self):
-        """The child loses host markers; a failed attempt is retried once."""
+        """The child loses host markers; a failed attempt is retried once, after a backoff."""
         runner = mock.Mock(side_effect=[_completed("", returncode=2, stderr="boom"), _completed("清洗后的文本")])
-        with mock.patch.dict(os.environ, {"CLAUDECODE": "1", "KEEP_ME": "1"}):
+        sleep = mock.Mock()
+        with mock.patch.dict(os.environ, {"CLAUDECODE": "1", "KEEP_ME": "1"}), \
+                mock.patch("sys.stderr", new_callable=io.StringIO) as stderr:
             result = agent_cli.call_cli_llm(
-                ["claude", "-p"], "prompt", max_retries=1, strip_env=["CLAUDECODE"], agent="claude-code", runner=runner,
+                ["claude", "-p"], "prompt", max_retries=1, backoff_sec=2.0, strip_env=["CLAUDECODE"],
+                agent="claude-code", runner=runner, sleep=sleep,
             )
         self.assertEqual(result["text"], "清洗后的文本")
+        self.assertEqual(1, sleep.call_count)
+        self.assertTrue(2.0 <= sleep.call_args.args[0] < 4.0, sleep.call_args)
+        self.assertIn("Retrying cli:claude-code after cli_exit_error", stderr.getvalue())
         self.assertEqual(result["attempts"], 2)
         self.assertEqual(result["request_url"], "cli:claude-code")
         child_env = runner.call_args.kwargs["env"]
@@ -118,12 +129,28 @@ class AgentCliRegressionTests(unittest.TestCase):
         self.assertIn("KEEP_ME", child_env)
 
     def test_call_cli_llm_raises_after_retries(self):
-        """Empty output on every attempt raises a retryable LLMRequestError."""
+        """Empty output on every attempt raises a retryable LLMRequestError; the waits grow, none after the last."""
         runner = mock.Mock(return_value=_completed(""))
-        with self.assertRaises(kernel_llm_api.LLMRequestError) as caught:
-            agent_cli.call_cli_llm(["pi", "-p"], "prompt", max_retries=1, runner=runner)
+        sleep = mock.Mock()
+        with self.assertRaises(kernel_llm_api.LLMRequestError) as caught, \
+                mock.patch("sys.stderr", new_callable=io.StringIO):
+            agent_cli.call_cli_llm(["pi", "-p"], "prompt", max_retries=2, backoff_sec=1.0, runner=runner, sleep=sleep)
         self.assertEqual(caught.exception.error_type, "cli_empty_output")
-        self.assertEqual(len(caught.exception.attempt_history), 2)
+        self.assertTrue(caught.exception.retryable)
+        self.assertEqual(len(caught.exception.attempt_history), 3)
+        waits = [call.args[0] for call in sleep.call_args_list]
+        self.assertEqual(2, len(waits))
+        self.assertTrue(1.0 <= waits[0] < 2.0 and 2.0 <= waits[1] < 3.0, waits)
+
+    def test_call_cli_llm_does_not_retry_a_missing_command(self):
+        """A CLI that cannot start fails at once, without waiting."""
+        runner = mock.Mock(side_effect=FileNotFoundError("no such file"))
+        sleep = mock.Mock()
+        with self.assertRaises(kernel_llm_api.LLMRequestError) as caught:
+            agent_cli.call_cli_llm(["nope"], "prompt", max_retries=3, runner=runner, sleep=sleep)
+        self.assertEqual("cli_not_found", caught.exception.error_type)
+        self.assertEqual(1, runner.call_count)
+        sleep.assert_not_called()
 
     def _make_work_dir(self, tmpdir):
         """Chunk a small transcript into a work dir (one window round covers it)."""
@@ -168,8 +195,8 @@ class AgentCliRegressionTests(unittest.TestCase):
         self.assertEqual(result["request_url"], "cli:claude-code")
         self.assertEqual(state["llm_backend"]["backend"], "cli")
 
-    def test_window_switches_to_api_when_cli_fails_mid_run(self):
-        """A CLI failure after its retries moves the round and the rest to the API."""
+    def test_window_stops_when_cli_fails_mid_run_and_never_calls_the_api(self):
+        """A CLI failure after its retries fails the run where it stands, even with the API configured."""
         cli_decision = {
             "mode": "auto", "backend": "cli", "agent": "codex", "agent_source": "detected",
             "command": ["codex", "exec", "-"], "strip_env": [], "api_configured": True,
@@ -177,26 +204,22 @@ class AgentCliRegressionTests(unittest.TestCase):
         }
         cli_error = kernel_llm_api.LLMRequestError("codex exited", error_type="cli_exit_error", retryable=True)
 
-        def api(**kwargs):
-            return {"text": tag_echo(kwargs["messages"][0]["content"]), "latency_ms": 5,
-                    "request_url": "https://api.deepseek.com/v1/chat/completions", "streaming_used": False,
-                    "finish_reason": "stop", "usage": {}, "attempts": 1}
-
         with tempfile.TemporaryDirectory() as tmpdir:
             work_dir = self._make_work_dir(tmpdir)
             with mock.patch.object(kernel_config, "load_config", return_value=self._config()), \
                 mock.patch.object(agent_cli, "resolve_llm_backend", return_value=cli_decision), \
-                mock.patch.object(agent_cli, "call_cli_llm", side_effect=cli_error), \
-                mock.patch.object(kernel_llm_api, "call_llm_api", side_effect=api) as api_call, \
+                mock.patch.object(agent_cli, "call_cli_llm", side_effect=cli_error) as cli_call, \
+                mock.patch.object(kernel_llm_api, "call_llm_api") as api_call, \
                 mock.patch("sys.stderr", new_callable=io.StringIO):
                 result = window.process_window(str(work_dir), "cleanup_zh")
             state = window.load_window_state(str(work_dir))
 
-        self.assertTrue(result["success"], result)
-        self.assertEqual(api_call.call_count, 1)
-        self.assertEqual(state["llm_backend"]["backend"], "api")
-        self.assertIn("Agent CLI failed mid-run", state["llm_backend"]["fallback_reason"])
-        self.assertTrue(any("switching the remaining window rounds" in w for w in result["warnings"]))
+        self.assertFalse(result["success"])
+        self.assertEqual(("failed", "cli_exit_error"), (result["status"], result["error"]))
+        self.assertEqual(1, cli_call.call_count)
+        api_call.assert_not_called()
+        self.assertEqual("cli", state["llm_backend"]["backend"])
+        self.assertEqual(0, state["cursor"])
 
     def test_window_without_any_backend_exits(self):
         """No CLI, no API and no agent handoff stops before the first round."""

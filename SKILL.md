@@ -67,7 +67,7 @@ Reply in the user's language. For `done`, give the title, `output_file`, the rou
    Output file: <output_file>
 ```
 
-If you answered `needs_agent_text` requests, say so: setting up an LLM backend (`llm_*` in `config.yaml`) lets later runs finish without you.
+If you answered `needs_agent_text` requests, say so: a working agent CLI (`llm_agent_cli` in `config.yaml`), or the paid API (`llm_backend: api` with `llm_api_key`, `llm_base_url` and `llm_model`), lets later runs finish without you.
 
 Product decisions you may need to explain:
 

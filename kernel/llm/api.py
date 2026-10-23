@@ -439,6 +439,11 @@ def _execute_llm_request(api_key: str, base_url: str, model: str, messages: list
         ) from e
 
 
+def backoff_delay(attempt: int, backoff_sec: float) -> float:
+    """Seconds to wait before retry number `attempt` (1-based): exponential, with jitter."""
+    return (backoff_sec * (2 ** (attempt - 1))) + random.uniform(0, max(backoff_sec, 0.1))
+
+
 def call_llm_api(api_key: str, base_url: str, model: str, messages: list,
                  api_format: str = "openai", max_tokens: int = 8192,
                  temperature: float = 0.3, timeout_sec: int = 120,
@@ -492,7 +497,7 @@ def call_llm_api(api_key: str, base_url: str, model: str, messages: list,
 
             # Retries are bounded and back off exponentially so transient provider
             # failures do not immediately abort the whole chunk run.
-            sleep_sec = (backoff_sec * (2 ** (attempt - 1))) + random.uniform(0, max(backoff_sec, 0.1))
+            sleep_sec = backoff_delay(attempt, backoff_sec)
             print(
                 f"Retrying LLM request after {error.error_type} in {sleep_sec:.1f}s "
                 f"(attempt {attempt}/{max_retries}, url={error.request_url or build_api_url(base_url, api_format)})",

@@ -9,6 +9,8 @@ import time
 import urllib.parse
 from pathlib import Path
 
+from kernel.files import atomic_write_text
+
 
 def _yaml_string(value: str) -> str:
     # Intentionally quote every scalar. The frontmatter should favor predictable
@@ -56,6 +58,27 @@ def sanitize_filename(title: str) -> str:
     if len(sanitized) > 200:
         sanitized = sanitized[:200]
     return sanitized
+
+
+def frontmatter_url(path: Path) -> str:
+    """The `url:` an article's YAML frontmatter names, or '' (no frontmatter, no url, unreadable)."""
+    try:
+        with open(path, encoding="utf-8") as handle:
+            if handle.readline().strip() != "---":
+                return ""
+            for line in handle:
+                if line.strip() == "---":
+                    break
+                key, _, value = line.partition(":")
+                if key.strip() == "url":
+                    value = value.strip()
+                    try:
+                        return str(json.loads(value)) if value.startswith('"') else value.strip("'")
+                    except ValueError:
+                        return value
+    except (OSError, UnicodeDecodeError):
+        pass
+    return ""
 
 
 def _is_valid_compact_date_fragment(value: str) -> bool:
@@ -173,10 +196,9 @@ def assemble_final(optimized_text_path: str, output_file: str,
     # Assemble final content
     final_content = '\n'.join(frontmatter_lines) + '\n' + '\n'.join(header_lines) + optimized_text + '\n' + '\n'.join(footer_lines)
     
-    # Write output file
+    # Through a dot-prefixed temp file and a rename: Obsidian never sees half an article.
     out_path = Path(output_file)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text(final_content, encoding='utf-8')
+    atomic_write_text(out_path, final_content)
     
     return {
         "success": True,

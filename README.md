@@ -86,7 +86,7 @@ Environment variables:
 
 With `llm_backend: auto` (the default) the text goes to an agent CLI chosen in this order: `YT_TRANSCRIPT_AGENT_CLI`, then `llm_agent_cli`, then the CLI this video's run already used, then the agent that is running `run` (Claude Code, Codex, OpenCode, pi, Gemini CLI or Cursor, detected from its environment variables). `llm_agent_cli` takes one of those names or a full non-interactive command (`{prompt}` marks where the prompt goes; otherwise it is sent on stdin). The CLI runs in an empty temporary directory and must answer a short probe first.
 
-If no CLI is found or the probe fails, the LLM API is used when `llm_api_key`, `llm_base_url` and `llm_model` are all set. A CLI that fails in the middle of a run also switches to the API when it is set. `llm_backend: api` skips the CLI. When no backend is reachable, `run` hands each text request to the host agent (`needs_agent_text`), which writes the answer itself and reruns.
+A CLI request that fails is retried `llm_cli_max_retries` times, waiting longer each time (`llm_backoff_sec`, as for the API). If it still fails, `run` stops with a retryable `llm_error`, and the rerun continues at the round that failed. `auto` never moves to the LLM API on its own, because the API costs money: `llm_backend: api` (with `llm_api_key`, `llm_base_url` and `llm_model`) uses it instead of the CLI. When no CLI is reachable, `run` hands each text request to the host agent (`needs_agent_text`), which writes the answer itself and reruns.
 
 #### YouTube cookies and bot checks
 
@@ -168,7 +168,7 @@ Known limitation: macOS (and many Linux systems) empties `/tmp` on restart, so a
 
 ### Output
 
-The article is written to `<output_dir>/<upload date>. <title>.md` (for example `2026-10-22. Some Title.md`). It starts with YAML frontmatter (`title`, `source`, `url`, `channel`, `author`, `date`, `created`, `type`, `bilingual`, `duration`, `transcript_source`, `tags`, `via`), then a header with the title, a channel link, the language mode and the duration, then the text with `##` section headings, and ends with a one-line footer. In bilingual articles each English paragraph is followed by its Chinese translation, and each heading is an English `##` line followed by a Chinese one. The frontmatter suits an Obsidian vault.
+The article is written to `<output_dir>/<upload date>. <title>.md` (for example `2026-10-22. Some Title.md`). If a file of that name already holds another video's article (its frontmatter `url` names another video, or none), the new one gets ` (<video_id>)` before `.md`; a rerun of the same video replaces its own article. The file is written to a hidden temp file first and then renamed, so the notes app never sees half an article. It starts with YAML frontmatter (`title`, `source`, `url`, `channel`, `author`, `date`, `created`, `type`, `bilingual`, `duration`, `transcript_source`, `tags`, `via`), then a header with the title, a channel link, the language mode and the duration, then the text with `##` section headings, and ends with a one-line footer. In bilingual articles each English paragraph is followed by its Chinese translation, and each heading is an English `##` line followed by a Chinese one. The frontmatter suits an Obsidian vault.
 
 ### Development
 
@@ -318,7 +318,7 @@ cp config.example.yaml config.yaml
 
 `llm_backend: auto`（默认）时，文字交给一个 agent 命令行，按这个顺序选：`YT_TRANSCRIPT_AGENT_CLI`，然后 `llm_agent_cli`，然后这个视频的运行已经用过的命令行，最后是正在运行 `run` 的 agent（Claude Code、Codex、OpenCode、pi、Gemini CLI 或 Cursor，从它的环境变量识别）。`llm_agent_cli` 可以写上面的名字，也可以写一条完整的非交互命令（`{prompt}` 标出 prompt 的位置，否则 prompt 从 stdin 传入）。命令行在一个空的临时目录里运行，并且要先通过一次简短的探测。
 
-找不到命令行或探测失败时，如果 `llm_api_key`、`llm_base_url` 和 `llm_model` 都设置了，就用 LLM API。命令行在运行中途失败，也会在设置了 API 时改用 API。`llm_backend: api` 不用命令行。没有任何可用后端时，`run` 把每个文字请求交给宿主 agent（`needs_agent_text`），由它自己写出答案再重跑。
+命令行请求失败时会重试 `llm_cli_max_retries` 次，每次等得更久（`llm_backoff_sec`，和 API 一样）。仍然失败，`run` 就以可重试的 `llm_error` 停下，重跑时从失败的那一轮继续。`auto` 从不自己改用 LLM API，因为 API 要花钱：要用 API，就设 `llm_backend: api`（再配好 `llm_api_key`、`llm_base_url` 和 `llm_model`），它会取代命令行。没有可用的命令行时，`run` 把每个文字请求交给宿主 agent（`needs_agent_text`），由它自己写出答案再重跑。
 
 #### YouTube cookies 和机器人验证
 
@@ -400,7 +400,7 @@ URL 也可以是 11 位的视频 id。
 
 ### 输出
 
-文章写到 `<output_dir>/<上传日期>. <标题>.md`（例如 `2026-10-22. 某个标题.md`）。开头是 YAML frontmatter（`title`、`source`、`url`、`channel`、`author`、`date`、`created`、`type`、`bilingual`、`duration`、`transcript_source`、`tags`、`via`），然后是标题、频道链接、语言模式和时长组成的头部，然后是带 `##` 小标题的正文，最后是一行页脚。双语文章里每个英文段落后面紧跟它的中文译文，每个小标题是一行英文 `##` 加一行中文 `##`。frontmatter 适合放进 Obsidian 库。
+文章写到 `<output_dir>/<上传日期>. <标题>.md`（例如 `2026-10-22. 某个标题.md`）。同名文件里已经是别的视频的文章时（它 frontmatter 里的 `url` 是另一个视频，或者没有 `url`），新文章在 `.md` 前加上 ` (<video_id>)`；同一个视频重跑则覆盖它自己的旧文章。文件先写到一个隐藏的临时文件再改名，所以笔记软件不会读到半篇文章。开头是 YAML frontmatter（`title`、`source`、`url`、`channel`、`author`、`date`、`created`、`type`、`bilingual`、`duration`、`transcript_source`、`tags`、`via`），然后是标题、频道链接、语言模式和时长组成的头部，然后是带 `##` 小标题的正文，最后是一行页脚。双语文章里每个英文段落后面紧跟它的中文译文，每个小标题是一行英文 `##` 加一行中文 `##`。frontmatter 适合放进 Obsidian 库。
 
 ### 开发
 

@@ -71,6 +71,8 @@ USAGE_EXIT_CODE = 2
 STATE_FILE = "state.json"
 # Video locks live outside the work dirs, which `cleanup` and `--restart` delete.
 LOCKS_DIR = ".locks"
+# Machine-wide, in kernel.locks.machine_dir(): held while an article's name is chosen and written.
+ARTICLES_LOCK = "articles.lock"
 METADATA_FILE = "metadata.json"
 CHAPTERS_FILE = "chapters.json"
 SOURCE_DIR = "source"
@@ -220,6 +222,19 @@ def parse_video_id(url: str) -> str:
 
 def canonical_url(video_id: str) -> str:
     return f"https://www.youtube.com/watch?v={video_id}"
+
+
+def article_path(folder: Path, name: str, video_id: str) -> Path:
+    """`<name>.md`, unless that file is another video's article: then `<name> (<video_id>).md`.
+
+    The frontmatter `url:` says whose article an existing file is; a file that
+    names no video counts as someone else's. A rerun of the same video
+    overwrites its own article.
+    """
+    path = folder / f"{name}.md"
+    if path.exists() and parse_video_id(kernel_assemble.frontmatter_url(path)) != video_id:
+        return folder / f"{name} ({video_id}).md"
+    return path
 
 
 def iso_date(upload_date: str) -> str:
@@ -987,7 +1002,8 @@ class _Run:
             error_type = str(result.get("error") or "")
             message = str(result.get("message") or "text processing failed")
             reason = "llm_timeout" if "timeout" in error_type.lower() else "llm_error"
-            raise Stop("failed", reason, message, retryable=True)
+            raise Stop("failed", reason, f"{message} (rerun next_command to continue where it stopped)",
+                       retryable=True)
         handoff.clear()
         record["outputs"] = [TEXT_DIR]
 
@@ -1030,20 +1046,28 @@ class _Run:
         meta = self.state["metadata"]
         date = iso_date(meta.get("upload_date", ""))
         title = kernel_assemble.sanitize_filename(str(meta.get("title") or "")).strip() or self.video_id
-        output_file = Path(output_dir).expanduser() / (f"{date}. {title}.md" if date else f"{title}.md")
         mode = self.state["route"]["mode"]
-        kernel_assemble.assemble_final(
-            str(self.path(OPTIMIZED_FILE)),
-            str(output_file),
-            title=str(meta.get("title") or ""),
-            source=self.url,
-            channel=str(meta.get("channel") or ""),
-            date=str(meta.get("upload_date") or ""),
-            created=date,
-            duration=int(meta.get("duration") or 0),
-            transcript_source=SOURCE_LABELS[self.state["route"]["source"]],
-            bilingual=mode == "bilingual",
-        )
+        # Choosing the name and writing under one machine-wide lock: two videos with the
+        # same title finishing at once cannot both take the free name.
+        lock = locks.FileLock(locks.machine_dir() / ARTICLES_LOCK)
+        lock.acquire(video_id=self.video_id)
+        try:
+            output_file = article_path(Path(output_dir).expanduser(), f"{date}. {title}" if date else title,
+                                       self.video_id)
+            kernel_assemble.assemble_final(
+                str(self.path(OPTIMIZED_FILE)),
+                str(output_file),
+                title=str(meta.get("title") or ""),
+                source=self.url,
+                channel=str(meta.get("channel") or ""),
+                date=str(meta.get("upload_date") or ""),
+                created=date,
+                duration=int(meta.get("duration") or 0),
+                transcript_source=SOURCE_LABELS[self.state["route"]["source"]],
+                bilingual=mode == "bilingual",
+            )
+        finally:
+            lock.release()
         self.state["output_file"] = str(output_file.absolute())
         record["outputs"] = [self.state["output_file"]]
 

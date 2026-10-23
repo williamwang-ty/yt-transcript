@@ -2,7 +2,7 @@
 
 YouTube meters requests per machine (its IP, or the account in the cookies),
 not per process, so these controls are machine-wide and live outside the work
-root, in `/tmp/yt-transcript/.locks/` (`$YT_TRANSCRIPT_LOCK_DIR` for tests):
+root, in the machine lock directory (`kernel.locks.machine_dir`):
 
 - `youtube.lock`: every yt-dlp call, and the yt-dlp update, runs while holding
   it. One yt-dlp at a time means yt-dlp's own pacing (`-t sleep`) paces the
@@ -19,15 +19,13 @@ root, in `/tmp/yt-transcript/.locks/` (`$YT_TRANSCRIPT_LOCK_DIR` for tests):
 from __future__ import annotations
 
 import json
-import os
 import time
 from datetime import datetime
 from pathlib import Path
 
 from kernel.files import atomic_write_text
+from kernel.locks import LOCK_DIR_ENV, machine_dir as lock_dir  # noqa: F401 - LOCK_DIR_ENV for callers
 
-LOCK_DIR_ENV = "YT_TRANSCRIPT_LOCK_DIR"
-DEFAULT_LOCK_DIR = "/tmp/yt-transcript/.locks"
 LOCK_FILE = "youtube.lock"
 REFUSAL_FILE = "youtube_rate_limit.json"
 
@@ -43,10 +41,6 @@ PROBLEMS = (
 )
 # Problems with this machine's standing at YouTube rather than with one video.
 SESSION_PROBLEMS = ("rate_limited", "bot_check")
-
-
-def lock_dir() -> Path:
-    return Path(os.environ.get(LOCK_DIR_ENV) or DEFAULT_LOCK_DIR).expanduser()
 
 
 def lock_path() -> Path:

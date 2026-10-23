@@ -1,5 +1,6 @@
 """Regression tests for the quality gate, the glossary and the atomic file write."""
 
+import signal
 import threading
 
 from tests._support import *
@@ -46,6 +47,38 @@ class AtomicWriteTests(unittest.TestCase):
             self.assertEqual(len(set(sources)), 2, sources)
             self.assertEqual(target.read_text(encoding="utf-8"), '{"writer":"a"}')
             self.assertEqual([path.name for path in Path(tmpdir).iterdir()], ["state.json"])
+
+    def test_an_article_killed_mid_write_leaves_no_half_file(self):
+        """A process killed between writing and renaming leaves the old article whole and only a dot file."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            folder = Path(tmpdir)
+            optimized = folder / "optimized.md"
+            optimized.write_text("## Part\n\n" + "正文。" * 20000, encoding="utf-8")
+            articles = folder / "articles"
+            articles.mkdir()
+            target = articles / "2026-10-01. Some Talk.md"
+            target.write_text("the earlier article\n", encoding="utf-8")
+            # The child dies (SIGKILL) once the whole text is in the temp file, before the rename.
+            child = (
+                "import os, signal, sys\n"
+                "from kernel import files\n"
+                "from kernel.text import assemble\n"
+                "files.os.fsync = lambda fd: os.kill(os.getpid(), signal.SIGKILL)\n"
+                "assemble.assemble_final(sys.argv[1], sys.argv[2], title='Some Talk')\n"
+            )
+            proc = subprocess.run([sys.executable, "-c", child, str(optimized), str(target)],
+                                  cwd=str(PROJECT_ROOT), capture_output=True, text=True, timeout=60)
+            self.assertEqual(-signal.SIGKILL, proc.returncode, proc.stderr)
+            self.assertEqual("the earlier article\n", target.read_text(encoding="utf-8"))
+            visible = [path.name for path in articles.iterdir() if not path.name.startswith(".")]
+            self.assertEqual([target.name], visible)
+
+            # Without the kill the article is replaced in one step, with a normal file mode.
+            kernel_assemble.assemble_final(str(optimized), str(target), title="Some Talk")
+            self.assertTrue(target.read_text(encoding="utf-8").startswith("---\ntitle: \"Some Talk\""))
+            umask = os.umask(0)
+            os.umask(umask)
+            self.assertEqual(0o666 & ~umask, target.stat().st_mode & 0o777)
 
 
 class GlossaryTests(unittest.TestCase):

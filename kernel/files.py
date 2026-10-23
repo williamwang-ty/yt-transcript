@@ -14,6 +14,10 @@ def atomic_write_text(path: Path, content: str) -> None:
     fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent), text=True)
     tmp_path = Path(tmp_name)
     try:
+        # mkstemp creates the file 0600; give it the mode a plain write would.
+        umask = os.umask(0)
+        os.umask(umask)
+        os.fchmod(fd, 0o666 & ~umask)
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             handle.write(content)
             handle.flush()

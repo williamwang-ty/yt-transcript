@@ -2,8 +2,8 @@
 
 With `llm_backend: auto`, chunk requests go to the command-line tool of the
 agent that is running the skill (Claude Code, Codex, ...), so long videos use
-the same model family and subscription as the calling agent. The configured
-`llm_*` API stays as the fallback. `llm_backend: api` keeps the old behavior.
+the same model family and subscription as the calling agent. Auto mode never
+moves to the paid `llm_*` API on its own; `llm_backend: api` uses it.
 """
 
 from __future__ import annotations
@@ -12,6 +12,7 @@ import os
 import shlex
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 
@@ -21,7 +22,7 @@ from kernel.config import (
     DEFAULT_CLI_TIMEOUT_SEC,
     normalize_backend_mode,
 )
-from kernel.llm.api import LLMRequestError
+from kernel.llm.api import LLMRequestError, backoff_delay
 
 AGENT_CLI_ENV_VAR = "YT_TRANSCRIPT_AGENT_CLI"
 PROMPT_PLACEHOLDER = "{prompt}"
@@ -160,16 +161,21 @@ def build_cli_invocation(command: list, prompt: str) -> tuple[list, str | None]:
 
 
 def call_cli_llm(command: list, prompt: str, *, timeout_sec: int = DEFAULT_CLI_TIMEOUT_SEC,
-                 max_retries: int = DEFAULT_CLI_MAX_RETRIES, strip_env=(), agent: str = "",
-                 runner=subprocess.run) -> dict:
-    """Run one prompt through an agent CLI; result mirrors `call_llm_api`."""
+                 max_retries: int = DEFAULT_CLI_MAX_RETRIES, backoff_sec: float = 1.5, strip_env=(),
+                 agent: str = "", runner=subprocess.run, sleep=time.sleep) -> dict:
+    """Run one prompt through an agent CLI; result mirrors `call_llm_api`.
+
+    A retryable failure is retried up to `max_retries` times, after the same
+    exponential backoff the API path uses.
+    """
     request_url = f"cli:{agent or (command[0] if command else 'unknown')}"
     argv, stdin_text = build_cli_invocation(command, prompt)
     child_env = {key: value for key, value in os.environ.items() if key not in set(strip_env or ())}
     attempt_history = []
     last_error = None
 
-    for attempt in range(1, max(0, int(max_retries)) + 2):
+    max_retries = max(0, int(max_retries))
+    for attempt in range(1, max_retries + 2):
         started = time.monotonic()
         try:
             # Run in an empty directory so the agent has no project files to
@@ -250,8 +256,12 @@ def call_cli_llm(command: list, prompt: str, *, timeout_sec: int = DEFAULT_CLI_T
             "streaming_used": False,
             "retryable": last_error.retryable,
         })
-        if not last_error.retryable:
+        if not last_error.retryable or attempt > max_retries:
             break
+        delay = backoff_delay(attempt, backoff_sec)
+        print(f"Retrying {request_url} after {last_error.error_type} in {delay:.1f}s "
+              f"(attempt {attempt}/{max_retries})", file=sys.stderr)
+        sleep(delay)
 
     last_error.attempts = len(attempt_history)
     last_error.attempt_history = attempt_history
@@ -266,12 +276,14 @@ def api_is_configured(config: dict) -> bool:
 
 def resolve_llm_backend(config: dict, *, env: dict | None = None, probe: bool = True,
                         previous: dict | None = None, which=shutil.which, runner=subprocess.run) -> dict:
-    """Pick the text backend: the host agent's CLI in auto mode, else the API.
+    """Pick the text backend: the host agent's CLI in auto mode, the API in api mode.
 
     Selection order in auto mode: an explicit command (`YT_TRANSCRIPT_AGENT_CLI`
     or `llm_agent_cli`), a backend recorded by an earlier run of the same work
     dir, then the detected host agent. A CLI is used only after a probe call
-    returns text; otherwise the API is used.
+    returns text; otherwise there is no backend ("none": the run hands its
+    requests to the agent). Auto mode never picks the API, because the API costs
+    money: that takes an explicit `llm_backend: api`.
     """
     config = config or {}
     env = os.environ if env is None else env
@@ -279,7 +291,7 @@ def resolve_llm_backend(config: dict, *, env: dict | None = None, probe: bool = 
     api_ready = api_is_configured(config)
     decision = {
         "mode": mode,
-        "backend": "api" if api_ready else "none",
+        "backend": "api" if mode == "api" and api_ready else "none",
         "agent": "",
         "agent_source": "",
         "command": [],
@@ -344,7 +356,7 @@ def resolve_llm_backend(config: dict, *, env: dict | None = None, probe: bool = 
         )
         probe_record["ok"] = True
         probe_record["latency_ms"] = result.get("latency_ms")
-    except Exception as error:  # noqa: BLE001 - any failure means "use the API"
+    except Exception as error:  # noqa: BLE001 - any failure means "no CLI"
         probe_record["error"] = str(error)
     decision["probe"] = probe_record
     if probe_record["ok"]:

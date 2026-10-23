@@ -1380,7 +1380,7 @@ def process_window(work_dir: str, prompt_name: str, extra_instruction: str = "",
         print(
             "Error: no LLM backend available. "
             f"{backend_decision['fallback_reason'] or 'Agent CLI unavailable'}; "
-            "and the fallback API is not configured (set llm_api_key, llm_base_url, llm_model in config.yaml)",
+            "to use the API instead, set llm_backend: api with llm_api_key, llm_base_url and llm_model",
             file=sys.stderr,
         )
         sys.exit(1)
@@ -1392,8 +1392,6 @@ def process_window(work_dir: str, prompt_name: str, extra_instruction: str = "",
             "window requests are handed to the agent.")
     elif use_cli:
         log(f"ℹ️ Window requests use the {backend_decision['agent']} CLI ({' '.join(backend_decision['command'])}).")
-    elif backend_decision["mode"] == "auto" and backend_decision["fallback_reason"]:
-        log(f"ℹ️ Window requests use the configured API: {backend_decision['fallback_reason']}")
 
     glossary_payload = kernel_glossary.load_glossary(work_dir)
     if not glossary_payload and prompt_name == "cleanup_zh":
@@ -1405,31 +1403,20 @@ def process_window(work_dir: str, prompt_name: str, extra_instruction: str = "",
     stream_mode = kernel_config.normalize_stream_mode(config.get("llm_stream", "auto"))
 
     def call_llm(prompt_text: str, max_output_tokens: int) -> dict:
-        nonlocal use_cli, request_url
         if use_handoff:
             return agent_handoff(prompt_text, max_output_tokens)
         if use_cli:
-            try:
-                return kernel_agent_cli.call_cli_llm(
-                    backend_decision["command"],
-                    prompt_text,
-                    timeout_sec=params["cli_timeout_sec"],
-                    max_retries=cli_max_retries,
-                    strip_env=backend_decision.get("strip_env", []),
-                    agent=backend_decision["agent"],
-                )
-            except LLMRequestError as error:
-                if not backend_decision["api_configured"]:
-                    raise
-                use_cli = False
-                request_url = api_request_url
-                backend_decision["backend"] = "api"
-                backend_decision["fallback_reason"] = f"Agent CLI failed mid-run: {error}"
-                state["llm_backend"] = backend_decision
-                warning = (f"⚠️ {backend_decision['agent']} CLI failed ({error.error_type}); "
-                           "switching the remaining window rounds to the configured API.")
-                warnings.append(warning)
-                log(warning)
+            # A CLI that still fails after its retries stops the run (retryable);
+            # it never hands the rest to the paid API.
+            return kernel_agent_cli.call_cli_llm(
+                backend_decision["command"],
+                prompt_text,
+                timeout_sec=params["cli_timeout_sec"],
+                max_retries=cli_max_retries,
+                backoff_sec=config.get("llm_backoff_sec", 1.5),
+                strip_env=backend_decision.get("strip_env", []),
+                agent=backend_decision["agent"],
+            )
         return kernel_llm_api.call_llm_api(
             api_key=config.get("llm_api_key", ""),
             base_url=config.get("llm_base_url", ""),

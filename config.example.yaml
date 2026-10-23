@@ -58,12 +58,13 @@ yt_dlp_cookies_file: ""
 #       Codex `codex exec`, OpenCode, pi, Gemini CLI, Cursor), detected from the
 #       environment or named in llm_agent_cli below (the YT_TRANSCRIPT_AGENT_CLI
 #       environment variable wins over both). The CLI runs in an empty temporary
-#       directory and must answer a short probe first; if it can't, or fails
-#       mid-run, the API below is used instead when it is configured.
+#       directory and must answer a short probe first. A failed request is
+#       retried llm_cli_max_retries times with the llm_backoff_sec backoff; if it
+#       still fails, `run` stops with a retryable llm_error and continues there
+#       on the rerun. auto never moves to the paid API below on its own.
+#       With no working CLI, `run` hands each request to the calling agent
+#       (`needs_agent_text`).
 # api:  skip the CLI and use the API below.
-# With no working CLI and no configured API (llm_api_key, llm_base_url and
-# llm_model all set), `run` hands each request to the calling agent
-# (`needs_agent_text`).
 llm_backend: "auto"
 # Optional fixed agent for auto mode: a name above or a full non-interactive
 # command (use {prompt} where the prompt goes; otherwise it is sent on stdin).
@@ -73,15 +74,14 @@ llm_cli_max_retries: 1
 llm_cli_probe_timeout_sec: 120
 
 # LLM API Configuration
-# Fallback for llm_backend=auto, and the only backend for llm_backend=api.
-# Leave llm_api_key empty to not use an API.
+# Used only with llm_backend: api (an API costs money; auto never picks it).
 # Format: "openai" (OpenAI-compatible) or "anthropic" (Anthropic Messages API)
 llm_api_format: "openai"
 llm_api_key: ""
 # Can be either provider root URL or a /v1 URL; the tool normalizes both.
 llm_base_url: "https://api.deepseek.com"
 llm_model: "deepseek-v4-pro"
-# Request hardening for API requests
+# Request hardening for API requests (llm_backoff_sec also paces the CLI retries)
 llm_timeout_sec: 180
 llm_max_retries: 3
 llm_backoff_sec: 1.5
