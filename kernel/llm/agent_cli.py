@@ -2,8 +2,10 @@
 
 With `llm_backend: auto`, chunk requests go to the command-line tool of the
 agent that is running the skill (Claude Code, Codex, ...), so long videos use
-the same model family and subscription as the calling agent. Auto mode never
-moves to the paid `llm_*` API on its own; `llm_backend: api` uses it.
+the same model family and subscription as the calling agent. When that CLI
+cannot be used and the paid `llm_*` API is configured, `llm_api_fallback`
+decides: ask the user (the default), use the API, or never use it.
+`llm_backend: api` always uses the API.
 """
 
 from __future__ import annotations
@@ -27,6 +29,21 @@ from kernel.llm.api import LLMRequestError, backoff_delay
 AGENT_CLI_ENV_VAR = "YT_TRANSCRIPT_AGENT_CLI"
 PROMPT_PLACEHOLDER = "{prompt}"
 CLI_PROBE_PROMPT = "Reply with OK only."
+
+
+class ApiFallbackNeeded(Exception):
+    """The agent CLI cannot be used, the API is configured, and the user has to say whether to use it.
+
+    `case` is "cli_unavailable" (no CLI found, or its probe failed) or
+    "cli_failed" (a request still failed after its retries).
+    """
+
+    def __init__(self, case: str, detail: str, agent: str = ""):
+        super().__init__(detail)
+        self.case = case
+        self.detail = detail
+        self.agent = agent
+
 
 # Ordered: the first agent whose marker variable is set wins. Markers are the
 # variables each host sets on the shell commands it runs. Commands either read
@@ -281,9 +298,9 @@ def resolve_llm_backend(config: dict, *, env: dict | None = None, probe: bool = 
     Selection order in auto mode: an explicit command (`YT_TRANSCRIPT_AGENT_CLI`
     or `llm_agent_cli`), a backend recorded by an earlier run of the same work
     dir, then the detected host agent. A CLI is used only after a probe call
-    returns text; otherwise there is no backend ("none": the run hands its
-    requests to the agent). Auto mode never picks the API, because the API costs
-    money: that takes an explicit `llm_backend: api`.
+    returns text; otherwise there is no backend ("none"). This never picks the
+    API in auto mode, because the API costs money: whether a run without a CLI
+    may use it is `llm_api_fallback`'s call, made by the caller.
     """
     config = config or {}
     env = os.environ if env is None else env

@@ -195,31 +195,95 @@ class AgentCliRegressionTests(unittest.TestCase):
         self.assertEqual(result["request_url"], "cli:claude-code")
         self.assertEqual(state["llm_backend"]["backend"], "cli")
 
-    def test_window_stops_when_cli_fails_mid_run_and_never_calls_the_api(self):
-        """A CLI failure after its retries fails the run where it stands, even with the API configured."""
-        cli_decision = {
+    def _api_result(self, **kwargs):
+        return {"text": tag_echo(kwargs["messages"][0]["content"]), "latency_ms": 5,
+                "request_url": "https://api.deepseek.com/chat/completions", "streaming_used": False,
+                "finish_reason": "stop", "usage": {}, "attempts": 1}
+
+    def _run_with_failing_cli(self, tmpdir, config, decision=None, **kwargs):
+        """process_window with a CLI that always fails (or the given decision); returns (result or error, calls)."""
+        decision = decision or {
             "mode": "auto", "backend": "cli", "agent": "codex", "agent_source": "detected",
             "command": ["codex", "exec", "-"], "strip_env": [], "api_configured": True,
             "probe": {"attempted": True, "ok": True}, "fallback_reason": "",
         }
         cli_error = kernel_llm_api.LLMRequestError("codex exited", error_type="cli_exit_error", retryable=True)
+        work_dir = self._make_work_dir(tmpdir)
+        outcome = None
+        with mock.patch.object(kernel_config, "load_config", return_value=config), \
+            mock.patch.object(agent_cli, "resolve_llm_backend", return_value=decision), \
+            mock.patch.object(agent_cli, "call_cli_llm", side_effect=cli_error) as cli_call, \
+            mock.patch.object(kernel_llm_api, "call_llm_api", side_effect=self._api_result) as api_call, \
+            mock.patch("sys.stderr", new_callable=io.StringIO):
+            try:
+                outcome = window.process_window(str(work_dir), "cleanup_zh", **kwargs)
+            except agent_cli.ApiFallbackNeeded as needed:
+                outcome = needed
+        return outcome, cli_call, api_call, window.load_window_state(str(work_dir))
 
+    def test_window_asks_before_moving_a_failing_cli_to_the_api(self):
+        """By default (llm_api_fallback: ask) a CLI failing mid-run stops the run for the user's answer."""
         with tempfile.TemporaryDirectory() as tmpdir:
-            work_dir = self._make_work_dir(tmpdir)
-            with mock.patch.object(kernel_config, "load_config", return_value=self._config()), \
-                mock.patch.object(agent_cli, "resolve_llm_backend", return_value=cli_decision), \
-                mock.patch.object(agent_cli, "call_cli_llm", side_effect=cli_error) as cli_call, \
-                mock.patch.object(kernel_llm_api, "call_llm_api") as api_call, \
-                mock.patch("sys.stderr", new_callable=io.StringIO):
-                result = window.process_window(str(work_dir), "cleanup_zh")
-            state = window.load_window_state(str(work_dir))
+            needed, cli_call, api_call, state = self._run_with_failing_cli(tmpdir, self._config())
+        self.assertIsInstance(needed, agent_cli.ApiFallbackNeeded)
+        self.assertEqual(("cli_failed", "codex"), (needed.case, needed.agent))
+        self.assertIn("codex exited", needed.detail)
+        self.assertEqual(1, cli_call.call_count)
+        api_call.assert_not_called()
+        self.assertEqual(0, state["cursor"])
 
+    def test_window_stops_when_cli_fails_and_llm_api_fallback_is_never(self):
+        """With llm_api_fallback: never, a CLI failure after its retries fails the run where it stands."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result, cli_call, api_call, state = self._run_with_failing_cli(
+                tmpdir, self._config(llm_api_fallback="never"))
         self.assertFalse(result["success"])
         self.assertEqual(("failed", "cli_exit_error"), (result["status"], result["error"]))
         self.assertEqual(1, cli_call.call_count)
         api_call.assert_not_called()
         self.assertEqual("cli", state["llm_backend"]["backend"])
         self.assertEqual(0, state["cursor"])
+
+    def test_window_moves_a_failing_cli_to_the_api_with_auto_or_this_videos_yes(self):
+        """llm_api_fallback: auto, or this video's answer over an ask/never config, moves the rest to the API."""
+        for config, answer in ((self._config(llm_api_fallback="auto"), None),
+                               (self._config(), "auto"), (self._config(llm_api_fallback="never"), "auto")):
+            with tempfile.TemporaryDirectory() as tmpdir:
+                result, cli_call, api_call, state = self._run_with_failing_cli(tmpdir, config, api_fallback=answer)
+            self.assertTrue(result["success"], result)
+            self.assertEqual(1, cli_call.call_count)
+            self.assertEqual(1, api_call.call_count)
+            self.assertEqual("api", state["llm_backend"]["backend"])
+            self.assertTrue(any("remaining requests use the configured API" in w for w in result["warnings"]))
+
+    def test_window_without_a_cli_asks_uses_or_skips_the_api(self):
+        """No usable CLI with the API configured: ask by default, the API with auto, nothing with never."""
+        none_decision = {
+            "mode": "auto", "backend": "none", "agent": "", "agent_source": "", "command": [],
+            "strip_env": [], "api_configured": True, "probe": {"attempted": False},
+            "fallback_reason": "No host agent detected",
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            needed, cli_call, api_call, _ = self._run_with_failing_cli(tmpdir, self._config(), dict(none_decision))
+        self.assertIsInstance(needed, agent_cli.ApiFallbackNeeded)
+        self.assertEqual(("cli_unavailable", "No host agent detected"), (needed.case, needed.detail))
+        api_call.assert_not_called()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result, cli_call, api_call, state = self._run_with_failing_cli(
+                tmpdir, self._config(llm_api_fallback="auto"), dict(none_decision))
+        self.assertTrue(result["success"], result)
+        cli_call.assert_not_called()
+        self.assertEqual(1, api_call.call_count)
+        self.assertEqual("api", state["llm_backend"]["backend"])
+
+        handoff = mock.Mock(side_effect=lambda prompt, tokens: self._cli_result(prompt))
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result, cli_call, api_call, _ = self._run_with_failing_cli(
+                tmpdir, self._config(), dict(none_decision), agent_handoff=handoff, api_fallback="never")
+        self.assertTrue(result["success"], result)
+        self.assertEqual(1, handoff.call_count)
+        api_call.assert_not_called()
 
     def test_window_without_any_backend_exits(self):
         """No CLI, no API and no agent handoff stops before the first round."""
@@ -236,6 +300,30 @@ class AgentCliRegressionTests(unittest.TestCase):
                 with self.assertRaises(SystemExit):
                     window.process_window(str(work_dir), "cleanup_zh")
         self.assertIn("no LLM backend available", stderr.getvalue())
+
+    def test_llm_api_fallback_is_read_and_saved_without_touching_the_rest_of_config(self):
+        """llm_api_fallback defaults to ask; set_config_value rewrites only its line and keeps the file mode."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "config.yaml"
+            original = (f'output_dir: "{tmpdir}"\n# llm_api_fallback: never\nllm_api_key: "secret"  # key\n'
+                        "llm_api_fallback: weird\n")
+            config_path.write_text(original, encoding="utf-8")
+            os.chmod(config_path, 0o600)
+            self.assertEqual("ask", kernel_config.load_config(str(config_path))["llm_api_fallback"])
+
+            kernel_config.set_config_value(str(config_path), "llm_api_fallback", "auto")
+            self.assertEqual(original.replace("llm_api_fallback: weird", "llm_api_fallback: auto"),
+                             config_path.read_text(encoding="utf-8"))
+            self.assertEqual(0o600, config_path.stat().st_mode & 0o777)
+            loaded = kernel_config.load_config(str(config_path))
+            self.assertEqual(("auto", "secret"), (loaded["llm_api_fallback"], loaded["llm_api_key"]))
+
+            # A config without the key gets it appended.
+            config_path.write_text(f'output_dir: "{tmpdir}"', encoding="utf-8")
+            kernel_config.set_config_value(str(config_path), "llm_api_fallback", "never")
+            self.assertEqual(f'output_dir: "{tmpdir}"\nllm_api_fallback: never\n',
+                             config_path.read_text(encoding="utf-8"))
+            self.assertEqual([], [p.name for p in Path(tmpdir).iterdir() if p.name.startswith(".")])
 
     def test_load_config_reads_backend_settings(self):
         """llm_backend and llm_agent_cli survive config loading; bad modes default to auto."""

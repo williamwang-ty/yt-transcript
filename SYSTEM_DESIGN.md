@@ -146,7 +146,7 @@ The agent never edits the state file and never runs internal stages by hand. If 
 | `source` | Detect the spoken language and pick the trusted track (6.3); download it and parse it into raw text and timed segments; score the subtitle quality and switch to Deepgram when the scoring rule calls for it; or transcribe with Deepgram directly | `source/`, `raw_text.txt`, `segments.json`, the route in `state.json` | `unsupported`, `needs_user` (preferred track refused, Deepgram key missing, or a yt-dlp case above), `failed` |
 | `normalize` | Build the normalized document: the cleaned text, the timed segments, and whether chunking follows the text or the segments | `normalized_document.json` | `failed` |
 | `plan` | Choose the text tasks for the mode (Chinese: `cleanup_zh`; bilingual: `structure_only`, then `translate_only`), mark the text `short` or `long`, and estimate its size (input tokens, expected rounds per task). Chinese Deepgram text gets an extra instruction to repair recognition artifacts | `plan.json` | `failed` |
-| `text` | Cut the normalized document into chunks, then run each planned task through the window executor (section 7); each task is recorded separately | `text/` | `needs_agent_text`, `in_progress`, `failed` |
+| `text` | Cut the normalized document into chunks, then run each planned task through the window executor (section 7); each task is recorded separately | `text/` | `needs_agent_text`, `needs_user` (`llm_api_fallback`, 6.8), `in_progress`, `failed` |
 | `merge` | Join the final task's paragraphs in order (the first task's with the outline's headings and whole sentences, 7.5 B), then drop headings, paragraphs and paragraph openings repeated at round seams | `optimized.md` | `failed` |
 | `verify` | Run the quality check against the raw text | `quality.json` | `failed` (hard failures only; warnings are recorded) |
 | `assemble` | Write the article: frontmatter, header, body and footer, named `yyyy-mm-dd. <title>.md` | the article in `output_dir` | `needs_user` (`output_dir_missing`), `failed` |
@@ -285,7 +285,7 @@ Every `run` call prints exactly one JSON object on stdout and exits with a fixed
 |---|---|---|---|
 | `done` | 0 | Article written: `output_file`, `title`, `route`, `warnings`, `llm`. After `--stage plan`: `stage`, `route`, `plan`, and a `message` when the route needs Deepgram | Report the result |
 | `failed` | 1 | A stage failed: `stage`, `reason`, `message`, `retryable` (plus `hard_failures` for a quality failure) | Rerun `next_command` once if `retryable`, otherwise report; may suggest an override |
-| `needs_user` | 3 | Only the user can fix it. `reason` is `cookies_required`, `login_required`, `rate_limited`, `deepgram_key_missing`, `tool_missing` or `output_dir_missing`; `message` says what to do. A refused preferred track adds `preferred_track`, `fallback_track` and `accept_command` | Tell the user; rerun after they act, or run `accept_command` if they accept the fallback |
+| `needs_user` | 3 | Only the user can fix it. `reason` is `cookies_required`, `login_required`, `rate_limited`, `deepgram_key_missing`, `tool_missing`, `output_dir_missing` or `llm_api_fallback`; `message` says what to do. A refused preferred track adds `preferred_track`, `fallback_track` and `accept_command`. `llm_api_fallback` (6.8) adds `choices`, each with `answer`, `label` and `command` | Tell the user; rerun after they act, run `accept_command` if they accept the fallback, or run the `command` of the choice they pick |
 | `unsupported` | 4 | The spoken language is not supported: `reason` `unsupported_language`, `language` | Report; do not retry. When `message` suggests `--mode` (the language was guessed from the title or detected by Deepgram) and the user says the video is Chinese or English, rerun with that `--mode` |
 | `needs_agent_text` | 5 | No LLM backend is reachable; one request is handed over: `task.name`, `task.prompt_file`, `task.output_file` | Answer it, write the answer to the output file, rerun `next_command` |
 | `in_progress` | 6 | The `--max-seconds` budget ran out at a safe point: `stage`, `progress` (`stages_done`, `text_tasks`). Also when the budget ran out while waiting for another run of the same video or for YouTube (6.4); `message` names the holder | Rerun `next_command` until the status changes |
@@ -342,6 +342,7 @@ The task is exactly one LLM request: an outline request, a window round, or a fa
 | `--from <stage>` | no | Mark that stage and every later stage not done, then run. For recovery and debugging. |
 | `--stage plan` | repeated in `next_command` | Stop after `plan`: the free routing check. |
 | `--max-seconds <n>` | repeated in `next_command` | Start no new stage or window round after n seconds, once the call has finished at least one; return `in_progress`. |
+| `--llm-api once\|always\|no\|never` | yes | Answer the `llm_api_fallback` question (6.8) for this video; `always` and `never` also save the answer in `config.yaml`. Redoes nothing. |
 | `--restart` | no | Delete the work directory, including saved overrides, and start over. |
 | `--config-path <file>` | repeated in `next_command` | Read another `config.yaml` instead of the one in the skill root. |
 
@@ -364,7 +365,17 @@ Every text request of the `text` stage goes through one request function in the 
 - **API**: an OpenAI-compatible or Anthropic Messages endpoint from config (`llm_api_format`, `llm_base_url`, `llm_model`, `llm_api_key`), with retries, backoff and optional streaming.
 - **agent handoff**: the `needs_agent_text` result above.
 
-With `llm_backend: auto` (the default), each task picks its backend when its window run starts: an explicit command first (the environment variable, then `llm_agent_cli`), else the CLI an earlier call of the same task used, else the host detected from its environment variables. The CLI is used only after it answers a one-line probe within `llm_cli_probe_timeout_sec`; otherwise the requests go to the agent handoff. A failed CLI request is retried `llm_cli_max_retries` times after the same exponential backoff the API uses (`llm_backoff_sec`); if it still fails, the run stops with a retryable `llm_error` and the rerun continues at that round. `auto` never moves to the API on its own, mid-run or after a failed probe, because the API costs money and several parallel videos would all switch at once: `llm_backend: api` uses the API and skips the CLI. `state.json` records the backend as `<agent>-cli`, `api` or `agent-handoff`.
+With `llm_backend: auto` (the default), each task picks its backend when its window run starts: an explicit command first (the environment variable, then `llm_agent_cli`), else the CLI an earlier call of the same task used, else the host detected from its environment variables. The CLI is used only after it answers a one-line probe within `llm_cli_probe_timeout_sec`. A failed CLI request is retried `llm_cli_max_retries` times after the same exponential backoff the API uses (`llm_backoff_sec`). `llm_backend: api` uses the API and skips the CLI. `state.json` records the backend as `<agent>-cli`, `api` or `agent-handoff`.
+
+In `auto` mode the CLI can still be unusable: none was found, its probe failed, or a request still failed after its retries. With the API configured, `llm_api_fallback` decides what happens then. The API is billed per request, and several parallel videos would all switch to it at once, so the default asks the user instead of choosing:
+
+| `llm_api_fallback` | No usable CLI | A CLI request still failing |
+|---|---|---|
+| `ask` (default) | `needs_user`, reason `llm_api_fallback`, with four `choices` (below) | the same, at that round |
+| `auto` | the API takes every request | the API takes the rest of the run, with a warning |
+| `never` | agent handoff | a retryable `llm_error`; the rerun continues at that round |
+
+Without the API configured, the run behaves as with `never`. The question lists four answers, each with its command (`next_command` plus `--llm-api <answer>`): `once` (the API for this video), `always` (the API, and `llm_api_fallback: auto` saved in `config.yaml`), `no` (not for this video) and `never` (not for this video, and `llm_api_fallback: never` saved). The video keeps its answer in `state.json` until `--restart`, like an override. Saving changes only that one line of `config.yaml` and keeps the file's mode, since the file holds API keys. Asking costs one stop per video at most, and a batch asks once (SKILL.md); the alternative, a silent switch, is how the paid API used to run up without anyone deciding.
 
 Nothing depends on a provider's special request fields. `max_tokens` is sent as a loose ceiling; truncation is detected through the window protocol's end line, which also works for CLI output that has no `finish_reason`. A reported `finish_reason` of `length` (or the provider's equivalent) only makes later rounds write less.
 
@@ -575,7 +586,7 @@ A response cut off before `<!--END-->` only loses its last paragraph: the cursor
 |---|---|
 | Chunks | `kernel/text/chunking.py` (`chunk_document`), called once by the `text` stage |
 | Units, rounds, sizing, validation, fallback, coverage | `kernel/text/window.py` (`process_window`, `run_window_rounds`, `parse_window_output`, `plan_round`, `update_sizing`) |
-| Backend choice per task; a failing CLI stops the run | the request function in `process_window`, over `kernel/llm/agent_cli.py` and `kernel/llm/api.py` |
+| Backend choice per task; what an unusable CLI does (`llm_api_fallback`) | the request function in `process_window`, over `kernel/llm/agent_cli.py` and `kernel/llm/api.py`; the question and its answers in `_Run.llm_api_question` and `_Run.answer_llm_api_question` |
 | Outline, chapter hints, terms per round | `kernel/text/outline.py` |
 | Headings and paragraph ends at sentence boundaries | `kernel/text/structure.py` (`structure_paragraphs`), called by `raw_stage_text` in `window.py` |
 | Transcript glossary and drift check | `kernel/text/glossary.py` |
@@ -887,7 +898,7 @@ agent 从不编辑状态文件，也从不手动执行内部阶段。需要不�
 | `source` | 判断口语语言并选出可信的字幕轨（6.3）；下载并解析成纯文本和带时间的片段；给字幕质量打分，评分规则要求时改用 Deepgram；或者直接用 Deepgram 转写 | `source/`、`raw_text.txt`、`segments.json`、`state.json` 里的路由 | `unsupported`、`needs_user`（首选字幕轨被拒、缺少 Deepgram 密钥，或上面的 yt-dlp 情况）、`failed` |
 | `normalize` | 生成规范化文档：清理后的文字、带时间的片段，以及分块时按文字切还是按片段切 | `normalized_document.json` | `failed` |
 | `plan` | 按模式选择文字任务（中文：`cleanup_zh`；双语：先 `structure_only` 再 `translate_only`），把文字标为 `short` 或 `long`，并估算规模（输入 token、每个任务预计轮数）。中文的 Deepgram 文字会多一条修复识别错误的说明 | `plan.json` | `failed` |
-| `text` | 先把规范化文档切成分块，再用窗口执行器（第 7 节）逐个执行规划好的任务；每个任务单独记账 | `text/` | `needs_agent_text`、`in_progress`、`failed` |
+| `text` | 先把规范化文档切成分块，再用窗口执行器（第 7 节）逐个执行规划好的任务；每个任务单独记账 | `text/` | `needs_agent_text`、`needs_user`（`llm_api_fallback`，6.8）、`in_progress`、`failed` |
 | `merge` | 按顺序拼接最后一个任务的段落（第一个任务的段落带上大纲的标题、句子完整，见 7.5 B），再去掉在轮次接缝处重复的标题、段落和段首 | `optimized.md` | `failed` |
 | `verify` | 对照原始文字做质量检查 | `quality.json` | `failed`（只有硬失败才停；警告只记录） |
 | `assemble` | 写出文章：frontmatter、头部、正文和结尾，文件名为 `yyyy-mm-dd. <标题>.md` | `output_dir` 里的文章 | `needs_user`（`output_dir_missing`）、`failed` |
@@ -1026,7 +1037,7 @@ agent 从不编辑状态文件，也从不手动执行内部阶段。需要不�
 |---|---|---|---|
 | `done` | 0 | 文章已写出：`output_file`、`title`、`route`、`warnings`、`llm`。`--stage plan` 之后：`stage`、`route`、`plan`，路由需要 Deepgram 时还有 `message` | 汇报结果 |
 | `failed` | 1 | 某个阶段失败：`stage`、`reason`、`message`、`retryable`（质量检查失败时还有 `hard_failures`） | `retryable` 时重跑一次 `next_command`，否则汇报；可以建议某个覆盖参数 |
-| `needs_user` | 3 | 只有用户能解决。`reason` 是 `cookies_required`、`login_required`、`rate_limited`、`deepgram_key_missing`、`tool_missing` 或 `output_dir_missing`；`message` 说明该怎么做。首选字幕轨被拒时还有 `preferred_track`、`fallback_track` 和 `accept_command` | 告诉用户；用户处理后重跑，用户接受备用字幕轨时执行 `accept_command` |
+| `needs_user` | 3 | 只有用户能解决。`reason` 是 `cookies_required`、`login_required`、`rate_limited`、`deepgram_key_missing`、`tool_missing`、`output_dir_missing` 或 `llm_api_fallback`；`message` 说明该怎么做。首选字幕轨被拒时还有 `preferred_track`、`fallback_track` 和 `accept_command`。`llm_api_fallback`（6.8）还有 `choices`，每项带 `answer`、`label` 和 `command` | 告诉用户；用户处理后重跑，用户接受备用字幕轨时执行 `accept_command`，或执行用户所选那一项的 `command` |
 | `unsupported` | 4 | 口语语言不受支持：`reason` 为 `unsupported_language`，还有 `language` | 汇报；不重试。`message` 建议了 `--mode`（语言是从标题推测的或由 Deepgram 自己识别的），而用户说视频其实是中文或英文时，用对应的 `--mode` 重跑 |
 | `needs_agent_text` | 5 | 没有可用的 LLM 后端，交出一次请求：`task.name`、`task.prompt_file`、`task.output_file` | 完成请求，把答案写进输出文件，重跑 `next_command` |
 | `in_progress` | 6 | `--max-seconds` 时间用完，在安全点停下：`stage`、`progress`（`stages_done`、`text_tasks`）。等同一视频的另一个运行或等 YouTube 时预算用完，也返回它（6.4），`message` 说明谁在占用 | 重跑 `next_command`，直到状态改变 |
@@ -1083,6 +1094,7 @@ agent 从不编辑状态文件，也从不手动执行内部阶段。需要不�
 | `--from <阶段>` | 否 | 把该阶段及之后的阶段标为未完成，然后运行。用于恢复和调试。 |
 | `--stage plan` | 写进 `next_command` | 做完 `plan` 就停：免费的路由检查。 |
 | `--max-seconds <n>` | 写进 `next_command` | n 秒后、且本次调用至少完成了一个阶段或一轮窗口时，不再开始新的阶段或新一轮窗口，返回 `in_progress`。 |
+| `--llm-api once\|always\|no\|never` | 是 | 回答这个视频的 `llm_api_fallback` 问题（6.8）；`always` 和 `never` 还会把回答记进 `config.yaml`。不重做任何阶段。 |
 | `--restart` | 否 | 删除工作目录（包括保存的覆盖参数），从头开始。 |
 | `--config-path <文件>` | 写进 `next_command` | 读取另一个 `config.yaml`，而不是 skill 根目录下的那个。 |
 
@@ -1105,7 +1117,17 @@ agent 从不编辑状态文件，也从不手动执行内部阶段。需要不�
 - **API**：配置里的 OpenAI 兼容接口或 Anthropic Messages 接口（`llm_api_format`、`llm_base_url`、`llm_model`、`llm_api_key`），带重试、退避和可选的流式响应。
 - **交给 agent**：上面的 `needs_agent_text` 结果。
 
-`llm_backend: auto`（默认）时，每个任务在它的窗口运行开始时选后端：先看明确指定的命令（先环境变量，再 `llm_agent_cli`），再看同一任务之前的调用用过的 CLI，最后根据环境变量识别宿主。CLI 要在 `llm_cli_probe_timeout_sec` 内答出一次一行的试调才会被使用；否则请求交给 agent。CLI 请求失败时，按 API 那条路同样的指数退避（`llm_backoff_sec`）重试 `llm_cli_max_retries` 次；仍然失败，运行就以可重试的 `llm_error` 停下，重跑时从那一轮继续。`auto` 从不自己改走 API，不管是运行中途还是试调失败，因为 API 要花钱，而且并行的几个视频会一起切过去：`llm_backend: api` 才用 API，并跳过 CLI。`state.json` 里把后端记为 `<agent>-cli`、`api` 或 `agent-handoff`。
+`llm_backend: auto`（默认）时，每个任务在它的窗口运行开始时选后端：先看明确指定的命令（先环境变量，再 `llm_agent_cli`），再看同一任务之前的调用用过的 CLI，最后根据环境变量识别宿主。CLI 要在 `llm_cli_probe_timeout_sec` 内答出一次一行的试调才会被使用。CLI 请求失败时，按 API 那条路同样的指数退避（`llm_backoff_sec`）重试 `llm_cli_max_retries` 次。`llm_backend: api` 用 API，并跳过 CLI。`state.json` 里把后端记为 `<agent>-cli`、`api` 或 `agent-handoff`。
+
+`auto` 模式下 CLI 仍可能用不了：没找到、试调失败，或者某个请求重试后仍然失败。配了 API 时，这时怎么办由 `llm_api_fallback` 决定。API 按请求收费，而且并行的几个视频会一起切过去，所以默认是问用户，而不是替用户选：
+
+| `llm_api_fallback` | 没有可用的 CLI | CLI 请求一直失败 |
+|---|---|---|
+| `ask`（默认） | `needs_user`，原因 `llm_api_fallback`，带四个 `choices`（见下） | 同样，停在那一轮 |
+| `auto` | 所有请求交给 API | 剩下的部分交给 API，并给出警告 |
+| `never` | 交给 agent | 可重试的 `llm_error`，重跑时从那一轮继续 |
+
+没配 API 时，行为和 `never` 一样。问题列出四个回答，每个都带着自己的命令（`next_command` 加上 `--llm-api <回答>`）：`once`（这个视频用 API）、`always`（用 API，并把 `llm_api_fallback: auto` 记进 `config.yaml`）、`no`（这个视频不用）和 `never`（这个视频不用，并记下 `llm_api_fallback: never`）。这个视频的回答像覆盖参数一样存进 `state.json`，直到 `--restart`。记进 `config.yaml` 时只改这一行，并保留文件权限，因为这个文件里有 API 密钥。问一次最多让每个视频停一次，批量时只问一次（SKILL.md）；另一种做法是悄悄切换，以前付费 API 的费用就是这样在没人决定的情况下涨上去的。
 
 不依赖任何提供方的特殊请求字段。`max_tokens` 只作为宽松的上限发送；截断通过窗口协议的结束行检测，没有 `finish_reason` 的命令行输出也适用。报告了 `finish_reason` 为 `length`（或提供方的同义值）时，只会让后面的轮次少写一些。
 
@@ -1315,7 +1337,7 @@ merge 阶段 -> verify 阶段 -> assemble 阶段
 |---|---|
 | 分块 | `kernel/text/chunking.py`（`chunk_document`），由 `text` 阶段调用一次 |
 | 单元、轮次、大小调整、校验、兜底、覆盖率 | `kernel/text/window.py`（`process_window`、`run_window_rounds`、`parse_window_output`、`plan_round`、`update_sizing`） |
-| 每个任务的后端选择；CLI 失败时停下 | `process_window` 里的请求函数，底层是 `kernel/llm/agent_cli.py` 和 `kernel/llm/api.py` |
+| 每个任务的后端选择；CLI 用不了时怎么办（`llm_api_fallback`） | `process_window` 里的请求函数，底层是 `kernel/llm/agent_cli.py` 和 `kernel/llm/api.py`；问题和回答在 `_Run.llm_api_question` 和 `_Run.answer_llm_api_question` |
 | 大纲、章节提示、每轮的术语 | `kernel/text/outline.py` |
 | 按句子边界放标题、收段落 | `kernel/text/structure.py`（`structure_paragraphs`），由 `window.py` 的 `raw_stage_text` 调用 |
 | 转录术语表和漂移检查 | `kernel/text/glossary.py` |

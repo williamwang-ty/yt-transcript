@@ -59,13 +59,21 @@ yt_dlp_cookies_file: ""
 #       environment or named in llm_agent_cli below (the YT_TRANSCRIPT_AGENT_CLI
 #       environment variable wins over both). The CLI runs in an empty temporary
 #       directory and must answer a short probe first. A failed request is
-#       retried llm_cli_max_retries times with the llm_backoff_sec backoff; if it
-#       still fails, `run` stops with a retryable llm_error and continues there
-#       on the rerun. auto never moves to the paid API below on its own.
-#       With no working CLI, `run` hands each request to the calling agent
-#       (`needs_agent_text`).
+#       retried llm_cli_max_retries times with the llm_backoff_sec backoff.
+#       When the CLI cannot be used (none found, the probe fails, or a request
+#       still fails after its retries) and the API below is configured,
+#       llm_api_fallback decides; without the API, a failing CLI stops `run` with
+#       a retryable llm_error (the rerun continues there), and with no CLI at all
+#       `run` hands each request to the calling agent (`needs_agent_text`).
 # api:  skip the CLI and use the API below.
 llm_backend: "auto"
+# What auto mode does then, since the API is billed per request: ask | auto | never
+# ask:   stop with needs_user and let the user choose: the API for this video,
+#        the API from now on, not this time, or never. `run --llm-api always` or
+#        `--llm-api never` saves the answer here.
+# auto:  use the API for the rest of that video's run, without asking.
+# never: never use it (a failing CLI gives llm_error; no CLI gives needs_agent_text).
+llm_api_fallback: ask
 # Optional fixed agent for auto mode: a name above or a full non-interactive
 # command (use {prompt} where the prompt goes; otherwise it is sent on stdin).
 llm_agent_cli: ""
@@ -74,7 +82,7 @@ llm_cli_max_retries: 1
 llm_cli_probe_timeout_sec: 120
 
 # LLM API Configuration
-# Used only with llm_backend: api (an API costs money; auto never picks it).
+# Used with llm_backend: api, and in auto mode as llm_api_fallback allows.
 # Format: "openai" (OpenAI-compatible) or "anthropic" (Anthropic Messages API)
 llm_api_format: "openai"
 llm_api_key: ""

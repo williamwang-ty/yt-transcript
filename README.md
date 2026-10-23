@@ -67,6 +67,7 @@ Then edit `config.yaml`: set `output_dir`, and add the Deepgram key and LLM API 
 | `yt_dlp_socket_timeout_sec`, `yt_dlp_retries`, `yt_dlp_extractor_retries` | yt-dlp timeouts and retries |
 | `yt_dlp_cookies_file`, `yt_dlp_cookies_from_browser` | YouTube cookies (see below) |
 | `llm_backend`, `llm_agent_cli`, `llm_cli_timeout_sec`, `llm_cli_max_retries`, `llm_cli_probe_timeout_sec` | Which LLM backend processes the text, and the agent CLI's limits |
+| `llm_api_fallback` | Whether `auto` may use the paid API when the CLI cannot be used: `ask` (default), `auto` or `never` |
 | `llm_api_format`, `llm_api_key`, `llm_base_url`, `llm_model`, `llm_timeout_sec`, `llm_max_retries`, `llm_backoff_sec`, `llm_stream` | The LLM API |
 | `window_*` | The sliding-window text processing (sizes, retries, the global outline) |
 | `chunk_*`, `output_ratio_*`, `max_output_tokens_*` | Per-task sizes: chunk targets, expected output/source ratio, and the `max_tokens` ceiling |
@@ -86,7 +87,11 @@ Environment variables:
 
 With `llm_backend: auto` (the default) the text goes to an agent CLI chosen in this order: `YT_TRANSCRIPT_AGENT_CLI`, then `llm_agent_cli`, then the CLI this video's run already used, then the agent that is running `run` (Claude Code, Codex, OpenCode, pi, Gemini CLI or Cursor, detected from its environment variables). `llm_agent_cli` takes one of those names or a full non-interactive command (`{prompt}` marks where the prompt goes; otherwise it is sent on stdin). The CLI runs in an empty temporary directory and must answer a short probe first.
 
-A CLI request that fails is retried `llm_cli_max_retries` times, waiting longer each time (`llm_backoff_sec`, as for the API). If it still fails, `run` stops with a retryable `llm_error`, and the rerun continues at the round that failed. `auto` never moves to the LLM API on its own, because the API costs money: `llm_backend: api` (with `llm_api_key`, `llm_base_url` and `llm_model`) uses it instead of the CLI. When no CLI is reachable, `run` hands each text request to the host agent (`needs_agent_text`), which writes the answer itself and reruns.
+A CLI request that fails is retried `llm_cli_max_retries` times, waiting longer each time (`llm_backoff_sec`, as for the API). `llm_backend: api` (with `llm_api_key`, `llm_base_url` and `llm_model`) uses the LLM API instead of the CLI. In `auto` mode the API is billed per request, so `auto` uses it only as `llm_api_fallback` says, and only when the CLI cannot be used: none was found, its probe failed, or a request still failed after its retries.
+
+- `ask` (the default): `run` stops with `needs_user` (reason `llm_api_fallback`) and lists four `choices`, each with the command that answers it: the API for this video, the API from now on, not this time, or never. "From now on" and "never" are saved as `llm_api_fallback` in `config.yaml`.
+- `auto`: the API takes over the rest of that video's run, with a warning.
+- `never`, or no API configured: a CLI that keeps failing stops `run` with a retryable `llm_error`, and the rerun continues at the round that failed. With no CLI at all, `run` hands each text request to the host agent (`needs_agent_text`), which writes the answer itself and reruns.
 
 #### YouTube cookies and bot checks
 
@@ -111,8 +116,9 @@ Give the agent a YouTube link, for example "Please transcribe this video: https:
 | Doing a video again from scratch | `--restart` |
 | Only checking which source and mode would be used, without spending anything | `--stage plan` |
 | Redoing the text after a quality failure | `--from text` |
+| An answer to the paid-API question: this video, from now on, not this time, never | `--llm-api once` / `always` / `no` / `never` |
 
-`--source` and `--mode` are remembered for the video until `--restart`.
+`--source`, `--mode` and `--llm-api` are remembered for the video until `--restart`.
 
 #### By hand
 
@@ -299,6 +305,7 @@ cp config.example.yaml config.yaml
 | `yt_dlp_socket_timeout_sec`、`yt_dlp_retries`、`yt_dlp_extractor_retries` | yt-dlp 的超时和重试 |
 | `yt_dlp_cookies_file`、`yt_dlp_cookies_from_browser` | YouTube cookies（见下文） |
 | `llm_backend`、`llm_agent_cli`、`llm_cli_timeout_sec`、`llm_cli_max_retries`、`llm_cli_probe_timeout_sec` | 文字交给哪个 LLM 后端，以及 agent 命令行的限制 |
+| `llm_api_fallback` | 命令行用不了时，`auto` 能不能改用付费 API：`ask`（默认，先问）、`auto` 或 `never` |
 | `llm_api_format`、`llm_api_key`、`llm_base_url`、`llm_model`、`llm_timeout_sec`、`llm_max_retries`、`llm_backoff_sec`、`llm_stream` | LLM API |
 | `window_*` | 滑动窗口文字处理（大小、重试、全局大纲） |
 | `chunk_*`、`output_ratio_*`、`max_output_tokens_*` | 每个任务的大小：分块目标、预期的输出/原文比例、`max_tokens` 上限 |
@@ -318,7 +325,11 @@ cp config.example.yaml config.yaml
 
 `llm_backend: auto`（默认）时，文字交给一个 agent 命令行，按这个顺序选：`YT_TRANSCRIPT_AGENT_CLI`，然后 `llm_agent_cli`，然后这个视频的运行已经用过的命令行，最后是正在运行 `run` 的 agent（Claude Code、Codex、OpenCode、pi、Gemini CLI 或 Cursor，从它的环境变量识别）。`llm_agent_cli` 可以写上面的名字，也可以写一条完整的非交互命令（`{prompt}` 标出 prompt 的位置，否则 prompt 从 stdin 传入）。命令行在一个空的临时目录里运行，并且要先通过一次简短的探测。
 
-命令行请求失败时会重试 `llm_cli_max_retries` 次，每次等得更久（`llm_backoff_sec`，和 API 一样）。仍然失败，`run` 就以可重试的 `llm_error` 停下，重跑时从失败的那一轮继续。`auto` 从不自己改用 LLM API，因为 API 要花钱：要用 API，就设 `llm_backend: api`（再配好 `llm_api_key`、`llm_base_url` 和 `llm_model`），它会取代命令行。没有可用的命令行时，`run` 把每个文字请求交给宿主 agent（`needs_agent_text`），由它自己写出答案再重跑。
+命令行请求失败时会重试 `llm_cli_max_retries` 次，每次等得更久（`llm_backoff_sec`，和 API 一样）。设 `llm_backend: api`（再配好 `llm_api_key`、`llm_base_url` 和 `llm_model`）就用 LLM API 取代命令行。`auto` 模式下 API 按请求收费，所以 `auto` 只按 `llm_api_fallback` 的设定用它，而且只在命令行用不了的时候：没找到命令行、探测失败，或者请求重试后仍然失败。
+
+- `ask`（默认）：`run` 以 `needs_user`（原因 `llm_api_fallback`）停下，列出四个 `choices`，每个都带着回答它的命令：这个视频用 API、以后都用 API、这次不用、永远不用。"以后都用"和"永远不用"会作为 `llm_api_fallback` 记进 `config.yaml`。
+- `auto`：这个视频剩下的部分交给 API，并给出警告。
+- `never`，或者没配 API：一直失败的命令行让 `run` 以可重试的 `llm_error` 停下，重跑时从失败的那一轮继续。完全没有命令行时，`run` 把每个文字请求交给宿主 agent（`needs_agent_text`），由它自己写出答案再重跑。
 
 #### YouTube cookies 和机器人验证
 
@@ -343,8 +354,9 @@ yt_dlp_cookies_file: "~/.config/yt-transcript/youtube_cookies.txt"
 | 把一个视频从头重做 | `--restart` |
 | 只看会用哪个来源和模式，不花钱 | `--stage plan` |
 | 质量检查失败后重做文字 | `--from text` |
+| 回答要不要用付费 API：这个视频用、以后都用、这次不用、永远不用 | `--llm-api once` / `always` / `no` / `never` |
 
-`--source` 和 `--mode` 会对这个视频一直记住，直到 `--restart`。
+`--source`、`--mode` 和 `--llm-api` 会对这个视频一直记住，直到 `--restart`。
 
 #### 手动运行
 

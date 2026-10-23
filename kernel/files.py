@@ -8,16 +8,21 @@ import time
 from pathlib import Path
 
 
-def atomic_write_text(path: Path, content: str) -> None:
-    """Write `content` to `path` through a temp file and a rename, so readers never see half a file."""
+def atomic_write_text(path: Path, content: str, mode: int | None = None) -> None:
+    """Write `content` to `path` through a temp file and a rename, so readers never see half a file.
+
+    The file gets `mode`, or by default the mode a plain write would give it.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent), text=True)
     tmp_path = Path(tmp_name)
     try:
-        # mkstemp creates the file 0600; give it the mode a plain write would.
-        umask = os.umask(0)
-        os.umask(umask)
-        os.fchmod(fd, 0o666 & ~umask)
+        if mode is None:
+            # mkstemp creates the file 0600; give it the mode a plain write would.
+            umask = os.umask(0)
+            os.umask(umask)
+            mode = 0o666 & ~umask
+        os.fchmod(fd, mode)
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             handle.write(content)
             handle.flush()
