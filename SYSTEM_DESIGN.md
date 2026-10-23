@@ -473,7 +473,7 @@ Paragraphs are written only by `cleanup_zh` and `structure_only`; `translate_onl
 - **chunk**
   - before the first round, the `text` stage cuts the normalized document into chunks of about `chunk_tokens_<task>` tokens (`kernel/text/chunking.py`, listed in `text/manifest.json`): at sentence ends on the text path, at subtitle cues on the segment path, where it also cuts before every YouTube chapter start when the plan says `long`. A chunk boundary stays a unit boundary. The text path (subtitles on the `chinese` route) has no chapter cuts, so a chapter can start inside a unit.
 - **unit / `[S<n>]`**
-  - one numbered source sentence. A sentence above about 120 tokens (common in unpunctuated ASR text) is cut at subtitle cue ends, longest pause first, or every ~120 tokens when the cues cannot be matched to the text, so in unpunctuated Chinese subtitles a unit often starts and ends in the middle of a sentence. Units are therefore reading positions, not sentences: where a heading or a paragraph end goes is decided on the written text, once the model's punctuation shows where sentences end (7.5 B). In `translate_only` a unit is one paragraph of the `structure_only` output, split only above about 600 tokens.
+  - one numbered piece of the source, a sentence where the source has punctuation. A sentence above about 120 tokens (common in unpunctuated ASR text) is cut at subtitle cue ends, longest pause first, or every ~120 tokens when the cues cannot be matched to the text, so in unpunctuated Chinese subtitles a unit often starts and ends in the middle of a sentence. Units are therefore reading positions, not sentences: where a heading or a paragraph end goes is decided on the written text, once the model's punctuation shows where sentences end (7.5 B). In `translate_only` a unit is one paragraph of the `structure_only` output, split only above about 600 tokens.
 
 ##### Layer 2: document-level guidance
 
@@ -569,11 +569,15 @@ The model never decides where its output starts or stops in the source. It copie
 
 #### B. Structure decided once, placed at sentence boundaries
 
-When the run has an outline, headings come only from it, and the program adds them; rounds write none. A round is told, for every section starting in its window, the unit and the words the section begins with, and starts a new paragraph at the beginning of the sentence holding those words. Where the heading goes is decided after the rounds, on the written text, because only the model's punctuation shows where sentences end: units of unpunctuated subtitles are cuts at cue pauses, and a heading put at a unit, or a model asked to write one there, splits sentences. The program looks for the section's anchor in the paragraphs near the section's unit (letters and digits only; when the whole anchor is missing, its first or its last six characters) and puts the heading before the sentence that holds it, splitting the paragraph there when needed. When the anchor is not found, the heading goes between two paragraphs, before the first one whose middle reaches the section's unit.
+The order is punctuation first, structure second. In unpunctuated subtitles, sentence ends exist only once a cleanup round has written the punctuation. The paragraph breaks a round makes inside its own output already fall at sentence ends, because the model sees the sentences it writes. Only two boundaries are fixed in units before that: where a round stops (always at the end of a unit) and where a section starts (a unit and the words it begins with). Both are therefore settled after the rounds, on the written text.
+
+When the run has an outline, headings come only from it, and the program adds them; rounds write none. A round is told, for every section starting in its window, the unit and the words the section begins with, and starts a new paragraph at the beginning of the sentence holding those words. Where the heading goes is decided after the rounds: units of unpunctuated subtitles are cuts at cue pauses, so a heading put at a unit, or a model asked to write one there, splits sentences. The program looks for the section's anchor in the paragraphs near the section's unit (letters and digits only; when the whole anchor is missing, its first or its last six characters) and puts the heading before the sentence that holds it, splitting the paragraph there when needed. When the anchor is not found, the heading goes between two paragraphs, before the first one whose middle reaches the section's unit.
 
 In the same pass, a paragraph that stops inside a sentence (usually where one round ended) takes the rest of that sentence from the next paragraph or hands its unfinished sentence to it, whichever piece is shorter, up to about 150 characters; a heading a round wrote right after such a paragraph moves before that sentence. A paragraph ending on a dash or a colon counts as finished, and text with no sentence end is left as it is, since nothing shows where its sentences are. The counts are kept as `structure` in the task's progress. Without an outline (the whole source fits in one round, `window_outline: false`, or the outline failed), rounds place their own headings and only the mending applies.
 
 Asking the model to write each heading before the sentence holding the anchor came first; the model still broke sentences at unit tags now and then, once adding a dash to hide the break, which is why the placement moved to the program.
+
+A separate punctuation pass before the rounds, so that every unit is a whole sentence, was considered and not built. The cleanup has to rewrite the whole text anyway (punctuation, fillers, recognition errors), so a punctuation pass would write it a second time, roughly doubling output tokens and time, and it would only help at the two boundaries above, which the program already puts at sentence ends after the rounds.
 
 #### C. Sizes as soft targets
 
@@ -1189,7 +1193,7 @@ prompts/*.md              任务 prompt：cleanup_zh、structure_only、translat
 - **分块（chunk）**
   - 第一轮之前，`text` 阶段把规范化文档切成约 `chunk_tokens_<task>` 个 token 的分块（`kernel/text/chunking.py`，列在 `text/manifest.json` 里）：按文字切时在句末切，按片段切时在字幕条之间切，计划判定为 `long` 时还会在每个 YouTube 章节开始处切。分块边界一定也是单元边界。按文字切（`chinese` 路线上的字幕）时不在章节处切，所以章节可能从一个单元的中间开始。
 - **单元 / `[S<n>]`**
-  - 一个编号的原文句子。超过约 120 token 的句子（没有标点的 ASR 文字里很常见）在字幕条结束处切开，优先最长的停顿；字幕对不上文字时每约 120 token 切一次。所以在没有标点的中文字幕里，单元常常在句子中间开始和结束。因此单元只是"读到哪儿了"的位置，不是句子：标题和段落结尾落在哪里，要等模型加好标点、句子边界出现以后，在写出的文字上决定（7.5 B）。`translate_only` 里一个单元是 `structure_only` 输出的一个段落，超过约 600 token 才拆开。
+  - 一段编号的原文，原文有标点时就是一句话。超过约 120 token 的句子（没有标点的 ASR 文字里很常见）在字幕条结束处切开，优先最长的停顿；字幕对不上文字时每约 120 token 切一次。所以在没有标点的中文字幕里，单元常常在句子中间开始和结束。因此单元只是"读到哪儿了"的位置，不是句子：标题和段落结尾落在哪里，要等模型加好标点、句子边界出现以后，在写出的文字上决定（7.5 B）。`translate_only` 里一个单元是 `structure_only` 输出的一个段落，超过约 600 token 才拆开。
 
 ##### 第 2 层：文档级指导
 
@@ -1285,11 +1289,15 @@ merge 阶段 -> verify 阶段 -> assemble 阶段
 
 #### B. 结构只决定一次，放在句子边界上
 
-有大纲时，标题只来自大纲，由程序加上，各轮不写标题。每一轮会拿到在本窗口开始的每一节的起始单元和开头那几个字，在这几个字所在的那句话开头另起一段。标题放在哪里，要等各轮写完、在写出的文字上决定，因为只有模型加的标点才能说明句子在哪里结束：没有标点的字幕切出来的单元是按字幕停顿切的，把标题放在单元上，或者让模型在那里写标题，都会把句子切开。程序在这一节起始单元附近的段落里找它的锚点（只比较字母和数字；整段锚点找不到时，再找它的前六个或后六个字符），把标题放在包含锚点的那句话前面，必要时在那里把段落拆开。找不到锚点时，标题放在两段之间，即第一个中点到达起始单元的段落前面。
+顺序是先有标点，再定结构。没有标点的字幕，要等清理的那一轮把标点写出来，才知道句子在哪里结束。一轮在自己的输出里分段，本来就落在句末，因为模型写的时候看得到句子。在这之前按单元定下的边界只有两种：一轮在哪里停（总是某个单元的末尾），一节从哪里开始（一个单元加上开头那几个字）。所以这两种边界都在各轮写完以后，在写出的文字上决定。
+
+有大纲时，标题只来自大纲，由程序加上，各轮不写标题。每一轮会拿到在本窗口开始的每一节的起始单元和开头那几个字，在这几个字所在的那句话开头另起一段。标题放在哪里，要等各轮写完以后再定：没有标点的字幕切出来的单元是按字幕停顿切的，把标题放在单元上，或者让模型在那里写标题，都会把句子切开。程序在这一节起始单元附近的段落里找它的锚点（只比较字母和数字；整段锚点找不到时，再找它的前六个或后六个字符），把标题放在包含锚点的那句话前面，必要时在那里把段落拆开。找不到锚点时，标题放在两段之间，即第一个中点到达起始单元的段落前面。
 
 同一步里，停在句子中间的段落（多半是一轮结束的地方）会从下一段拿回这句话剩下的部分，或者把没说完的这句交给下一段，看哪一块短，最长约 150 个字；紧跟在这种段落后面、由某一轮写出的标题，会挪到这句话前面。以破折号或冒号结尾的段落算作说完了；一个句末标点都没有的文字保持原样，因为看不出句子在哪里。这些计数记在任务进度的 `structure` 里。没有大纲时（全文一轮就能写完、`window_outline: false` 或大纲失败），各轮自己放标题，只做接句子这一步。
 
 最初的做法是让模型在包含锚点的那句话前面写出标题；模型仍会不时在单元编号处把句子切开，有一次还加了破折号掩盖断口，所以改由程序来放。
+
+也考虑过在各轮之前先单独打一遍标点，让每个单元都是完整的句子，但没有这样做。清理本来就要把全文重写一遍（加标点、去口头禅、改识别错误），单独打标点等于再把全文写一遍，输出 token 和耗时差不多翻倍；而它只对上面那两种边界有用，这两种边界现在已由程序在各轮之后放到句末。
 
 #### C. 大小是软目标
 

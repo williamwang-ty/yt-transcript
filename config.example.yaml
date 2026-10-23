@@ -108,10 +108,11 @@ window_tail_tokens: 400
 window_marker_retries: 1
 # Global outline (cleanup_zh and structure_only): before the first round the
 # whole numbered source goes to the model once and comes back as a short JSON
-# outline (section titles + first unit) and a list of names and terms with
-# their correct spellings. Rounds get the nearby outline lines and the terms
-# found in their window; section headings come only from the outline (written
-# by the model where the topic really starts, else placed by the program). For
+# outline (section titles, first unit and first words) and a list of names and
+# terms with their correct spellings. Rounds get the nearby outline lines and
+# the terms found in their window; section headings come only from the outline,
+# and after the rounds the program puts each one before the written sentence
+# holding the section's first words (rounds write no headings). For
 # a long video, its YouTube chapters are given as hints. The outline is skipped
 # when one round can process the whole text; if it fails, rounds place their
 # own headings. The source is outlined in parts when it is longer than
