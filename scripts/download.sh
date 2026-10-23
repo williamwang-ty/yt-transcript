@@ -12,8 +12,9 @@ set -euo pipefail
 #
 # One page extraction per video: `yt-dlp -J` runs once and its output is saved
 # to $YT_TRANSCRIPT_INFO_JSON; every mode reads that file, and subtitles are
-# downloaded from it (`--load-info-json`, no new page fetch). Audio downloads by
-# URL, because its saved format URLs expire.
+# downloaded from it (`--load-info-json`, no new page fetch; yt-dlp itself falls
+# back to the URL when the saved info no longer works). Audio still downloads by
+# URL, so the Deepgram route fetches the page a second time.
 
 if [ $# -lt 2 ]; then
     echo "Usage: $0 <VIDEO_URL> <MODE>" >&2
