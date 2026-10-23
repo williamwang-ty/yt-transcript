@@ -642,6 +642,40 @@ class CoreRegressionTests(unittest.TestCase):
             self.assertEqual(result["diagnostics"]["overlap_trim_count"], 1)
             self.assertEqual(result["diagnostics"]["overlap_trimmed_chars"], 3)
 
+    def test_parse_vtt_recovers_every_word_of_rolling_asr_captions(self):
+        """Test YouTube's rolling ASR cues (repeated lines, word timing tags) parse to each word once."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            vtt_path = Path(tmpdir) / "asr.vtt"
+            vtt_path.write_text(
+                "WEBVTT\n"
+                "Kind: captions\n"
+                "Language: en\n"
+                "\n"
+                "00:00:00.000 --> 00:00:02.310 align:start position:0%\n"
+                " \n"
+                "so<00:00:00.320><c> today</c><00:00:00.640><c> we're</c><00:00:01.000><c> looking</c>\n"
+                "\n"
+                "00:00:02.310 --> 00:00:02.320 align:start position:0%\n"
+                "so today we're looking\n"
+                " \n"
+                "\n"
+                "00:00:02.320 --> 00:00:04.800 align:start position:0%\n"
+                "so today we're looking\n"
+                "at<00:00:02.600><c> the</c><00:00:02.900><c> new</c><00:00:03.300><c> laptop</c>\n"
+                "\n"
+                "00:00:04.800 --> 00:00:04.810 align:start position:0%\n"
+                "at the new laptop\n"
+                " \n",
+                encoding="utf-8",
+            )
+
+            result = kernel_subtitle_cleanup.parse_vtt_segments(str(vtt_path), language="en")
+
+            self.assertEqual([segment["text"] for segment in result["segments"]],
+                             ["so today we're looking", "at the new laptop"])
+            self.assertEqual(result["diagnostics"]["exact_duplicate_cue_count"], 1)
+            self.assertEqual(result["diagnostics"]["overlap_trim_count"], 1)
+
     def test_assemble_final_escapes_markdown_header_text(self):
         """Test assemble final escapes markdown header text."""
         with tempfile.TemporaryDirectory() as tmpdir:

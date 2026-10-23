@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from kernel.text import subtitle_quality as kernel_subtitle_quality
 from kernel.text.measure import estimate_tokens
 from kernel.text.normalize import normalize_text_body
 
@@ -79,11 +78,6 @@ def plan_text_operations(*, video_id: str, duration: int, mode: str, source: str
         "oversized_short_input" if oversized_short_input else "duration_short_single_pass"
     )
     video_path = "long" if duration_bucket == "long" or oversized_short_input else "short"
-    source_routing = kernel_subtitle_quality.build_source_routing_signal(
-        source,
-        mode,
-        normalization.get("subtitle_quality", {}),
-    )
     plan_warnings = list(normalization.get("warnings", []))
     if oversized_short_input:
         plan_warnings.append(
@@ -92,21 +86,6 @@ def plan_text_operations(*, video_id: str, duration: int, mode: str, source: str
     if source == "deepgram":
         plan_warnings.append(
             "Deepgram fallback is active; review proper nouns and mixed-language terms carefully in the final output."
-        )
-    elif source_routing["reroute_recommended"] and source_routing["reroute_target"] == "deepgram":
-        plan_warnings.append(
-            "Subtitle quality is critical; reroute to Deepgram before text optimization is recommended "
-            f"(subtitle_quality_score={source_routing['subtitle_quality_score']:.3f})."
-        )
-    elif source_routing["subtitle_quality_band"] == "critical":
-        plan_warnings.append(
-            "Subtitle quality is critical on the current subtitle route; continue only with manual review "
-            f"(subtitle_quality_score={source_routing['subtitle_quality_score']:.3f})."
-        )
-    elif source_routing["subtitle_quality_band"] == "poor":
-        plan_warnings.append(
-            "Subtitle quality looks poor; keep the subtitle path only with extra review "
-            f"(subtitle_quality_score={source_routing['subtitle_quality_score']:.3f})."
         )
 
     outputs = {
@@ -190,32 +169,18 @@ def plan_text_operations(*, video_id: str, duration: int, mode: str, source: str
             "estimated_input_tokens": estimated_input_tokens,
             "estimated_input_chars": estimated_input_chars,
             "single_pass_token_limit": single_pass_token_limit,
-            "subtitle_quality_score": source_routing["subtitle_quality_score"],
-            "subtitle_quality_band": source_routing["subtitle_quality_band"],
-            "overlap_reduction_count": source_routing["overlap_reduction_count"],
-            "source_route_reason": source_routing["source_route_reason"],
-            "reroute_recommended": source_routing["reroute_recommended"],
-            "reroute_target": source_routing["reroute_target"],
         },
         "warnings": plan_warnings,
         "hard_failures": [],
         "video_path": video_path,
         "duration_bucket": duration_bucket,
         "routing_reason": routing_reason,
-        "source_route_reason": source_routing["source_route_reason"],
-        "reroute_recommended": source_routing["reroute_recommended"],
-        "reroute_target": source_routing["reroute_target"],
-        "reroute_reasons": source_routing["reroute_reasons"],
-        "subtitle_quality_score": source_routing["subtitle_quality_score"],
-        "subtitle_quality_band": source_routing["subtitle_quality_band"],
-        "subtitle_quality_reasons": source_routing["subtitle_quality_reasons"],
         "normalization": {
             "materialized": normalization.get("materialized", False),
             "source_adapter": normalization.get("source_adapter", ""),
             "preferred_chunk_source": normalization.get("preferred_chunk_source", ""),
             "segment_count": normalization.get("segment_count", 0),
             "normalized_document_path": normalization.get("normalized_document_path", ""),
-            "subtitle_quality": normalization.get("subtitle_quality", {}),
         },
         "estimated_input_tokens": estimated_input_tokens,
         "single_pass_token_limit": single_pass_token_limit,

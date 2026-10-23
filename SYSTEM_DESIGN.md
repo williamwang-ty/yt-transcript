@@ -81,7 +81,7 @@ The user and the agent need to see what path was chosen and why, what has been d
 Concretely:
 
 - **One entry point**: `run <url>` goes from URL to final Markdown; the agent does not chain internal commands.
-- **Deterministic routing**: language, source, reroute, and mode decisions are computed from structured data and recorded with their reasons.
+- **Deterministic routing**: language, source, and mode decisions are computed from structured data and recorded with their reasons.
 - **Resumable by rerunning**: every stage is idempotent and recorded; rerunning the same command continues from the first unfinished stage.
 - **Explicit handback**: `run` stops only at clean breakpoints and returns a small, fixed set of states, each with a reason and a next step.
 - **Model-tolerant**: prompts stay narrow and the program owns boundaries, so a weak model produces a worse article, not a broken run.
@@ -126,7 +126,7 @@ The key idea:
 | Concern | Owned by `run` (code) | Owned by the host agent (model) |
 |---|---|---|
 | Flow order, skipping, resuming | yes | no |
-| Language, source, reroute, mode decisions | yes, with recorded reasons | only through override flags the user asked for |
+| Language, source, mode decisions | yes, with recorded reasons | only through override flags the user asked for |
 | Text transformation | through an LLM backend | only when handed a `needs_agent_text` task |
 | Filenames, dates, frontmatter, title cleanup | yes | no |
 | Cookies, login, rate limits, missing keys or tools | detects them and returns `needs_user` | tells the user what to do |
@@ -143,7 +143,7 @@ The agent never edits the state file and never runs internal stages by hand. If 
 | Stage | What it does | Main outputs | Can stop with |
 |---|---|---|---|
 | `metadata` | Inside the YouTube lock (6.4): let Homebrew update yt-dlp (at most hourly), then fetch the video's yt-dlp info once with `yt-dlp -J` (title, channel, date, duration, chapters, track list, audio-track languages); later stages read this file instead of asking YouTube again | `metadata.json`, `chapters.json` | `needs_user` (`cookies_required` after one retry with Chrome cookies, `login_required`, `rate_limited`, `tool_missing`), `in_progress` (the wait for YouTube used up `--max-seconds`), `failed` |
-| `source` | Detect the spoken language and pick the trusted track (6.3); download it and parse it into raw text and timed segments; score the subtitle quality and switch to Deepgram when the scoring rule calls for it; or transcribe with Deepgram directly | `source/`, `raw_text.txt`, `segments.json`, the route in `state.json` | `unsupported`, `needs_user` (preferred track refused, Deepgram key missing, or a yt-dlp case above), `failed` |
+| `source` | Detect the spoken language and pick the trusted track (6.3); download it and parse it into raw text and timed segments; or transcribe with Deepgram directly | `source/`, `raw_text.txt`, `segments.json`, the route in `state.json` | `unsupported`, `needs_user` (preferred track refused, Deepgram key missing, or a yt-dlp case above), `failed` |
 | `normalize` | Build the normalized document: the cleaned text, the timed segments, and whether chunking follows the text or the segments | `normalized_document.json` | `failed` |
 | `plan` | Choose the text tasks for the mode (Chinese: `cleanup_zh`; bilingual: `structure_only`, then `translate_only`), mark the text `short` or `long`, and estimate its size (input tokens, expected rounds per task). Chinese Deepgram text gets an extra instruction to repair recognition artifacts | `plan.json` | `failed` |
 | `text` | Cut the normalized document into chunks, then run each planned task through the window executor (section 7); each task is recorded separately | `text/` | `needs_agent_text`, `needs_user` (`llm_api_fallback`, 6.8), `in_progress`, `failed` |
@@ -156,7 +156,7 @@ Notes:
 
 - **Idempotent stages.** Rerunning an unfinished stage starts that stage over, except that expensive sub-steps keep their results inside the stage (the downloaded audio, the Deepgram result of each audio piece, the outline, finished window rounds), so an interrupted stage never pays twice.
 - **No separate preflight.** Each stage checks what it needs right before it needs it: yt-dlp at `metadata` (including the Homebrew update, at most hourly, because YouTube keeps breaking older yt-dlp releases), the Deepgram key only when `source` chooses Deepgram, an LLM backend only at `text`, `output_dir` only at `assemble`. Cheap paths stay cheap.
-- **The source is final before any LLM call.** The subtitle quality reroute happens inside `source`, so `normalize` and everything after it work on accepted text.
+- **The source is final before any LLM call.** `source` either takes a trusted subtitle track or transcribes with Deepgram, so `normalize` and everything after it work on accepted text.
 - **One path for every length.** Short and long videos go through the same stages. `plan` marks the text `long` when the video runs 30 minutes or more, or when a shorter video's text is above the single-request limit (about 4,100 to 4,800 estimated tokens, depending on the route). For a `long` text, YouTube chapters become outline hints (on the segment path they also cut the chunks); a `short` text uses neither. The outline pass is skipped whenever one round can process the whole text (7.4), so a short video usually takes one request per task.
 - **Free routing check.** `--stage plan` runs `metadata` through `plan` without spending money. If the route needs Deepgram, it records that decision and stops inside `source`, without transcribing.
 
@@ -170,7 +170,9 @@ The `source` stage applies these rules (`kernel/sources/subtitle_language.py` pi
 4. Chinese video: otherwise the Chinese ASR track; mode `chinese`.
 5. English video: otherwise English subtitles, human ones first; mode `bilingual` (English source plus Chinese translation).
 6. Other spoken languages: `unsupported` (reason `unsupported_language`), unless human Chinese subtitles exist. When no signal names the language, every trusted Chinese or English track is a candidate.
-7. No trusted track, or a track whose quality score triggers the reroute rule (critical quality on the `chinese` route): transcribe with Deepgram in the detected language, or with Deepgram's own language detection when nothing, not even the video's text, names it. Deepgram runs automatically; there is no confirmation step. A Deepgram result in an unsupported language also returns `unsupported`.
+7. No trusted track: transcribe with Deepgram in the detected language, or with Deepgram's own language detection when nothing, not even the video's text, names it. Deepgram runs automatically; there is no confirmation step. A Deepgram result in an unsupported language also returns `unsupported`.
+
+A trusted track is used as it is, human or ASR; nothing scores its text. Both sources go through the same LLM text stage, which restores punctuation and paragraphs and fixes recognition slips from the context, so subtitles cost nothing where Deepgram is paid by the minute. What a score could see in the text is the shape of the file (YouTube's rolling ASR cues repeat each line and carry per-word timing tags), and the parser removes all of it; how accurate the recognition was cannot be read from the text. The subtitle quality score that used to sit here counted exactly that removed noise: it rated YouTube ASR tracks critical as a rule (an English one about 0.27, a Chinese one 0), so on the `chinese` route ASR subtitles always went to Deepgram, a rule nobody had chosen. It was removed. A video whose subtitles are poor anyway takes `--source deepgram`.
 
 A language that comes only from the video's text, or from nothing, is not firm: `--mode` names the spoken language instead (`chinese` = Chinese audio, `bilingual` = English audio), Deepgram is asked for that language, and the route records `language_signal: mode_override`. The `unsupported` result for such a guess, and for a language Deepgram detected itself, says so in its message. The text signal exists because a video with no caption track and no metadata language otherwise depends on Deepgram's detection alone, and that detection heard a Mandarin video (DQGrPstFRVI, whose title and description are Chinese) as Indonesian. Deepgram-specific options (restricting detection to Chinese and English, confidence thresholds) were not used.
 
@@ -187,7 +189,7 @@ Each video has one work directory:
   state.json                 the only state file; kept after cleanup
   metadata.json  chapters.json
   source/                    subtitles/ or audio/ from download.sh (plus audio pieces when split),
-                             subtitle_document.json (the subtitle quality check),
+                             subtitle_document.json (the subtitle parse check),
                              deepgram.json, deepgram_chunk_NNN.json (Deepgram result per audio piece)
   raw_text.txt  segments.json  normalized_document.json
   plan.json
@@ -222,10 +224,8 @@ Beside the video directories, `/tmp/yt-transcript/.locks/` holds the lock files 
     "track": "en",
     "track_kind": "manual",
     "mode": "bilingual",
-    "subtitle_quality": {"score": 1.0, "band": "excellent"},
     "blocked_tracks": [],
     "fallback_used": false,
-    "rerouted_from": null,
     "reason": "English video with human English subtitles"
   },
   "stages": {
@@ -337,7 +337,7 @@ The task is exactly one LLM request: an outline request, a window round, or a fa
 
 | Flag | Kept for reruns | Effect |
 |---|---|---|
-| `--source subtitles\|deepgram` | yes | Force the source. `deepgram` skips subtitles; `subtitles` keeps the chosen track even when its quality score would trigger the reroute. Redoes `source` and every later stage. |
+| `--source subtitles\|deepgram` | yes | Force the source. `deepgram` skips subtitles; `subtitles` fails instead of transcribing when the video has no trusted track. Redoes `source` and every later stage. |
 | `--mode chinese\|bilingual` | yes | Force the output form. The mode follows the source text (Chinese text gives `chinese`, English text gives `bilingual`), so this picks the track: on an English video, `bilingual` uses the English subtitles even when human Chinese subtitles exist, and `chinese` uses the human Chinese subtitles. When no track or metadata names the spoken language (6.3), it also names it for Deepgram: `chinese` = Chinese audio, `bilingual` = English audio. Redoes `source` and every later stage. |
 | `--from <stage>` | no | Mark that stage and every later stage not done, then run. For recovery and debugging. |
 | `--stage plan` | repeated in `next_command` | Stop after `plan`: the free routing check. |
@@ -416,7 +416,6 @@ kernel/
   text/
     cleanup/              VTT parsing and subtitle cleanup, CJK spacing, overlap trimming, post-merge cleanup
     normalize.py          the normalized document
-    subtitle_quality.py   subtitle quality score and the reroute signal
     plan.py               text tasks, short or long, size estimate
     chunking.py           the chunks the window run reads
     window.py             the sliding-window executor and the backend choice per task
@@ -438,9 +437,8 @@ prompts/*.md              task prompts: cleanup_zh, structure_only, translate_on
 
 Dependencies point one way. `config`, `files` and `locks` import nothing else from the kernel; `llm` uses only `config`, `sources` only `config`, `files` and `locks`; `text` uses `config`, `files` and `llm`; `quality` uses `text`; `pipeline` uses all of them; `cli` uses `pipeline`, plus `sources` and `quality` for the debug commands. Nothing in `kernel/` imports `yt_transcript_utils.py`. The only loop runs across processes: `pipeline` starts `download.sh`, which pipes metadata through the `subtitle-info` command.
 
-The module plan written before the split (stage 0 of the refactor) differs from the result in four places, for these reasons:
+The module plan written before the split (stage 0 of the refactor) differs from the result in three places, for these reasons:
 
-- **Subtitle quality lives in `text/subtitle_quality.py`, not in `sources`.** It scores cleaned subtitle text, and `normalize` uses it as well as the `source` stage; in `sources` it would make `text` depend on `sources`. The `source` stage reaches it through `pipeline`.
 - **`download.sh` stays a subprocess** instead of moving into `sources`. It is about 420 lines of shell that build the yt-dlp commands (settings, cookies, `-t sleep`, the subtitle candidates in order, the audio format choice), run each once and print JSON; the retry and error policy lives in Python (`sources/youtube.py`, `_Run.download`). Porting the rest would risk behavior for no user-visible gain. `pipeline` passes it paths and yt-dlp settings through environment variables, and the held lock descriptors.
 - **The agent handoff stays in `pipeline`** (`AgentHandoff`), not in `llm`. It belongs to the run rather than to a backend: it writes into the work directory and ends the call with a `needs_agent_text` result. The window executor receives it as a callback and treats it like any other backend.
 - **`config.py` owns the defaults.** It defines the default of every setting, and `load_config` always returns every key filled in, so the modules that read a setting get a complete value instead of keeping defaults of their own.
@@ -448,7 +446,7 @@ The module plan written before the split (stage 0 of the refactor) differs from 
 ### 6.12 Testing
 
 - **Unit tests** per area in `tests/regression_*.py`, all run by `python3 -m unittest tests.test_regressions` (offline, well under a minute). Tests of deleted code were deleted with it.
-- **End-to-end tests** (`tests/regression_e2e.py`) run the whole flow offline through `scripts/run_regression.py --fixtures tests/fixtures/e2e`: a fake `yt-dlp` on `PATH` (`tests/e2e/`) serves recorded metadata and subtitles, a fake Deepgram answers from a recorded response, and a fake LLM CLI (`tests/fake_llm.py`, plugged in through `llm_agent_cli`) implements the window protocol and the outline JSON. Cases: Chinese human subtitles (long, several rounds with an outline), English subtitles (bilingual), no subtitles (Deepgram), and an unsupported language. Routes and outputs are compared with `tests/fixtures/e2e/baseline.json`; `UPDATE_E2E_BASELINE=1` rewrites it after an intended change. The four cases run at the same time, and the fake `yt-dlp` logs every call, so the test also checks that yt-dlp never ran twice at once and that each video's page was fetched once (twice on the Deepgram route). `tests/regression_run.py` covers resume inside `text`, sticky and rejected overrides, `--max-seconds`, `--from`, `--restart`, `--stage plan`, the quality reroute, and every result status. `tests/regression_concurrency.py` covers the locks with real processes: eight processes racing for one lock never overlap, a killed holder frees it, a bounded wait returns `in_progress` with the holder, `cleanup` refuses a running video, and a rate limit stops the queued runs without another yt-dlp call while a later run tries once.
+- **End-to-end tests** (`tests/regression_e2e.py`) run the whole flow offline through `scripts/run_regression.py --fixtures tests/fixtures/e2e`: a fake `yt-dlp` on `PATH` (`tests/e2e/`) serves recorded metadata and subtitles, a fake Deepgram answers from a recorded response, and a fake LLM CLI (`tests/fake_llm.py`, plugged in through `llm_agent_cli`) implements the window protocol and the outline JSON. Cases: Chinese human subtitles (long, several rounds with an outline), English subtitles (bilingual), no subtitles (Deepgram), and an unsupported language. Routes and outputs are compared with `tests/fixtures/e2e/baseline.json`; `UPDATE_E2E_BASELINE=1` rewrites it after an intended change. The four cases run at the same time, and the fake `yt-dlp` logs every call, so the test also checks that yt-dlp never ran twice at once and that each video's page was fetched once (twice on the Deepgram route). `tests/regression_run.py` covers resume inside `text`, sticky and rejected overrides, `--max-seconds`, `--from`, `--restart`, `--stage plan`, and every result status. `tests/regression_concurrency.py` covers the locks with real processes: eight processes racing for one lock never overlap, a killed holder frees it, a bounded wait returns `in_progress` with the holder, `cleanup` refuses a running video, and a rate limit stops the queued runs without another yt-dlp call while a later run tries once.
 - **Real-video regression** on a machine that can reach YouTube (`scripts/run_regression.py`, which calls `run`; see `tests/live_regression/README.md`) before merging any change to the main path. `--stage plan` and `--no-deepgram` keep it free or cheap.
 
 ### 6.13 What SKILL.md contains
@@ -688,7 +686,6 @@ Because the project still has to find the source text, decide how to acquire it,
 | `--max-seconds` and `in_progress` (6.7) | `_Run.deadline_passed` and the `stop_check` that `stage_text` passes to the window executor |
 | yt-dlp calls, the update check, `needs_user` reasons (6.2) | `_Run.download`, `_Run.update_yt_dlp`, `kernel/sources/youtube.py` (`classify`); `scripts/download.sh`, `scripts/update_yt_dlp.sh` |
 | Language detection and track choice (6.3) | `kernel/sources/subtitle_language.py` (`select_subtitle_candidates`), `_Run.stage_source`, `_Run.subtitle_route` |
-| Subtitle quality score and reroute (6.3) | `kernel/text/subtitle_quality.py`, applied in `_Run.subtitle_route` |
 | Deepgram (6.3) | `kernel/sources/deepgram.py` (`transcribe_deepgram`), `_Run.transcribe` |
 | VTT parsing and subtitle cleanup | `kernel/text/cleanup/subtitle.py`, `cjk.py`, `overlap.py` |
 | Normalized document | `kernel/text/normalize.py` |
@@ -705,7 +702,7 @@ Because the project still has to find the source text, decide how to acquire it,
 
 The plan this design was implemented from differs from the code in a few places, all deliberate:
 
-- the four module-structure points in 6.11: subtitle quality is in `text`, `download.sh` is still a subprocess, the agent handoff is in `pipeline`, and `config.py` owns every default;
+- the three module-structure points in 6.11: `download.sh` is still a subprocess, the agent handoff is in `pipeline`, and `config.py` owns every default;
 - `subtitle-info` reads yt-dlp metadata on stdin instead of taking a URL, because `download.sh` pipes into it and `run` uses the metadata it already fetched;
 - the `text` stage still cuts the source into chunks before the window run, because a chunk is both the boundary layout of the units and the size of the fallback.
 
@@ -730,7 +727,7 @@ Behavior changes compared with the agent-driven flow before stage 3:
 1. Short videos' text goes through the LLM backend (normally the host CLI) instead of being written by the host model in the conversation.
 2. A refused preferred subtitle track stops the run with `needs_user` instead of silently falling back to another track (6.3).
 3. Rerunning a finished video returns the existing article instead of starting over; `--restart` redoes it.
-4. The subtitle quality reroute happens inside `source`, before normalization; the outcome is the same.
+4. The subtitle quality reroute happens inside `source`, before normalization; the outcome is the same. (The reroute was removed later, see 6.3.)
 5. New: `--max-seconds` and the `in_progress` result for hosts with shell time limits.
 
 Subtitle language selection, Deepgram transcription, the window executor's algorithms, the outline and glossary, and the quality checks moved without changing behavior, apart from two output fixes made in stage 3: merged window output no longer joins short paragraphs (which had glued bilingual pairs together), and `structure_only` drops `-` speaker marks.
@@ -833,7 +830,7 @@ LLM 只用来处理文字，从不决定下一步做什么。
 具体来说：
 
 - **唯一入口**：`run <url>` 从链接一直做到最终 Markdown；agent 不串联内部命令。
-- **确定性路由**：语言、来源、改道和模式的决定都由结构化数据计算得出，并连同原因一起记录。
+- **确定性路由**：语言、来源和模式的决定都由结构化数据计算得出，并连同原因一起记录。
 - **重跑即续跑**：每个阶段都是幂等的并且记账；重跑同一条命令就从第一个未完成的阶段继续。
 - **明确交回**：`run` 只在干净的断点停下，返回一小组固定的状态，每个状态都带原因和下一步。
 - **容忍弱模型**：prompt 保持窄，边界由程序掌握，所以弱模型只会让文章差一些，不会让流程坏掉。
@@ -878,7 +875,7 @@ LLM 只用来处理文字，从不决定下一步做什么。
 | 事项 | 由 `run`（代码）负责 | 由宿主 agent（模型）负责 |
 |---|---|---|
 | 流程顺序、跳过、续跑 | 是 | 否 |
-| 语言、来源、改道、模式的决定 | 是，并记录原因 | 只通过用户要求的覆盖参数 |
+| 语言、来源、模式的决定 | 是，并记录原因 | 只通过用户要求的覆盖参数 |
 | 文字处理 | 通过 LLM 后端 | 只在收到 `needs_agent_text` 任务时 |
 | 文件名、日期、frontmatter、标题清理 | 是 | 否 |
 | cookies、登录、限流、缺少密钥或工具 | 检测出来并返回 `needs_user` | 告诉用户该怎么做 |
@@ -895,7 +892,7 @@ agent 从不编辑状态文件，也从不手动执行内部阶段。需要不�
 | 阶段 | 做什么 | 主要产物 | 可能的停止状态 |
 |---|---|---|---|
 | `metadata` | 在 YouTube 锁里（6.4）：先让 Homebrew 更新 yt-dlp（最多每小时一次），再用 `yt-dlp -J` 取一次视频信息（标题、频道、日期、时长、章节、字幕轨列表、音轨语言）；后面的阶段读这个文件，不再向 YouTube 要这些信息 | `metadata.json`、`chapters.json` | `needs_user`（用 Chrome cookies 重试一次后仍要求机器人验证 `cookies_required`、`login_required`、`rate_limited`、`tool_missing`）、`in_progress`（等 YouTube 用完了 `--max-seconds`）、`failed` |
-| `source` | 判断口语语言并选出可信的字幕轨（6.3）；下载并解析成纯文本和带时间的片段；给字幕质量打分，评分规则要求时改用 Deepgram；或者直接用 Deepgram 转写 | `source/`、`raw_text.txt`、`segments.json`、`state.json` 里的路由 | `unsupported`、`needs_user`（首选字幕轨被拒、缺少 Deepgram 密钥，或上面的 yt-dlp 情况）、`failed` |
+| `source` | 判断口语语言并选出可信的字幕轨（6.3）；下载并解析成纯文本和带时间的片段；或者直接用 Deepgram 转写 | `source/`、`raw_text.txt`、`segments.json`、`state.json` 里的路由 | `unsupported`、`needs_user`（首选字幕轨被拒、缺少 Deepgram 密钥，或上面的 yt-dlp 情况）、`failed` |
 | `normalize` | 生成规范化文档：清理后的文字、带时间的片段，以及分块时按文字切还是按片段切 | `normalized_document.json` | `failed` |
 | `plan` | 按模式选择文字任务（中文：`cleanup_zh`；双语：先 `structure_only` 再 `translate_only`），把文字标为 `short` 或 `long`，并估算规模（输入 token、每个任务预计轮数）。中文的 Deepgram 文字会多一条修复识别错误的说明 | `plan.json` | `failed` |
 | `text` | 先把规范化文档切成分块，再用窗口执行器（第 7 节）逐个执行规划好的任务；每个任务单独记账 | `text/` | `needs_agent_text`、`needs_user`（`llm_api_fallback`，6.8）、`in_progress`、`failed` |
@@ -908,7 +905,7 @@ agent 从不编辑状态文件，也从不手动执行内部阶段。需要不�
 
 - **阶段幂等。** 重跑一个未完成的阶段，会把这个阶段从头做一遍；但昂贵的子步骤在阶段内部保留结果（下载好的音频、每段音频的 Deepgram 结果、大纲、已完成的窗口轮次），所以中断的阶段不会重复花钱。
 - **没有单独的 preflight。** 每个阶段在真正需要之前才检查它需要的东西：到 `metadata` 才检查 yt-dlp（包括 Homebrew 更新，最多每小时一次，因为 YouTube 经常让旧版 yt-dlp 失效），`source` 选了 Deepgram 才检查 Deepgram 密钥，到 `text` 才检查 LLM 后端，到 `assemble` 才检查 `output_dir`。便宜的路径保持便宜。
-- **第一次调用 LLM 之前来源已经定下来。** 字幕质量改道在 `source` 内部完成，所以 `normalize` 及之后的阶段处理的都是已经认可的文字。
+- **第一次调用 LLM 之前来源已经定下来。** `source` 要么采用一条可信的字幕轨，要么用 Deepgram 转写，所以 `normalize` 及之后的阶段处理的都是已经认可的文字。
 - **长短视频一条路径。** 短视频和长视频走同样的阶段。视频时长 30 分钟以上，或者较短视频的文字超过单次请求的上限（按路线不同，约 4100 到 4800 个估算 token），`plan` 就把文字标为 `long`。`long` 的文字把 YouTube 章节作为大纲的提示（按片段切时还会在章节开始处切分块）；`short` 的文字两者都不用。只要一轮能处理完全文就跳过大纲调用（7.4），所以短视频通常每个任务只需要一次请求。
 - **免费的路由检查。** `--stage plan` 执行 `metadata` 到 `plan`，不花钱。如果路由需要 Deepgram，就记下这个决定，在 `source` 内部停下，不做转写。
 
@@ -922,7 +919,9 @@ agent 从不编辑状态文件，也从不手动执行内部阶段。需要不�
 4. 中文视频：否则用中文 ASR 轨；模式 `chinese`。
 5. 英文视频：否则用英文字幕，人工优先；模式 `bilingual`（英文原文加中文翻译）。
 6. 其他口语语言：`unsupported`（原因 `unsupported_language`），除非有人工中文字幕。没有任何信号说明语言时，所有可信的中文或英文字幕轨都是候选。
-7. 没有可信的字幕轨，或者字幕质量分触发改道规则（`chinese` 路线上质量为 critical）：按检测出的语言用 Deepgram 转写，连视频文字也说明不了语言时才让 Deepgram 自己识别。Deepgram 自动执行，没有确认步骤。Deepgram 识别出的语言不受支持时，同样返回 `unsupported`。
+7. 没有可信的字幕轨：按检测出的语言用 Deepgram 转写，连视频文字也说明不了语言时才让 Deepgram 自己识别。Deepgram 自动执行，没有确认步骤。Deepgram 识别出的语言不受支持时，同样返回 `unsupported`。
+
+可信的字幕轨原样采用，人工字幕和 ASR 字幕都一样，不给它的文字打分。两种来源后面都经过同一个 LLM 文字阶段，它会补上标点和分段，并按上下文改正识别错误；字幕不花钱，Deepgram 按分钟收费。从文字里能统计出来的只是文件的格式（YouTube 的滚动式 ASR 字幕每行重复出现，还带逐词时间标签），而解析时这些全都清掉了；识别得准不准，从文字里看不出来。原来这里的字幕质量分统计的恰恰是这些被清掉的噪音：它照例把 YouTube ASR 字幕评为 critical（英文约 0.27，中文为 0），于是 `chinese` 路线上的 ASR 字幕总是改走 Deepgram，而这条规则没有人选过。它已经删除。字幕确实很差的个别视频用 `--source deepgram`。
 
 只来自视频文字的语言、或者完全没有信号时，语言都不算确定：这时 `--mode` 直接指定口语语言（`chinese` 为中文音频，`bilingual` 为英文音频），Deepgram 按这个语言转写，路由里记为 `language_signal: mode_override`。这种推测出的语言、以及 Deepgram 自己识别出的语言不受支持时，`unsupported` 的 `message` 会说明可以这样重跑。加视频文字这个信号，是因为没有任何字幕轨、元数据也没写语言的视频，原来只能靠 Deepgram 自己识别，而它把一个普通话视频（DQGrPstFRVI，标题和简介都是中文）识别成了印尼语。没有使用 Deepgram 专有的做法（把识别范围限定在中英文、按置信度定阈值）。
 
@@ -939,7 +938,7 @@ agent 从不编辑状态文件，也从不手动执行内部阶段。需要不�
   state.json                 唯一的状态文件；cleanup 后保留
   metadata.json  chapters.json
   source/                    download.sh 下载的 subtitles/ 或 audio/（音频被切开时还有各段音频），
-                             subtitle_document.json（字幕质量检查），
+                             subtitle_document.json（字幕解析检查），
                              deepgram.json、deepgram_chunk_NNN.json（每段音频的 Deepgram 结果）
   raw_text.txt  segments.json  normalized_document.json
   plan.json
@@ -974,10 +973,8 @@ agent 从不编辑状态文件，也从不手动执行内部阶段。需要不�
     "track": "en",
     "track_kind": "manual",
     "mode": "bilingual",
-    "subtitle_quality": {"score": 1.0, "band": "excellent"},
     "blocked_tracks": [],
     "fallback_used": false,
-    "rerouted_from": null,
     "reason": "English video with human English subtitles"
   },
   "stages": {
@@ -1089,7 +1086,7 @@ agent 从不编辑状态文件，也从不手动执行内部阶段。需要不�
 
 | 参数 | 重跑时保留 | 作用 |
 |---|---|---|
-| `--source subtitles\|deepgram` | 是 | 强制来源。`deepgram` 跳过字幕；`subtitles` 即使质量分会触发改道也坚持用选中的字幕轨。从 `source` 起重做后面所有阶段。 |
+| `--source subtitles\|deepgram` | 是 | 强制来源。`deepgram` 跳过字幕；`subtitles` 在视频没有可信字幕轨时直接失败，不去转写。从 `source` 起重做后面所有阶段。 |
 | `--mode chinese\|bilingual` | 是 | 强制输出形式。模式跟着来源文字走（中文文字对应 `chinese`，英文文字对应 `bilingual`），所以这个参数实际上决定用哪条字幕轨：英文视频上，`bilingual` 即使有人工中文字幕也用英文字幕，`chinese` 用人工中文字幕。没有字幕轨或元数据说明口语语言时（6.3），它也替 Deepgram 指定语言：`chinese` 为中文音频，`bilingual` 为英文音频。从 `source` 起重做后面所有阶段。 |
 | `--from <阶段>` | 否 | 把该阶段及之后的阶段标为未完成，然后运行。用于恢复和调试。 |
 | `--stage plan` | 写进 `next_command` | 做完 `plan` 就停：免费的路由检查。 |
@@ -1167,7 +1164,6 @@ kernel/
   text/
     cleanup/              VTT 解析和字幕清理、CJK 空格、重叠裁剪、合并后清理
     normalize.py          规范化文档
-    subtitle_quality.py   字幕质量分和改道信号
     plan.py               文字任务、short 或 long、规模估算
     chunking.py           窗口运行读取的分块
     window.py             滑动窗口执行器，以及每个任务的后端选择
@@ -1189,9 +1185,8 @@ prompts/*.md              任务 prompt：cleanup_zh、structure_only、translat
 
 依赖只朝一个方向。`config`、`files` 和 `locks` 不引用 kernel 里的其他模块；`llm` 只用 `config`，`sources` 只用 `config`、`files` 和 `locks`；`text` 用 `config`、`files` 和 `llm`；`quality` 用 `text`；`pipeline` 用上面所有模块；`cli` 用 `pipeline`，调试命令另外用 `sources` 和 `quality`。`kernel/` 里没有任何模块引用 `yt_transcript_utils.py`。唯一的回路跨越进程：`pipeline` 启动 `download.sh`，`download.sh` 再把元数据交给 `subtitle-info` 命令。
 
-拆分之前（重构第 0 阶段）写下的模块计划和结果有四处不同，原因如下：
+拆分之前（重构第 0 阶段）写下的模块计划和结果有三处不同，原因如下：
 
-- **字幕质量放在 `text/subtitle_quality.py`，不在 `sources`。** 它给清理后的字幕文字打分，`normalize` 和 `source` 阶段都要用；放在 `sources` 会让 `text` 依赖 `sources`。`source` 阶段通过 `pipeline` 调用它。
 - **`download.sh` 仍然作为子进程运行**，没有并入 `sources`。它是约 420 行的 shell，负责拼 yt-dlp 命令（设置、cookies、`-t sleep`、按顺序的候选字幕轨、选择音频格式），每个命令只执行一次，再输出 JSON；重试和错误处理的策略在 Python 里（`sources/youtube.py`、`_Run.download`）。把剩下的部分也移植过来有改变行为的风险，用户却得不到任何好处。`pipeline` 通过环境变量把路径和 yt-dlp 设置传给它，并把持有的锁描述符一起传过去。
 - **交给 agent 的逻辑留在 `pipeline`**（`AgentHandoff`），不在 `llm`。它属于这次运行，而不是某个后端：它往工作目录里写文件，并以 `needs_agent_text` 结果结束本次调用。窗口执行器把它作为回调接收，和其他后端一样对待。
 - **默认值都归 `config.py`。** 它定义每个配置项的默认值，`load_config` 返回的结果里每个键都已填好，所以读取配置的模块拿到的总是完整的值，不再各自保留默认值。
@@ -1199,7 +1194,7 @@ prompts/*.md              任务 prompt：cleanup_zh、structure_only、translat
 ### 6.12 测试
 
 - **单元测试**按领域放在 `tests/regression_*.py`，用 `python3 -m unittest tests.test_regressions` 全部运行（离线，不到一分钟）。被删除代码的测试已随代码一起删除。
-- **端到端测试**（`tests/regression_e2e.py`）通过 `scripts/run_regression.py --fixtures tests/fixtures/e2e` 离线跑整个流程：`PATH` 上的假 `yt-dlp`（`tests/e2e/`）提供录好的元数据和字幕，假 Deepgram 用录好的响应回答，假 LLM 命令行（`tests/fake_llm.py`，通过 `llm_agent_cli` 接入）实现窗口协议和大纲 JSON。用例：中文人工字幕（长视频，带大纲的多轮窗口）、英文字幕（双语）、无字幕（Deepgram）、不支持的语言。路由和产物与 `tests/fixtures/e2e/baseline.json` 对比；有意的改动之后用 `UPDATE_E2E_BASELINE=1` 重新生成。四个用例同时运行，假 `yt-dlp` 记下每次调用，所以这个测试还检查 yt-dlp 从没有两个同时在跑，以及每个视频的页面只取了一次（Deepgram 路线两次）。`tests/regression_run.py` 覆盖 `text` 阶段内的续跑、覆盖参数的保留和拒绝、`--max-seconds`、`--from`、`--restart`、`--stage plan`、质量改道，以及每一种结果状态。`tests/regression_concurrency.py` 用真实的进程测锁：八个进程抢一把锁从不重叠，持有者被杀掉后锁被释放，有上限的等待返回带持有者的 `in_progress`，`cleanup` 拒绝删除正在运行的视频，限流让排队的运行不再调用 yt-dlp，而之后开始的运行会试一次。
+- **端到端测试**（`tests/regression_e2e.py`）通过 `scripts/run_regression.py --fixtures tests/fixtures/e2e` 离线跑整个流程：`PATH` 上的假 `yt-dlp`（`tests/e2e/`）提供录好的元数据和字幕，假 Deepgram 用录好的响应回答，假 LLM 命令行（`tests/fake_llm.py`，通过 `llm_agent_cli` 接入）实现窗口协议和大纲 JSON。用例：中文人工字幕（长视频，带大纲的多轮窗口）、英文字幕（双语）、无字幕（Deepgram）、不支持的语言。路由和产物与 `tests/fixtures/e2e/baseline.json` 对比；有意的改动之后用 `UPDATE_E2E_BASELINE=1` 重新生成。四个用例同时运行，假 `yt-dlp` 记下每次调用，所以这个测试还检查 yt-dlp 从没有两个同时在跑，以及每个视频的页面只取了一次（Deepgram 路线两次）。`tests/regression_run.py` 覆盖 `text` 阶段内的续跑、覆盖参数的保留和拒绝、`--max-seconds`、`--from`、`--restart`、`--stage plan`，以及每一种结果状态。`tests/regression_concurrency.py` 用真实的进程测锁：八个进程抢一把锁从不重叠，持有者被杀掉后锁被释放，有上限的等待返回带持有者的 `in_progress`，`cleanup` 拒绝删除正在运行的视频，限流让排队的运行不再调用 yt-dlp，而之后开始的运行会试一次。
 - **真实视频回归**：任何动到主路径的改动合并前，在能访问 YouTube 的机器上跑 `scripts/run_regression.py`（它调用 `run`；见 `tests/live_regression/README.md`）。`--stage plan` 和 `--no-deepgram` 可以让它免费或很便宜。
 
 ### 6.13 SKILL.md 的内容
@@ -1439,7 +1434,6 @@ merge 阶段 -> verify 阶段 -> assemble 阶段
 | `--max-seconds` 和 `in_progress`（6.7） | `_Run.deadline_passed`，以及 `stage_text` 交给窗口执行器的 `stop_check` |
 | 调用 yt-dlp、更新检查、`needs_user` 的原因（6.2） | `_Run.download`、`_Run.update_yt_dlp`、`kernel/sources/youtube.py`（`classify`）；`scripts/download.sh`、`scripts/update_yt_dlp.sh` |
 | 语言判断和字幕轨选择（6.3） | `kernel/sources/subtitle_language.py`（`select_subtitle_candidates`）、`_Run.stage_source`、`_Run.subtitle_route` |
-| 字幕质量分和改道（6.3） | `kernel/text/subtitle_quality.py`，在 `_Run.subtitle_route` 里使用 |
 | Deepgram（6.3） | `kernel/sources/deepgram.py`（`transcribe_deepgram`）、`_Run.transcribe` |
 | VTT 解析和字幕清理 | `kernel/text/cleanup/subtitle.py`、`cjk.py`、`overlap.py` |
 | 规范化文档 | `kernel/text/normalize.py` |
@@ -1456,7 +1450,7 @@ merge 阶段 -> verify 阶段 -> assemble 阶段
 
 实现这份设计时依据的计划，和代码有几处不同，都是有意为之：
 
-- 6.11 里模块结构的四点：字幕质量在 `text`，`download.sh` 仍是子进程，交给 agent 的逻辑在 `pipeline`，默认值都归 `config.py`；
+- 6.11 里模块结构的三点：`download.sh` 仍是子进程，交给 agent 的逻辑在 `pipeline`，默认值都归 `config.py`；
 - `subtitle-info` 从 stdin 读 yt-dlp 元数据，而不是接收一个链接，因为 `download.sh` 把元数据管道给它，而 `run` 直接用已经取到的元数据；
 - `text` 阶段在窗口运行之前仍然先把原文切成分块，因为分块既决定单元边界的切分方式，也是兜底处理的大小。
 
@@ -1481,7 +1475,7 @@ merge 阶段 -> verify 阶段 -> assemble 阶段
 1. 短视频的文字改由 LLM 后端（通常是宿主 CLI）处理，不再由宿主模型在对话里直接写。
 2. 首选字幕轨被拒时，运行以 `needs_user` 停下，不再悄悄换用另一条字幕轨（6.3）。
 3. 对已完成的视频重跑会返回已有的文章，而不是从头再做；要重做用 `--restart`。
-4. 字幕质量改道在 `source` 内部、规范化之前完成；结果不变。
+4. 字幕质量改道在 `source` 内部、规范化之前完成；结果不变。（改道后来删除了，见 6.3。）
 5. 新增：`--max-seconds` 和 `in_progress` 结果，用于 shell 有时间上限的宿主。
 
 字幕语言选择、Deepgram 转写、窗口执行器的算法、大纲和术语表、质量检查都只是搬了位置，行为没变；唯一的例外是第 3 阶段的两处输出修正：窗口输出合并时不再拼接短段落（这曾把双语的中英两段粘在一起），`structure_only` 去掉 `-` 说话人标记。

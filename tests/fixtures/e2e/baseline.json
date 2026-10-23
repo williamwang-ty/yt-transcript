@@ -14,8 +14,6 @@
     "plan": {
       "video_path": "short",
       "routing_reason": "duration_short_single_pass",
-      "subtitle_quality_band": "excellent",
-      "reroute_recommended": false,
       "prompts": [
         "structure_only",
         "translate_only"
@@ -96,8 +94,6 @@
     "plan": {
       "video_path": "short",
       "routing_reason": "duration_short_single_pass",
-      "subtitle_quality_band": "",
-      "reroute_recommended": false,
       "prompts": [
         "cleanup_zh"
       ]
@@ -170,8 +166,6 @@
     "plan": {
       "video_path": "long",
       "routing_reason": "duration_threshold",
-      "subtitle_quality_band": "excellent",
-      "reroute_recommended": false,
       "prompts": [
         "cleanup_zh"
       ]
