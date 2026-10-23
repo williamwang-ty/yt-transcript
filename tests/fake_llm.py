@@ -12,10 +12,9 @@ stdin. It answers the requests the pipeline makes:
   replaced), no terms;
 - a window round by copying its `[Sn]` units back unchanged, roughly as many
   characters as the round asks for, in paragraphs of PARAGRAPH_UNITS units,
-  with `## ` headings from the round's outline block (or one placeholder
-  heading every SECTION_EVERY units when there is no outline), then
-  `<!--END-->`. A heading whose section begins at words inside a unit goes
-  right before those words, starting a new paragraph there;
+  then `<!--END-->`. A section from the round's outline block starts a new
+  paragraph, right before its words when it begins inside a unit; without an
+  outline, one placeholder `## ` heading goes in every SECTION_EVERY units;
 - a translation round (paragraph units) by keeping each English paragraph
   and adding a recognizable placeholder Chinese line under it.
 
@@ -36,9 +35,9 @@ SECTION_EVERY = 40
 PARAGRAPH_UNITS = 4
 PROBE_PROMPT = "Reply with OK only."
 UNIT_START = re.compile(r"^\[S(\d+)\] ?", re.MULTILINE)
-# A section the round should head: its title, then its unit and words (or that it began before the window).
-OUTLINE_LINE = re.compile(r"^- (.+?) \(starts in this window; it (?:began before \[S(\d+)\]|begins in (?:or right "
-                          r"after )?\[S(\d+)\](?: at the words “(.+?)”)?)", re.MULTILINE)
+# A section starting in the round's window: its unit and the words it begins with.
+OUTLINE_LINE = re.compile(r"^- .+? \(starts in this window: it begins in (?:or right after )?\[S(\d+)\]"
+                          r"(?: at the words “(.+?)”)?", re.MULTILINE)
 ZH_CHARS = ("的一是在不了有和人这中大为上个国我以要他时来用们生到作地于出就分对成会可主发年动同工也能下过子说产种面而方"
             "后多定行学法所民得经十三之进着等部度家电力里如水化高自二理起小物现实加量都两体制机当使点从业本去把性好应开它"
             "合还因由其些然前外天政四日那社义事平形相全表间样与关各重新线内数正心反你明看原又么利比或但质气第向道命此变条")
@@ -119,10 +118,10 @@ def window_round(prompt: str) -> str:
     target = re.search(r"roughly (\d+) characters", prompt)
     budget = int(target.group(1)) if target and not finish else 0
     paragraph_units = "Every source paragraph starts" in prompt
-    headings = {}  # unit number -> (title, words the section begins with)
+    breaks = {}  # unit number -> words a section begins with ("" for the unit start)
     if "## Outline (section titles" in prompt:
-        for title, before, number, words in OUTLINE_LINE.findall(prompt.split("## Outline", 1)[1]):
-            headings[first if before else int(number)] = (title, "" if before else words)
+        for number, words in OUTLINE_LINE.findall(prompt.split("## Outline", 1)[1]):
+            breaks[int(number)] = words
 
     written = []
     chars = 0
@@ -134,23 +133,20 @@ def window_round(prompt: str) -> str:
     out = []
     paragraph: list[str] = []
     for count, (number, text) in enumerate(written):
-        heading, words = "", ""
-        if paragraph_units:
-            pass  # translation keeps the structure it is given
-        elif headings:
-            heading, words = headings.get(number, ("", ""))
-        elif "Put `##` headers" in prompt and (number - 1) % SECTION_EVERY == 0:
+        heading = ""
+        section_starts = not paragraph_units and number in breaks
+        if not paragraph_units and not breaks and "Put `##` headers" in prompt and (number - 1) % SECTION_EVERY == 0:
             heading = f"Part {number}" if re.search(r"[A-Za-z]{3,}", text) and not re.search(r"[一-鿿]", text) \
                 else zh_title(number)
-        split = text.find(words) if heading and words else 0
-        if heading and split > 0:
+        words = breaks.get(number, "") if section_starts else ""
+        split = text.find(words) if words else 0
+        if split > 0:
             # The section begins inside this unit: the unit's first part ends the paragraph before.
             paragraph.append(f"[S{number}] {text[:split].rstrip()}")
             out.append(" ".join(paragraph))
-            out.append(f"## {heading}")
             paragraph = [text[split:]]
             continue
-        if heading or len(paragraph) >= PARAGRAPH_UNITS:
+        if heading or section_starts or len(paragraph) >= PARAGRAPH_UNITS:
             if paragraph:
                 out.append(" ".join(paragraph))
             paragraph = []

@@ -10,6 +10,7 @@ from pathlib import Path
 from kernel.quality import semantic as kernel_semantic
 from kernel.text import glossary as kernel_glossary
 from kernel.text import window as kernel_window
+from kernel.text.structure import SENTENCE_END
 from kernel.text.cleanup import overlap as kernel_overlap
 from kernel.text.cleanup.cjk import is_cjk_family_char
 from kernel.text.measure import (
@@ -29,9 +30,6 @@ QUALITY_CJK_SPACE_PATTERNS = (
 # Paragraph length past which the prompts ask the model to look for a split.
 PARAGRAPH_SPLIT_ABOVE_CHARS = 500
 PARAGRAPH_SPLIT_ABOVE_WORDS = 250
-# A paragraph ending like this finishes its last sentence (closing quotes,
-# brackets and Markdown emphasis may follow the punctuation).
-SENTENCE_END = re.compile(r"[。！？!?.…；;][\"'”’」』）)\]】》*_]*$")
 
 
 def _has_unbalanced_terminal_markers(text: str) -> bool:
@@ -219,9 +217,10 @@ def _compute_paragraph_length_metrics(body_paragraphs: list[str], *, bilingual: 
 def _count_headings_mid_sentence(blocks: list[str]) -> int:
     """Count `##` headings right after a paragraph that stops in the middle of a sentence (advisory only).
 
-    Such a heading usually splits one sentence in two, which happens when a
-    heading is put at a source unit boundary inside an unpunctuated subtitle
-    sentence instead of before the sentence its section begins with.
+    Such a heading usually splits one sentence in two. The program puts
+    headings at sentence starts of the written text (`kernel/text/structure.py`),
+    so this counts what it let through: a paragraph ending on a dash or a
+    colon, a sentence piece too long to move, or text without punctuation.
     """
     count = 0
     previous = None

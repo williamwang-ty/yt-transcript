@@ -938,7 +938,7 @@ class _Run:
                     task={**needed.task, "name": prompt},
                 ) from None
             task_record.update({key: result.get(key) for key in (
-                "round_count", "fallback_rounds", "invalid_rounds", "outline", "coverage", "efficiency")
+                "round_count", "fallback_rounds", "invalid_rounds", "outline", "structure", "coverage", "efficiency")
                 if key in result})
             self.update_task_progress(task_record, task["input_key"])
             self.update_llm_usage()

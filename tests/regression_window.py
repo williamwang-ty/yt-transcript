@@ -7,6 +7,7 @@ from kernel.llm import agent_cli
 from kernel.text import chunking
 from kernel.text import merge as kernel_merge
 from kernel.text import outline
+from kernel.text import structure
 from kernel.text import window
 from tests import fake_llm
 
@@ -753,51 +754,89 @@ class WindowOutlineTests(unittest.TestCase):
         self.assertEqual([s["title"] for s in merged["sections"]], ["甲", "乙", "丙"])
         self.assertEqual(merged["terms"], [{"term": "GPU", "variants": ["G P U"], "kind": "term"}])
 
-    def test_heading_goes_before_the_paragraph_whose_middle_is_past_the_section_start(self):
-        sections = [{"start": 1, "title": "a"}, {"start": 12, "title": "b"}, {"start": 20, "title": "c"}]
-        self.assertEqual(outline.sections_before(sections, 0, 1, 4), 1)
-        # Section b starts late in S9-S12: it waits for the next paragraph.
-        self.assertEqual(outline.sections_before(sections, 1, 9, 12), 1)
-        self.assertEqual(outline.sections_before(sections, 1, 13, 15), 2)
-        # Early in a paragraph: the heading goes before it.
-        self.assertEqual(outline.sections_before(sections, 2, 19, 25), 3)
+    def test_heading_without_anchor_goes_before_the_paragraph_whose_middle_is_past_the_section_start(self):
+        paragraphs = [{"text": "甲。", "start": 1, "end": 4}, {"text": "乙。", "start": 5, "end": 8},
+                      {"text": "丙。", "start": 9, "end": 12}, {"text": "丁。", "start": 13, "end": 15}]
+        sections = [{"start": 1, "title": "a"}, {"start": 12, "title": "b"}]
+        text, stats = structure.structure_paragraphs(paragraphs, sections)
+        # b starts late in S9-S12: its heading waits for the next paragraph.
+        self.assertEqual(text, "## a\n\n甲。\n\n乙。\n\n丙。\n\n## b\n\n丁。")
+        self.assertEqual((stats["headings_between_paragraphs"], stats["unplaced_sections"]), (2, 0))
+        # Early in a paragraph: the heading goes before it; past the middle of the last one: not placed.
+        text, stats = structure.structure_paragraphs(paragraphs, [{"start": 10, "title": "c"},
+                                                                  {"start": 15, "title": "d"}])
+        self.assertEqual(text, "甲。\n\n乙。\n\n## c\n\n丙。\n\n丁。")
+        self.assertEqual(stats["unplaced_sections"], 1)
 
-    def test_model_heading_for_a_nearby_section_is_kept_where_the_model_put_it(self):
-        sections = [{"start": 1, "title": "开场"}, {"start": 10, "title": "第二部分", "title_zh": "第二部分"},
-                    {"start": 20, "title": "第三部分"}]
-        # The topic really starts a little after S10's tag: the model's heading stays there.
-        text = "前一个话题的结尾。\n\n## 第二部分\n\n新话题开始了。\n\n## 自己编的标题\n\n继续。"
-        body, placed, next_section, written = outline.place_headings(sections, 1, text, 9, 12)
-        self.assertEqual(body, "前一个话题的结尾。\n\n## 第二部分\n\n新话题开始了。\n\n继续。")
-        self.assertEqual((placed, next_section, written), ([10], 2, 1))
-        # A matching title far from its section start is not trusted; the program places it.
-        body, placed, next_section, written = outline.place_headings(sections, 1, "## 第三部分\n\n甲。", 9, 11)
-        self.assertEqual((body, placed, next_section, written), ("## 第二部分\n\n甲。", [10], 2, 0))
-        # Skipped sections before a model-placed one are headed with it, in order.
-        body, placed, next_section, written = outline.place_headings(sections, 1, "甲。\n\n## 第三部分\n\n乙。",
-                                                                     18, 21)
-        self.assertEqual(body, "甲。\n\n## 第二部分\n\n## 第三部分\n\n乙。")
-        self.assertEqual((placed, next_section, written), ([10, 20], 3, 1))
+    def test_headings_go_before_the_written_sentence_holding_the_anchor(self):
+        written = ("上一个话题讲完了。在整个日常经营里边的表现，这个是现在我们看到的问题。"
+                   "可不可以具体举一个例子？比如说一个跨境商家。")
+        paragraphs = [{"text": written, "start": 1, "end": 3},
+                      {"text": "他一开始用 Accio Work 是想解决什么问题。", "start": 4, "end": 4}]
+        sections = [{"start": 1, "title": "开场", "anchor": "上一个话题讲完了"},
+                    {"start": 2, "title": "商家案例", "anchor": "可不可以具体举一个例子"}]
+        text, stats = structure.structure_paragraphs(paragraphs, sections)
+        self.assertEqual(text, "## 开场\n\n上一个话题讲完了。在整个日常经营里边的表现，这个是现在我们看到的问题。\n\n"
+                               "## 商家案例\n\n可不可以具体举一个例子？比如说一个跨境商家。\n\n"
+                               "他一开始用 Accio Work 是想解决什么问题。")
+        self.assertEqual(stats["headings_at_sentence"], 2)
+        # An anchor that begins mid-sentence (a unit cut at a cue pause): the heading goes
+        # before the whole sentence, never inside it.
+        text, _ = structure.structure_paragraphs(paragraphs, [{"start": 1, "title": "甲", "anchor": "这个是现在我们看到的"}])
+        self.assertIn("上一个话题讲完了。\n\n## 甲\n\n在整个日常经营里边的表现，", text)
+        # The cleanup dropped a filler the anchor starts with: the anchor's end is still found.
+        text, _ = structure.structure_paragraphs(paragraphs, [{"start": 2, "title": "乙", "anchor": "嗯可不可以具体举一个例子"}])
+        self.assertIn("问题。\n\n## 乙\n\n可不可以具体举一个例子？", text)
+        # Words found only far from the section's unit do not count: the heading goes between paragraphs.
+        text, stats = structure.structure_paragraphs(paragraphs, [{"start": 9, "title": "丙", "anchor": "上一个话题讲完了"}])
+        self.assertEqual(stats["headings_at_sentence"], 0)
+
+    def test_paragraphs_that_stop_inside_a_sentence_are_mended_with_the_shorter_piece(self):
+        paragraphs = [
+            {"text": "我们核心讲的还是说，越来越多的重复性工作交给 AI，", "start": 1, "end": 1},
+            {"text": "我觉得这是一个进步。你刚刚提到最后一个下单的动作。", "start": 2, "end": 2},
+            {"text": "长的一段。然后话没说完就断开了因为", "start": 3, "end": 3},
+            {"text": "这一轮到这里结束，下一轮接着把它讲完。后面还有。", "start": 4, "end": 4},
+            {"text": "And he was turning—", "start": 5, "end": 5},
+            {"text": "That's correct.", "start": 6, "end": 6},
+            {"text": "没有标点的一段", "start": 7, "end": 7},
+            {"text": "也没有标点", "start": 8, "end": 8},
+        ]
+        text, stats = structure.structure_paragraphs(paragraphs)
+        self.assertEqual(text.split("\n\n"), [
+            # The paragraph takes the rest of its sentence from the next one ...
+            "我们核心讲的还是说，越来越多的重复性工作交给 AI，我觉得这是一个进步。",
+            "你刚刚提到最后一个下单的动作。",
+            # ... or hands its unfinished sentence to it, whichever is shorter.
+            "长的一段。",
+            "然后话没说完就断开了因为这一轮到这里结束，下一轮接着把它讲完。后面还有。",
+            # A dash ends a turn; without punctuation nothing shows where a sentence ends.
+            "And he was turning—", "That's correct.", "没有标点的一段", "也没有标点"])
+        self.assertEqual((stats["mended_sentences"], stats["unfinished_paragraphs"]), (2, 1))
+        # A heading a round wrote after an unfinished sentence moves before that sentence.
+        text, stats = structure.structure_paragraphs([{"text": "甲。乙，\n\n## 标题\n\n丙。丁。", "start": 1, "end": 3}])
+        self.assertEqual(text, "甲。\n\n## 标题\n\n乙，丙。丁。")
+        self.assertEqual(stats["moved_headings"], 1)
+        self.assertEqual(structure.sentence_ends('He said. Alibaba.com is 3.5 big!" Then…'), [8, 33, 39])
 
     def test_round_context_lists_nearby_sections_and_terms_found_in_the_window(self):
         sections = [{"start": 1, "title": "甲"}, {"start": 10, "title": "乙", "anchor": "可不可以具体举一个例子"},
                     {"start": 14, "title": "戊"}, {"start": 30, "title": "丙"}, {"start": 50, "title": "丁"}]
-        text = outline.round_outline_text(sections, cursor=4, window_end=20, next_section=1)
-        self.assertIn("- 甲 (the section [S5] is in; already headed)", text)
-        # The heading goes before the sentence holding the section's first words, not at the unit tag.
-        self.assertIn("- 乙 (starts in this window; it begins in [S10] at the words “可不可以具体举一个例子”: start a "
-                      "new paragraph at the beginning of the sentence that contains these words, and put the line "
-                      "`## 乙` before it)", text)
-        self.assertIn("- 戊 (starts in this window; it begins in or right after [S14], where this topic starts", text)
+        text = outline.round_outline_text(sections, cursor=4, window_end=20)
+        self.assertIn("- 甲 (the section [S5] is in)", text)
+        # A new paragraph starts at the sentence holding the section's first words, not at the unit tag.
+        self.assertIn("- 乙 (starts in this window: it begins in [S10] at the words “可不可以具体举一个例子”; start a "
+                      "new paragraph at the beginning of the sentence that contains these words)", text)
+        self.assertIn("- 戊 (starts in this window: it begins in or right after [S14], where this topic starts", text)
         self.assertIn("- 丙 (next section", text)
         self.assertNotIn("丁", text)
-        self.assertNotIn("[S10] 乙", text)
-        # A section that began before the window and has no heading yet opens the output.
-        text = outline.round_outline_text(sections, cursor=11, window_end=20, next_section=1)
-        self.assertIn("- 乙 (starts in this window; it began before [S12], so start the output with the line `## 乙`)",
-                      text)
-        text = outline.round_outline_text(sections, cursor=9, window_end=20, next_section=1)
-        self.assertIn("- 乙 (starts in this window; it begins in [S10] at the words", text)
+        self.assertNotIn("`##", text)
+        text = outline.round_outline_text(sections, cursor=11, window_end=20)
+        self.assertIn("- 乙 (the section [S12] is in)", text)
+        # A section starting at the window's first unit may begin inside it.
+        text = outline.round_outline_text(sections, cursor=9, window_end=20)
+        self.assertIn("- 甲 (the section [S10] is in)", text)
+        self.assertIn("- 乙 (starts in this window: it begins in [S10] at the words", text)
         terms = [{"term": "英伟达", "variants": ["因为达"], "kind": "organization"},
                  {"term": "CUDA", "variants": [], "kind": "product"},
                  {"term": "黄仁勋", "variants": [], "kind": "person"}]
@@ -902,17 +941,18 @@ class WindowOutlineTests(unittest.TestCase):
             result, _ = WindowExecutorTests._run(self, work_dir, self._config(), llm)
             state = window.load_window_state(str(work_dir))
             merge, merged = self._merged(work_dir, tmpdir)
+            files = [(Path(work_dir) / "window" / p["file"]).read_text(encoding="utf-8") for p in state["paragraphs"]]
 
         self.assertTrue(result["success"], result)
         self.assertEqual(len(calls["outline"]), 1)
         self.assertEqual(result["outline"]["status"], "ok")
         self.assertEqual(result["outline"]["section_count"], 3)
-        self.assertEqual(result["outline"]["unplaced_sections"], 0)
+        self.assertEqual(result["structure"]["unplaced_sections"], 0)
         self.assertIn("[S1] " + _sentence(1), calls["outline"][0])
         self.assertIn(f"[S{self.SENTENCE_COUNT}] ", calls["outline"][0])
         first_round = calls["rounds"][0]
-        self.assertIn("do not invent headers", first_round)
-        self.assertIn("- 开场 (starts in this window; it begins in or right after [S1]", first_round)
+        self.assertIn("Do not write any `#` header lines", first_round)
+        self.assertIn("- 开场 (starts in this window: it begins in or right after [S1]", first_round)
         self.assertIn('"first_words"', calls["outline"][0])
         self.assertIn("write 测验", first_round)
         self.assertNotIn("Terminology Guardrails", first_round)
@@ -927,7 +967,8 @@ class WindowOutlineTests(unittest.TestCase):
         for i in range(1, self.SENTENCE_COUNT + 1):
             self.assertEqual(merged.count(_sentence(i)), 1, i)
         self.assertEqual(merge["sections"], 3)
-        self.assertEqual(sum(len(p.get("sections", [])) for p in state["paragraphs"]), 3)
+        # The paragraph files hold only text; the headings are added when they are joined.
+        self.assertFalse(any("##" in text for text in files))
 
     def test_headings_go_before_the_words_a_section_begins_with_not_at_a_unit_tag(self):
         # Unpunctuated text, like Chinese subtitles: units are fixed-size cuts that start mid-sentence.
@@ -955,7 +996,7 @@ class WindowOutlineTests(unittest.TestCase):
         self.assertIn(f"\n\n## 第二部分\n\n{words}然后", merged)
         self.assertEqual(merged.replace("\n", "").replace("## 开场", "").replace("## 第二部分", ""), text)
         self.assertEqual(result["outline"]["anchored_sections"], 2)
-        self.assertEqual(result["outline"]["model_placed_sections"], 2)
+        self.assertEqual(result["structure"]["headings_at_sentence"], 2)
 
     def test_failed_outline_falls_back_to_headings_from_the_rounds(self):
         llm, calls = self._llm("抱歉，我无法生成大纲。")

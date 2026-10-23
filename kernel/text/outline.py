@@ -6,13 +6,14 @@ returns a short JSON object: the section list (title, first source unit and
 the words the section begins with) and a list of names and terms with the
 spellings that should be used. The window rounds then get the relevant part
 of the outline and the terms that occur in their window; section headings
-come from the outline instead of being chosen by each round.
+come from the outline instead of being chosen by each round, and the program
+adds them to the written text (`kernel/text/structure.py`).
 
 A section's position is its anchor: the words it begins with, copied from the
 source, plus the unit holding them. Unit numbers alone are too coarse, since
 a unit of unpunctuated subtitles is a cut at a cue pause and often starts in
-the middle of a sentence; a heading placed at a unit tag would split that
-sentence.
+the middle of a sentence; the heading goes before the written sentence that
+holds the anchor.
 
 YouTube chapters, when the video has them, are mapped to source units and
 given to the model as hints, anchored at the chapter's first subtitle cue.
@@ -45,9 +46,9 @@ MAX_TERM_CHARS = 60
 MAX_ROUND_TERMS = 20
 TERM_KINDS = ("person", "organization", "product", "term")
 HEADER_LINE = re.compile(r"^[ \t]*#{1,6}[ \t]+.*$\n?", re.MULTILINE)
-# A heading the model writes for a section is accepted when its paragraph
-# covers units within this distance of the section's first unit; the
-# section's first words are looked for this far from the unit the model gave.
+# A section's first words are looked for this far from the unit the model
+# gave, in the source and again in the written text, and a chapter takes over
+# the section starting this close to it.
 HEADING_TOLERANCE_UNITS = 2
 # Length of an anchor, weighing an English word 2 and a Chinese character 1:
 # about as long as the words it is made from (a cue, the model's first
@@ -396,7 +397,7 @@ def generate_outline(units: list[str], *, prompt_name: str, call_llm, max_output
 # Anchors: the words a section begins with
 # ---------------------------------------------------------------------------
 
-def _key_chars(text: str) -> tuple[str, list[int]]:
+def key_chars(text: str) -> tuple[str, list[int]]:
     """Lower-cased letters and digits of `text`, and the index in `text` of each."""
     chars, positions = [], []
     for index, char in enumerate(text):
@@ -411,7 +412,7 @@ def _join_units(left: str, right: str) -> str:
     return left + (" " if (left[-1:] + right[:1]).isascii() else "") + right
 
 
-def _weight(text: str) -> int:
+def text_weight(text: str) -> int:
     return sum(2 if word.isascii() else 1 for word in ANCHOR_WORD.findall(text))
 
 
@@ -423,7 +424,7 @@ def anchor_text(units: list[str], index: int, position: int, weight: int = ANCHO
     """
     text = units[index][position:]
     for following in units[index + 1:index + 3]:
-        if _weight(text) >= ANCHOR_MIN_WEIGHT:
+        if text_weight(text) >= ANCHOR_MIN_WEIGHT:
             break
         text = _join_units(text, following)
     target = max(ANCHOR_MIN_WEIGHT, min(ANCHOR_MAX_WEIGHT, weight))
@@ -445,7 +446,7 @@ def locate_words(units: list[str], words: str, start: int) -> tuple[int, int] | 
     whole of the words is not there, their first ANCHOR_PROBE_KEY characters
     are tried, since models sometimes fix a word while copying.
     """
-    key, _ = _key_chars(words)
+    key, _ = key_chars(words)
     if len(key) < MIN_ANCHOR_KEY:
         return None
     probes = [key, key[:ANCHOR_PROBE_KEY]] if len(key) > ANCHOR_PROBE_KEY else [key]
@@ -456,7 +457,7 @@ def locate_words(units: list[str], words: str, start: int) -> tuple[int, int] | 
         for index in range(first, last):
             # The words may run over the end of the unit into the next one.
             text = _join_units(units[index], units[index + 1]) if index + 1 < len(units) else units[index]
-            compact, positions = _key_chars(text)
+            compact, positions = key_chars(text)
             found = compact.find(probe)
             while found >= 0 and positions[found] < len(units[index]):
                 candidate = (abs(index - (start - 1)), index, positions[found])
@@ -483,7 +484,7 @@ def anchor_sections(sections: list[dict], units: list[str]) -> list[dict]:
         if found:
             index, position = found
             section["start"] = index + 1
-            section["anchor"] = anchor_text(units, index, position, _weight(words))
+            section["anchor"] = anchor_text(units, index, position, text_weight(words))
         if anchored and section["start"] <= anchored[-1]["start"]:
             continue
         anchored.append(section)
@@ -591,7 +592,7 @@ def hints_from_times(chapters: list[dict], cue_starts: list[tuple[int, float]],
             within = max(0, offset - unit_offsets[unit_index])
             position = _visible_index(unit, within)
             # As long as the chapter's first cue (the part of it in this unit).
-            weight = _weight(unit[position:_visible_index(unit, within + cue_ends[offset] - offset)]) \
+            weight = text_weight(unit[position:_visible_index(unit, within + cue_ends[offset] - offset)]) \
                 if offset in cue_ends else ANCHOR_DEFAULT_WEIGHT
             anchor = anchor_text(units, unit_index, position, weight)
             if anchor:
@@ -604,35 +605,27 @@ def hints_from_times(chapters: list[dict], cue_starts: list[tuple[int, float]],
 # Use in window rounds
 # ---------------------------------------------------------------------------
 
-def round_outline_text(sections: list[dict], cursor: int, window_end: int, next_section: int = 0) -> str:
+def round_outline_text(sections: list[dict], cursor: int, window_end: int) -> str:
     """The outline lines a round needs: the section it starts in, those starting in its window, and the next.
 
-    Sections from `next_section` on have no heading yet; the model is asked
-    to write the heading of those that begin in its window, before the
-    sentence holding the section's anchor, so that a heading never splits a
-    sentence that runs across a unit tag.
+    The model is asked to start a new paragraph at the beginning of the
+    sentence each section in its window begins with, so that the heading the
+    program adds there later falls between two paragraphs.
     """
     lines = []
-    current = None
-    for index, section in enumerate(sections):
-        if section["start"] <= cursor + 1:
-            current = index
     following = None
     for index, section in enumerate(sections):
         start, title = section["start"], section["title"]
-        heading = f"put the line `## {title}` before it"
-        if index == current and index < next_section:
-            lines.append(f"- {title} (the section [S{cursor + 1}] is in; already headed)")
-        elif index >= next_section and (index == current or cursor + 1 < start <= window_end):
-            if start <= cursor:
-                spot = f"it began before [S{cursor + 1}], so start the output with the line `## {title}`"
-            elif section.get("anchor"):
-                spot = (f"it begins in [S{start}] at the words “{section['anchor']}”: start a new paragraph at the "
-                        f"beginning of the sentence that contains these words, and {heading}")
+        if start <= cursor and (index + 1 == len(sections) or sections[index + 1]["start"] > cursor):
+            lines.append(f"- {title} (the section [S{cursor + 1}] is in)")
+        elif cursor < start <= window_end:
+            if section.get("anchor"):
+                spot = (f"it begins in [S{start}] at the words “{section['anchor']}”; start a new paragraph at the "
+                        "beginning of the sentence that contains these words")
             else:
-                spot = (f"it begins in or right after [S{start}], where this topic starts: start a new paragraph at "
-                        f"the beginning of that sentence, and {heading}")
-            lines.append(f"- {title} (starts in this window; {spot})")
+                spot = (f"it begins in or right after [S{start}], where this topic starts; start a new paragraph at "
+                        "the beginning of that sentence")
+            lines.append(f"- {title} (starts in this window: {spot})")
         elif start > window_end and following is None:
             following = index
             lines.append(f"- {title} (next section, after this window)")
@@ -682,64 +675,3 @@ def heading_block(section: dict) -> str:
     if section.get("title_zh") and section["title_zh"] != section["title"]:
         lines.append(f"## {section['title_zh']}")
     return "\n".join(lines)
-
-
-def place_headings(sections: list[dict], next_section: int, text: str, start: int,
-                   end: int) -> tuple[str, list, int, int]:
-    """Put the outline's headings into one committed paragraph group (units start..end, 1-based).
-
-    The model is asked to write a section's title, as given, before the
-    sentence holding the section's anchor. Such a heading is kept (in the
-    canonical form) when the section starts near the group's units; any
-    other header line is removed. A section the model did not head gets its
-    heading from the program, before the first paragraph whose midpoint
-    reaches the section start, so the program never splits a paragraph.
-    Returns the text, the starts of the sections placed here, the next
-    unplaced section index, and how many of the headings the model wrote.
-    """
-    placed: list[int] = []
-    out_lines: list[str] = []
-    model_placed = False
-    written = 0
-    for line in (text or "").split("\n"):
-        if not re.match(r"^[ \t]*#{1,6}[ \t]+", line):
-            out_lines.append(line)
-            continue
-        key = _title_key(clean_title(line))
-        match = None
-        for index in range(next_section, len(sections)):
-            section = sections[index]
-            near = start - HEADING_TOLERANCE_UNITS <= section["start"] <= end + HEADING_TOLERANCE_UNITS
-            if near and key and key in {_title_key(section["title"]), _title_key(section.get("title_zh", ""))}:
-                match = index
-                break
-        if match is None:
-            continue
-        # Sections skipped before this one get their headings here too, in order.
-        out_lines.append("\n\n".join(heading_block(section) for section in sections[next_section:match + 1]))
-        placed.extend(section["start"] for section in sections[next_section:match + 1])
-        next_section = match + 1
-        model_placed = True
-        written += 1
-    body = re.sub(r"\n{3,}", "\n\n", "\n".join(out_lines)).strip()
-    if not model_placed:
-        last = sections_before(sections, next_section, start, end)
-        if last > next_section:
-            body = "\n\n".join([heading_block(section) for section in sections[next_section:last]] + [body])
-            placed.extend(section["start"] for section in sections[next_section:last])
-            next_section = last
-    return body, placed, next_section, written
-
-
-def sections_before(sections: list[dict], next_section: int, start: int, end: int) -> int:
-    """Return the index past the sections whose heading goes before the paragraph covering units start..end (1-based).
-
-    A section heading goes before the first paragraph whose midpoint is at or
-    after the section's first unit, so a section start that falls late in a
-    paragraph moves to the next paragraph instead of splitting it.
-    """
-    midpoint = (start + end) / 2
-    index = next_section
-    while index < len(sections) and sections[index]["start"] <= midpoint:
-        index += 1
-    return index

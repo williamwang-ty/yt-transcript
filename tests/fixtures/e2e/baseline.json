@@ -119,7 +119,7 @@
       "hard_failures": [],
       "warnings": [
         "Chinese spacing anomalies detected (223 issue(s), ratio 0.095)",
-        "Chinese punctuation density looks unusually low (density 0.001)"
+        "Chinese punctuation density looks unusually low (density 0.002)"
       ],
       "checks": {
         "size_ratio_vs_raw": 1.11,
@@ -130,7 +130,7 @@
         "over_limit_paragraph_count": 1,
         "paragraph_line_break_count": 0,
         "heading_mid_sentence_count": 0,
-        "total_chars": 3364,
+        "total_chars": 3363,
         "header_density": 0.143,
         "chunk_seam_warning_count": 0,
         "glossary_drift_count": 0,

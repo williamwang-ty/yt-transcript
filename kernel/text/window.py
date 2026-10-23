@@ -4,8 +4,9 @@ Instead of cutting the source into fixed chunks up front, the executor keeps a
 cursor into numbered source units and moves it forward round by round:
 
 1. Every source unit gets a number (`[S12]`). On the raw stage a unit is a
-   sentence; on the processed stage (translation of the structured text) it
-   is a paragraph of the previous stage's output.
+   sentence, or a cut at a cue pause in unpunctuated subtitles, so it may
+   start mid-sentence; on the processed stage (translation of the structured
+   text) it is a paragraph of the previous stage's output.
 2. Each round sends a read window starting at the cursor, plus the tail of
    what was already written as left context, and asks for about N tokens of
    output that stop at a paragraph or section end.
@@ -30,7 +31,10 @@ is sent whole when one round can finish it.
 
 For prompts that write section headings, a global outline (see `outline.py`)
 is generated before the first round and kept in the state; headings then come
-from it rather than from each round.
+from it rather than from each round. The raw stage's paragraphs are joined
+through `structure.py`, which adds those headings and mends paragraphs that
+stop inside a sentence, once the model's punctuation shows where sentences
+end.
 """
 
 from __future__ import annotations
@@ -58,6 +62,7 @@ from . import glossary as kernel_glossary
 from . import measure as kernel_measure
 from . import outline as kernel_outline
 from . import prompting as kernel_prompting
+from . import structure as kernel_structure
 
 RAW_STAGE = "raw_path"
 PROCESSED_STAGE = "processed_path"
@@ -97,7 +102,8 @@ TRUNCATION_FINISH_REASONS = {"length", "max_tokens", "max_output_tokens"}
 WINDOW_DIR_NAME = "window"
 PROCESSED_DIR_NAME = "processed"
 STATE_FILE_NAME = "state.json"
-STATE_SCHEMA_VERSION = 2
+# 3: paragraph files hold no outline headings; they are added when joined.
+STATE_SCHEMA_VERSION = 3
 
 # Legacy per-paragraph markers; still stripped from output if a model writes them.
 MARKER_PATTERN = re.compile(r"<!--\s*S(\d+)\s*-->")
@@ -123,10 +129,9 @@ The input below is one window of a longer transcript. Every source {unit} starts
 
 HEADER_NOTE = " Put `##` headers on their own line."
 OUTLINE_HEADER_NOTE = (
-    " Section headings come from the Outline block below, not from you: do not invent headers, even if the task "
-    "asks for them. For a section the outline says starts in this window, start a new paragraph at the beginning of "
-    "the sentence it names and put that section's `## ` title line, exactly as given, before it; write no other "
-    "`#` lines."
+    " Do not write any `#` header lines, even if the task asks for them: the program adds the section headings "
+    "from the Outline block below. For a section the outline says starts in this window, start a new paragraph at "
+    "the beginning of the sentence it names."
 )
 
 TASK_PROTOCOL_NOTES = {
@@ -465,13 +470,9 @@ def _group_sentences(sentences: list[str], max_tokens: int, config: dict | None)
 
 
 def build_processed_units(work_dir: str, config: dict | None = None) -> list[str]:
-    """Number the raw stage's window output by paragraph for the processed stage."""
-    raw_state = load_window_state(work_dir, RAW_STAGE)
-    raw_dir = stage_dir_for(work_dir, RAW_STAGE)
-    units: list[str] = []
-    for entry in raw_state.get("paragraphs", []):
-        units.extend(split_paragraph_units(_paragraph_text(raw_dir, entry), config))
-    return units
+    """Number the raw stage's window output (with its headings) by paragraph for the processed stage."""
+    text, _ = raw_stage_text(work_dir)
+    return split_paragraph_units(text, config)
 
 
 def sentences_digest(sentences: list[str]) -> str:
@@ -807,29 +808,16 @@ def _commit_paragraphs(out_dir: Path, state: dict, paragraphs: list[dict], sente
                        *, mode: str, round_index: int) -> None:
     """Write paragraphs to disk, then record them and the new cursor in the state.
 
-    When the run has an outline, only headings for the outline's sections
-    are kept (the model's, where it wrote one near the section start, else
-    the program's); see `outline.place_headings`. The outline counts the
-    headings the model wrote in `model_placed`. Heading text is not counted
-    in `output_chars`.
+    When the run has an outline, header lines the model wrote anyway are
+    dropped: the outline's headings are added when the paragraphs are joined
+    (`raw_stage_text`).
     """
     outline = state.get("outline") or {}
     use_outline = outline.get("status") == "ok" and _stage(state.get("input_key", RAW_STAGE)) == RAW_STAGE
-    sections = outline.get("sections", []) if use_outline else []
     for paragraph in paragraphs:
         paragraph_id = len(state["paragraphs"]) + 1
         file_name = f"out_{paragraph_id:05d}.md"
-        text = paragraph["text"]
-        placed = []
-        if sections:
-            content, placed, outline["next_section"], written = kernel_outline.place_headings(
-                sections, int(outline.get("next_section", 0) or 0), text, paragraph["start"] + 1, paragraph["end"] + 1)
-            outline["model_placed"] = int(outline.get("model_placed", 0) or 0) + written
-            text = kernel_outline.strip_headers(content)
-        elif use_outline:
-            content = text = kernel_outline.strip_headers(text)
-        else:
-            content = text
+        text = kernel_outline.strip_headers(paragraph["text"]) if use_outline else paragraph["text"]
         entry = {
             "id": paragraph_id,
             "start": paragraph["start"] + 1,
@@ -840,9 +828,7 @@ def _commit_paragraphs(out_dir: Path, state: dict, paragraphs: list[dict], sente
             "source_chars": sum(len(sentences[i]) for i in range(paragraph["start"], paragraph["end"] + 1)),
             "output_chars": len(text),
         }
-        if placed:
-            entry["sections"] = placed
-        atomic_write_text(out_dir / file_name, content.strip() + "\n")
+        atomic_write_text(out_dir / file_name, text.strip() + "\n")
         state["paragraphs"].append(entry)
         state["cursor"] = paragraph["end"] + 1
     _write_state(out_dir, state)
@@ -914,21 +900,34 @@ def efficiency_report(state: dict) -> dict:
     }
 
 
-def merged_window_text(work_dir: str, state: dict | None = None) -> tuple[str, int]:
-    """Join the latest stage's committed paragraphs; also return the number of section headings.
+def raw_stage_text(work_dir: str, state: dict | None = None) -> tuple[str, dict]:
+    """Join the raw stage's committed paragraphs, with the outline's headings and whole sentences.
 
-    Markers are never stored in paragraph files; outline headings are.
+    See `structure.structure_paragraphs`; also returns its counts.
+    """
+    state = state if state is not None else load_window_state(work_dir, RAW_STAGE)
+    out_dir = stage_dir_for(work_dir, RAW_STAGE)
+    outline = state.get("outline") or {}
+    paragraphs = [{"text": _paragraph_text(out_dir, entry), "start": int(entry.get("start", 0) or 0),
+                   "end": int(entry.get("end", 0) or 0)} for entry in state.get("paragraphs", [])]
+    return kernel_structure.structure_paragraphs(
+        paragraphs, outline.get("sections", []) if outline.get("status") == "ok" else [])
+
+
+def merged_window_text(work_dir: str, state: dict | None = None) -> tuple[str, int]:
+    """Join the latest stage's committed paragraphs; also return the number of outline headings added.
+
+    Markers are never stored in paragraph files. The raw stage's paragraphs
+    go through `raw_stage_text`; the processed stage's already carry the
+    headings of the text it translated.
     """
     state = state if state is not None else load_window_state(work_dir)
-    out_dir = stage_dir_for(work_dir, state.get("input_key", RAW_STAGE))
-    parts = []
-    sections = 0
-    for entry in state.get("paragraphs", []):
-        sections += len(entry.get("sections", []))
-        text = _paragraph_text(out_dir, entry)
-        if text:
-            parts.append(text)
-    return "\n\n".join(parts), sections
+    if _stage(state.get("input_key", RAW_STAGE)) == RAW_STAGE:
+        text, stats = raw_stage_text(work_dir, state)
+        return text, stats.get("headings_at_sentence", 0) + stats.get("headings_between_paragraphs", 0)
+    out_dir = stage_dir_for(work_dir, PROCESSED_STAGE)
+    parts = [text for text in (_paragraph_text(out_dir, entry) for entry in state.get("paragraphs", [])) if text]
+    return "\n\n".join(parts), 0
 
 
 # ---------------------------------------------------------------------------
@@ -1049,8 +1048,7 @@ def run_window_rounds(work_dir: str, prompt_name: str, prompt_template: str, *, 
                 prompt_name=prompt_name,
                 unit=unit,
                 finish=plan["finish"] and end >= total,
-                outline_text=kernel_outline.round_outline_text(
-                    sections, cursor, end, int(outline.get("next_section", 0) or 0)) if sections else "",
+                outline_text=kernel_outline.round_outline_text(sections, cursor, end) if sections else "",
             )
 
         record = {
@@ -1159,9 +1157,8 @@ def run_window_rounds(work_dir: str, prompt_name: str, prompt_template: str, *, 
                            round_index=round_index)
         log(f"ℹ️ Window round {round_index}: S{cursor + 1}-S{parsed['next_cursor']} done ({total} total)")
 
-    if sections:
-        # Sections starting too close to the end to get a paragraph of their own.
-        outline["unplaced_sections"] = len(sections) - int(outline.get("next_section", 0) or 0)
+    if _stage(input_key) == RAW_STAGE:
+        state["structure"] = raw_stage_text(work_dir, state)[1]
     state["status"] = "done"
     _write_state(out_dir, state)
     return {"status": "done"}
@@ -1262,7 +1259,6 @@ def _prepare_outline(work_dir: str, prompt_name: str, state: dict, sentences: li
         log=log,
     )
     record["generated_at"] = now_iso()
-    record["next_section"] = 0
     state["outline"] = record
     if record["status"] == "ok":
         log(f"ℹ️ Outline: {len(record['sections'])} sections, {len(record['terms'])} terms.")
@@ -1284,9 +1280,6 @@ def outline_summary(state: dict) -> dict:
             "chapter_hints": len(outline.get("hints", [])),
             "requests": len(outline.get("requests", [])),
         })
-    if outline.get("status") == "ok" and state.get("status") == "done":
-        summary["unplaced_sections"] = int(outline.get("unplaced_sections", 0) or 0)
-        summary["model_placed_sections"] = int(outline.get("model_placed", 0) or 0)
     if outline.get("error"):
         summary["error"] = outline["error"]
     return summary
@@ -1316,6 +1309,7 @@ def _build_result(work_dir: str, state: dict, outcome: dict, *, prompt_name: str
         "coverage": coverage,
         "efficiency": efficiency_report(state),
         "outline": outline_summary(state),
+        "structure": state.get("structure", {}),
         "params": state.get("params", {}),
         "sizing": state.get("sizing", {}),
         "request_url": request_url,
