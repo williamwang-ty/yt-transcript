@@ -16,6 +16,8 @@ It works at three levels:
 
 **Design history**: [section 9.3](#93-design-history) lists each stage of the refactor that produced this design, with its pull request, and links to the earlier design notes and the previous version of this document. Those were deleted from the repository but stay readable there.
 
+**Verification and known issues**: [section 9.4](#94-how-far-the-changes-were-verified-and-known-issues) records how far each change was checked and the known issues found since.
+
 `SYSTEM_DESIGN.md` is the single authoritative design document for this repository.
 
 ---
@@ -446,7 +448,7 @@ The module plan written before the split (stage 0 of the refactor) differs from 
 ### 6.12 Testing
 
 - **Unit tests** per area in `tests/regression_*.py`, all run by `python3 -m unittest tests.test_regressions` (offline, well under a minute). Tests of deleted code were deleted with it.
-- **End-to-end tests** (`tests/regression_e2e.py`) run the whole flow offline through `scripts/run_regression.py --fixtures tests/fixtures/e2e`: a fake `yt-dlp` on `PATH` (`tests/e2e/`) serves recorded metadata and subtitles, a fake Deepgram answers from a recorded response, and a fake LLM CLI (`tests/fake_llm.py`, plugged in through `llm_agent_cli`) implements the window protocol and the outline JSON. Cases: Chinese human subtitles (long, several rounds with an outline), English subtitles (bilingual), no subtitles (Deepgram), and an unsupported language. Routes and outputs are compared with `tests/fixtures/e2e/baseline.json`; `UPDATE_E2E_BASELINE=1` rewrites it after an intended change. The four cases run at the same time, and the fake `yt-dlp` logs every call, so the test also checks that yt-dlp never ran twice at once and that each video's page was fetched once (twice on the Deepgram route). `tests/regression_run.py` covers resume inside `text`, sticky and rejected overrides, `--max-seconds`, `--from`, `--restart`, `--stage plan`, and every result status. `tests/regression_concurrency.py` covers the locks with real processes: eight processes racing for one lock never overlap, a killed holder frees it, a bounded wait returns `in_progress` with the holder, `cleanup` refuses a running video, and a rate limit stops the queued runs without another yt-dlp call while a later run tries once.
+- **End-to-end tests** (`tests/regression_e2e.py`) run the whole flow offline through `scripts/run_regression.py --fixtures tests/fixtures/e2e`: a fake `yt-dlp` on `PATH` (`tests/e2e/`) serves recorded metadata and subtitles, a fake Deepgram answers from a response synthesized from subtitle cues (so it has none of the real service's pause-based utterance splits; see 9.4), and a fake LLM CLI (`tests/fake_llm.py`, plugged in through `llm_agent_cli`) implements the window protocol and the outline JSON. Cases: Chinese human subtitles (long, several rounds with an outline), English subtitles (bilingual), no subtitles (Deepgram), and an unsupported language. Routes and outputs are compared with `tests/fixtures/e2e/baseline.json`; `UPDATE_E2E_BASELINE=1` rewrites it after an intended change. The four cases run at the same time, and the fake `yt-dlp` logs every call, so the test also checks that yt-dlp never ran twice at once and that each video's page was fetched once (twice on the Deepgram route). `tests/regression_run.py` covers resume inside `text`, sticky and rejected overrides, `--max-seconds`, `--from`, `--restart`, `--stage plan`, and every result status. `tests/regression_concurrency.py` covers the locks with real processes: eight processes racing for one lock never overlap, a killed holder frees it, a bounded wait returns `in_progress` with the holder, `cleanup` refuses a running video, and a rate limit stops the queued runs without another yt-dlp call while a later run tries once.
 - **Real-video regression** on a machine that can reach YouTube (`scripts/run_regression.py`, which calls `run`; see `tests/live_regression/README.md`) before merging any change to the main path. `--stage plan` and `--no-deepgram` keep it free or cheap.
 
 ### 6.13 What SKILL.md contains
@@ -741,6 +743,24 @@ The design notes written before this refactor were deleted in stage 6, together 
 
 Each stage's reasoning and checks are in its pull request and issue linked in the table above.
 
+### 9.4 How far the changes were verified, and known issues
+
+Reviewed on 2026-10-23 at `ce8fb9d`, from the code, the checks recorded in each pull request, and a read-only scan of the 115 YouTube articles in the author's Obsidian output folder. Nothing was paid for.
+
+**Size.** From the last commit before stage 0 (`47b3514`) to `ce8fb9d`: non-test code about 20,100 → 11,500 lines, test code about 8,500 → 6,200 lines, `SKILL.md` 371 → 76 lines. All 249 unit tests pass.
+
+| Change | Checked by | Not checked |
+|---|---|---|
+| Stages 0 to 6 (`run`, deletions, package split, docs) | Stages 2, 4 and 5 compared with the previous `main` on the 9 real videos of the live regression set: same routes, same quality results. Stage 5 offline output and prompts byte-identical | Real Deepgram on only 2 videos (stage 5). Stage 2 ran about 18% slower (2092 s vs 1774 s); never investigated, possibly the LLM CLI's response-time noise |
+| Language from the video's text (6.3) | Routing check on the video that had been heard as Indonesian: Deepgram, Chinese | A real Deepgram transcription of that video |
+| Paragraph rule (`cleanup_zh`, `structure_only`) | Prompt change; paragraph metrics recorded by the quality check (not gating) | No comparison on everyday articles |
+| Headings at sentence boundaries (7.5 B) | One Chinese video: headings inside a sentence 1 → 0, paragraphs ending mid-sentence 30 → 0, tokens about the same | One video only; everyday articles from mid-2026 on already had 0 to 2 such spots |
+| Locks, CLI backoff, the paid-API question (6.4, 6.8) | Real processes in tests; on the Mac, 3 videos 1094 s serial vs 320 s parallel with no overlapping yt-dlp; fault-injected CLI and a fake API key | Batch `run` does not exist yet |
+
+No article had been produced with the refactored code when this was written: the newest article in the output folder dates from 2026-10-16, before stage 0. The output quality of the new code in everyday use is therefore not yet measured.
+
+**Known issue: numbers split at the decimal point in Chinese Deepgram text.** The two newest Deepgram articles (videos `O-rl_1xhlPE` and `8-TnOtMt0SU`, made before the refactor) contain 11 places where a number was cut into two paragraphs at its decimal point, the point turned into "。" or lost: "稳定在4。" / "4到4.5左右", "每年做2。" / a heading / "8万亿", "Qwen 3。" / "8 Flash Next". The other 113 articles have none. Their work directories are gone, so the cause is not proven. The likely path: Deepgram ends an utterance at a pause, a speaker can pause inside "三点八", and `kernel/sources/deepgram.py` joins utterances with a blank line, so the pause becomes a paragraph break before the LLM sees the text. Sentence splitting on already joined text is not the cause: `split_sentences` and `structure.sentence_ends` keep "3.8" and "2.8万亿" whole. The Deepgram code did not change in the refactor, so `main` very likely still has the issue. The fix should come from the cause, treating only speaker changes as forced breaks and leaving pause boundaries to the paragraph rule, rather than gluing digits back together. Confirming the cause needs the `source/` files of a Chinese Deepgram run kept before `cleanup`.
+
 ---
 
 ## 10. One-Sentence Summary
@@ -764,6 +784,8 @@ Each stage's reasoning and checks are in its pull request and issue linked in th
 - **实现对照**（第 9 节）：每一部分由哪个模块实现，代码和当初的计划有哪些不同，以及代码是怎样走到现在这个样子的。
 
 **设计历史**：[第 9.3 节](#93-设计历史)列出产生这份设计的重构的每个阶段及其 pull request，并链接到早期的设计笔记和本文的旧版本。它们已从仓库中删除，但从那里仍然可以阅读。
+
+**验证程度和已知问题**：[第 9.4 节](#94-改动的验证程度和已知问题)记录每项改动验证到了什么程度，以及之后发现的已知问题。
 
 `SYSTEM_DESIGN.md` 是本仓库唯一权威的设计文档。
 
@@ -1194,7 +1216,7 @@ prompts/*.md              任务 prompt：cleanup_zh、structure_only、translat
 ### 6.12 测试
 
 - **单元测试**按领域放在 `tests/regression_*.py`，用 `python3 -m unittest tests.test_regressions` 全部运行（离线，不到一分钟）。被删除代码的测试已随代码一起删除。
-- **端到端测试**（`tests/regression_e2e.py`）通过 `scripts/run_regression.py --fixtures tests/fixtures/e2e` 离线跑整个流程：`PATH` 上的假 `yt-dlp`（`tests/e2e/`）提供录好的元数据和字幕，假 Deepgram 用录好的响应回答，假 LLM 命令行（`tests/fake_llm.py`，通过 `llm_agent_cli` 接入）实现窗口协议和大纲 JSON。用例：中文人工字幕（长视频，带大纲的多轮窗口）、英文字幕（双语）、无字幕（Deepgram）、不支持的语言。路由和产物与 `tests/fixtures/e2e/baseline.json` 对比；有意的改动之后用 `UPDATE_E2E_BASELINE=1` 重新生成。四个用例同时运行，假 `yt-dlp` 记下每次调用，所以这个测试还检查 yt-dlp 从没有两个同时在跑，以及每个视频的页面只取了一次（Deepgram 路线两次）。`tests/regression_run.py` 覆盖 `text` 阶段内的续跑、覆盖参数的保留和拒绝、`--max-seconds`、`--from`、`--restart`、`--stage plan`，以及每一种结果状态。`tests/regression_concurrency.py` 用真实的进程测锁：八个进程抢一把锁从不重叠，持有者被杀掉后锁被释放，有上限的等待返回带持有者的 `in_progress`，`cleanup` 拒绝删除正在运行的视频，限流让排队的运行不再调用 yt-dlp，而之后开始的运行会试一次。
+- **端到端测试**（`tests/regression_e2e.py`）通过 `scripts/run_regression.py --fixtures tests/fixtures/e2e` 离线跑整个流程：`PATH` 上的假 `yt-dlp`（`tests/e2e/`）提供录好的元数据和字幕，假 Deepgram 用由字幕时间轴合成的响应回答（因此没有真实服务按停顿切出的 utterance，见 9.4），假 LLM 命令行（`tests/fake_llm.py`，通过 `llm_agent_cli` 接入）实现窗口协议和大纲 JSON。用例：中文人工字幕（长视频，带大纲的多轮窗口）、英文字幕（双语）、无字幕（Deepgram）、不支持的语言。路由和产物与 `tests/fixtures/e2e/baseline.json` 对比；有意的改动之后用 `UPDATE_E2E_BASELINE=1` 重新生成。四个用例同时运行，假 `yt-dlp` 记下每次调用，所以这个测试还检查 yt-dlp 从没有两个同时在跑，以及每个视频的页面只取了一次（Deepgram 路线两次）。`tests/regression_run.py` 覆盖 `text` 阶段内的续跑、覆盖参数的保留和拒绝、`--max-seconds`、`--from`、`--restart`、`--stage plan`，以及每一种结果状态。`tests/regression_concurrency.py` 用真实的进程测锁：八个进程抢一把锁从不重叠，持有者被杀掉后锁被释放，有上限的等待返回带持有者的 `in_progress`，`cleanup` 拒绝删除正在运行的视频，限流让排队的运行不再调用 yt-dlp，而之后开始的运行会试一次。
 - **真实视频回归**：任何动到主路径的改动合并前，在能访问 YouTube 的机器上跑 `scripts/run_regression.py`（它调用 `run`；见 `tests/live_regression/README.md`）。`--stage plan` 和 `--no-deepgram` 可以让它免费或很便宜。
 
 ### 6.13 SKILL.md 的内容
@@ -1488,6 +1510,24 @@ merge 阶段 -> verify 阶段 -> assemble 阶段
 - [第 6 阶段之前的本文](https://github.com/williamwang-ty/yt-transcript/blob/f33bb9f302cc41c4b8fc436db611f2212f6d2efc/SYSTEM_DESIGN.md)：其中第 9 节逐个列出旧文件和旧命令在每个阶段去了哪里。
 
 每个阶段的理由和验证记录在上表链接的 pull request 和 issue 里。
+
+### 9.4 改动的验证程度和已知问题
+
+2026-10-23 在 `ce8fb9d` 上复查，依据是代码、每个 pull request 里记录的验证，以及对作者 Obsidian 输出目录里 115 篇 YouTube 文章的只读统计。整个过程没有花钱。
+
+**规模。** 从第 0 阶段之前的最后一个提交（`47b3514`）到 `ce8fb9d`：非测试代码约 20,100 → 11,500 行，测试代码约 8,500 → 6,200 行，`SKILL.md` 371 → 76 行。249 个单元测试全部通过。
+
+| 改动 | 怎么验证的 | 没验证的 |
+|---|---|---|
+| 第 0 到 6 阶段（`run`、删除、拆包、文档） | 第 2、4、5 阶段用真实视频回归集的 9 个视频和之前的 `main` 对比：路由相同，质量检查结果相同。第 5 阶段离线输出和提示词逐字节相同 | 真实 Deepgram 只跑过 2 个视频（第 5 阶段）。第 2 阶段慢约 18%（2092 秒对 1774 秒），一直没查，可能只是 LLM 命令行响应时间的波动 |
+| 根据视频文字判断语言（6.3） | 对曾被识别成印尼语的视频做路由检查：Deepgram、中文 | 该视频的真实 Deepgram 转写 |
+| 自然段规则（`cleanup_zh`、`structure_only`） | 提示词改动；质量检查记录段落指标（不拦截） | 没有在日常文章上对比 |
+| 标题落在句子边界（7.5 B） | 一个中文视频：标题打断句子 1 → 0，停在半句的段落 30 → 0，token 基本不变 | 只有一个视频；2026 年年中以后的日常文章里这类地方本来就只有 0 到 2 处 |
+| 锁、命令行退避、付费 API 询问（6.4、6.8） | 测试里用真实进程；Mac 上 3 个视频串行 1094 秒对并行 320 秒，yt-dlp 没有重叠；注入故障的命令行和假 API 密钥 | 批量 `run` 还不存在 |
+
+写这一节时，还没有任何文章是用重构后的代码生成的：输出目录里最新的文章是 2026-10-16 的，早于第 0 阶段。所以新代码在日常使用中的输出质量还没有测量过。
+
+**已知问题：中文 Deepgram 文字里的数字在小数点处被拆开。** 最新两篇 Deepgram 文章（视频 `O-rl_1xhlPE` 和 `8-TnOtMt0SU`，在重构之前生成）一共有 11 处，一个数字在小数点处被拆成两段，小数点变成"。"或者丢失："稳定在4。" / "4到4.5左右"，"每年做2。" / 一个标题 / "8万亿"，"Qwen 3。" / "8 Flash Next"。其余 113 篇没有。两个视频的工作目录已经不在，所以原因没有得到证实。最可能的路径是：Deepgram 在停顿处结束一个 utterance，说"三点八"时中间可能停一下，而 `kernel/sources/deepgram.py` 用空行拼接 utterance，于是停顿在 LLM 看到文字之前就成了段落边界。对已拼好文字的分句不是原因：`split_sentences` 和 `structure.sentence_ends` 会把"3.8""2.8万亿"保持完整。Deepgram 相关代码在重构中没有改动，所以 `main` 很可能仍有这个问题。修复应当从原因入手：只把换说话人当作强制分段，停顿边界交给分段规则判断，而不是把数字重新粘起来。要证实原因，需要保留一次中文 Deepgram 运行在 `cleanup` 之前的 `source/` 文件。
 
 ---
 
