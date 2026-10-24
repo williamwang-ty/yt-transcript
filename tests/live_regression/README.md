@@ -30,10 +30,10 @@ as the agent-driven flow used to do silently. The Notes column lists blocked
 tracks, and `--compare` labels a source change as flaky when a track was
 blocked in either run.
 
-When the `source` stage rates the subtitles critical, `run` switches to
-Deepgram before any LLM call, and Notes says `rerouted from ...`. With
-`--stage plan` or `--no-deepgram` Deepgram never runs: such a video ends with
-status `rerouted`, and a video without usable subtitles with `skipped`.
+A trusted subtitle track is always used, human or ASR: the text stage fixes
+punctuation and recognition slips, and only a video without one goes to
+Deepgram. With `--stage plan` or `--no-deepgram` Deepgram never runs: a video
+without usable subtitles ends with status `skipped`.
 
 ## Running
 

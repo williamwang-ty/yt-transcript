@@ -111,7 +111,7 @@ Give the agent a YouTube link, for example "Please transcribe this video: https:
 
 | You ask for | Flag |
 |---|---|
-| Deepgram instead of subtitles / the subtitles even if they look poor | `--source deepgram` / `--source subtitles` |
+| Deepgram instead of subtitles / subtitles only, never Deepgram | `--source deepgram` / `--source subtitles` |
 | A Chinese article only / English with a Chinese translation | `--mode chinese` / `--mode bilingual` |
 | Doing a video again from scratch | `--restart` |
 | Only checking which source and mode would be used, without spending anything | `--stage plan` |
@@ -349,7 +349,7 @@ yt_dlp_cookies_file: "~/.config/yt-transcript/youtube_cookies.txt"
 
 | 你要的 | 参数 |
 |---|---|
-| 用 Deepgram 而不是字幕 / 字幕质量看起来差也要用字幕 | `--source deepgram` / `--source subtitles` |
+| 用 Deepgram 而不是字幕 / 只用字幕，绝不用 Deepgram | `--source deepgram` / `--source subtitles` |
 | 只要中文文章 / 英文原文加中文翻译 | `--mode chinese` / `--mode bilingual` |
 | 把一个视频从头重做 | `--restart` |
 | 只看会用哪个来源和模式，不花钱 | `--stage plan` |

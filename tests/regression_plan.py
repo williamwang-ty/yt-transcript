@@ -3,21 +3,6 @@
 from tests._support import *
 from kernel.text import chunking
 
-# Subtitle cleanup counters that score as critically poor captions.
-NOISY_CAPTION_DIAGNOSTICS = {
-    "cue_count": 20,
-    "empty_cue_count": 3,
-    "exact_duplicate_cue_count": 5,
-    "overlap_trim_count": 5,
-    "overlap_collapsed_cue_count": 2,
-    "markup_tag_count": 8,
-    "nbsp_entity_count": 4,
-    "collapsed_cjk_spacing_count": 12,
-    "tightened_punctuation_spacing_count": 6,
-    "tightened_bracket_spacing_count": 2,
-}
-
-
 def _youtube(language: str) -> dict:
     return {"type": "youtube", "title": "Sample", "channel": "Channel", "source_language": language,
             "subtitle_source": "YouTube Subtitles"}
@@ -110,8 +95,6 @@ class NormalizedDocumentTests(unittest.TestCase):
         self.assertEqual(payload["content"]["text"], "你好，\n\n第二行。")
         self.assertEqual([segment["text"] for segment in payload["segments"]], ["你好，", "第二行。"])
         self.assertEqual(payload["diagnostics"]["subtitle_cleanup"]["overlap_trim_count"], 1)
-        self.assertTrue(payload["diagnostics"]["subtitle_quality"]["applicable"])
-        self.assertGreaterEqual(payload["diagnostics"]["subtitle_quality"]["subtitle_quality_score"], 0.75)
         self.assertEqual(chunked["source_kind"], "text")
 
 
@@ -123,7 +106,6 @@ class TextPlanTests(unittest.TestCase):
         self.assertEqual(plan["video_path"], "short")
         self.assertEqual([(op["kind"], op["prompt"]) for op in plan["operations"]], [("prompt", "cleanup_zh")])
         self.assertEqual(plan["operations"][0]["extra_instruction"], "")
-        self.assertFalse(plan["reroute_recommended"])
 
     def test_short_bilingual_video_structures_then_translates(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -157,43 +139,3 @@ class TextPlanTests(unittest.TestCase):
         self.assertEqual(plan["routing_reason"], "oversized_short_input")
         self.assertTrue(all(op["kind"] == "chunk" for op in plan["operations"]))
         self.assertGreater(plan["estimated_input_tokens"], plan["single_pass_token_limit"])
-
-    def test_critical_chinese_subtitles_recommend_deepgram(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            raw_text = Path(tmpdir) / "raw.txt"
-            raw_text.write_text("\n".join(["我 们", "先 看", "这 里", "再 说", "下 一", "步 呢",
-                                           "你 看", "对 吧", "现 在", "继 续", "往 下", "讲 吧"]), encoding="utf-8")
-            segments = _write_segments(Path(tmpdir) / "segments.json", "zh-Hans", [
-                {"id": idx, "text": f"片段 {idx}", "start_time": float(idx), "end_time": float(idx + 1)}
-                for idx in range(20)
-            ], diagnostics=NOISY_CAPTION_DIAGNOSTICS)
-            normalization = _normalize(tmpdir, raw_text=raw_text, segments=segments, source=_youtube("zh-Hans"))
-            plan = _plan(tmpdir, duration=120, mode="chinese", normalization=normalization, raw_text=raw_text)
-
-        self.assertTrue(plan["reroute_recommended"])
-        self.assertEqual(plan["reroute_target"], "deepgram")
-        self.assertEqual(plan["source_route_reason"], "subtitle_quality_critical_deepgram_recommended")
-        self.assertEqual(plan["subtitle_quality_band"], "critical")
-        self.assertLess(plan["subtitle_quality_score"], 0.35)
-        self.assertGreater(plan["checks"]["overlap_reduction_count"], 0)
-        self.assertTrue(any("Deepgram before text optimization is recommended" in warning
-                            for warning in plan["warnings"]))
-
-    def test_critical_bilingual_subtitles_stay_on_subtitles_with_a_review_warning(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            raw_text = Path(tmpdir) / "raw.txt"
-            raw_text.write_text("\n".join(f"segment {idx}" for idx in range(12)), encoding="utf-8")
-            segments = _write_segments(Path(tmpdir) / "segments.json", "en", [
-                {"id": idx, "text": f"segment {idx}", "start_time": float(idx), "end_time": float(idx + 1)}
-                for idx in range(20)
-            ], diagnostics=NOISY_CAPTION_DIAGNOSTICS)
-            normalization = _normalize(tmpdir, raw_text=raw_text, segments=segments, source=_youtube("en"),
-                                       mode="bilingual")
-            plan = _plan(tmpdir, duration=120, mode="bilingual", normalization=normalization, raw_text=raw_text)
-
-        self.assertFalse(plan["reroute_recommended"])
-        self.assertEqual(plan["reroute_target"], "")
-        self.assertEqual(plan["source_route_reason"], "subtitle_quality_critical_manual_review_only")
-        self.assertEqual(plan["subtitle_quality_band"], "critical")
-        self.assertLess(plan["subtitle_quality_score"], 0.35)
-        self.assertTrue(any("continue only with manual review" in warning for warning in plan["warnings"]))

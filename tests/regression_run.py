@@ -25,7 +25,6 @@ from kernel import pipeline
 from kernel.quality import verify as kernel_verify
 from kernel.sources import deepgram as kernel_deepgram
 from kernel.sources import youtube as kernel_youtube
-from kernel.text import subtitle_quality as kernel_subtitle_quality
 from kernel.llm import agent_cli as _agent_cli
 from tests.e2e import fake_deepgram
 
@@ -650,25 +649,6 @@ class RunCommandTests(RunFixture):
         self.assert_finished(ENGLISH, full)
         for name in EARLY_STAGES:
             self.assertEqual(starts[name], self.stage_starts(ENGLISH)[name], name)
-
-    def test_critical_subtitles_reroute_to_deepgram_in_the_source_stage(self):
-        real_signal = kernel_subtitle_quality.build_source_routing_signal
-
-        def critical(*args, **kwargs):
-            return {**real_signal(*args, **kwargs), "subtitle_quality_score": 0.2,
-                    "subtitle_quality_band": "critical", "reroute_recommended": True, "reroute_target": "deepgram"}
-
-        recorded = lambda *args, **kwargs: fake_deepgram.recorded_response(f"/x/{DEEPGRAM}.m4a")  # noqa: E731
-        with mock.patch.object(kernel_subtitle_quality, "build_source_routing_signal", critical), \
-                mock.patch.object(kernel_deepgram, "_call_deepgram_api", recorded):
-            rerouted = self.run_video(LONG, stage="plan")
-            self.assertEqual("deepgram", rerouted["route"]["source"])
-            self.assertEqual({"track": "zh-Hans", "track_kind": "manual", "mode": "chinese",
-                              "subtitle_quality": {"score": 0.2, "band": "critical"}},
-                             rerouted["route"]["rerouted_from"])
-            kept = self.run_video(LONG, source="subtitles", stage="plan")
-            self.assertEqual("subtitles", kept["route"]["source"])
-            self.assertIsNone(kept["route"]["rerouted_from"])
 
     def test_status_and_cleanup_commands(self):
         self.run_video(ENGLISH)

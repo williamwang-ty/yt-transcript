@@ -47,7 +47,6 @@ from kernel.text import chunking as kernel_chunking
 from kernel.text import merge as kernel_merge
 from kernel.text import normalize as kernel_normalize
 from kernel.text import plan as kernel_plan
-from kernel.text import subtitle_quality as kernel_subtitle_quality
 from kernel.text import window as kernel_window
 from kernel.text.cleanup import subtitle as kernel_subtitle_cleanup
 
@@ -733,10 +732,8 @@ class _Run:
             "track": None,
             "track_kind": None,
             "mode": "",
-            "subtitle_quality": None,
             "blocked_tracks": [],
             "fallback_used": False,
-            "rerouted_from": None,
             "reason": "",
         }
         self.state["route"] = route
@@ -766,17 +763,17 @@ class _Run:
                        "subtitle track", retryable=False)
 
         if usable and want_source != "deepgram":
-            if self.subtitle_route(route, sub_info, want_mode):
-                return self.record_source(record)
-        elif want_source == "deepgram":
+            self.subtitle_route(route, sub_info, want_mode)
+            return self.record_source(record)
+        if want_source == "deepgram":
             route["reason"] = "--source deepgram"
         else:
             route["reason"] = "no trusted subtitle track in the spoken language"
         self.transcribe(route, source_language or "auto")
         self.record_source(record)
 
-    def subtitle_route(self, route: dict, sub_info: dict, want_mode: str | None) -> bool:
-        """Take the subtitle track; return False when its quality calls for Deepgram instead."""
+    def subtitle_route(self, route: dict, sub_info: dict, want_mode: str | None) -> None:
+        """Take the subtitle track."""
         subs = self.download("subtitles", subtitle_mode=want_mode or "")
         blocked = [c for c in subs.get("blocked_candidates", []) or [] if isinstance(c, dict)]
         for candidate in blocked:
@@ -827,28 +824,14 @@ class _Run:
         )
         if not check.get("passed"):
             raise Stop("failed", "source_error", "; ".join(check.get("hard_failures", [])), retryable=False)
-        routing = kernel_subtitle_quality.build_source_routing_signal("youtube", mode,
-                                                                      check.get("subtitle_quality", {}))
-        score, band = routing["subtitle_quality_score"], routing["subtitle_quality_band"]
-        route["subtitle_quality"] = {"score": score, "band": band}
         family = LANGUAGE_NAMES.get(kernel_subtitle_language.language_family(language), language)
         spoken = LANGUAGE_NAMES.get(route["source_language"], route["source_language"] or "unknown-language")
         route["reason"] = f"{spoken} video with {'human' if kind == 'manual' else 'ASR'} {family} subtitles" \
             + (f" (preferred track blocked: {', '.join(route['blocked_tracks'])})" if route["blocked_tracks"] else "")
-        if routing["reroute_recommended"] and routing["reroute_target"] == "deepgram" \
-                and self.overrides.get("source") != "subtitles":
-            route["rerouted_from"] = {"track": language, "track_kind": kind, "mode": mode,
-                                      "subtitle_quality": route["subtitle_quality"]}
-            route["reason"] = f"subtitle quality {band} ({score}); rerouted to Deepgram"
-            _log(f"ℹ️ Subtitle quality is {band} ({score}); transcribing the audio with Deepgram instead.")
-            for name in (RAW_TEXT_FILE, SEGMENTS_FILE):
-                _remove(self.path(name))
-            return False
-        return True
 
     def transcribe(self, route: dict, language: str) -> None:
         requested_family = kernel_subtitle_language.language_family(language)
-        route.update({"source": "deepgram", "track": None, "track_kind": None, "subtitle_quality": None,
+        route.update({"source": "deepgram", "track": None, "track_kind": None,
                       "language": requested_family if language != "auto" else "",
                       "mode": kernel_subtitle_language.MODE_BY_FAMILY.get(requested_family, "")})
         if self.plan_only:
@@ -955,10 +938,6 @@ class _Run:
             "video_path": plan.get("video_path"),
             "routing_reason": plan.get("routing_reason"),
             "estimated_input_tokens": plan.get("estimated_input_tokens"),
-            "subtitle_quality_score": plan.get("subtitle_quality_score"),
-            "subtitle_quality_band": plan.get("subtitle_quality_band"),
-            "reroute_recommended": plan.get("reroute_recommended"),
-            "reroute_target": plan.get("reroute_target"),
             "warnings": plan.get("warnings", []),
         }
         self.add_warnings(plan.get("warnings", []))

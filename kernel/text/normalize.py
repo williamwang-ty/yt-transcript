@@ -10,10 +10,18 @@ from pathlib import Path
 from kernel.config import coerce_float_or_none, parse_int
 from kernel.files import atomic_write_text, now_iso
 from kernel.text.cleanup.subtitle import normalize_subtitle_segment_text, normalize_subtitle_text
-from kernel.text.subtitle_quality import evaluate_subtitle_quality, is_youtube_subtitle_source
 
 NORMALIZED_DOCUMENT_SCHEMA_VERSION = 1
 NORMALIZED_DOCUMENT_FORMAT = "yt_transcript.normalized_document/v1"
+
+
+def is_youtube_subtitle_source(source_payload: dict) -> bool:
+    """Return whether the normalized document source came from YouTube subtitles."""
+    if not isinstance(source_payload, dict):
+        return False
+    source_type = str(source_payload.get("type", "")).strip().lower()
+    subtitle_source = str(source_payload.get("subtitle_source", "")).strip().lower()
+    return source_type == "youtube" and "subtitle" in subtitle_source
 
 
 def load_normalized_document(normalized_document_path: str) -> dict:
@@ -222,19 +230,8 @@ def build_normalized_document(*, document_id: str, raw_text_path: str, segments_
         },
         "segments": normalized_segments,
     }
-    subtitle_quality = evaluate_subtitle_quality(
-        normalized_text,
-        cleanup_diagnostics,
-        source_payload=source_payload,
-        workflow_payload=workflow_payload,
-        segment_count=len(normalized_segments),
-    )
-    if cleanup_diagnostics or subtitle_quality.get("applicable"):
-        normalized_doc["diagnostics"] = {}
-        if cleanup_diagnostics:
-            normalized_doc["diagnostics"]["subtitle_cleanup"] = cleanup_diagnostics
-        if subtitle_quality.get("applicable"):
-            normalized_doc["diagnostics"]["subtitle_quality"] = subtitle_quality
+    if cleanup_diagnostics:
+        normalized_doc["diagnostics"] = {"subtitle_cleanup": cleanup_diagnostics}
     atomic_write_text(Path(normalized_document_path), json.dumps(normalized_doc, ensure_ascii=False, indent=2))
     return {
         "passed": True,
@@ -248,7 +245,6 @@ def build_normalized_document(*, document_id: str, raw_text_path: str, segments_
         "has_timing": has_timing,
         "char_count": len(normalized_text),
         "cleanup_diagnostics": cleanup_diagnostics,
-        "subtitle_quality": subtitle_quality,
         "raw_text_path": used_raw_text,
         "segments_path": used_segments,
     }

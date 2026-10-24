@@ -39,7 +39,7 @@ Rules:
 | The user asks for | Add to `run` |
 |---|---|
 | speech-to-text (Deepgram) instead of subtitles | `--source deepgram` |
-| the subtitles, even if their quality looks poor | `--source subtitles` |
+| subtitles only, never paid speech-to-text | `--source subtitles` |
 | a Chinese article only / English text with a Chinese translation | `--mode chinese` / `--mode bilingual` |
 | doing a video again from scratch | `--restart` |
 | only checking which source and mode would be used, without spending anything | `--stage plan` |
