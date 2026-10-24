@@ -5,10 +5,10 @@ Runs `yt_transcript_utils.py run` on a fixed set of real YouTube videos and
 writes a report so behaviour can be compared before and after a change.
 
 Stages (pick with --stage):
-    plan      `run --stage plan`: metadata, subtitle selection, subtitle
-              quality, normalization and the text plan. No LLM requests and
-              no Deepgram; a video that needs audio transcription is reported
-              as skipped (no usable subtitles) or rerouted (subtitle quality).
+    plan      `run --stage plan`: metadata, subtitle selection,
+              normalization and the text plan. No LLM requests and no
+              Deepgram; a video that needs audio transcription is reported as
+              skipped (no usable subtitles).
     full      `run` to the finished article (default). With --no-deepgram it
               runs `--stage plan` first and stops there when the route needs
               Deepgram.
@@ -180,16 +180,13 @@ def report_item(video: dict, result: dict, state: dict, blocked: list[str] | Non
         "result": {key: result.get(key) for key in ("status", "stage", "reason") if key in result},
         "route_reason": route.get("reason", ""),
     }
-    rerouted = route.get("rerouted_from") or {}
     skipped_audio = needs_deepgram(state)
-    if route.get("source") == "subtitles" or (skipped_audio and rerouted):
-        # A rerouted video that was not transcribed reports the subtitle track it checked.
-        track = rerouted if route.get("source") == "deepgram" else route
+    if route.get("source") == "subtitles":
         item["source"] = {
             "src": "youtube",
-            "language": track.get("track") or "",
-            "kind": track.get("track_kind") or "",
-            "mode": track.get("mode") or "",
+            "language": route.get("track") or "",
+            "kind": route.get("track_kind") or "",
+            "mode": route.get("mode") or "",
             "fallback_used": route.get("fallback_used"),
             # e.g. "zh-Hans:rate_limited"; a non-empty list means YouTube refused a
             # preferred track this run, so the selected source can differ between runs.
@@ -199,23 +196,14 @@ def report_item(video: dict, result: dict, state: dict, blocked: list[str] | Non
         item["source"] = {"src": "deepgram", "language": route.get("language") or "", "kind": "audio",
                           "mode": route.get("mode") or ""}
         item["source"].update(route.get("deepgram") or {})
-        if rerouted:
-            item["source"]["rerouted_from"] = track_case(str(rerouted.get("track") or ""),
-                                                         str(rerouted.get("track_kind") or ""))
     if "raw_chars" in state:
         item["raw_chars"] = state["raw_chars"]
 
     plan = (stages.get("plan") or {}).get("summary") or {}
     if plan:
-        item["plan"] = {key: plan.get(key) for key in (
-            "video_path", "routing_reason", "subtitle_quality_score", "subtitle_quality_band",
-            "reroute_recommended", "reroute_target")}
+        item["plan"] = {key: plan.get(key) for key in ("video_path", "routing_reason")}
         item["plan"]["prompts"] = [task["prompt"] for task in plan.get("tasks", [])]
         item["plan"]["warnings"] = plan.get("warnings", [])
-    elif rerouted:
-        quality = rerouted.get("subtitle_quality") or {}
-        item["plan"] = {"subtitle_quality_score": quality.get("score"), "subtitle_quality_band": quality.get("band"),
-                        "reroute_recommended": True, "reroute_target": "deepgram"}
 
     tasks = (stages.get("text") or {}).get("tasks") or {}
     if tasks:
@@ -239,9 +227,8 @@ def report_item(video: dict, result: dict, state: dict, blocked: list[str] | Non
 
     status = result.get("status")
     if status == "done" and skipped_audio:
-        item["status"] = "rerouted" if rerouted else "skipped"
-        item["error"] = ("subtitle quality is critical; the route moves to Deepgram, which this run does not call"
-                         if rerouted else "no usable subtitles; the route needs Deepgram, which this run does not call")
+        item["status"] = "skipped"
+        item["error"] = "no usable subtitles; the route needs Deepgram, which this run does not call"
     elif status == "done":
         item["status"] = "ok"
     elif status == "failed" and result.get("reason") == "quality_hard_failure":
@@ -309,11 +296,6 @@ def source_notes(item: dict) -> str:
     notes = []
     if source.get("blocked"):
         notes.append("blocked " + ", ".join(source["blocked"]))
-    if source.get("rerouted_from"):
-        notes.append(f"rerouted from {source['rerouted_from']}")
-    plan = item.get("plan") or {}
-    if plan.get("reroute_recommended") and not source.get("rerouted_from"):
-        notes.append(f"plan recommends {plan.get('reroute_target') or 'reroute'}")
     return "; ".join(notes)
 
 
@@ -338,14 +320,12 @@ def compare(current: dict, baseline: dict) -> list[str]:
                 diffs.append(f"{key} {old.get(key)!r} -> {item.get(key)!r}")
         if observed_case(item) != observed_case(old):
             new_src, old_src = item.get("source") or {}, old.get("source") or {}
-            flaky = (new_src.get("blocked") or old_src.get("blocked")) and not (
-                new_src.get("rerouted_from") or old_src.get("rerouted_from"))
+            flaky = new_src.get("blocked") or old_src.get("blocked")
             diffs.append(f"source {observed_case(old)!r} -> {observed_case(item)!r}"
                          + (" (flaky: a preferred track was blocked by YouTube)" if flaky else ""))
-        for key in ("video_path", "subtitle_quality_score", "reroute_recommended"):
-            a, b = (old.get("plan") or {}).get(key), (item.get("plan") or {}).get(key)
-            if a != b:
-                diffs.append(f"plan.{key} {a!r} -> {b!r}")
+        a, b = (old.get("plan") or {}).get("video_path"), (item.get("plan") or {}).get("video_path")
+        if a != b:
+            diffs.append(f"plan.video_path {a!r} -> {b!r}")
         ov, nv = old.get("verify") or {}, item.get("verify") or {}
         if len(ov.get("hard_failures", [])) != len(nv.get("hard_failures", [])):
             diffs.append(f"hard_failures {len(ov.get('hard_failures', []))} -> {len(nv.get('hard_failures', []))}")
@@ -378,8 +358,8 @@ def render_markdown(report: dict, diff_lines: list[str] | None) -> str:
         f"{report['summary']['ok']}/{report['summary']['total']} ok · "
         f"{report['summary']['source_mismatch']} source mismatch (⚠)",
         "",
-        "| Video | Expected | Observed | Mode | Path | Sub quality | Verify | HF | Warn | Size ratio | Longest para | Status | Notes |",
-        "|---|---|---|---|---|---|---|---|---|---|---|---|---|",
+        "| Video | Expected | Observed | Mode | Path | Verify | HF | Warn | Size ratio | Longest para | Status | Notes |",
+        "|---|---|---|---|---|---|---|---|---|---|---|---|",
     ]
     for item in report["videos"]:
         plan = item.get("plan") or {}
@@ -390,7 +370,6 @@ def render_markdown(report: dict, diff_lines: list[str] | None) -> str:
         out.append(
             f"| {item['id']} | {item.get('expected_case', '')} | {observed_case(item)}{' ⚠' if source_mismatch(item) else ''} | "
             f"{(item.get('source') or {}).get('mode', '')} | {plan.get('video_path', '')} | "
-            f"{plan.get('subtitle_quality_band') or ''} {'' if plan.get('subtitle_quality_score') is None else plan['subtitle_quality_score']} | "
             f"{'' if not verify else ('pass' if verify.get('passed') else 'fail')} | "
             f"{len(verify.get('hard_failures', [])) if verify else ''} | {len(verify.get('warnings', [])) if verify else ''} | "
             f"{f'{ratio:.2f}' if isinstance(ratio, (int, float)) else ''} | {longest_paragraph(checks)} | "
@@ -481,7 +460,6 @@ def main() -> int:
             "quality_failed": sum(1 for r in results if r["status"] == "quality_failed"),
             "error": sum(1 for r in results if r["status"] == "error"),
             "skipped": sum(1 for r in results if r["status"] == "skipped"),
-            "rerouted": sum(1 for r in results if r["status"] == "rerouted"),
             "unsupported": sum(1 for r in results if r["status"] == "unsupported"),
             "source_mismatch": sum(1 for r in results if source_mismatch(r)),
         },
