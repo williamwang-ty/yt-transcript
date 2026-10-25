@@ -702,6 +702,26 @@ class CoreRegressionTests(unittest.TestCase):
         self.assertEqual(kernel_subtitle_cleanup.normalize_subtitle_text("a [Music] b\n[Laughter]\nc\n\nd"),
                          "a b\nc\n\nd")
 
+    def test_parse_vtt_drops_the_bare_foreign_tag_of_speech_recognition(self):
+        """Test YouTube's bare "foreign" for speech in another language goes, but the real word stays."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            vtt_path = Path(tmpdir) / "asr.vtt"
+            vtt_path.write_text(
+                "WEBVTT\nKind: captions\nLanguage: en\n\n"
+                "00:00:00.000 --> 00:00:02.000\nforeign\n\n"
+                "00:00:02.000 --> 00:00:04.000\nForeign foreign\n\n"
+                "00:00:04.000 --> 00:00:06.000\nforeign foreign so he said\n\n"
+                "00:00:06.000 --> 00:00:08.000\nso he said\nforeign\n\n"
+                "00:00:08.000 --> 00:00:10.000\nforeign policy is hard\n",
+                encoding="utf-8",
+            )
+
+            result = kernel_subtitle_cleanup.parse_vtt_segments(str(vtt_path), language="en")
+
+        self.assertEqual([segment["text"] for segment in result["segments"]],
+                         ["so he said", "foreign policy is hard"])
+        self.assertEqual(result["diagnostics"]["sound_tag_count"], 4)
+
     def test_assemble_final_escapes_markdown_header_text(self):
         """Test assemble final escapes markdown header text."""
         with tempfile.TemporaryDirectory() as tmpdir:

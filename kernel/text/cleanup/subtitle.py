@@ -42,6 +42,12 @@ def build_empty_subtitle_diagnostics() -> dict:
 # lines with music notes. Neither is speech, so neither goes into the text.
 SOUND_TAG = re.compile(r"\[[^\[\]\n]{1,40}\]")
 MUSIC_NOTES = re.compile(r"[♪♫♬♩]")
+# YouTube's English speech recognition writes the bare word "foreign" for
+# speech in another language, usually as a caption line of its own. A line of
+# nothing else, or the word twice in a row, is that tag; a single "foreign"
+# among other words is left alone, since it may be the real word.
+FOREIGN_LINE = re.compile(r"^\W*foreign(?:\W+foreign)*\W*$", re.IGNORECASE)
+FOREIGN_RUN = re.compile(r"\bforeign(?:[\s,.]+foreign)+\b", re.IGNORECASE)
 
 
 def _merge_diagnostics(target: dict, update: dict) -> None:
@@ -54,22 +60,26 @@ def _merge_diagnostics(target: dict, update: dict) -> None:
 
 
 def strip_subtitle_markup(text: str) -> tuple[str, dict]:
-    """Strip subtitle markup (VTT cue tags) and caption sound tags such as `[Music]` and music notes."""
+    """Strip subtitle markup (VTT cue tags) and caption sound tags such as `[Music]`, music notes and "foreign"."""
     source = str(text or "")
     cleaned, tag_count = re.subn(r"<[^>]+>", "", source)
     nbsp_count = cleaned.count("&nbsp;")
     cleaned = cleaned.replace("&nbsp;", " ")
     sound_count = 0
-    if SOUND_TAG.search(cleaned) or MUSIC_NOTES.search(cleaned):
-        lines = []
-        for line in cleaned.split("\n"):
-            stripped, count = SOUND_TAG.subn(" ", line)
-            stripped = MUSIC_NOTES.sub(" ", stripped)
-            sound_count += count
-            # A line that held only a tag goes, rather than becoming a paragraph break.
-            if stripped.strip() or not line.strip():
-                lines.append(stripped)
-        cleaned = "\n".join(lines)
+    lines = []
+    for line in cleaned.split("\n"):
+        stripped, count = SOUND_TAG.subn(" ", line)
+        stripped = MUSIC_NOTES.sub(" ", stripped)
+        if FOREIGN_LINE.match(stripped):
+            stripped, count = "", count + 1
+        else:
+            stripped, foreign_count = FOREIGN_RUN.subn(" ", stripped)
+            count += foreign_count
+        sound_count += count
+        # A line that held only a tag goes, rather than becoming a paragraph break.
+        if stripped.strip() or not line.strip():
+            lines.append(stripped)
+    cleaned = "\n".join(lines)
     return cleaned, {
         "markup_tag_count": tag_count,
         "nbsp_entity_count": nbsp_count,

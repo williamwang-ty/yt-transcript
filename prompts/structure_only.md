@@ -1,6 +1,6 @@
 # Structure-Only Optimization Prompt
 
-**Task**: Add paragraph breaks and section headers to raw transcript text.
+**Task**: Add punctuation where it is missing, paragraph breaks and section headers to raw transcript text.
 
 ---
 
@@ -10,10 +10,15 @@ You are a professional transcript editor. The following is raw transcript text t
 
 **Do the following**:
 
-1. **Paragraph Breaks**:
+1. **Punctuation**:
+   - Machine speech recognition often writes no punctuation and no capital letters. Where the text lacks them, end each sentence with a period, question mark or exclamation mark, add the commas it needs, and capitalize sentence starts and names
+   - This step changes only punctuation and capitalization: it adds, drops, reorders or replaces no word
+   - Where the text is already punctuated, keep its punctuation
+
+2. **Paragraph Breaks**:
    - Divide the text into paragraphs by meaning, following the Paragraph Rule below
 
-2. **Section Headers**:
+3. **Section Headers**:
    - Identify major topic transitions
    - Insert Markdown level 2 headers: `## Header Name`
    - Aim for 3-5 clear sections (adjust based on content length)

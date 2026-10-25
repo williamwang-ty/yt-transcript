@@ -231,15 +231,31 @@ def _count_headings_mid_sentence(blocks: list[str]) -> int:
     return count
 
 
-LEFTOVER_TAG = re.compile(r"\[[^\[\]\n]{1,40}\](?!\()|[♪♫♬♩]")
+LEFTOVER_TAG = re.compile(r"\[[^\[\]\n]{1,40}\](?!\()|[♪♫♬♩]|(?i:\bforeign(?:[\s,.]+foreign)+\b)")
+# A sentence end inside a paragraph; a point inside "4.5" or "deleteme.com" is not one.
+SENTENCE_STOP = re.compile(r"[.!?…](?=[\s\"'”’)\]]|$)|[。！？]")
+# An English paragraph this long with no sentence end in it was left unpunctuated.
+UNPUNCTUATED_MIN_WORDS = 40
 # A number cut at its decimal point: "稳定在4。" then, in the next paragraph or
 # the same one, "4到4.5".
 SPLIT_NUMBER = re.compile(r"\d。\s*\d")
 
 
 def _count_leftover_tags(body_paragraphs: list[str]) -> int:
-    """Count caption sound tags (`[Music]`, music notes) that reached the text (advisory only)."""
+    """Count caption sound tags (`[Music]`, music notes, "foreign foreign") that reached the text (advisory only)."""
     return sum(len(LEFTOVER_TAG.findall(block)) for block in body_paragraphs)
+
+
+def _count_unpunctuated_paragraphs(body_paragraphs: list[str]) -> int:
+    """Count long English paragraphs without a single sentence end (advisory only).
+
+    YouTube's English speech recognition writes no punctuation; text that kept
+    none reads as one run-on sentence, and headings cannot find a sentence start
+    in it. Chinese text has its own check, the punctuation density.
+    """
+    return sum(1 for block in body_paragraphs
+               if count_cjk_chars(block) < 4 and len(block.split()) >= UNPUNCTUATED_MIN_WORDS
+               and not SENTENCE_STOP.search(block))
 
 
 def _count_split_numbers(blocks: list[str]) -> int:
@@ -351,6 +367,10 @@ def verify_quality(optimized_text_path: str, raw_text_path: str = None,
     checks["leftover_tag_count"] = _count_leftover_tags(body_paragraphs)
     if checks["leftover_tag_count"]:
         warnings.append(f"{checks['leftover_tag_count']} caption sound tag(s) such as [Music] left in the text")
+    checks["unpunctuated_paragraph_count"] = _count_unpunctuated_paragraphs(body_paragraphs)
+    if checks["unpunctuated_paragraph_count"]:
+        warnings.append(f"{checks['unpunctuated_paragraph_count']} long English paragraph(s) have no sentence end "
+                        "(text left without punctuation)")
     checks["split_number_count"] = _count_split_numbers(paragraphs)
     if checks["split_number_count"]:
         warnings.append(f"{checks['split_number_count']} number(s) look cut at the decimal point "

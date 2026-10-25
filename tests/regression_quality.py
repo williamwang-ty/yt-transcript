@@ -511,6 +511,23 @@ class VerifyQualityTests(unittest.TestCase):
         self.assertEqual((0, 0), (clean_result["checks"]["leftover_tag_count"],
                                   clean_result["checks"]["split_number_count"]))
 
+    def test_verify_quality_warns_about_foreign_tags_and_long_english_paragraphs_without_a_sentence_end(self):
+        """Test "foreign foreign" counts as a sound tag and a long unpunctuated English paragraph is warned about."""
+        run_on = " ".join(["so we went to the lab and looked at the data"] * 5)
+        punctuated = "So we went to the lab. We looked at the data at deleteme.com and saw 4.5 percent. " * 3
+        with tempfile.TemporaryDirectory() as tmpdir:
+            optimized = Path(tmpdir) / "opt.md"
+            optimized.write_text(f"## Start\n\nforeign foreign {run_on}\n\n{punctuated}\n\nforeign policy is hard\n",
+                                 encoding="utf-8")
+
+            result = kernel_verify.verify_quality(str(optimized), bilingual=False)
+
+        self.assertTrue(result["passed"], result)
+        self.assertEqual(result["checks"]["leftover_tag_count"], 1)
+        self.assertEqual(result["checks"]["unpunctuated_paragraph_count"], 1)
+        self.assertIn("1 long English paragraph(s) have no sentence end (text left without punctuation)",
+                      result["warnings"])
+
     def test_verify_quality_measures_bilingual_paragraphs_in_english_words(self):
         """Test bilingual output is measured by its English paragraphs, in words."""
         with tempfile.TemporaryDirectory() as tmpdir:
