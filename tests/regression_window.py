@@ -1044,6 +1044,54 @@ class WindowOutlineTests(unittest.TestCase):
         self.assertEqual(result["outline"]["status"], "skipped")
         self.assertIn("Put `##` headers on their own line.", calls["rounds"][0])
 
+    def test_video_information_goes_to_the_outline_or_else_to_every_round(self):
+        info = {"title": "对话 黄仁勋", "channel": "硅谷101", "chapters": ["开场", "", "AI 工厂"],
+                "description": "本期嘉宾：黄仁勋（NVIDIA 创始人）\nhttps://example.com/x\n\n订阅我们：https://y.z\n" + "长" * 3000}
+        reference = outline.video_reference_text(info)
+        self.assertIn("Title: 对话 黄仁勋\nChannel: 硅谷101\nChapters: 开场 | AI 工厂\nDescription:\n本期嘉宾：黄仁勋",
+                      reference)
+        self.assertIn("订阅我们：\n", reference)
+        self.assertNotIn("http", reference)
+        self.assertLess(len(reference), 2400)
+        self.assertTrue(reference.rstrip().endswith("…"))
+        self.assertEqual("", outline.video_reference_text({"title": "", "description": "https://only.link"}))
+        self.assertEqual("", outline.video_reference_text(None))
+
+        # With an outline, the reference goes with the outline request; its terms carry the spellings.
+        llm, calls = self._llm(_outline_json(self.SECTIONS))
+        with tempfile.TemporaryDirectory() as tmpdir:
+            work_dir = WindowExecutorTests._make_work_dir(self, tmpdir)
+            result, _ = WindowExecutorTests._run(self, work_dir, self._config(), llm, video_info=info)
+            state = window.load_window_state(str(work_dir))
+        self.assertTrue(result["success"], result)
+        self.assertIn("## Video Information (reference only)", calls["outline"][0])
+        self.assertIn("本期嘉宾：黄仁勋（NVIDIA 创始人）", calls["outline"][0])
+        self.assertIn("give the correct spelling as `term` and the misheard forms as `variants`", calls["outline"][0])
+        self.assertLess(calls["outline"][0].index("## Video Information"), calls["outline"][0].index("## Transcript"))
+        self.assertEqual(len(reference), state["outline"]["reference_chars"])
+        self.assertFalse(any("## Video Information" in prompt for prompt in calls["rounds"]))
+
+        # Without one, every round gets it, before the input text.
+        llm, calls = self._llm(_outline_json(self.SECTIONS))
+        with tempfile.TemporaryDirectory() as tmpdir:
+            work_dir = WindowExecutorTests._make_work_dir(self, tmpdir)
+            result, _ = WindowExecutorTests._run(self, work_dir, self._config(window_outline=False), llm,
+                                                 video_info=info)
+        self.assertTrue(result["success"], result)
+        self.assertEqual(calls["outline"], [])
+        self.assertGreater(len(calls["rounds"]), 1)
+        for prompt in calls["rounds"]:
+            self.assertIn("本期嘉宾：黄仁勋", prompt)
+            self.assertLess(prompt.index("## Video Information"), prompt.index("## Input Text"))
+
+        # No video text, no block: the requests are as before.
+        llm, calls = self._llm(_outline_json(self.SECTIONS))
+        with tempfile.TemporaryDirectory() as tmpdir:
+            work_dir = WindowExecutorTests._make_work_dir(self, tmpdir)
+            WindowExecutorTests._run(self, work_dir, self._config(), llm)
+        self.assertFalse(any("## Video Information" in prompt for prompt in calls["outline"] + calls["rounds"]))
+        self.assertNotIn("misheard forms as `variants`", calls["outline"][0])
+
     def test_resumed_run_reuses_the_outline_without_repeating_headings(self):
         writer, _ = _headed_marker_writer()
         failures = {"round": 0}

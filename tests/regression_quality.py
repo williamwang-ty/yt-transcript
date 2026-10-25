@@ -488,6 +488,29 @@ class VerifyQualityTests(unittest.TestCase):
             self.assertTrue(result["passed"], result)
             self.assertFalse(any("heading" in warning.lower() for warning in result["warnings"]))
 
+    def test_verify_quality_warns_about_leftover_sound_tags_and_numbers_cut_at_the_point(self):
+        """Test caption tags and "4。" + "4" number splits are counted and warned about, without failing."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            optimized = Path(tmpdir) / "opt.md"
+            optimized.write_text(
+                "## 开场\n\n市场目前稳定在4。\n\n4到4.5左右。[Music] 每年做2。\n\n## 下一节\n\n"
+                "8万亿，详见[链接](https://example.com)。♪\n\n增长了3.8%，还有2.8万亿。\n",
+                encoding="utf-8",
+            )
+            clean = Path(tmpdir) / "clean.md"
+            clean.write_text("## 开场\n\n市场目前稳定在4.4到4.5左右，每年做2.8万亿。\n", encoding="utf-8")
+
+            result = kernel_verify.verify_quality(str(optimized), bilingual=False)
+            clean_result = kernel_verify.verify_quality(str(clean), bilingual=False)
+
+        self.assertTrue(result["passed"], result)
+        self.assertEqual(result["checks"]["leftover_tag_count"], 2)
+        self.assertEqual(result["checks"]["split_number_count"], 2)
+        self.assertIn("2 caption sound tag(s) such as [Music] left in the text", result["warnings"])
+        self.assertTrue(any("cut at the decimal point" in warning for warning in result["warnings"]))
+        self.assertEqual((0, 0), (clean_result["checks"]["leftover_tag_count"],
+                                  clean_result["checks"]["split_number_count"]))
+
     def test_verify_quality_measures_bilingual_paragraphs_in_english_words(self):
         """Test bilingual output is measured by its English paragraphs, in words."""
         with tempfile.TemporaryDirectory() as tmpdir:

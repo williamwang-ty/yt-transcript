@@ -188,8 +188,11 @@ class EndToEndFixtureTests(unittest.TestCase):
                 self.assertEqual("done", state["status"])
                 self.assertEqual(STAGES, tuple(state["stages"]))
                 self.assertTrue(all(stage["status"] == "done" for stage in state["stages"].values()))
-                # The cleanup stage leaves only state.json in the video's work dir.
-                self.assertEqual(["state.json"], sorted(p.name for p in (vdir.parent / "work" / vid).iterdir()))
+                # The cleanup stage leaves only state.json in the video's work dir, plus
+                # Deepgram's response for a Deepgram article.
+                kept = ["deepgram.json"] if video["expected_case"] == "deepgram" else []
+                self.assertEqual(sorted(["state.json", *kept]),
+                                 sorted(p.name for p in (vdir.parent / "work" / vid).iterdir()))
                 self.assertEqual(vdir / "output" / item["output_file"], Path(state["output_file"]))
                 self.assertTrue(item["verify"]["passed"])
                 self.assertEqual([], item["verify"]["hard_failures"])

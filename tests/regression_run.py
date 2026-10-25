@@ -123,7 +123,12 @@ class RunFixture(unittest.TestCase):
         state = self.state(video)
         self.assertEqual("done", state["status"])
         self.assertTrue(all(state["stages"][name]["status"] == "done" for name in pipeline.STAGES))
-        self.assertEqual([pipeline.STATE_FILE], sorted(p.name for p in self.work_dir(video).iterdir()))
+        # Cleanup keeps state.json, and Deepgram's response for a Deepgram article.
+        kept = [pipeline.KEPT_DEEPGRAM_FILE] if state["route"]["source"] == "deepgram" else []
+        self.assertEqual(sorted([pipeline.STATE_FILE, *kept]), sorted(p.name for p in self.work_dir(video).iterdir()))
+        if kept:
+            response = json.loads((self.work_dir(video) / pipeline.KEPT_DEEPGRAM_FILE).read_text(encoding="utf-8"))
+            self.assertIn("results", json.dumps(response)[:20000])
 
     def cli(self, *args: str) -> list:
         """The argv of `run` through the CLI, with Deepgram answered from the fixture."""
@@ -183,6 +188,19 @@ class RunCommandTests(RunFixture):
         third = self.run_video(ENGLISH)
         self.assert_finished(ENGLISH, third)
         self.assertEqual(["window", "translate"] * 2, self.llm_calls())
+
+    def test_the_video_text_goes_to_the_outline_or_to_rounds_without_one(self):
+        # A short video has no outline: its round gets the video's text. A long one sends it
+        # with the outline request, whose terms carry the spellings to the rounds.
+        for video, expected in ((ENGLISH, [("window", True), ("translate", False)]),
+                                (LONG, [("outline", True), ("window", False)])):
+            with self.subTest(video=video):
+                if self.llm_log.exists():
+                    self.llm_log.unlink()
+                self.assert_finished(video, self.run_video(video))
+                entries = [json.loads(line) for line in self.llm_log.read_text(encoding="utf-8").splitlines()]
+                seen = [(entry["kind"], entry.get("reference")) for entry in entries if entry["kind"] != "probe"]
+                self.assertEqual(expected, list(dict.fromkeys(seen)))
 
     def test_rerun_after_llm_failure_resumes_at_the_text_cursor(self):
         expected = self.reference_article(LONG)

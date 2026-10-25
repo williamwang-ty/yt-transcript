@@ -27,6 +27,7 @@ You are a careful Chinese transcript editor. The following text may come from su
 
 4. **Conservative normalization**:
    - Correct only obvious recurring product or proper-name variants when the context is highly clear
+   - A Terminology section or a Video Information block below, when present, gives the correct spelling of names; use it to fix misheard names, never to add content
    - If uncertain, keep the original wording instead of guessing
 
 ## Paragraph Rule

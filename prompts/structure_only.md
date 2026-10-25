@@ -29,7 +29,7 @@ A paragraph covers one thing: one point, one example or story, one step, or one 
 
 **Do NOT**:
 - Translate content
-- Fix speech recognition errors, except names and terms whose spelling a Terminology section below gives
+- Fix speech recognition errors, except names and terms whose spelling a Terminology section or a Video Information block below gives
 - Remove or summarize content
 - Add speaker labels
 

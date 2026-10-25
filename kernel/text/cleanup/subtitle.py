@@ -33,7 +33,15 @@ def build_empty_subtitle_diagnostics() -> dict:
         "collapsed_cjk_spacing_count": 0,
         "tightened_punctuation_spacing_count": 0,
         "tightened_bracket_spacing_count": 0,
+        "sound_tag_count": 0,
     }
+
+
+# Captions mark sounds in square brackets, `[Music]`, `[Applause]`, `[音乐]`
+# (YouTube's speech recognition writes nothing else in brackets), and sung
+# lines with music notes. Neither is speech, so neither goes into the text.
+SOUND_TAG = re.compile(r"\[[^\[\]\n]{1,40}\]")
+MUSIC_NOTES = re.compile(r"[♪♫♬♩]")
 
 
 def _merge_diagnostics(target: dict, update: dict) -> None:
@@ -46,13 +54,26 @@ def _merge_diagnostics(target: dict, update: dict) -> None:
 
 
 def strip_subtitle_markup(text: str) -> tuple[str, dict]:
-    """Strip lightweight subtitle markup such as VTT cue tags."""
+    """Strip subtitle markup (VTT cue tags) and caption sound tags such as `[Music]` and music notes."""
     source = str(text or "")
     cleaned, tag_count = re.subn(r"<[^>]+>", "", source)
     nbsp_count = cleaned.count("&nbsp;")
-    return cleaned.replace("&nbsp;", " "), {
+    cleaned = cleaned.replace("&nbsp;", " ")
+    sound_count = 0
+    if SOUND_TAG.search(cleaned) or MUSIC_NOTES.search(cleaned):
+        lines = []
+        for line in cleaned.split("\n"):
+            stripped, count = SOUND_TAG.subn(" ", line)
+            stripped = MUSIC_NOTES.sub(" ", stripped)
+            sound_count += count
+            # A line that held only a tag goes, rather than becoming a paragraph break.
+            if stripped.strip() or not line.strip():
+                lines.append(stripped)
+        cleaned = "\n".join(lines)
+    return cleaned, {
         "markup_tag_count": tag_count,
         "nbsp_entity_count": nbsp_count,
+        "sound_tag_count": sound_count,
     }
 
 

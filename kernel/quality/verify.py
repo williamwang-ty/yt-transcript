@@ -231,6 +231,28 @@ def _count_headings_mid_sentence(blocks: list[str]) -> int:
     return count
 
 
+LEFTOVER_TAG = re.compile(r"\[[^\[\]\n]{1,40}\](?!\()|[♪♫♬♩]")
+# A number cut at its decimal point: "稳定在4。" then, in the next paragraph or
+# the same one, "4到4.5".
+SPLIT_NUMBER = re.compile(r"\d。\s*\d")
+
+
+def _count_leftover_tags(body_paragraphs: list[str]) -> int:
+    """Count caption sound tags (`[Music]`, music notes) that reached the text (advisory only)."""
+    return sum(len(LEFTOVER_TAG.findall(block)) for block in body_paragraphs)
+
+
+def _count_split_numbers(blocks: list[str]) -> int:
+    """Count numbers that look cut at the decimal point, with "。" in place of the point (advisory only).
+
+    A pause inside a spoken number such as "四点四" can end a speech
+    recognition segment there; the text then reads "4。" and goes on with "4"
+    after it, sometimes in the next paragraph or after a heading.
+    """
+    body = "\n\n".join(block for block in blocks if not block.startswith(("#", ">", "---")))
+    return len(SPLIT_NUMBER.findall(body))
+
+
 def _count_bilingual_paragraph_pairs(paragraphs: list[str]) -> int:
     """Count adjacent English-to-Chinese body paragraph pairs."""
     normalized_blocks = [str(block or "").strip() for block in paragraphs if str(block or "").strip()]
@@ -326,6 +348,13 @@ def verify_quality(optimized_text_path: str, raw_text_path: str = None,
     checks["paragraph_count"] = len(body_paragraphs)
     checks.update(_compute_paragraph_length_metrics(body_paragraphs, bilingual=bilingual))
     checks["heading_mid_sentence_count"] = _count_headings_mid_sentence(paragraphs)
+    checks["leftover_tag_count"] = _count_leftover_tags(body_paragraphs)
+    if checks["leftover_tag_count"]:
+        warnings.append(f"{checks['leftover_tag_count']} caption sound tag(s) such as [Music] left in the text")
+    checks["split_number_count"] = _count_split_numbers(paragraphs)
+    if checks["split_number_count"]:
+        warnings.append(f"{checks['split_number_count']} number(s) look cut at the decimal point "
+                        "(a digit, \"。\", then a digit)")
 
     # Check 1: Non-empty
     checks["non_empty"] = total_chars > 0

@@ -164,7 +164,7 @@ When YouTube refuses the preferred subtitle track (rate limit or bot check) and 
 
 ### Work directory and resume
 
-Each video has one work directory, `/tmp/yt-transcript/<video_id>/`, holding `state.json` (stage records, route, overrides, warnings, LLM usage, last result) and the files of each stage. Rerunning `run` skips finished stages and continues an interrupted text stage paragraph by paragraph. A second `run` of a video that is still running waits for the first one (within its `--max-seconds`), then returns what the first one left, usually `done`. Once the article is written, the `cleanup` stage removes the intermediate files; `state.json` stays, so a rerun returns `done` at once with the existing article.
+Each video has one work directory, `/tmp/yt-transcript/<video_id>/`, holding `state.json` (stage records, route, overrides, warnings, LLM usage, last result) and the files of each stage. Rerunning `run` skips finished stages and continues an interrupted text stage paragraph by paragraph. A second `run` of a video that is still running waits for the first one (within its `--max-seconds`), then returns what the first one left, usually `done`. Once the article is written, the `cleanup` stage removes the intermediate files; `state.json` stays, so a rerun returns `done` at once with the existing article, and so does Deepgram's response (`deepgram.json`) for a Deepgram article, for looking into its text later.
 
 ### Several runs at once
 
@@ -402,7 +402,7 @@ URL 也可以是 11 位的视频 id。
 
 ### 工作目录和续跑
 
-每个视频有一个工作目录 `/tmp/yt-transcript/<video_id>/`，里面是 `state.json`（各阶段记录、路由、覆盖参数、警告、LLM 用量、上一次结果）和各阶段的文件。重跑 `run` 会跳过已完成的阶段，中断的文字阶段按段落继续。同一个视频还在运行时再启动一次 `run`，它会等第一次结束（在自己的 `--max-seconds` 之内），然后返回第一次留下的结果，通常是 `done`。文章写出后，`cleanup` 阶段删掉中间文件，只留下 `state.json`，所以重跑会立刻返回 `done` 和已有的文章。
+每个视频有一个工作目录 `/tmp/yt-transcript/<video_id>/`，里面是 `state.json`（各阶段记录、路由、覆盖参数、警告、LLM 用量、上一次结果）和各阶段的文件。重跑 `run` 会跳过已完成的阶段，中断的文字阶段按段落继续。同一个视频还在运行时再启动一次 `run`，它会等第一次结束（在自己的 `--max-seconds` 之内），然后返回第一次留下的结果，通常是 `done`。文章写出后，`cleanup` 阶段删掉中间文件，只留下 `state.json`，所以重跑会立刻返回 `done` 和已有的文章；Deepgram 文章还会留下 Deepgram 的返回结果（`deepgram.json`），方便以后查它的文字。
 
 ### 多个运行同时进行
 

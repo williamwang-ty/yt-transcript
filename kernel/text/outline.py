@@ -19,6 +19,12 @@ YouTube chapters, when the video has them, are mapped to source units and
 given to the model as hints, anchored at the chapter's first subtitle cue.
 If the outline cannot be produced or fails validation, the run continues
 without it and the rounds place their own headings, as before.
+
+The video's own text (title, channel, chapter titles, description) goes with
+the request as a spelling reference: speech recognition mishears names, and
+the uploader usually spells them right. The terms carry the corrected
+spellings to every round; a run without an outline gives the reference to
+its rounds instead.
 """
 
 from __future__ import annotations
@@ -45,6 +51,11 @@ MAX_TERM_CHARS = 60
 # Terms sent with one window round.
 MAX_ROUND_TERMS = 20
 TERM_KINDS = ("person", "organization", "product", "term")
+# The video's own text sent as the spelling reference: the description is
+# cut to about this many characters, the chapter titles to this many.
+REFERENCE_DESCRIPTION_CHARS = 1500
+REFERENCE_CHAPTER_CHARS = 600
+URL = re.compile(r"(?:https?://|www\.)\S+", re.IGNORECASE)
 HEADER_LINE = re.compile(r"^[ \t]*#{1,6}[ \t]+.*$\n?", re.MULTILINE)
 # A section's first words are looked for this far from the unit the model
 # gave, in the source and again in the written text, and a chapter takes over
@@ -75,7 +86,7 @@ Return only one JSON object and nothing else:
 {{"sections": [{{"start": {first}, "first_words": "...", "title": "..."{title_zh_example}}}], "terms": [{{"term": "...", "variants": ["..."], "kind": "person"{zh_example}}}]}}
 
 - `sections`: the major topics in order. `first_words` are the first words of the sentence that begins the topic (about 6 to 12 Chinese characters, or 4 to 8 English words), copied exactly from the transcript without the tag; `start` is the number of the unit that contains them, and the numbers must increase.{first_note} Aim for {low} to {high} sections; start a section only at a real topic shift, not for a single remark. `title` is a short heading in {title_language} (at most about 20 Chinese characters or 8 English words), without numbering or `#`.{title_zh_note}
-- `terms`: at most {max_terms} names of people, organizations and products, and technical terms, that recur or matter. `term` is the name as the speaker uses it, spelled correctly: keep a Chinese name in Chinese when that is what is said, and do not expand it to a full name or swap in a translation. `variants` lists only misrecognized or misspelled forms of that same word that actually appear in the transcript (speech-recognition errors, typos); never a translation, an abbreviation, a short form or a full name, since the speaker's wording is kept. Leave it empty unless you are confident. `kind` is one of person, organization, product, term.{zh_note}{hints}
+- `terms`: at most {max_terms} names of people, organizations and products, and technical terms, that recur or matter. `term` is the name as the speaker uses it, spelled correctly: keep a Chinese name in Chinese when that is what is said, and do not expand it to a full name or swap in a translation. `variants` lists only misrecognized or misspelled forms of that same word that actually appear in the transcript (speech-recognition errors, typos); never a translation, an abbreviation, a short form or a full name, since the speaker's wording is kept. Leave it empty unless you are confident. `kind` is one of person, organization, product, term.{zh_note}{reference_note}{hints}{reference}
 
 ## Transcript
 
@@ -90,6 +101,16 @@ The video has its own chapters, listed below with the unit and the words where e
 
 {lines}"""
 
+REFERENCE_BLOCK = """## Video Information (reference only)
+
+The video's title, channel, chapter titles and description, as its uploader wrote them. They usually spell names of people, organizations and products correctly where speech recognition misheard them. Use them only to check spelling: never add anything from them to the output, and do not replace the words the speaker uses with other names or another language.
+
+{lines}"""
+
+REFERENCE_NOTE = (" The Video Information block below spells many names correctly: when the transcript has a misheard"
+                  " form of a name written there, give the correct spelling as `term` and the misheard forms as"
+                  " `variants`.")
+
 OUTLINE_ROUND_BLOCK = """## Outline (section titles for this part of the transcript)
 
 {lines}"""
@@ -101,6 +122,51 @@ def outline_supported(prompt_name: str) -> bool:
 
 def outline_enabled(config: dict | None) -> bool:
     return parse_bool((config or {}).get("window_outline", True), True)
+
+
+def _clip(text: str, limit: int) -> str:
+    """`text` cut to about `limit` characters, at a line or word end when one is near."""
+    if len(text) <= limit:
+        return text
+    cut = text[:limit]
+    for separator in ("\n", " "):
+        position = cut.rfind(separator)
+        if position >= limit * 0.7:
+            cut = cut[:position]
+            break
+    return cut.rstrip() + " …"
+
+
+def video_reference_text(info: dict | None) -> str:
+    """The Video Information block for the video's title, channel, chapter titles and description, or "".
+
+    Links are dropped from the description (with the lines left empty by
+    that), since they only cost tokens; the rest is kept as written, cut to
+    about REFERENCE_DESCRIPTION_CHARS characters.
+    """
+    info = info if isinstance(info, dict) else {}
+    lines = []
+    title = re.sub(r"\s+", " ", str(info.get("title") or "")).strip()
+    channel = re.sub(r"\s+", " ", str(info.get("channel") or "")).strip()
+    if title:
+        lines.append(f"Title: {title}")
+    if channel:
+        lines.append(f"Channel: {channel}")
+    chapters = [re.sub(r"\s+", " ", str(chapter or "")).strip() for chapter in info.get("chapters") or []]
+    chapters = [chapter for chapter in chapters if chapter]
+    if chapters:
+        lines.append(f"Chapters: {_clip(' | '.join(chapters), REFERENCE_CHAPTER_CHARS)}")
+    description_lines = []
+    for line in str(info.get("description") or "").splitlines():
+        line = URL.sub("", line).strip()
+        if re.search(r"[^\W_]", line):
+            description_lines.append(line)
+    description = "\n".join(description_lines)
+    if description:
+        lines.append("Description:\n" + _clip(description, REFERENCE_DESCRIPTION_CHARS))
+    if not lines:
+        return ""
+    return REFERENCE_BLOCK.format(lines="\n".join(lines))
 
 
 # ---------------------------------------------------------------------------
@@ -139,8 +205,11 @@ def section_range(source_tokens: int) -> tuple[int, int]:
 def build_outline_prompt(units: list[str], start: int, end: int, *, prompt_name: str,
                          source_tokens: int, hints: list[dict] | None = None,
                          part: int = 1, parts: int = 1, previous_title: str = "",
-                         max_terms: int = DEFAULT_OUTLINE_MAX_TERMS) -> str:
-    """Build the outline request for units[start:end] (0-based, end exclusive)."""
+                         max_terms: int = DEFAULT_OUTLINE_MAX_TERMS, reference: str = "") -> str:
+    """Build the outline request for units[start:end] (0-based, end exclusive).
+
+    `reference` is the Video Information block (`video_reference_text`), or "".
+    """
     bilingual = OUTLINE_PROMPTS.get(prompt_name) == "source"
     title_language = "the transcript's own language" if bilingual else "Simplified Chinese"
     low, high = section_range(source_tokens)
@@ -173,7 +242,9 @@ def build_outline_prompt(units: list[str], start: int, end: int, *, prompt_name:
         max_terms=max_terms,
         zh_note=(" Also give `zh`, the usual Simplified Chinese rendering of the term (the term itself when it is"
                  " normally kept as is, like API)." if bilingual else ""),
+        reference_note=REFERENCE_NOTE if reference else "",
         hints=hints_text,
+        reference=f"\n\n{reference}" if reference else "",
         numbered=numbered,
     )
 
@@ -346,24 +417,27 @@ def merge_parts(parsed_parts: list[dict], max_terms: int = DEFAULT_OUTLINE_MAX_T
 def generate_outline(units: list[str], *, prompt_name: str, call_llm, max_output_tokens: int,
                      estimate, read_tokens: int = DEFAULT_OUTLINE_READ_TOKENS,
                      max_terms: int = DEFAULT_OUTLINE_MAX_TERMS, hints: list[dict] | None = None,
-                     log=None) -> dict:
+                     reference: str = "", log=None) -> dict:
     """Ask the model for the outline, in parts when the source is too long for one request.
 
     `call_llm(prompt_text, max_output_tokens)` is the window executor's
     backend call; `LLMRequestError` from it is caught and reported as a
-    failed outline. Returns the outline record kept in the window state.
+    failed outline. `reference` (the Video Information block) goes with every
+    part. Returns the outline record kept in the window state.
     """
     log = log or (lambda message: None)
     unit_tokens = [estimate(f"[S{index + 1}] {unit}") for index, unit in enumerate(units)]
     parts = split_parts(unit_tokens, read_tokens)
     record = {"status": "failed", "sections": [], "terms": [], "parts": len(parts),
-              "hints": list(hints or []), "requests": [], "error_type": "", "error": ""}
+              "hints": list(hints or []), "reference_chars": len(reference), "requests": [],
+              "error_type": "", "error": ""}
     parsed_parts = []
     previous_title = ""
     for number, (start, end) in enumerate(parts, 1):
         prompt = build_outline_prompt(
             units, start, end, prompt_name=prompt_name, source_tokens=sum(unit_tokens[start:end]),
             hints=hints, part=number, parts=len(parts), previous_title=previous_title, max_terms=max_terms,
+            reference=reference,
         )
         request = {"part": number, "first": start + 1, "last": end, "prompt_tokens": estimate(prompt)}
         try:

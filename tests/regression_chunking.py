@@ -2,6 +2,7 @@
 
 from tests._support import *
 from kernel.text import chunking
+from kernel.text import window as kernel_window
 from kernel.text.cleanup import post_merge
 
 
@@ -9,9 +10,10 @@ def _chunks(work_dir: Path) -> list[str]:
     return [path.read_text(encoding="utf-8") for path in sorted(work_dir.glob("chunk_*.txt"))]
 
 
-def _segment_document(path: Path, segments: list[dict]) -> Path:
+def _segment_document(path: Path, segments: list[dict], mode: str = "") -> Path:
     path.write_text(json.dumps({
         "content": {"text": "\n".join(segment["text"] for segment in segments), "preferred_chunk_source": "segments"},
+        "workflow": {"mode": mode},
         "segments": segments,
     }, ensure_ascii=False), encoding="utf-8")
     return path
@@ -81,7 +83,7 @@ class ChunkingTests(unittest.TestCase):
 
         self.assertEqual(result["source_kind"], "segments")
         self.assertEqual(result["chapters_path"], str(chapters.absolute()))
-        self.assertEqual(chunks, ["A" * 10 + "\n\n" + "B" * 10, "C" * 10])
+        self.assertEqual(chunks, ["A" * 10 + " " + "B" * 10, "C" * 10])
 
     def test_tiny_chunk_at_a_chapter_start_merges_forward(self):
         segments = [
@@ -92,7 +94,7 @@ class ChunkingTests(unittest.TestCase):
             {"id": 4, "text": "戊" * 90, "start_time": 31.0, "end_time": 50.0},
         ]
         with tempfile.TemporaryDirectory() as tmpdir:
-            normalized = _segment_document(Path(tmpdir) / "normalized.json", segments)
+            normalized = _segment_document(Path(tmpdir) / "normalized.json", segments, mode="chinese")
             chapters = Path(tmpdir) / "chapters.json"
             chapters.write_text(json.dumps({"chapters": [{"title": "Two", "start_time": 30.0}]}), encoding="utf-8")
             config = {**kernel_config.default_config_values(), "chunk_size_override": 100}
@@ -103,7 +105,34 @@ class ChunkingTests(unittest.TestCase):
 
         self.assertTrue(any("undersized chunk fragment" in warning for warning in result["warnings"]), result)
         self.assertEqual(len(chunks), 2)
-        self.assertEqual(chunks[-1], "丁" * 5 + "\n\n" + "戊" * 90)
+        # The merge joins Chinese text without a space, like segments inside a chunk.
+        self.assertEqual(chunks[-1], "丁" * 5 + "戊" * 90)
+
+    def test_a_pause_between_segments_is_not_a_break_in_the_text(self):
+        # Deepgram ended an utterance inside "4.4"; joined with a space, "4. 4" would be two sentences.
+        segments = [
+            {"id": 0, "text": "目前稳定在4.", "start_time": 0.0, "end_time": 2.0, "speaker": 0},
+            {"id": 1, "text": "4到4.5左右。我们用的是GPT", "start_time": 2.9, "end_time": 5.0, "speaker": 0},
+            {"id": 2, "text": "4o。", "start_time": 5.5, "end_time": 6.0, "speaker": 0},
+            {"id": 3, "text": "对。", "start_time": 6.5, "end_time": 7.0, "speaker": 1},
+        ]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            zh = _segment_document(Path(tmpdir) / "zh.json", segments, mode="chinese")
+            chunking.chunk_document(str(zh), str(Path(tmpdir) / "zh"), "cleanup_zh",
+                                    kernel_config.default_config_values())
+            en = _segment_document(Path(tmpdir) / "en.json", [
+                {"id": 0, "text": "so the rate", "start_time": 0.0, "end_time": 1.0, "speaker": 0},
+                {"id": 1, "text": "went up.", "start_time": 1.5, "end_time": 2.0, "speaker": 0},
+                {"id": 2, "text": "Right.", "start_time": 2.5, "end_time": 3.0, "speaker": 1},
+            ], mode="bilingual")
+            chunking.chunk_document(str(en), str(Path(tmpdir) / "en"), "structure_only",
+                                    kernel_config.default_config_values())
+            zh_chunks, en_chunks = _chunks(Path(tmpdir) / "zh"), _chunks(Path(tmpdir) / "en")
+
+        self.assertEqual(zh_chunks, ["目前稳定在4.4到4.5左右。我们用的是GPT 4o。\n\n对。"])
+        self.assertEqual(en_chunks, ["so the rate went up.\n\nRight."])
+        self.assertEqual(["目前稳定在4.4到4.5左右。", "我们用的是GPT 4o。", "对。"],
+                         kernel_window.split_source_sentences(zh_chunks[0]))
 
     def test_text_is_used_when_the_document_prefers_it(self):
         document = {
