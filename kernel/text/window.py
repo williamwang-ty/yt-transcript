@@ -958,7 +958,7 @@ def window_params(prompt_name: str, config: dict) -> dict:
 def run_window_rounds(work_dir: str, prompt_name: str, prompt_template: str, *, config: dict,
                       call_llm, state: dict, sentences: list[str], glossary_payload: dict | None = None,
                       should_stop=None, log=None, input_key: str = RAW_STAGE,
-                      outline_terms: list[dict] | None = None) -> dict:
+                      outline_terms: list[dict] | None = None, reference_text: str = "") -> dict:
     """Advance the cursor until the source is done, a stop is requested, or the LLM fails.
 
     `call_llm(prompt_text, max_output_tokens)` returns the backend result dict
@@ -970,6 +970,8 @@ def run_window_rounds(work_dir: str, prompt_name: str, prompt_template: str, *, 
     outline lines for its window and the outline's terms instead of the
     heuristic glossary, and only the outline's headings are kept.
     `outline_terms` passes the raw stage's terms to the translation stage.
+    `reference_text` (the Video Information block) goes with every round
+    when there is no usable outline, whose terms would carry it otherwise.
     """
     log = log or (lambda message: print(message, file=sys.stderr))
     params = state["params"]
@@ -998,10 +1000,14 @@ def run_window_rounds(work_dir: str, prompt_name: str, prompt_template: str, *, 
         outline_terms = outline.get("terms", [])
     translation_terms = unit == "paragraph"
 
+    round_reference = reference_text if unit == "sentence" and not sections else ""
+
     def round_glossary(source_text: str) -> str:
         if outline_terms:
-            return kernel_outline.round_terms_text(outline_terms, source_text, translation=translation_terms)
-        return _glossary_text(glossary_payload, source_text, max_glossary_terms)
+            glossary = kernel_outline.round_terms_text(outline_terms, source_text, translation=translation_terms)
+        else:
+            glossary = _glossary_text(glossary_payload, source_text, max_glossary_terms)
+        return "\n\n".join(block for block in (glossary, round_reference) if block)
 
     # Invalid rounds already recorded at the cursor count toward the fallback,
     # so a resumed run still reaches it instead of retrying the same stretch forever.
@@ -1213,7 +1219,7 @@ def load_chapter_hints(work_dir: str, unit_offsets: list, units: list[str] | Non
 
 
 def _prepare_outline(work_dir: str, prompt_name: str, state: dict, sentences: list[str], config: dict,
-                     params: dict, call_llm, *, unit_offsets: list, log) -> None:
+                     params: dict, call_llm, *, unit_offsets: list, log, reference: str = "") -> None:
     """Generate the run's outline into `state["outline"]`, or keep the one it already has.
 
     A run that already wrote output keeps whatever outline it started with,
@@ -1256,6 +1262,7 @@ def _prepare_outline(work_dir: str, prompt_name: str, state: dict, sentences: li
         max_terms=kernel_config.parse_int_min(config.get("window_outline_max_terms"),
                                        kernel_config.DEFAULT_OUTLINE_MAX_TERMS, 0),
         hints=hints,
+        reference=reference,
         log=log,
     )
     record["generated_at"] = now_iso()
@@ -1327,7 +1334,8 @@ def _build_result(work_dir: str, state: dict, outcome: dict, *, prompt_name: str
 
 def process_window(work_dir: str, prompt_name: str, extra_instruction: str = "",
                    config_path: str = None, input_key: str = RAW_STAGE, stop_check=None,
-                   agent_handoff=None, api_fallback: str | None = None) -> dict:
+                   agent_handoff=None, api_fallback: str | None = None,
+                   video_info: dict | None = None) -> dict:
     """Run (or resume) the sliding-window executor for one stage of a work dir.
 
     `stop_check()` returns "paused" to stop at the next round boundary (the
@@ -1337,6 +1345,8 @@ def process_window(work_dir: str, prompt_name: str, extra_instruction: str = "",
     `api_fallback` ("auto" or "never") is the user's answer for this video and
     takes the place of `llm_api_fallback`; with "ask" a CLI that cannot be used
     raises `ApiFallbackNeeded` when the API is configured.
+    `video_info` (title, channel, description, chapter titles) is the
+    spelling reference for names; see `kernel.text.outline.video_reference_text`.
     """
     log = lambda message: print(message, file=sys.stderr)  # noqa: E731
     stage = _stage(input_key)
@@ -1470,9 +1480,10 @@ def process_window(work_dir: str, prompt_name: str, extra_instruction: str = "",
         log(f"ℹ️ Resuming the window run at S{state['cursor'] + 1} of {len(sentences)}.")
 
     outline_terms = None
+    reference = kernel_outline.video_reference_text(video_info) if stage == RAW_STAGE else ""
     if stage == RAW_STAGE:
         _prepare_outline(work_dir, prompt_name, state, sentences, config, params, call_llm,
-                         unit_offsets=unit_offsets, log=log)
+                         unit_offsets=unit_offsets, log=log, reference=reference)
         _write_state(out_dir, state)
     else:
         raw_outline = load_window_state(work_dir, RAW_STAGE).get("outline") or {}
@@ -1492,6 +1503,7 @@ def process_window(work_dir: str, prompt_name: str, extra_instruction: str = "",
         log=log,
         input_key=stage,
         outline_terms=outline_terms,
+        reference_text=reference,
     )
     return _build_result(work_dir, state, outcome, prompt_name=prompt_name, input_key=stage,
                          request_url=request_url, backend_decision=backend_decision,

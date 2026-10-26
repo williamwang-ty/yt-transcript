@@ -6,6 +6,10 @@ run. A chunk boundary stays a unit boundary in the window run (see
 ends, on the segment path at subtitle cues and before every YouTube chapter
 start. `manifest.json` in the work dir lists the chunk files, the normalized
 document (for cue timings) and the chapters file (for outline hints).
+
+Inside a chunk, a segment end (a cue, or a Deepgram utterance) is only a
+pause in the speech, not a break in the text: segments of one speaker run on,
+with no space in Chinese text, and a speaker change starts a new paragraph.
 """
 
 from __future__ import annotations
@@ -48,7 +52,9 @@ def chunk_document(normalized_document_path: str, output_dir: str, prompt_name: 
     hard_cap = max(target, int(math.ceil(target * multiplier)))
 
     if use_segments:
-        chunks, warnings = _chunk_segments(segments, target, hard_cap, chapters_path)
+        workflow = payload.get("workflow", {}) if isinstance(payload.get("workflow", {}), dict) else {}
+        chinese = str(workflow.get("mode", "")).strip().lower() == "chinese"
+        chunks, warnings = _chunk_segments(segments, target, hard_cap, chapters_path, chinese=chinese)
     else:
         text = str(content.get("text", "")).strip()
         if not text:
@@ -108,9 +114,38 @@ def _chunk_sentences(sentences: list[str], target: int, hard_cap: int) -> tuple[
     return chunks, warnings
 
 
+def segment_joiner(left: dict, right: dict, *, chinese: bool) -> str:
+    """What goes between two neighbouring segments: a pause between them is not a break in the text.
+
+    A speaker change starts a paragraph. Otherwise Chinese text runs on with
+    no space, except between two letters or digits, and other text gets one
+    space. A space would make "稳定在4." + "4到4.5" (a pause inside "4.4")
+    two sentences.
+    """
+    if left.get("speaker") != right.get("speaker"):
+        return CHUNK_SEPARATOR
+    if not chinese:
+        return " "
+    before, after = str(left.get("text", ""))[-1:], str(right.get("text", ""))[:1]
+    return " " if before.isascii() and before.isalnum() and after.isascii() and after.isalnum() else ""
+
+
+def _join_segments(parts: list[dict], *, chinese: bool) -> str:
+    parts = [part for part in parts if part.get("text")]
+    if not parts:
+        return ""
+    text = parts[0]["text"]
+    for left, right in zip(parts, parts[1:]):
+        text += segment_joiner(left, right, chinese=chinese) + right["text"]
+    return text
+
+
 def _chunk_segments(segments: list[dict], target: int, hard_cap: int,
-                    chapters_path: str = "") -> tuple[list[str], list[str]]:
-    """Pack timed segments into chunks, starting a new chunk at every chapter start."""
+                    chapters_path: str = "", *, chinese: bool = False) -> tuple[list[str], list[str]]:
+    """Pack timed segments into chunks, starting a new chunk at every chapter start.
+
+    `chinese` says the text is Chinese, which joins segments without spaces.
+    """
     prepared = []
     warnings = []
     for index, segment in enumerate(segments):
@@ -132,9 +167,11 @@ def _chunk_segments(segments: list[dict], target: int, hard_cap: int,
         if not parts:
             return
         specs.append({
-            "content": CHUNK_SEPARATOR.join(part["text"] for part in parts if part.get("text")),
+            "content": _join_segments(parts, chinese=chinese),
             "segment_ids": [part.get("id") for part in parts if part.get("id") is not None],
             "starts_with_chapter_break": _starts_chapter(parts[0], break_ids),
+            "first": parts[0],
+            "last": parts[-1],
         })
 
     for part in prepared:
@@ -154,7 +191,7 @@ def _chunk_segments(segments: list[dict], target: int, hard_cap: int,
             current_size = candidate
     finalize(current)
 
-    specs, merge_warnings = _coalesce_small_chunks(specs, target, hard_cap)
+    specs, merge_warnings = _coalesce_small_chunks(specs, target, hard_cap, chinese=chinese)
     warnings.extend(merge_warnings)
     return [spec["content"] for spec in specs], warnings
 
@@ -249,7 +286,8 @@ def _segment_at(timestamp: float, timed: list[dict], tolerance: float) -> tuple[
     return timed[-1], False
 
 
-def _coalesce_small_chunks(specs: list[dict], target: int, hard_cap: int) -> tuple[list[dict], list[str]]:
+def _coalesce_small_chunks(specs: list[dict], target: int, hard_cap: int,
+                           *, chinese: bool = False) -> tuple[list[dict], list[str]]:
     """Merge tiny chunks into a neighbor when the result stays within the hard cap."""
     if len(specs) < 3 or target <= 0:
         return specs, []
@@ -260,7 +298,9 @@ def _coalesce_small_chunks(specs: list[dict], target: int, hard_cap: int) -> tup
     slack = max(10, minimum // 2)
 
     def joined(left: dict, right: dict) -> str:
-        return CHUNK_SEPARATOR.join(part for part in (left["content"], right["content"]) if part)
+        if not left["content"] or not right["content"]:
+            return left["content"] or right["content"]
+        return left["content"] + segment_joiner(left["last"], right["first"], chinese=chinese) + right["content"]
 
     index = 0
     while index < len(merged):
@@ -297,6 +337,8 @@ def _coalesce_small_chunks(specs: list[dict], target: int, hard_cap: int) -> tup
             "content": joined(left, right),
             "segment_ids": left["segment_ids"] + right["segment_ids"],
             "starts_with_chapter_break": left["starts_with_chapter_break"],
+            "first": left["first"],
+            "last": right["last"],
         }
         if direction == "prev":
             merged[index - 1] = combined_spec

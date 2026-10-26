@@ -86,7 +86,11 @@ TEXT_DIR = "text"
 AGENT_TASK_DIR = "agent_task"
 OPTIMIZED_FILE = "optimized.md"
 QUALITY_FILE = "quality.json"
-# Everything the cleanup stage removes once the article exists; state.json stays.
+# Deepgram's response, which the cleanup stage moves out of source/ and keeps:
+# it was paid for, and a question about a Deepgram article's text needs it.
+KEPT_DEEPGRAM_FILE = "deepgram.json"
+# Everything the cleanup stage removes once the article exists; state.json and
+# KEPT_DEEPGRAM_FILE stay.
 INTERMEDIATE_PATHS = (METADATA_FILE, CHAPTERS_FILE, SOURCE_DIR, RAW_TEXT_FILE, SEGMENTS_FILE,
                       NORMALIZED_FILE, PLAN_FILE, TEXT_DIR, AGENT_TASK_DIR, OPTIMIZED_FILE, QUALITY_FILE)
 # Files a stage owns: removed when the stage has to start over because an
@@ -961,6 +965,7 @@ class _Run:
                                            self.config, chapters_path=str(chapters) if has_chapters else "")
         handoff = AgentHandoff(self.path(AGENT_TASK_DIR))
         handoff.collect()
+        video_info = self.video_info()
         task_records = record.setdefault("tasks", {})
         for task in tasks:
             prompt = task["prompt"]
@@ -994,6 +999,7 @@ class _Run:
                     stop_check=stop_check,
                     agent_handoff=handoff.request,
                     api_fallback=self.state.get("llm_api"),
+                    video_info=video_info,
                 )
             except kernel_agent_cli.ApiFallbackNeeded as needed:
                 task_record["status"] = "running"
@@ -1034,6 +1040,17 @@ class _Run:
                        retryable=True)
         handoff.clear()
         record["outputs"] = [TEXT_DIR]
+
+    def video_info(self) -> dict:
+        """The video's own text, the spelling reference for names in the text stage."""
+        info, meta = self.load_info(), self.state["metadata"]
+        return {
+            "title": str(info.get("title") or meta.get("title") or ""),
+            "channel": str(info.get("channel") or info.get("uploader") or meta.get("channel") or ""),
+            "description": str(info.get("description") or ""),
+            "chapters": [str(chapter.get("title") or "") for chapter in info.get("chapters") or []
+                         if isinstance(chapter, dict)],
+        }
 
     def update_task_progress(self, task_record: dict, input_key: str) -> None:
         window = kernel_window.load_window_state(str(self.path(TEXT_DIR)), input_key)
@@ -1100,6 +1117,9 @@ class _Run:
         record["outputs"] = [self.state["output_file"]]
 
     def stage_cleanup(self, record: dict) -> None:
+        response = self.path(DEEPGRAM_FILE)
+        if response.is_file():
+            response.replace(self.path(KEPT_DEEPGRAM_FILE))
         for relative in INTERMEDIATE_PATHS:
             _remove(self.path(relative))
         record["outputs"] = []

@@ -114,11 +114,10 @@
       "passed": true,
       "hard_failures": [],
       "warnings": [
-        "Chinese spacing anomalies detected (223 issue(s), ratio 0.095)",
         "Chinese punctuation density looks unusually low (density 0.002)"
       ],
       "checks": {
-        "size_ratio_vs_raw": 1.11,
+        "size_ratio_vs_raw": 1.03,
         "section_count": 1,
         "paragraph_count": 7,
         "paragraph_length_unit": "chars",
@@ -126,7 +125,7 @@
         "over_limit_paragraph_count": 1,
         "paragraph_line_break_count": 0,
         "heading_mid_sentence_count": 0,
-        "total_chars": 3363,
+        "total_chars": 3130,
         "header_density": 0.143,
         "chunk_seam_warning_count": 0,
         "glossary_drift_count": 0,

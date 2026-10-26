@@ -676,6 +676,52 @@ class CoreRegressionTests(unittest.TestCase):
             self.assertEqual(result["diagnostics"]["exact_duplicate_cue_count"], 1)
             self.assertEqual(result["diagnostics"]["overlap_trim_count"], 1)
 
+    def test_parse_vtt_drops_caption_sound_tags_and_music_notes(self):
+        """Test `[Music]`-style tags and music notes are not text: a cue of only a tag goes."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            vtt_path = Path(tmpdir) / "asr.vtt"
+            vtt_path.write_text(
+                "WEBVTT\nKind: captions\nLanguage: en\n\n"
+                "00:00:00.000 --> 00:00:03.000\n[Music]\n\n"
+                "00:00:03.000 --> 00:00:05.000\nso today [Applause] we look at\n\n"
+                "00:00:05.000 --> 00:00:07.000\n♪ the engine ♪\n\n"
+                "00:00:07.000 --> 00:00:08.000\n[音乐]\n",
+                encoding="utf-8",
+            )
+
+            result = kernel_subtitle_cleanup.parse_vtt_segments(str(vtt_path), language="en")
+            text = kernel_subtitle_cleanup.parse_vtt(str(vtt_path))
+
+        self.assertEqual([segment["text"] for segment in result["segments"]],
+                         ["so today we look at", "the engine"])
+        self.assertEqual([3.0, 5.0], [segment["start_time"] for segment in result["segments"]])
+        self.assertEqual(result["diagnostics"]["sound_tag_count"], 3)
+        self.assertEqual(result["diagnostics"]["empty_cue_count"], 2)
+        self.assertEqual(text, "so today we look at\nthe engine")
+        # A line that held only a tag goes; it does not become a paragraph break.
+        self.assertEqual(kernel_subtitle_cleanup.normalize_subtitle_text("a [Music] b\n[Laughter]\nc\n\nd"),
+                         "a b\nc\n\nd")
+
+    def test_parse_vtt_drops_the_bare_foreign_tag_of_speech_recognition(self):
+        """Test YouTube's bare "foreign" for speech in another language goes, but the real word stays."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            vtt_path = Path(tmpdir) / "asr.vtt"
+            vtt_path.write_text(
+                "WEBVTT\nKind: captions\nLanguage: en\n\n"
+                "00:00:00.000 --> 00:00:02.000\nforeign\n\n"
+                "00:00:02.000 --> 00:00:04.000\nForeign foreign\n\n"
+                "00:00:04.000 --> 00:00:06.000\nforeign foreign so he said\n\n"
+                "00:00:06.000 --> 00:00:08.000\nso he said\nforeign\n\n"
+                "00:00:08.000 --> 00:00:10.000\nforeign policy is hard\n",
+                encoding="utf-8",
+            )
+
+            result = kernel_subtitle_cleanup.parse_vtt_segments(str(vtt_path), language="en")
+
+        self.assertEqual([segment["text"] for segment in result["segments"]],
+                         ["so he said", "foreign policy is hard"])
+        self.assertEqual(result["diagnostics"]["sound_tag_count"], 4)
+
     def test_assemble_final_escapes_markdown_header_text(self):
         """Test assemble final escapes markdown header text."""
         with tempfile.TemporaryDirectory() as tmpdir:

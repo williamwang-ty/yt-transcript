@@ -19,7 +19,8 @@ stdin. It answers the requests the pipeline makes:
   and adding a recognizable placeholder Chinese line under it.
 
 Any other prompt exits 1, so a fallback path the test did not expect fails
-loudly. With FAKE_LLM_LOG set, each call appends one JSON line describing it.
+loudly. With FAKE_LLM_LOG set, each call appends one JSON line describing it
+(for outline and window requests, also whether the video's text came with it).
 With FAKE_LLM_FAIL_FROM_UNIT=<n>, a window round starting at unit n or later
 exits 1, like an LLM outage in the middle of a run.
 """
@@ -34,6 +35,8 @@ import sys
 SECTION_EVERY = 40
 PARAGRAPH_UNITS = 4
 PROBE_PROMPT = "Reply with OK only."
+# The block with the video's own text (title, description, ...) that the pipeline adds as a spelling reference.
+REFERENCE_HEADING = "## Video Information"
 UNIT_START = re.compile(r"^\[S(\d+)\] ?", re.MULTILINE)
 # A section starting in the round's window: its unit and the words it begins with.
 OUTLINE_LINE = re.compile(r"^- .+? \(starts in this window: it begins in (?:or right after )?\[S(\d+)\]"
@@ -101,7 +104,8 @@ def outline(prompt: str) -> str:
         if bilingual:
             section["title_zh"] = zh_title(start)
         sections.append(section)
-    log({"kind": "outline", "first": first, "last": numbers[-1], "sections": len(sections)})
+    log({"kind": "outline", "first": first, "last": numbers[-1], "sections": len(sections),
+         "reference": REFERENCE_HEADING in prompt})
     return json.dumps({"sections": sections, "terms": []}, ensure_ascii=False)
 
 
@@ -161,7 +165,7 @@ def window_round(prompt: str) -> str:
     if paragraph:
         out.append(" ".join(paragraph))
     log({"kind": "translate" if paragraph_units else "window", "first": written[0][0], "last": written[-1][0],
-         "headings": sum(1 for line in out if line.startswith("## "))})
+         "headings": sum(1 for line in out if line.startswith("## ")), "reference": REFERENCE_HEADING in prompt})
     return "\n\n".join(out) + "\n\n<!--END-->"
 
 
