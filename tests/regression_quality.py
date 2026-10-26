@@ -6,6 +6,7 @@ import threading
 from tests._support import *
 from kernel import files as kernel_files
 from kernel.text import glossary as kernel_glossary
+from kernel.text import window as kernel_window
 
 
 class AtomicWriteTests(unittest.TestCase):
@@ -527,6 +528,59 @@ class VerifyQualityTests(unittest.TestCase):
         self.assertEqual(result["checks"]["unpunctuated_paragraph_count"], 1)
         self.assertIn("1 long English paragraph(s) have no sentence end (text left without punctuation)",
                       result["warnings"])
+
+    def test_verify_quality_warns_about_bilingual_headings_without_a_chinese_heading(self):
+        """Test an English heading of a bilingual article needs a Chinese heading right under it."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            optimized = Path(tmpdir) / "opt.md"
+            optimized.write_text(
+                "## The Robot Arrives\n## 机器人到货\n\nIt came in a crate.\n\n它装在木箱里送来。\n\n"
+                "## Unboxing\n\nWe opened it.\n\n我们打开了它。\n\n"
+                "## Testing / 测试\n\nIt works.\n\n它能用。\n\n## Outro\n\n## 结尾\n\nBye.\n\n再见。\n",
+                encoding="utf-8",
+            )
+
+            result = kernel_verify.verify_quality(str(optimized), bilingual=True)
+            chinese = kernel_verify.verify_quality(str(optimized), bilingual=False)
+
+        self.assertTrue(result["passed"], result)
+        # Only "Unboxing" lacks one; a heading with Chinese in it and one a blank line above its Chinese pass.
+        self.assertEqual(result["checks"]["untranslated_heading_count"], 1)
+        self.assertIn("1 English heading(s) have no Chinese heading under them", result["warnings"])
+        self.assertNotIn("untranslated_heading_count", chinese["checks"])
+
+    def test_verify_quality_counts_headings_of_the_structure_stage_missing_from_the_article(self):
+        """Test headings the first text task wrote, and outline headings it could not place, are reported."""
+        def llm(prompt: str) -> str:
+            if prompt.startswith("# Transcript Outline"):
+                return json.dumps({"sections": [{"start": 1, "title": "Opening"}, {"start": 4, "title": "Details"},
+                                                {"start": 40, "title": "Past the end"}], "terms": []})
+            return tag_echo(prompt)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            work_dir = chunk_plain_text(" ".join(f"This is sentence number {i}." for i in range(1, 41)),
+                                        Path(tmpdir) / "chunks", "structure_only")
+            config = {**kernel_config.default_config_values(), "llm_backend": "api", "llm_api_key": "key",
+                      "llm_base_url": "https://api.example.com", "llm_model": "demo",
+                      "window_read_tokens": 200, "window_write_tokens": 100}
+            with mock.patch.object(kernel_config, "load_config", return_value=config), \
+                    mock.patch.object(kernel_llm_api, "call_llm_api",
+                                      side_effect=lambda **kw: {"text": llm(kw["messages"][0]["content"])}), \
+                    mock.patch("sys.stderr", new_callable=io.StringIO):
+                result = kernel_window.process_window(str(work_dir), "structure_only")
+            self.assertTrue(result["success"], result)
+            structured, _ = kernel_window.raw_stage_text(str(work_dir))
+            article = Path(tmpdir) / "opt.md"
+            article.write_text(structured.replace("## Details\n\n", ""), encoding="utf-8")
+
+            quality = kernel_verify.verify_quality(str(article), bilingual=False, work_dir=str(work_dir))
+
+        # The section starting at unit 40 has no paragraph left to go before, so the text has 2 headings.
+        self.assertEqual((2, 1, 1), tuple(quality["checks"][key] for key in (
+            "structure_heading_count", "missing_heading_count", "unplaced_heading_count")))
+        self.assertIn("1 of the 2 headings the structure stage wrote are missing from the article",
+                      quality["warnings"])
+        self.assertIn("1 outline section heading(s) found no place in the text", quality["warnings"])
 
     def test_verify_quality_measures_bilingual_paragraphs_in_english_words(self):
         """Test bilingual output is measured by its English paragraphs, in words."""

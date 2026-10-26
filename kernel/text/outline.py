@@ -83,9 +83,9 @@ Every source unit starts with a number tag like [S12]. A unit may start or end i
 
 Return only one JSON object and nothing else:
 
-{{"sections": [{{"start": {first}, "first_words": "...", "title": "..."{title_zh_example}}}], "terms": [{{"term": "...", "variants": ["..."], "kind": "person"{zh_example}}}]}}
+{{"sections": [{{"start": {first}, "first_words": "...", "title": "..."}}], "terms": [{{"term": "...", "variants": ["..."], "kind": "person"{zh_example}}}]}}
 
-- `sections`: the major topics in order. `first_words` are the first words of the sentence that begins the topic (about 6 to 12 Chinese characters, or 4 to 8 English words), copied exactly from the transcript without the tag; `start` is the number of the unit that contains them, and the numbers must increase.{first_note} Aim for {low} to {high} sections; start a section only at a real topic shift, not for a single remark. `title` is a short heading in {title_language} (at most about 20 Chinese characters or 8 English words), without numbering or `#`.{title_zh_note}
+- `sections`: the major topics in order. `first_words` are the first words of the sentence that begins the topic (about 6 to 12 Chinese characters, or 4 to 8 English words), copied exactly from the transcript without the tag; `start` is the number of the unit that contains them, and the numbers must increase.{first_note} Aim for {low} to {high} sections; start a section only at a real topic shift, not for a single remark. `title` is a short heading in {title_language} (at most about 20 Chinese characters or 8 English words), without numbering or `#`.
 - `terms`: at most {max_terms} names of people, organizations and products, and technical terms, that recur or matter. `term` is the name as the speaker uses it, spelled correctly: keep a Chinese name in Chinese when that is what is said, and do not expand it to a full name or swap in a translation. `variants` lists only misrecognized or misspelled forms of that same word that actually appear in the transcript (speech-recognition errors, typos); never a translation, an abbreviation, a short form or a full name, since the speaker's wording is kept. Leave it empty unless you are confident. `kind` is one of person, organization, product, term.{zh_note}{reference_note}{hints}{reference}
 
 ## Transcript
@@ -232,13 +232,11 @@ def build_outline_prompt(units: list[str], start: int, end: int, *, prompt_name:
     return OUTLINE_PROMPT.format(
         part_note=part_note,
         first=start + 1,
-        title_zh_example=', "title_zh": "..."' if bilingual else "",
         zh_example=', "zh": "..."' if bilingual else "",
         first_note=first_note,
         low=low,
         high=high,
         title_language=title_language,
-        title_zh_note=(" Also give `title_zh`, the title in Simplified Chinese." if bilingual else ""),
         max_terms=max_terms,
         zh_note=(" Also give `zh`, the usual Simplified Chinese rendering of the term (the term itself when it is"
                  " normally kept as is, like API)." if bilingual else ""),
@@ -319,9 +317,6 @@ def parse_outline(text: str, first: int, last: int, *, max_terms: int = DEFAULT_
             dropped += 1  # the same topic listed twice in a row
             continue
         section = {"start": start, "title": title}
-        title_zh = clean_title(entry.get("title_zh"))
-        if title_zh and title_zh != title:
-            section["title_zh"] = title_zh
         first_words = re.sub(r"\[S\d+\]|\s+", " ", str(entry.get("first_words", "") or "")).strip(" \"'“”‘’「」")
         if first_words:
             section["first_words"] = first_words[:MAX_TITLE_CHARS]
@@ -601,10 +596,7 @@ def apply_chapters(sections: list[dict], hints: list[dict] | None, prompt_name: 
         placeholder = "untitled chapter" in title.lower() or title.lower().startswith("<untitled")
         if not title or placeholder or (OUTLINE_PROMPTS.get(prompt_name) == "zh" and not _has_cjk(title)):
             continue
-        if section["title"] != title:
-            section["title"] = title
-            if section.get("title_zh") == title:
-                section.pop("title_zh")
+        section["title"] = title
     # A chapter that moved onto or past a neighbouring section wins over it.
     ordered = sorted(range(len(sections)), key=lambda index: (sections[index]["start"], index not in taken))
     kept = []
@@ -745,7 +737,5 @@ def strip_headers(text: str) -> str:
 
 
 def heading_block(section: dict) -> str:
-    lines = [f"## {section['title']}"]
-    if section.get("title_zh") and section["title_zh"] != section["title"]:
-        lines.append(f"## {section['title_zh']}")
-    return "\n".join(lines)
+    """The section's heading line; in a bilingual run the translation stage adds the Chinese line under it."""
+    return f"## {section['title']}"
