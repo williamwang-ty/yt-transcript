@@ -496,6 +496,82 @@ class WindowBilingualTests(unittest.TestCase):
         self.assertEqual(16, len(blocks), merged)
         self.assertEqual(["Yes, that is turn 1.", "译文1"], blocks[:2])
 
+    def test_header_units_keep_the_structured_header_and_take_only_the_chinese_title(self):
+        units = ["Para one.", "## The Robot Arrives", "Para three.", "## Unboxing", "Para five."]
+        body = "[S1] Para one.\n\n第一段。\n\n{s2}\n\n[S3] Para three.\n\n第三段。\n\n{s4}\n\n[S5] Para five.\n\n第五段。"
+        replies = {
+            "header lines": ("[S2] ## The Robot Arrives\n## 机器人到货", "[S4] ## Unboxing\n\n## 开箱"),
+            "plain line, same line": ("[S2] ## The Robot Arrives\n\n机器人到货", "[S4] ## Unboxing / 开箱"),
+            "changed English": ("[S2] ## A Robot Arrived\n## 机器人到货", "[S4] ## 开箱"),
+            "invented header": ("[S2] ## The Robot Arrives\n## 机器人到货\n\n## Extra\n## 额外",
+                                "[S4] ## Unboxing\n## 开箱"),
+            # The tag of S2 left out, S4 left out entirely.
+            "tags left out": ("## The Robot Arrives\n## 机器人到货", ""),
+        }
+        for name, (s2, s4) in replies.items():
+            with self.subTest(reply=name):
+                output = body.format(s2=s2, s4=s4) + "\n\n<!--END-->"
+                owned, stats = window.own_header_units(output, units, 0, 5)
+                parsed = window.parse_window_output(owned, 0, 5)
+                self.assertTrue(parsed["ok"], parsed)
+                texts = [(p["start"], p["end"], p["text"]) for p in parsed["paragraphs"]]
+                expected_s4 = "## Unboxing" if name == "tags left out" else "## Unboxing\n## 开箱"
+                self.assertEqual([(1, 1, "## The Robot Arrives\n## 机器人到货"), (3, 3, expected_s4)],
+                                 [item for item in texts if item[2].startswith("#")])
+                self.assertEqual(5, len(texts))
+                self.assertEqual({2, 4}, set(stats["units"]))
+                self.assertEqual(name != "tags left out", stats["units"][4]["translated"])
+                self.assertEqual(name == "tags left out", stats["units"][2]["restored"])
+
+        # A reply whose tags the parser rejects is left for it to reject.
+        backwards = "[S3] Para three.\n\n[S2] ## The Robot Arrives\n\n<!--END-->"
+        self.assertEqual(backwards, window.own_header_units(backwards, units, 0, 5)[0])
+
+    def test_one_round_bilingual_run_gets_a_chinese_heading_under_every_heading(self):
+        # The text fits one round, so there is no outline and the structure round writes the headings.
+        zh = {"Opening": "开场", "Details": "细节"}
+
+        def llm(**kwargs):
+            prompt = kwargs["messages"][0]["content"]
+            lines = _window_lines(prompt)
+            if "Translation-Only" not in prompt:
+                self.assertIn("Put `##` headers on their own line.", prompt)
+                first = " ".join(f"[S{n}] {text}" for n, text in lines[:3])
+                second = " ".join(f"[S{n}] {text}" for n, text in lines[3:])
+                return _api_result(f"## Opening\n\n{first}\n\n## Details\n\n{second}\n\n<!--END-->")
+            self.assertIn("then on the next line a `##` header with its Chinese translation", prompt)
+            out = []
+            for number, text in re.findall(r"^\[S(\d+)\] (.*)$", prompt, re.MULTILINE):
+                if text.startswith("## "):
+                    title = text[3:]
+                    # One title as a header line, the other with the Chinese on the same line;
+                    # neither tag starts a paragraph the model invented.
+                    out.append(f"[S{number}] {text}\n## {zh[title]}" if title == "Opening"
+                               else f"[S{number}] {text} / {zh[title]}\n\n## 多余的标题")
+                else:
+                    out.append(f"[S{number}] {text}\n\n【译】{text}")
+            return _api_result("\n\n".join(out + ["<!--END-->"]))
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            work_dir = chunk_plain_text(" ".join(f"This is sentence number {i}." for i in range(1, 7)),
+                                        Path(tmpdir) / "chunks", "structure_only")
+            config = WindowExecutorTests._config(self, window_read_tokens=6000, window_write_tokens=3000)
+            structure, _ = WindowExecutorTests._run(self, work_dir, config, llm, prompt_name="structure_only")
+            translate, _ = WindowExecutorTests._run(self, work_dir, config, llm, prompt_name="translate_only",
+                                                    input_key="processed_path")
+            output = Path(tmpdir) / "optimized.md"
+            kernel_merge.merge_content(str(work_dir), str(output))
+            merged = output.read_text(encoding="utf-8")
+            quality = kernel_verify.verify_quality(str(output), bilingual=True, work_dir=str(work_dir))
+
+        self.assertEqual((1, 1), (structure["round_count"], translate["round_count"]))
+        self.assertEqual(["Opening", "开场", "Details", "细节"], re.findall(r"^## (.+)$", merged, re.MULTILINE))
+        self.assertEqual({"header_units": 2, "translated": 2, "restored": 0, "dropped_headers": 1},
+                         translate["headings"])
+        self.assertEqual((2, 0, 0), tuple(quality["checks"][key] for key in (
+            "structure_heading_count", "missing_heading_count", "untranslated_heading_count")))
+        self.assertFalse(any("heading" in warning for warning in quality["warnings"]), quality["warnings"])
+
 
 # Unpunctuated caption phrases; with 0.1s gaps inside a thought and 0.8s after
 # every third cue (the "real" pauses).
@@ -1207,13 +1283,15 @@ class WindowOutlineTests(unittest.TestCase):
         self.assertEqual(units[30], "第30条字幕说完了。")
 
     def test_bilingual_outline_titles_and_terms_carry_into_the_translation(self):
+        zh_titles = {"## Opening": "开场", "## Details": "细节"}
+
         def llm(**kwargs):
             prompt = kwargs["messages"][0]["content"]
             if prompt.startswith("# Transcript Outline"):
-                self.assertIn('"title_zh"', prompt)
+                # The outline's titles stay English; the translation writes the Chinese ones.
+                self.assertNotIn("title_zh", prompt)
                 return _api_result(json.dumps({
-                    "sections": [{"start": 1, "title": "Opening", "title_zh": "开场"},
-                                 {"start": 16, "title": "Details", "title_zh": "细节"}],
+                    "sections": [{"start": 1, "title": "Opening"}, {"start": 16, "title": "Details"}],
                     "terms": [{"term": "sentence", "variants": [], "kind": "term", "zh": "句子"}],
                 }))
             if "Translation-Only" in prompt:
@@ -1222,8 +1300,7 @@ class WindowOutlineTests(unittest.TestCase):
                 out = []
                 for number, block in re.findall(r"^\[S(\d+)\] (.*?)(?=\n\n|\Z)", body, re.MULTILINE | re.DOTALL)[:2]:
                     out.append(f"[S{number}] {block.strip()}")
-                    if not block.startswith("#"):
-                        out.append("【译】" + block.strip())
+                    out.append(f"## {zh_titles[block.strip()]}" if block.startswith("#") else "【译】" + block.strip())
                 out.append("<!--END-->")
                 return _api_result("\n\n".join(out))
             return _api_result(WindowBilingualTests._structure_writer(prompt))

@@ -269,6 +269,61 @@ def _count_split_numbers(blocks: list[str]) -> int:
     return len(SPLIT_NUMBER.findall(body))
 
 
+HEADING_LINE = re.compile(r"^#{2,6}[ \t]+(.+?)[ \t]*$", re.MULTILINE)
+
+
+def _heading_key(title: str) -> str:
+    return re.sub(r"[\W_]+", "", title.lower())
+
+
+def _count_untranslated_headings(text: str) -> int:
+    """Count headings of a bilingual article with no Chinese in them and no Chinese heading right under them.
+
+    Each heading of a bilingual article is the English line followed by its
+    Chinese translation as a heading of its own (see `own_header_units` in
+    kernel/text/window.py).
+    """
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    count = 0
+    for index, line in enumerate(lines):
+        if not HEADING_LINE.match(line) or count_cjk_chars(line):
+            continue
+        following = lines[index + 1] if index + 1 < len(lines) else ""
+        if not (HEADING_LINE.match(following) and count_cjk_chars(following)):
+            count += 1
+    return count
+
+
+def _structure_heading_checks(text: str, work_dir: str) -> dict:
+    """Compare the article's headings with the ones the structure stage wrote (advisory only).
+
+    The first text task (`cleanup_zh`, or `structure_only` in a bilingual run)
+    decides the headings; later steps only carry them (translation adds the
+    Chinese line under each). Counts the structure stage's headings, those of
+    them the article lacks, and outline sections that found no place in the
+    text. {} without a work dir or a finished first task.
+    """
+    if not work_dir:
+        return {}
+    state = kernel_window.load_window_state(work_dir, kernel_window.RAW_STAGE)
+    if state.get("status") != "done":
+        return {}
+    structured, stats = kernel_window.raw_stage_text(work_dir, state)
+    expected = [_heading_key(title) for title in HEADING_LINE.findall(structured)]
+    found = Counter(_heading_key(title) for title in HEADING_LINE.findall(text))
+    missing = 0
+    for key in expected:
+        if found[key] > 0:
+            found[key] -= 1
+        else:
+            missing += 1
+    return {
+        "structure_heading_count": len(expected),
+        "missing_heading_count": missing,
+        "unplaced_heading_count": int(stats.get("unplaced_sections", 0) or 0),
+    }
+
+
 def _count_bilingual_paragraph_pairs(paragraphs: list[str]) -> int:
     """Count adjacent English-to-Chinese body paragraph pairs."""
     normalized_blocks = [str(block or "").strip() for block in paragraphs if str(block or "").strip()]
@@ -387,6 +442,20 @@ def verify_quality(optimized_text_path: str, raw_text_path: str = None,
     checks["has_sections"] = len(section_headers) > 0
     if not checks["has_sections"] and total_chars > 1200:
         hard_failures.append(f"No section headers (##) found in {total_chars} chars of text")
+    heading_checks = _structure_heading_checks(text, work_dir)
+    checks.update(heading_checks)
+    if heading_checks.get("missing_heading_count"):
+        warnings.append(f"{heading_checks['missing_heading_count']} of the "
+                        f"{heading_checks['structure_heading_count']} headings the structure stage wrote "
+                        "are missing from the article")
+    if heading_checks.get("unplaced_heading_count"):
+        warnings.append(f"{heading_checks['unplaced_heading_count']} outline section heading(s) found no place "
+                        "in the text")
+    if bilingual:
+        checks["untranslated_heading_count"] = _count_untranslated_headings(text)
+        if checks["untranslated_heading_count"]:
+            warnings.append(f"{checks['untranslated_heading_count']} English heading(s) have no Chinese "
+                            "heading under them")
     if len(body_paragraphs) < 2 and total_chars > 400:
         warnings.append(f"Only {len(body_paragraphs)} body paragraph found in {total_chars} chars of text")
     

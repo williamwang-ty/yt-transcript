@@ -16,7 +16,8 @@ stdin. It answers the requests the pipeline makes:
   paragraph, right before its words when it begins inside a unit; without an
   outline, one placeholder `## ` heading goes in every SECTION_EVERY units;
 - a translation round (paragraph units) by keeping each English paragraph
-  and adding a recognizable placeholder Chinese line under it.
+  and adding a recognizable placeholder Chinese line under it, and each
+  `##` header with a placeholder Chinese header line under it.
 
 Any other prompt exits 1, so a fallback path the test did not expect fails
 loudly. With FAKE_LLM_LOG set, each call appends one JSON line describing it
@@ -84,7 +85,7 @@ def zh_title(index: int) -> str:
 
 
 def outline(prompt: str) -> str:
-    bilingual = '"title_zh"' in prompt
+    bilingual = "the transcript's own language" in prompt
     transcript = prompt.split("## Transcript", 1)[1]
     numbers = [int(n) for n in UNIT_START.findall(transcript)]
     first = numbers[0]
@@ -100,10 +101,7 @@ def outline(prompt: str) -> str:
         if not title or title.startswith("<Untitled Chapter"):
             # The outline prompt asks to replace yt-dlp's placeholder chapter titles.
             title = f"Part {start}" if bilingual else zh_title(start)
-        section = {"start": start, "first_words": words or units.get(start, "")[:12], "title": title}
-        if bilingual:
-            section["title_zh"] = zh_title(start)
-        sections.append(section)
+        sections.append({"start": start, "first_words": words or units.get(start, "")[:12], "title": title})
     log({"kind": "outline", "first": first, "last": numbers[-1], "sections": len(sections),
          "reference": REFERENCE_HEADING in prompt})
     return json.dumps({"sections": sections, "terms": []}, ensure_ascii=False)
@@ -157,8 +155,8 @@ def window_round(prompt: str) -> str:
         if heading:
             out.append(f"## {heading}")
         if paragraph_units:
-            # A heading unit stays as is (translate_only keeps headers in English).
-            out.append(f"[S{number}] {text}" if text.startswith("#") and "\n" not in text
+            # A header unit keeps its English line and gets a Chinese header line under it.
+            out.append(f"[S{number}] {text}\n## （占位标题 S{number}）" if text.startswith("#")
                        else f"[S{number}] {text}\n\n{placeholder_translation(number, text)}")
         else:
             paragraph.append(f"[S{number}] {text}")

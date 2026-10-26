@@ -34,7 +34,9 @@ is generated before the first round and kept in the state; headings then come
 from it rather than from each round. The raw stage's paragraphs are joined
 through `structure.py`, which adds those headings and mends paragraphs that
 stop inside a sentence, once the model's punctuation shows where sentences
-end.
+end. The translation stage changes no structure: the program writes each
+heading unit itself and takes only its Chinese title from the model
+(`own_header_units`).
 """
 
 from __future__ import annotations
@@ -144,9 +146,18 @@ TASK_PROTOCOL_NOTES = {
     ),
     "translate_only": (
         "\n- For each source paragraph, write its tag and the English paragraph unchanged, then a blank line "
-        "and its Chinese translation. Copy `##` headers as they are."
+        "and its Chinese translation. For a source unit that is a `##` header, write its tag and the header "
+        "unchanged, then on the next line a `##` header with its Chinese translation. Write no other headers."
     ),
 }
+
+# Header units of the translation stage: a Markdown header line, and the
+# Chinese characters that show a line is the header's translation.
+HEADER_MARK = re.compile(r"^[ \t]*(#{1,6})[ \t]+")
+CJK_CHAR = re.compile(r"[㐀-鿿]")
+# Longest plain line (without `#`) taken as a header's translation.
+MAX_TITLE_LINE_CHARS = 80
+TITLE_SEPARATORS = " \t/|｜-—–:：·•()（）[]【】"
 
 ALREADY_WRITTEN_BLOCK = """## Already Written (context only, do not repeat)
 
@@ -663,6 +674,158 @@ def _invalid(error_type: str, message: str) -> dict:
             "error_type": error_type, "error": message}
 
 
+def header_unit_lines(unit: str) -> list[str]:
+    """The lines of a unit made only of Markdown headers (a heading of the structured text), else []."""
+    lines = [line.strip() for line in (unit or "").splitlines() if line.strip()]
+    return lines if lines and all(HEADER_MARK.match(line) for line in lines) else []
+
+
+def _title_key(text: str) -> str:
+    return re.sub(r"[\W_]+", "", HEADER_MARK.sub("", text).lower())
+
+
+def _title_translation(line: str, english: list[str]) -> str:
+    """The Chinese title in one line the model wrote for a header unit, or ''.
+
+    The line may repeat the English title before it ("The Robot Arrives / 机器人到货").
+    """
+    text = HEADER_MARK.sub("", line or "").strip()
+    if not CJK_CHAR.search(text):
+        return ""
+    for source in english:
+        title = HEADER_MARK.sub("", source).strip()
+        if title and text.lower().startswith(title.lower()):
+            text = text[len(title):]
+            break
+    text = text.lstrip(TITLE_SEPARATORS).rstrip()
+    for opener, closer in (("(", ")"), ("（", "）"), ("[", "]"), ("【", "】")):
+        if text.endswith(closer) and opener not in text:
+            text = text[:-1].rstrip()
+    return text
+
+
+def _split_header_reply(text: str, english: list[str]) -> tuple[list[str], str]:
+    """Split what the model wrote after a header unit's tag into the Chinese titles and the text after them.
+
+    The reply starts with header lines (the English one copied, the Chinese one
+    added), or gives the Chinese title as a short plain line. Text after that
+    belongs to a unit whose tag the model left out, and is kept.
+    """
+    lines = (text or "").split("\n")
+    keys = {_title_key(line) for line in english}
+    titles: list[str] = []
+    index = 0
+    first = True
+    while index < len(lines):
+        line = lines[index].strip()
+        if not line:
+            index += 1
+            continue
+        if HEADER_MARK.match(line) or _title_key(line) in keys:
+            if not first and not CJK_CHAR.search(line) and _title_key(line) not in keys:
+                break  # another English header: the next header unit, written without its tag
+        elif titles or not CJK_CHAR.search(line) or len(line) > MAX_TITLE_LINE_CHARS \
+                or line.endswith(("。", "！", "？")):
+            break
+        title = _title_translation(line, english)
+        if title:
+            titles.append(title)
+        first = False
+        index += 1
+    return titles, "\n".join(lines[index:]).strip()
+
+
+def _header_block(english: list[str], titles: list[str]) -> str:
+    """The header unit as the article shows it: each English header line, then its Chinese one."""
+    if any(CJK_CHAR.search(line) for line in english):
+        return "\n".join(english)
+    lines = []
+    for position, line in enumerate(english):
+        lines.append(line)
+        if position < len(titles):
+            lines.append(f"{HEADER_MARK.match(line).group(1)} {titles[position]}")
+    return "\n".join(lines)
+
+
+def own_header_units(output: str, units: list[str], cursor: int, window_end: int) -> tuple[str, dict]:
+    """Write a translation round's header units the program's way, keeping only the model's Chinese titles.
+
+    A bilingual article's headings come from the structure stage; the
+    translation only adds a Chinese line under each one. So for every header
+    unit (`header_unit_lines`) the model's reply after the unit's tag only
+    supplies the Chinese title: the unit becomes its own header lines, each
+    followed by a header with the translation. Header lines the model wrote
+    anywhere else are dropped. A header unit it left out while writing a later
+    unit is put back before that unit, with the translation when one of the
+    dropped lines right after the English title holds it.
+
+    `units` are the stage's units and `cursor`..`window_end` the round's window
+    (0-based, end exclusive). A response whose tags `parse_window_output`
+    rejects is returned unchanged. Also returns, per header unit written
+    (1-based number), whether it got a translation and whether it was put back,
+    and the number of header lines dropped.
+    """
+    stats = {"units": {}, "dropped_headers": 0}
+    raw = output or ""
+    end_match = END_PATTERN.search(raw)
+    body, tail = (raw[:end_match.start()], raw[end_match.start():]) if end_match else (raw, "")
+    pieces = re.split(r"(\[S\d+\])", body)
+    segments = [[int(pieces[i][2:-1]), pieces[i + 1], False] for i in range(1, len(pieces), 2)]
+    numbers = [segment[0] for segment in segments]
+    if not numbers or numbers != sorted(numbers) or numbers[0] <= cursor or numbers[-1] > window_end:
+        return raw, stats
+    stray: list[str] = []
+
+    def drop_headers(text: str) -> str:
+        kept = []
+        for line in text.split("\n"):
+            if HEADER_MARK.match(line):
+                stray.append(line.strip())
+                stats["dropped_headers"] += 1
+            else:
+                kept.append(line)
+        return "\n".join(kept)
+
+    def header_text(number: int, english: list[str], titles: list[str], rest: str = "",
+                    restored: bool = False) -> str:
+        translated = bool(titles) or any(CJK_CHAR.search(line) for line in english)
+        stats["units"][number] = {"translated": translated, "restored": restored}
+        stats["dropped_headers"] += max(0, len(titles) - len(english))
+        return " " + _header_block(english, titles) + "\n\n" + (rest + "\n\n" if rest else "")
+
+    lead = drop_headers(pieces[0])
+    seen = set()
+    for segment in segments:
+        english = header_unit_lines(units[segment[0] - 1])
+        if english and segment[0] not in seen:
+            titles, rest = _split_header_reply(segment[1], english)
+            segment[1], segment[2] = header_text(segment[0], english, titles, drop_headers(rest).strip()), True
+        else:
+            segment[1] = drop_headers(segment[1])
+        seen.add(segment[0])
+
+    for number in range(cursor + 1, numbers[-1]):
+        english = header_unit_lines(units[number - 1])
+        if not english or number in seen:
+            continue
+        titles = []
+        for index, line in enumerate(stray[:-1]):
+            if _title_key(line) == _title_key(english[0]):
+                title = _title_translation(stray[index + 1], english)
+                titles = [title] if title else []
+                break
+        position = next(index for index, segment in enumerate(segments) if segment[0] > number)
+        segments.insert(position, [number, header_text(number, english, titles, restored=True), True])
+        seen.add(number)
+
+    rebuilt = lead
+    for number, text, own_block in segments:
+        if own_block and rebuilt.strip():
+            rebuilt = rebuilt.rstrip() + "\n\n"
+        rebuilt += f"[S{number}]{text}"
+    return rebuilt + tail, stats
+
+
 # ---------------------------------------------------------------------------
 # Adaptive window sizing
 # ---------------------------------------------------------------------------
@@ -1112,6 +1275,9 @@ def run_window_rounds(work_dir: str, prompt_name: str, prompt_template: str, *, 
             marker_failures = 0
             continue
 
+        heading_stats = None
+        if unit == "paragraph":
+            output, heading_stats = own_header_units(output, sentences, cursor, end)
         parsed = parse_window_output(output, cursor, end)
         if parsed["ok"]:
             advanced_tokens = span_tokens(cursor, parsed["next_cursor"])
@@ -1147,6 +1313,15 @@ def run_window_rounds(work_dir: str, prompt_name: str, prompt_template: str, *, 
             "truncated": truncated,
             "slow": slow,
         })
+        if heading_stats:
+            written = [item for number, item in heading_stats["units"].items() if number <= parsed["next_cursor"]]
+            if written or heading_stats["dropped_headers"]:
+                record["headings"] = {
+                    "header_units": len(written),
+                    "translated": sum(1 for item in written if item["translated"]),
+                    "restored": sum(1 for item in written if item["restored"]),
+                    "dropped_headers": heading_stats["dropped_headers"],
+                }
         sizing = update_sizing(sizing, params, {
             "advanced_tokens": advanced_tokens,
             "output_tokens": output_tokens,
@@ -1292,6 +1467,15 @@ def outline_summary(state: dict) -> dict:
     return summary
 
 
+def headings_summary(state: dict) -> dict:
+    """Totals of the translation rounds' header units (`own_header_units`); {} for the raw stage."""
+    rounds = [r["headings"] for r in state.get("rounds", []) if r.get("result") == "ok" and r.get("headings")]
+    if _stage(state.get("input_key", RAW_STAGE)) != PROCESSED_STAGE:
+        return {}
+    keys = ("header_units", "translated", "restored", "dropped_headers")
+    return {key: sum(int(item.get(key, 0) or 0) for item in rounds) for key in keys}
+
+
 def _build_result(work_dir: str, state: dict, outcome: dict, *, prompt_name: str, input_key: str,
                   request_url: str, backend_decision: dict, warnings: list, resumed: bool) -> dict:
     status = outcome.get("status", state.get("status", ""))
@@ -1317,6 +1501,7 @@ def _build_result(work_dir: str, state: dict, outcome: dict, *, prompt_name: str
         "efficiency": efficiency_report(state),
         "outline": outline_summary(state),
         "structure": state.get("structure", {}),
+        "headings": headings_summary(state),
         "params": state.get("params", {}),
         "sizing": state.get("sizing", {}),
         "request_url": request_url,

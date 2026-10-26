@@ -44,18 +44,18 @@
       "warnings": [],
       "checks": {
         "size_ratio_vs_raw": 1.24,
-        "section_count": 3,
+        "section_count": 6,
         "paragraph_count": 48,
         "paragraph_length_unit": "words",
         "max_paragraph_len": 95,
         "over_limit_paragraph_count": 0,
         "paragraph_line_break_count": 0,
         "heading_mid_sentence_count": 0,
-        "total_chars": 8077,
-        "cn_char_ratio": 0.157,
-        "en_char_ratio": 0.627,
+        "total_chars": 8112,
+        "cn_char_ratio": 0.158,
+        "en_char_ratio": 0.625,
         "bilingual_pairs": 24,
-        "header_density": 0.062,
+        "header_density": 0.125,
         "chunk_seam_warning_count": 0,
         "glossary_drift_count": 0,
         "semantic_missing_count": 0
@@ -76,8 +76,11 @@
       "headings": [
         "# Why Abraham Lincoln was killed \\| Gary Gallagher and Lex Fridman",
         "## Part 1",
+        "## 占位标题 S1",
         "## Part 41",
-        "## Part 81"
+        "## 占位标题 S12",
+        "## Part 81",
+        "## 占位标题 S23"
       ]
     }
   },
