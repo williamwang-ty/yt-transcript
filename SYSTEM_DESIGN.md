@@ -760,6 +760,7 @@ Reviewed on 2026-10-23 at `ce8fb9d`, from the code, the checks recorded in each 
 | Paragraph rule (`cleanup_zh`, `structure_only`) | Prompt change; paragraph metrics recorded by the quality check (not gating) | No comparison on everyday articles |
 | Headings at sentence boundaries (7.5 B) | One Chinese video: headings inside a sentence 1 → 0, paragraphs ending mid-sentence 30 → 0, tokens about the same | One video only; everyday articles from mid-2026 on already had 0 to 2 such spots |
 | Locks, CLI backoff, the paid-API question (6.4, 6.8) | Real processes in tests; on the Mac, 3 videos 1094 s serial vs 320 s parallel with no overlapping yt-dlp; fault-injected CLI and a fake API key | Batch `run` does not exist yet |
+| Chinese headings in bilingual articles (7.5 B) | On the Mac with DeepSeek Flash, against `main`: a short video (one round, no outline) 5 of 5 English headings with a Chinese one in two runs, `main` 0 of 5; a long video (outline, chapters) 10 of 10, `main` 3 of 7; tokens about the same | The new `verify` heading warnings have fired only in tests; the translation's fixed-chunk fallback keeps the headings as the model wrote them |
 
 No article had been produced with the refactored code when this was written: the newest article in the output folder dates from 2026-10-16, before stage 0. The output quality of the new code in everyday use is therefore not yet measured.
 
@@ -1534,6 +1535,7 @@ merge 阶段 -> verify 阶段 -> assemble 阶段
 | 自然段规则（`cleanup_zh`、`structure_only`） | 提示词改动；质量检查记录段落指标（不拦截） | 没有在日常文章上对比 |
 | 标题落在句子边界（7.5 B） | 一个中文视频：标题打断句子 1 → 0，停在半句的段落 30 → 0，token 基本不变 | 只有一个视频；2026 年年中以后的日常文章里这类地方本来就只有 0 到 2 处 |
 | 锁、命令行退避、付费 API 询问（6.4、6.8） | 测试里用真实进程；Mac 上 3 个视频串行 1094 秒对并行 320 秒，yt-dlp 没有重叠；注入故障的命令行和假 API 密钥 | 批量 `run` 还不存在 |
+| 双语文章的中文标题（7.5 B） | Mac 上用 DeepSeek Flash 和 `main` 对比：短视频（一轮、没有大纲）两次都是 5 个英文标题 5 个有中文标题，`main` 5 个里 0 个；长视频（有大纲和章节）10 个里 10 个，`main` 7 个里 3 个；token 基本不变 | 新的 `verify` 标题警告只在测试里触发过；翻译的固定分块兜底保留模型写的标题原样 |
 
 写这一节时，还没有任何文章是用重构后的代码生成的：输出目录里最新的文章是 2026-10-16 的，早于第 0 阶段。所以新代码在日常使用中的输出质量还没有测量过。
 
