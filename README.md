@@ -174,7 +174,7 @@ Known limitation: macOS (and many Linux systems) empties `/tmp` on restart, so a
 
 ### Output
 
-The article is written to `<output_dir>/<upload date>. <title>.md` (for example `2026-10-22. Some Title.md`). If a file of that name already holds another video's article (its frontmatter `url` names another video, or none), the new one gets ` (<video_id>)` before `.md`; a rerun of the same video replaces its own article. The file is written to a hidden temp file first and then renamed, so the notes app never sees half an article. It starts with YAML frontmatter (`title`, `source`, `url`, `channel`, `author`, `date`, `created`, `type`, `bilingual`, `duration`, `transcript_source`, `tags`, `via`), then a header with the title, a channel link, the language mode and the duration, then the text with `##` section headings, and ends with a one-line footer. In bilingual articles each English paragraph is followed by its Chinese translation, and each heading is an English `##` line followed by a Chinese one. The frontmatter suits an Obsidian vault.
+The article is written to `<output_dir>/<upload date as yymmdd>. <title>.md` (for example `261022. Some Title.md`). If a file of that name already holds another video's article (its frontmatter `url` names another video, or none), the new one gets ` (<video_id>)` before `.md`; a rerun of the same video replaces its own article. The file is written to a hidden temp file first and then renamed, so the notes app never sees half an article. It starts with YAML frontmatter (`title`, `source`, `url`, `channel`, `author`, `date`, `created`, `type`, `bilingual`, `duration`, `transcript_source`, `tags`, `via`), then a header with the title, a channel link, the language mode and the duration, then the text with `##` section headings, and ends with a one-line footer. In bilingual articles each English paragraph is followed by its Chinese translation, and each heading is an English `##` line followed by a Chinese one. The frontmatter suits an Obsidian vault.
 
 ### Development
 
@@ -412,7 +412,7 @@ URL 也可以是 11 位的视频 id。
 
 ### 输出
 
-文章写到 `<output_dir>/<上传日期>. <标题>.md`（例如 `2026-10-22. 某个标题.md`）。同名文件里已经是别的视频的文章时（它 frontmatter 里的 `url` 是另一个视频，或者没有 `url`），新文章在 `.md` 前加上 ` (<video_id>)`；同一个视频重跑则覆盖它自己的旧文章。文件先写到一个隐藏的临时文件再改名，所以笔记软件不会读到半篇文章。开头是 YAML frontmatter（`title`、`source`、`url`、`channel`、`author`、`date`、`created`、`type`、`bilingual`、`duration`、`transcript_source`、`tags`、`via`），然后是标题、频道链接、语言模式和时长组成的头部，然后是带 `##` 小标题的正文，最后是一行页脚。双语文章里每个英文段落后面紧跟它的中文译文，每个小标题是一行英文 `##` 加一行中文 `##`。frontmatter 适合放进 Obsidian 库。
+文章写到 `<output_dir>/<上传日期 yymmdd>. <标题>.md`（例如 `261022. 某个标题.md`）。同名文件里已经是别的视频的文章时（它 frontmatter 里的 `url` 是另一个视频，或者没有 `url`），新文章在 `.md` 前加上 ` (<video_id>)`；同一个视频重跑则覆盖它自己的旧文章。文件先写到一个隐藏的临时文件再改名，所以笔记软件不会读到半篇文章。开头是 YAML frontmatter（`title`、`source`、`url`、`channel`、`author`、`date`、`created`、`type`、`bilingual`、`duration`、`transcript_source`、`tags`、`via`），然后是标题、频道链接、语言模式和时长组成的头部，然后是带 `##` 小标题的正文，最后是一行页脚。双语文章里每个英文段落后面紧跟它的中文译文，每个小标题是一行英文 `##` 加一行中文 `##`。frontmatter 适合放进 Obsidian 库。
 
 ### 开发
 

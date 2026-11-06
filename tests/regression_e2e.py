@@ -34,7 +34,7 @@ BASELINE = FIXTURES / "baseline.json"
 # What the copied skill needs to run the pipeline and the fakes.
 SKILL_FILES = ("yt_transcript_utils.py", "kernel", "prompts", "scripts", "tests/e2e", "tests/fake_llm.py")
 UPDATE_ENV = "UPDATE_E2E_BASELINE"
-DATE_PREFIX = re.compile(r"^\d{4}-\d{2}-\d{2}\. ")
+DATE_PREFIX = re.compile(r"^\d{6}\. ")
 FRONTMATTER_KEYS = ("title", "source", "channel", "date", "created", "bilingual", "duration", "transcript_source")
 
 
@@ -208,7 +208,7 @@ class EndToEndFixtureTests(unittest.TestCase):
                 self.assertTrue(output["file"].endswith(".md"))
                 frontmatter = output["frontmatter"]
                 self.assertRegex(frontmatter["date"], r"^\d{4}-\d{2}-\d{2}$")
-                self.assertEqual(frontmatter["date"], output["file"][:10])
+                self.assertEqual(frontmatter["date"][2:].replace("-", ""), output["file"][:6])
                 self.assertEqual(f"https://www.youtube.com/watch?v={video['id']}", frontmatter["source"])
                 self.assertEqual("true" if video["expected_case"].startswith("en") else "false",
                                  frontmatter["bilingual"])

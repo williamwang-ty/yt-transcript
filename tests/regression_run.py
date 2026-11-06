@@ -176,7 +176,7 @@ class RunCommandTests(RunFixture):
         self.assertEqual("subtitles", first["route"]["source"])
         self.assertEqual("bilingual", first["route"]["mode"])
         self.assertEqual(["window", "translate"], self.llm_calls())
-        self.assertRegex(Path(first["output_file"]).name, r"^\d{4}-\d{2}-\d{2}\. .+\.md$")
+        self.assertRegex(Path(first["output_file"]).name, r"^\d{6}\. .+\.md$")
 
         second = self.run_video(f"https://youtu.be/{ENGLISH}")
         self.assertEqual("done", second["status"])
