@@ -245,10 +245,10 @@ def article_path(folder: Path, name: str, video_id: str) -> Path:
     return path
 
 
-def iso_date(upload_date: str) -> str:
-    """yyyymmdd -> yyyy-mm-dd, the date format for output filenames."""
+def short_date(upload_date: str) -> str:
+    """yyyymmdd -> yymmdd (20261103 -> 261103), the date format of the user's notes."""
     text = str(upload_date or "")
-    return f"{text[:4]}-{text[4:6]}-{text[6:8]}" if len(text) == 8 and text.isdigit() else text
+    return text[2:] if len(text) == 8 and text.isdigit() else text
 
 
 def _remove(path: Path) -> None:
@@ -1090,7 +1090,7 @@ class _Run:
         if not output_dir.strip():
             raise Stop("needs_user", "output_dir_missing", NEEDS_USER_MESSAGES["output_dir_missing"])
         meta = self.state["metadata"]
-        date = iso_date(meta.get("upload_date", ""))
+        date = short_date(meta.get("upload_date", ""))
         title = kernel_assemble.sanitize_filename(str(meta.get("title") or "")).strip() or self.video_id
         mode = self.state["route"]["mode"]
         # Choosing the name and writing under one machine-wide lock: two videos with the
@@ -1107,7 +1107,7 @@ class _Run:
                 source=self.url,
                 channel=str(meta.get("channel") or ""),
                 date=str(meta.get("upload_date") or ""),
-                created=date,
+                created=str(meta.get("upload_date") or ""),
                 duration=int(meta.get("duration") or 0),
                 transcript_source=SOURCE_LABELS[self.state["route"]["source"]],
                 bilingual=mode == "bilingual",
